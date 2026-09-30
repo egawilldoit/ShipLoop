@@ -7,12 +7,20 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const DEADLINE_MS = 900_000;
 
 async function testFiles(dir) {
+  const files = [];
+  let entries;
   try {
-    const entries = await readdir(dir, { withFileTypes: true });
-    return entries.filter((entry) => entry.isFile() && entry.name.endsWith('.test.ts')).map((entry) => join(dir, entry.name));
+    entries = await readdir(dir, { withFileTypes: true });
   } catch {
-    return [];
+    return files;
   }
+  for (const entry of entries) {
+    if (entry.name === 'node_modules') continue;
+    const path = join(dir, entry.name);
+    if (entry.isDirectory()) files.push(...(await testFiles(path)));
+    else if (entry.name.endsWith('.test.ts')) files.push(path);
+  }
+  return files.sort();
 }
 
 const suites = [

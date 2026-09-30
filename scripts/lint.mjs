@@ -76,7 +76,7 @@ const rules = [
       if (/apps\//.test(match[1]) || /@shiploop\/(web|worker)/.test(match[1])) {
         report(file, lineNumber, 'layering/no-app-import', `packages must not import from apps (${match[1]}).`);
       }
-      if (match[1].startsWith('@shiploop/') && match[1].includes('/')) {
+      if (/^@shiploop\/[^/]+\//.test(match[1])) {
         report(file, lineNumber, 'layering/no-deep-import', `Import another package by its root name, not ${match[1]}.`);
       }
     },
