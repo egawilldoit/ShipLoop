@@ -84,7 +84,7 @@ export interface FailureClassification {
   readonly evidence: string;
 }
 
-export function classifyFailure(input: {
+export function classifyCheckFailure(input: {
   readonly failedOnCandidate: boolean;
   readonly failedOnBaseSha: boolean | null;
   readonly baseShaObserved: boolean;

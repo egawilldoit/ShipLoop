@@ -1,5 +1,5 @@
 import {
-  classifyFailure,
+  classifyCheckFailure,
   err,
   invalid,
   isBlocking,
@@ -426,12 +426,12 @@ export function evaluateCandidateReadiness(input: ReadinessInput): Result<Readin
  * Delegates to the domain function so this module holds no second opinion, and
  * records that neither attribution waives a required check (F20-AC4).
  */
-export function classifyCheckFailure(input: {
+export function attributeCheckFailure(input: {
   readonly failedOnCandidate: boolean;
   readonly failedOnBaseSha: boolean | null;
   readonly baseShaObserved: boolean;
 }): { readonly classification: FailureClassification; readonly waivesRequiredCheck: false } {
-  return { classification: classifyFailure(input), waivesRequiredCheck: false };
+  return { classification: classifyCheckFailure(input), waivesRequiredCheck: false };
 }
 
 export interface CheckRequest {

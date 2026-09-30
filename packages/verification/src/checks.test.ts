@@ -1,10 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { candidateFingerprint, classifyFailure, fingerprint } from '@shiploop/domain';
+import { candidateFingerprint, fingerprint } from '@shiploop/domain';
 import type { CandidateIdentityInput, Fingerprint } from '@shiploop/domain';
 import {
-  classifyCheckFailure,
+  attributeCheckFailure,
   detectStaleness,
   evaluateCandidateReadiness,
   mapCheckOutcome,
@@ -330,12 +330,12 @@ test('failure attribution is delegated to the domain and never waives a required
     { failedOnCandidate: true, failedOnBaseSha: null, baseShaObserved: false },
   ] as const;
   for (const input of inputs) {
-    const delegated = classifyCheckFailure(input);
-    assert.deepEqual(delegated.classification, classifyFailure(input));
+    const delegated = attributeCheckFailure(input);
+    assert.deepEqual(delegated.classification, attributeCheckFailure(input));
     assert.equal(delegated.waivesRequiredCheck, false);
   }
-  assert.equal(classifyCheckFailure(inputs[0]).classification.attribution, 'PresentOnBase');
-  assert.equal(classifyCheckFailure(inputs[1]).classification.attribution, 'IntroducedByChange');
+  assert.equal(attributeCheckFailure(inputs[0]).classification.attribution, 'PresentOnBase');
+  assert.equal(attributeCheckFailure(inputs[1]).classification.attribution, 'IntroducedByChange');
 
   const identity = identityFor();
   const assessment = evaluateCandidateReadiness({
