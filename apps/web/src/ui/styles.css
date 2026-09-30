@@ -1,0 +1,636 @@
+/*
+ * Owner UI styles.
+ *
+ * Two rules govern this file.
+ *
+ * Layout never assumes more width than a 375px phone (F01-AC3, N03-AC2). Every container is
+ * a max-width block that centres, every flex row wraps, every flex child is allowed to
+ * shrink with min-width: 0, and no fixed pixel width anywhere is wider than the smallest
+ * supported viewport. Long repository URLs and opaque identifiers break rather than push the
+ * page sideways.
+ *
+ * State is never carried by colour alone (N03-AC1). Each badge tone draws a different
+ * shape and uses a different border treatment as well as a colour, so a monochrome print or
+ * a colour-blind reader can still separate healthy, degraded, revoked and unconfigured.
+ * Focus is drawn by a single :focus-visible rule and is never removed.
+ */
+
+:root {
+  --ink: #14181f;
+  --ink-soft: #45505f;
+  --paper: #ffffff;
+  --paper-sunken: #f2f4f7;
+  --line: #b9c1cc;
+  --accent: #14406b;
+  --focus: #a8320d;
+  --ok-ink: #14532d;
+  --ok-fill: #dcf3e4;
+  --warn-ink: #7a2e00;
+  --warn-fill: #fdeedd;
+  --stop-ink: #7a1020;
+  --stop-fill: #fce4e8;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  padding: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+  font-size: 100%;
+  line-height: 1.5;
+}
+
+h1,
+h2,
+h3,
+h4 {
+  margin: 0 0 0.5rem;
+  line-height: 1.25;
+}
+
+p {
+  margin: 0 0 0.5rem;
+}
+
+ul,
+ol,
+dl {
+  margin: 0;
+  padding: 0;
+}
+
+li {
+  list-style: none;
+}
+
+/* One focus treatment for the whole application; nothing turns it off. */
+:focus-visible {
+  outline: 3px solid var(--focus);
+  outline-offset: 2px;
+}
+
+.skip-link {
+  display: block;
+  width: 100%;
+  max-width: 64rem;
+  margin: 0 auto;
+  padding: 0.5rem 1rem;
+  background: var(--accent);
+  color: var(--paper);
+  transform: translateY(-150%);
+}
+
+.skip-link:focus {
+  transform: translateY(0);
+}
+
+.app__header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  width: 100%;
+  max-width: 64rem;
+  margin: 0 auto;
+  padding: 1rem;
+}
+
+.app__identity {
+  min-width: 0;
+}
+
+.app__title {
+  margin: 0;
+  font-size: 1.5rem;
+}
+
+.app__owner {
+  margin: 0;
+  color: var(--ink-soft);
+  overflow-wrap: anywhere;
+}
+
+.app__nav,
+.app__main,
+.banner {
+  width: 100%;
+  max-width: 64rem;
+  margin: 0 auto;
+  padding: 0 1rem 1rem;
+}
+
+.app__nav-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.page {
+  min-width: 0;
+}
+
+.page--narrow {
+  max-width: 32rem;
+  margin: 0 auto;
+  padding: 2rem 1rem;
+}
+
+.page__header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.page__title {
+  font-size: 1.35rem;
+  overflow-wrap: anywhere;
+}
+
+/* Buttons and controls */
+
+.button {
+  display: inline-block;
+  min-height: 2.75rem;
+  padding: 0.5rem 1rem;
+  border: 2px solid var(--accent);
+  border-radius: 0.35rem;
+  background: var(--accent);
+  color: var(--paper);
+  font: inherit;
+  text-align: center;
+  cursor: pointer;
+}
+
+.button--secondary {
+  background: var(--paper);
+  color: var(--accent);
+}
+
+.button--danger {
+  background: var(--stop-ink);
+  border-color: var(--stop-ink);
+}
+
+.button--tab[aria-current='page'] {
+  background: var(--ink);
+  border-color: var(--ink);
+  font-weight: 700;
+}
+
+.button:disabled {
+  background: var(--paper-sunken);
+  border-color: var(--line);
+  color: var(--ink-soft);
+  cursor: not-allowed;
+}
+
+/* Status and state lines */
+
+.state-line {
+  margin: 0 0 0.75rem;
+  padding: 0.5rem 0.75rem;
+  border: 2px solid var(--line);
+  border-radius: 0.35rem;
+  background: var(--paper-sunken);
+  overflow-wrap: anywhere;
+}
+
+.state-line--error {
+  border-style: double;
+  border-width: 4px;
+  border-color: var(--stop-ink);
+  background: var(--stop-fill);
+  color: var(--stop-ink);
+}
+
+.banner {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.banner__text {
+  flex: 1 1 16rem;
+  min-width: 0;
+  margin: 0;
+  padding: 0.5rem 0.75rem;
+  border: 2px solid var(--line);
+  border-radius: 0.35rem;
+  background: var(--paper-sunken);
+  overflow-wrap: anywhere;
+}
+
+.banner--ok .banner__text {
+  border-color: var(--ok-ink);
+  background: var(--ok-fill);
+}
+
+.banner--warn .banner__text {
+  border-style: double;
+  border-width: 4px;
+  border-color: var(--warn-ink);
+  background: var(--warn-fill);
+  color: var(--warn-ink);
+}
+
+.banner__state {
+  display: inline-block;
+  margin-right: 0.25rem;
+}
+
+/*
+ * A badge is a word, a shape and a border treatment. The shape differs per tone, so the
+ * state survives greyscale printing and colour-blindness (N03-AC1).
+ */
+
+.badge {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem;
+  max-width: 100%;
+  padding: 0.15rem 0.5rem;
+  border: 2px solid var(--ink);
+  border-radius: 0.35rem;
+  background: var(--paper);
+  font-size: 0.95rem;
+}
+
+.badge__mark {
+  display: inline-block;
+  flex: none;
+  width: 0.8rem;
+  height: 0.8rem;
+  border: 2px solid currentColor;
+}
+
+.badge__detail {
+  color: var(--ink-soft);
+}
+
+.badge[data-tone='healthy'] {
+  border-color: var(--ok-ink);
+  color: var(--ok-ink);
+}
+
+.badge[data-tone='healthy'] .badge__mark {
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.badge[data-tone='degraded'] {
+  border-style: dashed;
+  border-color: var(--warn-ink);
+  color: var(--warn-ink);
+}
+
+.badge[data-tone='degraded'] .badge__mark {
+  border: none;
+  background: currentColor;
+  clip-path: polygon(50% 0%, 100% 100%, 0% 100%);
+}
+
+.badge[data-tone='revoked'] {
+  border-style: double;
+  border-width: 4px;
+  border-color: var(--stop-ink);
+  color: var(--stop-ink);
+}
+
+.badge[data-tone='revoked'] .badge__mark {
+  position: relative;
+  border-radius: 50%;
+}
+
+.badge[data-tone='revoked'] .badge__mark::after {
+  content: '';
+  position: absolute;
+  inset: -2px;
+  background: linear-gradient(
+    to bottom right,
+    transparent calc(50% - 1px),
+    currentColor calc(50% - 1px),
+    currentColor calc(50% + 1px),
+    transparent calc(50% + 1px)
+  );
+}
+
+.badge[data-tone='unconfigured'] {
+  border-style: dotted;
+  border-color: var(--ink-soft);
+  color: var(--ink-soft);
+}
+
+.badge[data-tone='unconfigured'] .badge__mark {
+  border-style: dotted;
+}
+
+.badge[data-tone='pending'] {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.badge[data-tone='pending'] .badge__mark {
+  position: relative;
+  border-radius: 50%;
+}
+
+.badge[data-tone='pending'] .badge__mark::before {
+  content: '';
+  position: absolute;
+  inset: -2px 50% -2px -2px;
+  background: currentColor;
+}
+
+.badge[data-tone='neutral'] .badge__mark {
+  border-radius: 50%;
+}
+
+/* Panels, lists and detail rows */
+
+.panel {
+  min-width: 0;
+  margin: 0 0 1rem;
+  padding: 1rem;
+  border: 2px solid var(--line);
+  border-radius: 0.5rem;
+  background: var(--paper);
+}
+
+.panel__title {
+  font-size: 1.1rem;
+  overflow-wrap: anywhere;
+}
+
+.panel__note {
+  color: var(--ink-soft);
+  overflow-wrap: anywhere;
+}
+
+.profile-list,
+.connector-list,
+.capability-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.profile-list__item {
+  min-width: 0;
+  padding-bottom: 0.75rem;
+  border-bottom: 1px solid var(--line);
+}
+
+.profile-list__item:last-child {
+  border-bottom: none;
+  padding-bottom: 0;
+}
+
+.profile-list__name {
+  display: block;
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
+
+.profile-list__detail {
+  display: block;
+  color: var(--ink-soft);
+  overflow-wrap: anywhere;
+}
+
+.detail-list__row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem 0.75rem;
+  padding: 0.25rem 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.detail-list__row:last-child {
+  border-bottom: none;
+}
+
+.detail-list__row dt {
+  flex: 0 0 9rem;
+  min-width: 0;
+  font-weight: 700;
+}
+
+.detail-list__row dd {
+  flex: 1 1 10rem;
+  min-width: 0;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.version-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.version-list__item {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  min-width: 0;
+  padding: 0.5rem;
+  border: 1px solid var(--line);
+  border-radius: 0.35rem;
+}
+
+.version-list__id {
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
+
+.version-list__summary,
+.version-list__time {
+  flex: 1 1 12rem;
+  min-width: 0;
+  color: var(--ink-soft);
+  overflow-wrap: anywhere;
+}
+
+.version-list__flag {
+  padding: 0.1rem 0.4rem;
+  border: 2px solid var(--ink);
+  border-radius: 0.35rem;
+  font-weight: 700;
+}
+
+/* Connectors */
+
+.connector__header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.connector__subtitle {
+  font-size: 1rem;
+}
+
+.connector__capabilities {
+  display: grid;
+  gap: 0.75rem;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 14rem), 1fr));
+  margin: 0.75rem 0;
+}
+
+.connector__capabilities > div {
+  min-width: 0;
+}
+
+.capability-list__item {
+  padding: 0.15rem 0 0.15rem 0.9rem;
+  position: relative;
+  overflow-wrap: anywhere;
+}
+
+.capability-list__item::before {
+  content: '\2013';
+  position: absolute;
+  left: 0;
+}
+
+.connector__none,
+.connector__limitations {
+  color: var(--ink-soft);
+  overflow-wrap: anywhere;
+}
+
+.connector__problem {
+  margin: 0.75rem 0;
+  padding: 0.5rem 0.75rem;
+  border: 4px double var(--stop-ink);
+  border-radius: 0.35rem;
+  background: var(--stop-fill);
+  color: var(--stop-ink);
+}
+
+.connector__problem-line {
+  overflow-wrap: anywhere;
+}
+
+.connector__actions,
+.form__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin-top: 0.75rem;
+}
+
+/* Forms */
+
+.form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  max-width: 32rem;
+}
+
+.form--grid {
+  display: grid;
+  gap: 1rem;
+  max-width: none;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 17rem), 1fr));
+}
+
+.form--grid .form__actions {
+  grid-column: 1 / -1;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  min-width: 0;
+}
+
+.field__label {
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
+
+.field__input {
+  width: 100%;
+  max-width: 26rem;
+  min-height: 2.75rem;
+  padding: 0.4rem 0.5rem;
+  border: 2px solid var(--line);
+  border-radius: 0.35rem;
+  background: var(--paper);
+  color: inherit;
+  font: inherit;
+}
+
+.field--check {
+  flex-direction: row;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.field__hint {
+  color: var(--ink-soft);
+  overflow-wrap: anywhere;
+}
+
+.field__error {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.35rem;
+  margin: 0;
+  color: var(--stop-ink);
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
+
+.field__error-mark {
+  display: inline-block;
+  flex: none;
+  width: 0.75rem;
+  height: 0.75rem;
+  border: 2px solid currentColor;
+  background: currentColor;
+  clip-path: polygon(50% 0%, 100% 100%, 0% 100%);
+}
+
+@media (max-width: 40rem) {
+  .app__header {
+    align-items: flex-start;
+  }
+
+  .detail-list__row dt,
+  .detail-list__row dd {
+    flex: 1 1 100%;
+  }
+
+  .version-list__summary,
+  .version-list__time {
+    flex: 1 1 100%;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .skip-link {
+    transition: none;
+  }
+}
