@@ -1,0 +1,20 @@
+{
+  "name": "@shiploop/controller",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "node --test --experimental-test-module-mocks 'src/**/*.test.ts'"
+  },
+  "dependencies": {
+    "@shiploop/domain": "workspace:*",
+    "@shiploop/storage": "workspace:*",
+    "@shiploop/adapters": "workspace:*",
+    "@shiploop/verification": "workspace:*",
+    "zod": "4.6.5"
+  }
+}

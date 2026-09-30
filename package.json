@@ -1,6 +1,6 @@
 {
   "name": "shiploop",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "private": true,
   "packageManager": "pnpm@11.15.0",
   "engines": {
@@ -9,8 +9,15 @@
   "scripts": {
     "doctor": "node scripts/doctor.mjs",
     "check": "node scripts/check.mjs",
-    "test": "node --test scripts/tests/*.test.mjs",
+    "test": "node scripts/run-tests.mjs",
     "verify": "node scripts/verify.mjs foundation",
-    "verify:app": "node scripts/verify.mjs application"
+    "verify:app": "node scripts/verify.mjs application",
+    "typecheck": "tsc --build tsconfig.json",
+    "build": "pnpm --filter @shiploop/web run build",
+    "e2e": "pnpm --filter @shiploop/web run e2e"
+  },
+  "devDependencies": {
+    "@types/node": "24.19.0",
+    "typescript": "5.9.3"
   }
 }

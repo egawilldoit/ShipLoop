@@ -28,8 +28,141 @@
     },
     "application": {
       "stage": "application",
-      "blockedReason": "No application exists yet. Add real lint, typecheck, unit/integration, build and browser E2E gates with the first runnable application slice.",
-      "commands": []
+      "commands": [
+        {
+          "id": "foundation-check",
+          "argv": [
+            "node",
+            "scripts/check.mjs"
+          ],
+          "timeoutMs": 120000,
+          "maxOutputBytes": 65536
+        },
+        {
+          "id": "policy-lint",
+          "argv": [
+            "node",
+            "scripts/lint.mjs"
+          ],
+          "timeoutMs": 120000,
+          "maxOutputBytes": 131072
+        },
+        {
+          "id": "typecheck-domain",
+          "argv": [
+            "node",
+            "node_modules/typescript/bin/tsc",
+            "--noEmit",
+            "-p",
+            "packages/domain/tsconfig.json"
+          ],
+          "timeoutMs": 180000,
+          "maxOutputBytes": 65536
+        },
+        {
+          "id": "typecheck-storage",
+          "argv": [
+            "node",
+            "node_modules/typescript/bin/tsc",
+            "--noEmit",
+            "-p",
+            "packages/storage/tsconfig.json"
+          ],
+          "timeoutMs": 180000,
+          "maxOutputBytes": 65536
+        },
+        {
+          "id": "typecheck-adapters",
+          "argv": [
+            "node",
+            "node_modules/typescript/bin/tsc",
+            "--noEmit",
+            "-p",
+            "packages/adapters/tsconfig.json"
+          ],
+          "timeoutMs": 180000,
+          "maxOutputBytes": 65536
+        },
+        {
+          "id": "typecheck-verification",
+          "argv": [
+            "node",
+            "node_modules/typescript/bin/tsc",
+            "--noEmit",
+            "-p",
+            "packages/verification/tsconfig.json"
+          ],
+          "timeoutMs": 180000,
+          "maxOutputBytes": 65536
+        },
+        {
+          "id": "typecheck-controller",
+          "argv": [
+            "node",
+            "node_modules/typescript/bin/tsc",
+            "--noEmit",
+            "-p",
+            "packages/controller/tsconfig.json"
+          ],
+          "timeoutMs": 180000,
+          "maxOutputBytes": 65536
+        },
+        {
+          "id": "typecheck-worker",
+          "argv": [
+            "node",
+            "node_modules/typescript/bin/tsc",
+            "--noEmit",
+            "-p",
+            "apps/worker/tsconfig.json"
+          ],
+          "timeoutMs": 180000,
+          "maxOutputBytes": 65536
+        },
+        {
+          "id": "typecheck-web",
+          "argv": [
+            "node",
+            "node_modules/typescript/bin/tsc",
+            "--noEmit",
+            "-p",
+            "apps/web/tsconfig.json"
+          ],
+          "timeoutMs": 180000,
+          "maxOutputBytes": 65536
+        },
+        {
+          "id": "app-tests",
+          "argv": [
+            "node",
+            "scripts/run-tests.mjs"
+          ],
+          "timeoutMs": 900000,
+          "maxOutputBytes": 262144
+        },
+        {
+          "id": "web-build",
+          "argv": [
+            "pnpm",
+            "--filter",
+            "@shiploop/web",
+            "run",
+            "build"
+          ],
+          "timeoutMs": 600000,
+          "maxOutputBytes": 131072
+        },
+        {
+          "id": "browser-e2e",
+          "argv": [
+            "node",
+            "node_modules/@playwright/test/cli.js",
+            "test"
+          ],
+          "timeoutMs": 900000,
+          "maxOutputBytes": 262144
+        }
+      ]
     }
   }
 }

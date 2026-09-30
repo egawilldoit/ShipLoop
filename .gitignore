@@ -10,3 +10,5 @@ coverage/
 .shiploop-dev/
 playwright-report/
 test-results/
+.shiploop-dev/
+.worktrees/
