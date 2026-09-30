@@ -4,9 +4,10 @@ import { fingerprint } from './fingerprint.ts';
 import {
   CHECK_RESULTS,
   acceptanceReady,
-  classifyFailure,
+  classifyCheckFailure,
   deliveryEligible,
   isBlocking,
+  isSatisfied,
   isTerminalSuccess,
   type CheckRecord,
   type CheckResult,
@@ -76,12 +77,34 @@ describe('F20-AC2 check result classification', () => {
     }
   });
 
-  test('isBlocking is true for Failed, Missing and Stale and false for Passed and NotApplicable', () => {
+  test('isBlocking is true for Failed, Missing and Stale and false for Passed', () => {
     assert.equal(isBlocking('Failed'), true);
     assert.equal(isBlocking('Missing'), true);
     assert.equal(isBlocking('Stale'), true);
     assert.equal(isBlocking('Passed'), false);
-    assert.equal(isBlocking('NotApplicable'), false);
+  });
+
+  test('F20-AC5 NotApplicable blocks unless a policy decision approved it', () => {
+    // A bare result string cannot prove that a policy decision was made, so the
+    // approval is a separate argument and the default is to block.
+    assert.equal(isBlocking('NotApplicable'), true);
+    assert.equal(isBlocking('NotApplicable', false), true);
+    assert.equal(isBlocking('NotApplicable', true), false);
+  });
+
+  test('F20-AC5 isSatisfied accepts a Passed check and a policy-approved NotApplicable check', () => {
+    assert.equal(isSatisfied(checkRecord({ result: 'Passed' })), true);
+    assert.equal(
+      isSatisfied({ result: 'NotApplicable', notApplicableApprovedByPolicy: true }),
+      true,
+    );
+  });
+
+  test('F20-AC5 isSatisfied refuses a NotApplicable check with no policy approval, and every non-pass', () => {
+    assert.equal(isSatisfied({ result: 'NotApplicable', notApplicableApprovedByPolicy: false }), false);
+    for (const result of ['Failed', 'Missing', 'Waiting', 'Stale'] as const) {
+      assert.equal(isSatisfied(checkRecord({ result })), false, `${result} must not satisfy a required check`);
+    }
   });
 
   test('F20-AC2 a required check that never ran is Missing, Waiting or Stale and never Passed', () => {
@@ -128,7 +151,33 @@ describe('F20-AC2 check result classification', () => {
 
     const decision = deliverFor([unapproved]);
     assert.equal(decision.eligible, false);
-    assert.deepEqual(decision.reasons, ['Required check "pnpm verify:app" is NotApplicable, not Passed.']);
+    assert.deepEqual(decision.reasons, [
+      'Required check "pnpm verify:app" is NotApplicable without a policy approval.',
+    ]);
+  });
+
+  test('F20-AC5 a required check that is NotApplicable under a policy approval is satisfied', () => {
+    // The approval field used to be dead: an approved NotApplicable check still
+    // blocked forever, so no candidate with one could ever be delivered.
+    const approved = checkRecord({
+      result: 'NotApplicable',
+      notApplicableApprovedByPolicy: true,
+      endedAt: null,
+      exitCode: null,
+    });
+
+    assert.deepEqual(deliverFor([approved]), { eligible: true, reasons: [] });
+  });
+
+  test('F20-AC5 isBlocking and deliveryEligible no longer contradict each other over NotApplicable', () => {
+    // The two functions used to disagree: isBlocking said NotApplicable was fine
+    // while deliveryEligible blocked it. isBlocking answers "blocks", eligible
+    // answers "may deliver", so they must now be exact opposites.
+    const approved = checkRecord({ result: 'NotApplicable', notApplicableApprovedByPolicy: true, endedAt: null, exitCode: null });
+    const unapproved = checkRecord({ result: 'NotApplicable', notApplicableApprovedByPolicy: false, endedAt: null, exitCode: null });
+
+    assert.equal(isBlocking('NotApplicable', true), !deliverFor([approved]).eligible);
+    assert.equal(isBlocking('NotApplicable', false), !deliverFor([unapproved]).eligible);
   });
 
   test('F20-AC2 a Waiting required check is not treated as a terminal success by deliveryEligible', () => {
@@ -144,22 +193,22 @@ describe('F20-AC2 check result classification', () => {
 
 describe('F20-AC4 failure attribution', () => {
   test('classifies a failure reproduced on the observed base commit as PresentOnBase', () => {
-    const classification = classifyFailure({ failedOnCandidate: true, failedOnBaseSha: true, baseShaObserved: true });
+    const classification = classifyCheckFailure({ failedOnCandidate: true, failedOnBaseSha: true, baseShaObserved: true });
 
     assert.equal(classification.attribution, 'PresentOnBase');
     assert.match(classification.evidence, /also failed on the observed base commit/);
   });
 
   test('classifies a failure absent from the observed base commit as IntroducedByChange', () => {
-    const classification = classifyFailure({ failedOnCandidate: true, failedOnBaseSha: false, baseShaObserved: true });
+    const classification = classifyCheckFailure({ failedOnCandidate: true, failedOnBaseSha: false, baseShaObserved: true });
 
     assert.equal(classification.attribution, 'IntroducedByChange');
     assert.match(classification.evidence, /passed on the observed base commit/);
   });
 
   test('classifies an unobserved base commit as Indeterminate whatever the base result says', () => {
-    const unobservedTrue = classifyFailure({ failedOnCandidate: true, failedOnBaseSha: true, baseShaObserved: false });
-    const unobservedNull = classifyFailure({ failedOnCandidate: true, failedOnBaseSha: null, baseShaObserved: false });
+    const unobservedTrue = classifyCheckFailure({ failedOnCandidate: true, failedOnBaseSha: true, baseShaObserved: false });
+    const unobservedNull = classifyCheckFailure({ failedOnCandidate: true, failedOnBaseSha: null, baseShaObserved: false });
 
     assert.equal(unobservedTrue.attribution, 'Indeterminate');
     assert.equal(unobservedNull.attribution, 'Indeterminate');
@@ -167,7 +216,7 @@ describe('F20-AC4 failure attribution', () => {
   });
 
   test('classifies a check the candidate did not report as failed as Indeterminate', () => {
-    const classification = classifyFailure({ failedOnCandidate: false, failedOnBaseSha: true, baseShaObserved: true });
+    const classification = classifyCheckFailure({ failedOnCandidate: false, failedOnBaseSha: true, baseShaObserved: true });
 
     assert.equal(classification.attribution, 'Indeterminate');
     assert.match(classification.evidence, /did not report this check as failed/);
@@ -175,7 +224,7 @@ describe('F20-AC4 failure attribution', () => {
 
   test('F20-AC4 an existing base failure does not automatically waive the required check', () => {
     const failedOnCandidateToo = checkRecord({ result: 'Failed', exitCode: 1, endedAt: '2026-03-04T09:14:00.000Z' });
-    const attribution = classifyFailure({ failedOnCandidate: true, failedOnBaseSha: true, baseShaObserved: true });
+    const attribution = classifyCheckFailure({ failedOnCandidate: true, failedOnBaseSha: true, baseShaObserved: true });
     const decision = deliverFor([failedOnCandidateToo]);
 
     assert.equal(attribution.attribution, 'PresentOnBase');

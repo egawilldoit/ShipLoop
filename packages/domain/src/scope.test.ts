@@ -246,6 +246,44 @@ describe('scope comparison: material', () => {
     assert.deepEqual(comparison.materialDifferences, ['dependencies.added.ENG-102']);
   });
 
+  test('F12-AC2 - a removed dependency is Material and names the dependency', () => {
+    // Removals were never reported, so the comparison returned kind Unchanged while
+    // its own recordedFingerprint and currentFingerprint disagreed.
+    const comparison = compareScope(RECORDED, withScope({ dependencyIssueIds: ['ENG-100'] }));
+
+    assert.equal(comparison.kind, 'Material');
+    assert.deepEqual(comparison.materialDifferences, ['dependencies.removed.ENG-101']);
+    assert.ok(comparison.materialDifferences.length > 0, 'a removed dependency is a material difference');
+    assert.notEqual(
+      comparison.recordedFingerprint,
+      comparison.currentFingerprint,
+      'the two fingerprints must differ, so Unchanged could never have been honest here',
+    );
+  });
+
+  test('F12-AC2 - Unchanged is only returned when the two fingerprints actually agree', () => {
+    const samples: readonly ScopeSnapshot[] = [
+      withScope({}),
+      withScope({ dependencyIssueIds: [] }),
+      withScope({ dependencyIssueIds: ['ENG-101', 'ENG-100'] }),
+      withScope({ description: 'Retries must be cancelable.' }),
+      withScope({ acceptanceCriteria: [CRITERION_ONE] }),
+      withScope({ title: 'Renamed' }),
+    ];
+    for (const current of samples) {
+      const comparison = compareScope(RECORDED, current);
+      const fingerprintsAgree = comparison.recordedFingerprint === comparison.currentFingerprint;
+      if (!fingerprintsAgree) {
+        assert.equal(
+          comparison.kind,
+          'Material',
+          `differing fingerprints must never be reported as ${comparison.kind}`,
+        );
+        assert.ok(comparison.materialDifferences.length > 0, 'Material must carry at least one difference');
+      }
+    }
+  });
+
   test('F12-AC2 - a material edit outranks a cosmetic one in the same comparison', () => {
     const comparison = compareScope(
       RECORDED,
@@ -274,7 +312,11 @@ describe('scope comparison: material', () => {
       'criteria.changed.c1',
       'criteria.added.c3',
       'criteria.removed.c2',
+      // Swapping ENG-101 for ENG-102 is both an addition and a removal. The
+      // removal was silently dropped before the fix, so this list was incomplete
+      // while the test claimed to prove it was complete.
       'dependencies.added.ENG-102',
+      'dependencies.removed.ENG-101',
     ]);
   });
 });
@@ -318,10 +360,10 @@ describe('scope snapshot immutability', () => {
   /**
    * F12 depends on a captured snapshot being append-only.
    *
-   * Only the type-level half is provable here: the collections are `readonly`
-   * arrays, and no runtime assertion is made that they are frozen or copied,
-   * because the module returns the caller's own scope object by reference. A
-   * mutable path into a captured snapshot would therefore go undetected here.
+   * The types alone were not enough: captureRunContext used to hand back the
+   * caller's own scope object, so a storage adapter returning a mutable decoded
+   * record could change the scope after the fingerprint was recorded. The
+   * collections are now frozen and copied, which is provable at runtime.
    */
 
   /** True only for a mutable array type, so `= false` proves the field is readonly. */
@@ -340,6 +382,76 @@ describe('scope snapshot immutability', () => {
     const captured = capture();
     assert.deepEqual(captured.scope, RECORDED);
     assert.equal(scopeFingerprint(captured.scope), captured.scopeFingerprintValue);
+  });
+
+  test('F12-AC1 - mutating the caller dependency array afterwards does not change the captured scope', () => {
+    // The caller keeps a genuinely mutable array, which the readonly ScopeSnapshot
+    // field accepts. Under the old by-reference capture this push was visible
+    // through the captured snapshot and through its recorded fingerprint.
+    const sharedDependencies: string[] = [...RECORDED.dependencyIssueIds];
+    const captured = captureRunContext(
+      {
+        scope: { ...RECORDED, dependencyIssueIds: sharedDependencies },
+        baseSha: BASE_SHA,
+        profileVersionId: 'profile-version-1',
+        procedureVersionId: 'procedure-version-1',
+      },
+      RECORDED.retrievedAt,
+    );
+    const fingerprintAtCapture = captured.scopeFingerprintValue;
+
+    sharedDependencies.push('ENG-999');
+    assert.deepEqual(sharedDependencies, ['ENG-100', 'ENG-101', 'ENG-999'], 'the caller array really was mutated');
+
+    assert.deepEqual([...captured.scope.dependencyIssueIds], ['ENG-100', 'ENG-101']);
+    assert.equal(
+      scopeFingerprint(captured.scope),
+      fingerprintAtCapture,
+      'a mutated caller array must not change the recomputed scope fingerprint',
+    );
+    assert.notEqual(
+      scopeFingerprint(withScope({ dependencyIssueIds: sharedDependencies })),
+      fingerprintAtCapture,
+      'the mutation really is material, so the assertion above is not vacuous',
+    );
+  });
+
+  test('F12-AC1 - mutating the caller criteria array afterwards does not change the captured scope', () => {
+    const sharedCriteria: ScopeCriterion[] = [CRITERION_ONE, CRITERION_TWO];
+    const captured = captureRunContext(
+      {
+        scope: { ...RECORDED, acceptanceCriteria: sharedCriteria },
+        baseSha: BASE_SHA,
+        profileVersionId: 'profile-version-1',
+        procedureVersionId: 'procedure-version-1',
+      },
+      RECORDED.retrievedAt,
+    );
+    const fingerprintAtCapture = captured.scopeFingerprintValue;
+
+    sharedCriteria[1] = { id: 'c2', text: 'A retry storm is capped per work item' };
+    sharedCriteria.push({ id: 'c3', text: 'A retry storm is capped per work item' });
+
+    assert.deepEqual(
+      captured.scope.acceptanceCriteria.map((criterion) => criterion.id),
+      ['c1', 'c2'],
+    );
+    assert.equal(
+      captured.scope.acceptanceCriteria[1]?.text,
+      CRITERION_TWO.text,
+      'the captured criterion keeps its captured text, not the mutated one',
+    );
+    assert.equal(scopeFingerprint(captured.scope), fingerprintAtCapture);
+  });
+
+  test('F12-AC1 - the captured collections are frozen, so a later write cannot even be attempted', () => {
+    const captured = capture();
+
+    assert.equal(Object.isFrozen(captured.scope.dependencyIssueIds), true);
+    assert.equal(Object.isFrozen(captured.scope.acceptanceCriteria), true);
+    for (const criterion of captured.scope.acceptanceCriteria) {
+      assert.equal(Object.isFrozen(criterion), true);
+    }
   });
 
   test('F12-AC3 - re-capturing after a cosmetic edit keeps the same scope revision', () => {

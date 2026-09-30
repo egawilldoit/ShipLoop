@@ -67,20 +67,29 @@ export function redactDeep<T>(value: T, rules: readonly RedactionRule[] = DEFAUL
  * Redaction of patterns cannot catch a secret that has an unusual shape, so a
  * credential reference is dropped structurally as well.
  *
- * `SECRET_KEY_ALWAYS` words have no legitimate non-credential data field, so they
- * are stripped wherever they appear in the key. `SECRET_KEY_SUFFIX` words are only
- * stripped when they END the key, because a name such as `tokenCount` is real data
- * that an export carrying a full evidence index must keep (F32-AC2).
+ * The decision is whether the credential noun is the key's TRAILING word, not
+ * whether the key merely contains one. `tokenCount`, `cookiePolicy` and
+ * `credentialStatus` are real data an export carrying a full evidence index must
+ * keep (F32-AC2), while `apiToken`, `secretValue` and `credentials` must not
+ * survive. `credential` therefore cannot be an always-match word, because
+ * `credentialStatus` is a legitimate state field.
+ *
+ * The trailing rule tolerates every spelling a field name is written in, so
+ * `apiKey`, `api_key` and `api-key` are all stripped, as are `apiToken`,
+ * `accessToken` and `apiTokens`. It errs towards stripping: a field whose name
+ * happens to end in a credential noun is dropped, which costs an export a
+ * column, whereas a missed spelling leaks the credential itself.
  */
-const SECRET_KEY_ALWAYS = /(?:secret|password|passphrase|credential|privatekey|private_key)/i;
-const SECRET_KEY_SUFFIX = /(?:^|[-_.])(?:token|tokens|apikey|api_key|authorization|cookie|cookies)$/i;
+const SECRET_KEY_ALWAYS = /(?:secret|password|passphrase|private[-_]?key)/i;
+const SECRET_KEY_TRAILING =
+  /(?:^|[-_.]|[a-z0-9])(?:api)?[-_]?(?:keys?|tokens?|authorization|cookies?|credentials?)$/i;
 
 export function stripSecretFields<T>(value: T): T {
   if (Array.isArray(value)) return value.map((entry) => stripSecretFields(entry)) as unknown as T;
   if (value && typeof value === 'object') {
     const output: Record<string, unknown> = {};
     for (const [key, member] of Object.entries(value as Record<string, unknown>)) {
-      if (SECRET_KEY_ALWAYS.test(key) || SECRET_KEY_SUFFIX.test(key)) continue;
+      if (SECRET_KEY_ALWAYS.test(key) || SECRET_KEY_TRAILING.test(key)) continue;
       output[key] = stripSecretFields(member);
     }
     return output as unknown as T;

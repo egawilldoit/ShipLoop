@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
 import {
   checkAuthorization,
+  consumeAuthorization,
   subjectFingerprint,
   type AuthorizationRejection,
   type AuthorizationSubject,
@@ -43,6 +44,8 @@ function authorizationFor(subject: AuthorizationSubject, overrides: Partial<Owne
     authorizationId: 'auth_1',
     ownerId: OWNER,
     issuedAt: '2026-03-04T11:00:00.000Z',
+    // Six hours after the check instant below, so the default fixture is unexpired.
+    expiresAt: '2026-03-04T18:00:00.000Z',
     subject,
     subjectFingerprint: subjectFingerprint(subject),
     state: 'Authorized',
@@ -188,6 +191,25 @@ describe('F26-AC2 authorization acceptance', () => {
     assert.equal(rejectionOf(check(expired)), 'Expired');
   });
 
+  test('F27-AC3 refuses an authorization whose expiry has passed even while its state is still Authorized', () => {
+    // No writer was marking stale authorizations as Expired, so the recorded state
+    // stayed Authorized forever. The elapsed time itself has to refuse the write.
+    const lapsed = authorizationFor(SUBJECT, { expiresAt: '2026-03-04T11:30:00.000Z' });
+    assert.equal(lapsed.state, 'Authorized', 'the record is still stamped Authorized');
+    const result = check(lapsed);
+
+    assert.equal(rejectionOf(result), 'Expired');
+    assert.match(rejection(result), /expired at 2026-03-04T11:30:00.000Z/);
+  });
+
+  test('F27-AC3 the expiry instant itself is already too late, and an unexpired record is accepted', () => {
+    const atBoundary = authorizationFor(SUBJECT, { expiresAt: NOW });
+    const justInside = authorizationFor(SUBJECT, { expiresAt: '2026-03-04T12:00:00.001Z' });
+
+    assert.equal(rejectionOf(check(atBoundary)), 'Expired', 'expiresAt is the first refused instant');
+    assert.equal(check(justInside).valid, true);
+  });
+
   test('F27-AC3 refuses a proposed subject whose fingerprint differs', () => {
     const authorization = authorizationFor(SUBJECT);
     const result = check(authorization, { ...SUBJECT, headSha: BASE_SHA });
@@ -216,6 +238,36 @@ describe('F26-AC3 and F27-AC3 single use', () => {
 
     const consumed: OwnerAuthorization = { ...authorized, state: 'Consumed', consumedAt: NOW };
     assert.equal(rejectionOf(check(consumed)), 'AlreadyConsumed');
+  });
+
+  test('F27-AC3 consumeAuthorization flips Authorized to Consumed and records when it happened', () => {
+    const authorized = authorizationFor(SUBJECT);
+    const consumed = consumeAuthorization(authorized, NOW);
+
+    assert.equal(consumed.state, 'Consumed');
+    assert.equal(consumed.consumedAt, NOW);
+    assert.equal(consumed.authorizationId, 'auth_1');
+    assert.equal(consumed.subjectFingerprint, authorized.subjectFingerprint);
+    assert.equal(consumed.singleUse, true);
+  });
+
+  test('F27-AC3 the domain refuses the second consumption instead of relying on a caller to remember', () => {
+    const authorized = authorizationFor(SUBJECT);
+    const consumed = consumeAuthorization(authorized, NOW);
+    const again = consumeAuthorization(consumed, '2026-03-04T13:00:00.000Z');
+
+    assert.equal(again.state, 'Consumed');
+    assert.equal(again.consumedAt, NOW, 'the first consumption instant is preserved');
+    assert.deepEqual(again, consumed);
+    assert.equal(rejectionOf(check(again)), 'AlreadyConsumed');
+  });
+
+  test('F27-AC3 an invalidated or expired authorization is never consumed', () => {
+    const invalidated = authorizationFor(SUBJECT, { state: 'Invalidated', invalidatedReason: 'The base branch moved.' });
+    const expired = authorizationFor(SUBJECT, { state: 'Expired' });
+
+    assert.equal(consumeAuthorization(invalidated, NOW), invalidated);
+    assert.equal(consumeAuthorization(expired, NOW), expired);
   });
 
   test('F27-AC3 changing the candidate fingerprint after authorization invalidates the old decision', () => {

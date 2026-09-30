@@ -20,6 +20,7 @@ import { fingerprint } from './fingerprint.ts';
 const CANDIDATE = fingerprint({ candidate: 'current' });
 
 const ALL_KINDS: readonly AttentionKind[] = [
+  'RunProgress',
   'ClarificationRequested',
   'Blocker',
   'ReadyForYourTest',
@@ -35,6 +36,7 @@ const ALL_KINDS: readonly AttentionKind[] = [
 const ALL_BUCKETS: readonly AttentionBucket[] = ['Working', 'NeedsYourInput', 'ReadyForYourTest', 'ReadyForRelease'];
 
 const EXPECTED_BUCKET: Readonly<Record<AttentionKind, AttentionBucket>> = {
+  RunProgress: 'Working',
   ClarificationRequested: 'NeedsYourInput',
   Blocker: 'NeedsYourInput',
   ReadyForYourTest: 'ReadyForYourTest',
@@ -111,6 +113,69 @@ describe('F31-AC3 bucketing and dedup keys', () => {
     assert.equal(key, dedupKeyFor('Blocker', 'SL-12'));
     assert.notEqual(key, dedupKeyFor('ClarificationRequested', 'SL-12'));
     assert.notEqual(key, dedupKeyFor('Blocker', 'SL-13'));
+  });
+
+  test('F31-AC1 RunProgress is the only kind that maps to the Working bucket', () => {
+    assert.equal(
+      bucketFor('RunProgress'),
+      'Working',
+      'the dashboard Working group was permanently empty because no kind reached it',
+    );
+
+    const inWorking = ALL_KINDS.filter((kind) => bucketFor(kind) === 'Working');
+    assert.deepEqual([...inWorking], ['RunProgress']);
+  });
+});
+
+describe('F32-AC1 the stored record carries no control fields', () => {
+  /**
+   * The observation envelope carries `now` and `resolved` as merge inputs. Spreading
+   * the envelope into the record persisted both into every stored, exported and
+   * serialized attention item, where nothing reads them and an export must not
+   * carry them (F32-AC2).
+   */
+  const DECLARED_ITEM_FIELDS: readonly (keyof AttentionItem)[] = [
+    'attentionItemId',
+    'dedupKey',
+    'kind',
+    'state',
+    'projectId',
+    'workItemId',
+    'issueIdentifier',
+    'title',
+    'blocker',
+    'nextAction',
+    'createdAt',
+    'updatedAt',
+    'acknowledgedAt',
+    'acknowledgedBy',
+    'candidateFingerprint',
+  ];
+
+  test('F32-AC2 a created item holds exactly the declared fields and no now or resolved', () => {
+    const created = upsertAttentionItem([], incomingObservation({ resolved: true }));
+    const item = only(created, 'created item');
+
+    assert.deepEqual([...Object.keys(item).sort()], [...DECLARED_ITEM_FIELDS].sort());
+    assert.equal('now' in item, false, 'now is a merge input, not a stored field');
+    assert.equal('resolved' in item, false, 'resolved is a merge input, not a stored field');
+  });
+
+  test('F32-AC2 an updated item holds exactly the declared fields too', () => {
+    const created = upsertAttentionItem([], incomingObservation({ attentionItemId: 'att_1' }));
+    const updated = upsertAttentionItem(
+      created,
+      incomingObservation({ attentionItemId: 'att_2', now: '2026-03-05T09:00:00.000Z', resolved: true }),
+    );
+    const item = only(updated, 'updated item');
+
+    assert.deepEqual([...Object.keys(item).sort()], [...DECLARED_ITEM_FIELDS].sort());
+    assert.equal('now' in item, false);
+    assert.equal('resolved' in item, false);
+    // The envelope values are still consumed: resolved still drives the state and
+    // now still stamps updatedAt, so nothing was lost by refusing to persist them.
+    assert.equal(item.state, 'Resolved');
+    assert.equal(item.updatedAt, '2026-03-05T09:00:00.000Z');
   });
 });
 
@@ -307,5 +372,22 @@ describe('F31-AC1 attention grouping', () => {
 
     assert.ok(acknowledged, 'an acknowledged item must still be listed');
     assert.equal(acknowledged.state, 'Acknowledged');
+  });
+
+  test('F31-AC1 a RunProgress item reaches the dashboard Working group', () => {
+    const running = itemAt({
+      attentionItemId: 'att_running',
+      dedupKey: 'k_running',
+      kind: 'RunProgress',
+      blocker: null,
+      title: 'The agent is implementing the change',
+      nextAction: 'Wait for the run to reach the acceptance card.',
+    });
+
+    const groups = groupAttention([running]);
+    const working = groups.find((group) => group.bucket === 'Working');
+
+    assert.ok(working, 'a RunProgress item must produce a Working group');
+    assert.deepEqual(working.items.map((item) => item.attentionItemId), ['att_running']);
   });
 });

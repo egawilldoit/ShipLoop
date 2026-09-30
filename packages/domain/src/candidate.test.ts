@@ -270,7 +270,7 @@ describe('candidate staleness: every differing input, not just the first', () =>
     assert.deepEqual(assessment.componentDetail, [{ component: 'web', reason: 'DeploymentReplaced' }]);
   });
 
-  test('F22-AC5 - a replaced deployment is reported once however many components are replaced', () => {
+  test('F22-AC4 - a replaced deployment is reported once however many components are replaced', () => {
     const rebuiltWeb: ComponentIdentity = { ...WEB, deploymentId: 'dep-web-0002' };
     const rebuiltWorker: ComponentIdentity = { ...WORKER, environment: 'staging' };
     const assessment = assessStaleness(
@@ -281,6 +281,58 @@ describe('candidate staleness: every differing input, not just the first', () =>
     assert.deepEqual(assessment.componentDetail, [
       { component: 'web', reason: 'DeploymentReplaced' },
       { component: 'worker', reason: 'DeploymentReplaced' },
+    ]);
+  });
+
+  test('F22-AC4 - two added components report one ComponentChanged reason and name both', () => {
+    // ComponentChanged used to be pushed without the dedup guard DeploymentReplaced
+    // used, so one reason appeared twice and the reason list stopped being a set.
+    const docs: ComponentIdentity = {
+      component: 'docs',
+      deploymentId: 'dep-docs-0002',
+      deploymentUrl: 'https://preview.example.test/dep-docs-0002',
+      environment: 'preview',
+    };
+
+    const assessment = assessStaleness(RECORDED, { ...IDENTITY, components: [WEB, API, WORKER, docs] });
+
+    assert.equal(assessment.stale, true);
+    assert.deepEqual(assessment.reasons, ['ComponentChanged']);
+    assert.equal(assessment.reasons.filter((reason) => reason === 'ComponentChanged').length, 1);
+    assert.deepEqual(assessment.componentDetail, [
+      { component: 'worker', reason: 'ComponentChanged' },
+      { component: 'docs', reason: 'ComponentChanged' },
+    ]);
+  });
+
+  test('F25-AC3 - two removed components report one ComponentChanged reason and name both', () => {
+    const assessment = assessStaleness(
+      { ...RECORDED, components: THREE_COMPONENTS },
+      { ...IDENTITY, components: [WEB] },
+    );
+
+    assert.deepEqual(assessment.reasons, ['ComponentChanged']);
+    assert.deepEqual(assessment.componentDetail, [
+      { component: 'api', reason: 'ComponentChanged' },
+      { component: 'worker', reason: 'ComponentChanged' },
+    ]);
+  });
+
+  test('F22-AC4 - one added and one removed component still report a single ComponentChanged', () => {
+    const docs: ComponentIdentity = {
+      component: 'docs',
+      deploymentId: null,
+      deploymentUrl: null,
+      environment: 'preview',
+    };
+    const assessment = assessStaleness(RECORDED, { ...IDENTITY, components: [WEB, docs] });
+
+    assert.deepEqual(assessment.reasons, ['ComponentChanged']);
+    // The added component is noted from the current list, then the removed one
+    // from the recorded list, so detail follows that order and still names both.
+    assert.deepEqual(assessment.componentDetail, [
+      { component: 'docs', reason: 'ComponentChanged' },
+      { component: 'api', reason: 'ComponentChanged' },
     ]);
   });
 

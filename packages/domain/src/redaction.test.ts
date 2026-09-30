@@ -37,6 +37,7 @@ const SEEDED = {
   linearApiKey: concat(['lin_', 'api_', OPaque]),
   githubToken: concat(['gh', 'p_', OPaque]),
   openaiKey: concat(['sk-', 'proj-', OPaque]),
+  bareOpenaiKey: concat(['sk-', OPaque]),
   anthropicKey: concat(['sk-', 'ant-', 'api03-', OPaque]),
   slackToken: concat(['xox', 'b-', '1234567890-', 'AbCdEfGhIj']),
   bearerHeader: `Bearer ${OPaque}`,
@@ -68,18 +69,43 @@ describe('N02-AC2 redact', () => {
     }
   });
 
-  test('N02-AC2 an Anthropic key is removed from the text and reported as redacted', () => {
-    // DEFECT D1 (packages/domain/src/redaction.ts:20): the anthropic-key rule is
-    // unreachable. The openai-key rule at line 19 precedes it and its pattern
-    // [\w-]{16,} matches everything "sk-ant-<16+>" does, so an Anthropic key is
-    // labelled openai-key. Proposed fix: put anthropic-key before openai-key, or
-    // exclude the "ant-" prefix from the openai-key pattern.
-    // The excluded assertion is that appliedLabels contains 'anthropic-key'.
+  test('N02-AC2 an Anthropic key is removed from the text and reported under the anthropic label', () => {
+    // The anthropic-key rule used to be unreachable: the openai-key rule preceded it
+    // and its pattern matched everything "sk-ant-…" does, so an Anthropic key was
+    // removed under the wrong provider label. Both the ordering and the negative
+    // lookahead in the openai-key pattern are what make the label correct.
     const result = redact(`model config: ${SEEDED.anthropicKey}`);
 
     assert.equal(result.text.includes(SEEDED.anthropicKey), false, 'the Anthropic key survived redaction');
     assert.equal(result.appliedLabels.length, 1, 'exactly one rule must have matched');
-    assert.ok(result.text.startsWith('model config: [redacted:'));
+    assert.ok(result.appliedLabels.includes('anthropic-key'), 'the key must be labelled anthropic-key');
+    assert.equal(result.appliedLabels.includes('openai-key'), false, 'it must not be labelled openai-key');
+    assert.equal(result.text, 'model config: [redacted:anthropic-key]');
+  });
+
+  test('N02-AC2 an OpenAI key is still labelled openai-key and never anthropic-key', () => {
+    const prefixed = redact(`key ${SEEDED.openaiKey}`);
+    const bare = redact(`key ${SEEDED.bareOpenaiKey}`);
+
+    for (const [shape, result] of [
+      ['sk-proj-…', prefixed],
+      ['sk-…', bare],
+    ] as const) {
+      assert.equal(result.appliedLabels.length, 1, `${shape}: exactly one rule must have matched`);
+      assert.ok(result.appliedLabels.includes('openai-key'), `${shape}: expected the openai-key label`);
+      assert.equal(result.appliedLabels.includes('anthropic-key'), false, `${shape}: must not match the anthropic rule`);
+      assert.equal(result.text, 'key [redacted:openai-key]');
+    }
+  });
+
+  test('N02-AC2 both providers in one line are labelled separately', () => {
+    const result = redact(`${SEEDED.anthropicKey} and ${SEEDED.openaiKey}`);
+
+    assert.equal(result.appliedLabels.length, 2);
+    assert.ok(result.appliedLabels.includes('anthropic-key'));
+    assert.ok(result.appliedLabels.includes('openai-key'));
+    assert.equal(result.text.includes(SEEDED.anthropicKey), false);
+    assert.equal(result.text.includes(SEEDED.openaiKey), false);
   });
 
   test('N02-AC2 an RSA private key block is removed in full', () => {
@@ -238,6 +264,96 @@ describe('F32-AC2 stripSecretFields', () => {
     assert.equal(stripped.deliveryHistory.length, 1);
     assert.equal(stripped.evidenceIndex[0]?.result, 'Passed');
     assert.equal(stripped.deliveryHistory[0]?.mergedAt, '2026-03-04T12:00:00.000Z');
+  });
+
+  test('F32-AC2 keeps metadata fields that merely begin with a credential word', () => {
+    // The trailing word decides, not the presence of a credential word anywhere.
+    // These are all real data an export must carry, and deleting them emptied the
+    // evidence index the export exists to provide.
+    const stripped = stripSecretFields({
+      tokenCount: 42,
+      cookiePolicy: 'lax',
+      credentialStatus: 'ok',
+      evidenceIndex: [],
+    });
+
+    assert.deepEqual(stripped, {
+      tokenCount: 42,
+      cookiePolicy: 'lax',
+      credentialStatus: 'ok',
+      evidenceIndex: [],
+    });
+  });
+
+  test('F32-AC2 keeps the metadata and drops the credentials in the same structure', () => {
+    const stripped = stripSecretFields({
+      tokenCount: 42,
+      cookiePolicy: 'lax',
+      credentialStatus: 'ok',
+      apiToken: 'x',
+      secretValue: 'y',
+      evidenceIndex: [],
+    });
+
+    assert.deepEqual(stripped, {
+      tokenCount: 42,
+      cookiePolicy: 'lax',
+      credentialStatus: 'ok',
+      evidenceIndex: [],
+    });
+  });
+
+  test('N02-AC2 a credential is stripped whatever spelling the field name uses', () => {
+    // The trailing-word rule has to tolerate camelCase, snake_case and kebab-case,
+    // otherwise api-key, apiToken and accessToken all survive into an export.
+    const spellings = [
+      'apiKey',
+      'api_key',
+      'api-key',
+      'apiToken',
+      'accessToken',
+      'apiTokens',
+      'refreshToken',
+      'privateKey',
+      'private-key',
+      'credential',
+      'credentials',
+      'apiCredential',
+      'token',
+      'tokens',
+      'authorization',
+      'cookie',
+      'cookies',
+      'secretValue',
+    ];
+
+    const probe: Record<string, string> = {};
+    for (const key of spellings) probe[key] = 'value';
+    const stripped = stripSecretFields(probe);
+
+    for (const key of spellings) {
+      assert.equal(key in stripped, false, `${key} must be stripped from an export`);
+    }
+    assert.deepEqual(stripped, {});
+  });
+
+  test('N02-AC2 ordinary export metadata is not mistaken for a credential', () => {
+    const metadata = {
+      runId: 'run_1',
+      checkId: 'chk_1',
+      result: 'Passed',
+      artifactRef: 'artifacts/a.json',
+      durationMs: 12,
+      startedAt: '2026-03-04T09:00:00.000Z',
+      endedAt: '2026-03-04T09:12:00.000Z',
+      exitCode: 0,
+      required: true,
+      candidateFingerprint: 'fp_0123456789abcdef0123456789abcdef',
+      scopeFingerprint: 'fp_fedcba9876543210fedcba9876543210',
+      deliveryHistory: [],
+    };
+
+    assert.deepEqual(stripSecretFields(metadata), metadata);
   });
 
   test('leaves a structure with no credential keys unchanged', () => {

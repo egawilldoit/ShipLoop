@@ -272,6 +272,29 @@ describe('lifecycle: unknown states', () => {
       { path: 'delivery', message: 'Not a valid delivery state.' },
     ]);
   });
+
+  test('§3 - from equal to an unknown state is rejected instead of being taken as a no-op', () => {
+    // The from === to check ran before the state was known to exist, so two equal
+    // nonsense strings were accepted as an idempotent no-op.
+    const rejected = expectInvalid(assertTransition('attempt', 'Bogus', 'Bogus'));
+
+    assert.equal(rejected.reason, 'Unknown attempt state: Bogus');
+    assert.deepEqual(rejected.fields, [{ path: 'attempt', message: 'Not a valid attempt state.' }]);
+  });
+
+  test('§3 - every dimension refuses an equal pair of unknown states and names itself', () => {
+    const cases: readonly [TransitionDimension, string][] = [
+      ['attempt', 'Bogus'],
+      ['acceptance', 'Bogus'],
+      ['delivery', 'Bogus'],
+    ];
+    for (const [dimension, state] of cases) {
+      const rejected = expectInvalid(assertTransition(dimension, state, state));
+      assert.equal(rejected.reason, `Unknown ${dimension} state: ${state}`, dimension);
+      assert.equal(rejected.fields[0]?.path, dimension, dimension);
+      assert.equal(canTransition(dimension, state, state), false, dimension);
+    }
+  });
 });
 
 describe('lifecycle: capacity and lease state', () => {
@@ -347,12 +370,43 @@ describe('lifecycle: outcome unknown and reconciliation', () => {
   /**
    * F28-AC4/F30-AC5 want OutcomeUnknown to be left only through reconciliation.
    *
-   * Not asserted here: whether Released is directly reachable from OutcomeUnknown.
-   * It currently is, which contradicts the stated rule; pinning either way would
-   * hide a known defect, so the whole reachable set is deliberately not compared
-   * and the individual reconciliation destinations are checked instead.
+   * Released used to be directly reachable from OutcomeUnknown, which let a lost
+   * response be resolved by assuming success and repeating the release blind. It is
+   * now rejected, so the reachable set is compared in full.
    */
-  test('F28-AC4/F30-AC5 - OutcomeUnknown can be resolved by reconciliation', () => {
+  test('F28-AC4/F30-AC5 OutcomeUnknown cannot reach Released directly', () => {
+    assert.equal(canTransition('delivery', 'OutcomeUnknown', 'Released'), false);
+
+    const rejected = expectInvalid(assertTransition('delivery', 'OutcomeUnknown', 'Released'));
+    assert.equal(rejected.reason, 'Illegal delivery transition OutcomeUnknown -> Released');
+    assert.equal(rejected.fields[0]?.path, 'delivery');
+    assert.equal(
+      rejected.fields[0]?.message,
+      'From OutcomeUnknown the reachable states are: Merged, Releasing, Failed, Authorized.',
+    );
+  });
+
+  test('F28-AC4/F30-AC5 the whole reachable set of OutcomeUnknown is reconciliation, never a release', () => {
+    // Listed in the exported DELIVERY_STATES order, not the table order, so this
+    // pins the complete set rather than one particular listing of it.
+    assert.deepEqual(reachableStates('delivery', 'OutcomeUnknown'), [
+      'Authorized',
+      'Merged',
+      'Releasing',
+      'Failed',
+    ]);
+    const reachable = new Set(reachableStates('delivery', 'OutcomeUnknown'));
+    for (const state of DELIVERY_STATES) {
+      assert.equal(
+        canTransition('delivery', 'OutcomeUnknown', state),
+        reachable.has(state),
+        `unexpected reachability for OutcomeUnknown -> ${state}`,
+      );
+    }
+    assert.equal(reachable.has('Released'), false, 'a release must never be assumed from a lost response');
+  });
+
+  test('F28-AC4/F30-AC5 OutcomeUnknown can be resolved by reconciliation', () => {
     for (const state of ['Merged', 'Releasing', 'Failed', 'Authorized'] as const) {
       assert.equal(
         canTransition('delivery', 'OutcomeUnknown', state),
@@ -363,7 +417,13 @@ describe('lifecycle: outcome unknown and reconciliation', () => {
     }
   });
 
-  test('F28-AC4 - a lost result is not a licence to repeat the delivery attempt', () => {
+  test('F28-AC4 the three reconciliation destinations that resolve what actually happened stay accepted', () => {
+    for (const state of ['Merged', 'Releasing', 'Failed'] as const) {
+      expectAllowed(assertTransition('delivery', 'OutcomeUnknown', state));
+    }
+  });
+
+  test('F28-AC4 a lost result is not a licence to repeat the delivery attempt', () => {
     // Repeating a deployment or merge is reachable from a known Failed outcome,
     // not from an unresolved one.
     assert.equal(canTransition('delivery', 'Failed', 'Authorized'), true);
