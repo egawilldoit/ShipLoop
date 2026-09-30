@@ -38,29 +38,17 @@ import { instantAfterMs, jsonArray, optionalText, requiredText, runInTransaction
  * DDL for the operation ledger, published so the migration owner composes it rather
  * than re-deriving a different column set.
  */
-export const OPERATION_SCHEMA_SQL = `
-CREATE TABLE IF NOT EXISTS external_operation (
-  operation_id   TEXT PRIMARY KEY,
-  kind           TEXT NOT NULL,
-  target         TEXT NOT NULL,
-  expected_refs  TEXT NOT NULL,
-  correlation_id TEXT NOT NULL,
-  status         TEXT NOT NULL,
-  recorded_at    TEXT NOT NULL,
-  updated_at     TEXT NOT NULL,
-  outcome_at     TEXT,
-  outcome_detail TEXT,
-  operation_ref  TEXT
-);
-CREATE INDEX IF NOT EXISTS external_operation_pending
-  ON external_operation (status, updated_at);
-CREATE INDEX IF NOT EXISTS external_operation_target
-  ON external_operation (kind, target);
-`;
-
+/**
+ * The columns this store depends on are owned by `migrations.ts`; this module
+ * creates nothing, so a drift between the store and the schema is a failing
+ * statement rather than a test that passed against a table the product does
+ * not have.
+ */
 export interface RecordIntentInput {
   /** Stable identity of this external write; reused by every retry of it. */
   readonly operationId: string;
+  /** The project the write acts on, so an external effect is always attributable. */
+  readonly projectId: string;
   readonly kind: string;
   /** Opaque provider-side identity of what is being written. */
   readonly target: string;
@@ -121,13 +109,13 @@ function rowToOperation(row: SqlRow): ExternalOperation {
   return {
     operationId: requiredText(row, 'operation_id'),
     kind: requiredText(row, 'kind'),
-    target: requiredText(row, 'target'),
+    target: requiredText(row, 'target_identity'),
     expectedRefs: jsonArray(requiredText(row, 'expected_refs')),
     correlationId: requiredText(row, 'correlation_id'),
-    status: requiredText(row, 'status') as OperationStatus,
-    recordedAt: requiredText(row, 'recorded_at'),
+    status: statusFrom(requiredText(row, 'state')),
+    recordedAt: requiredText(row, 'requested_at'),
     updatedAt: requiredText(row, 'updated_at'),
-    outcomeAt: optionalText(row, 'outcome_at'),
+    outcomeAt: optionalText(row, 'settled_at'),
     outcomeDetail: optionalText(row, 'outcome_detail'),
     operationRef: optionalText(row, 'operation_ref'),
   };
@@ -137,16 +125,46 @@ function missingIntent(operationId: string): DomainError {
   return { code: 'NotFound', reason: `Operation ${operationId} has no recorded intent` };
 }
 
+/**
+ * The durable state the schema records alongside the store's own status.
+ *
+ * `Succeeded` and `Failed` must carry a settled time, and an unresolved outcome
+ * must carry the instant it became unresolved, so a lost response is
+ * distinguishable from one that never started (F28-AC4).
+ */
+function schemaStateFor(status: OperationStatus): string {
+  if (status === 'IntentRecorded') return 'InFlight';
+  return status;
+}
+
+/** Reads the store's status back out of the schema's state column. */
+function statusFrom(state: string): OperationStatus {
+  switch (state) {
+    case 'InFlight':
+    case 'Planned':
+      return 'IntentRecorded';
+    case 'Succeeded':
+      return 'Succeeded';
+    case 'Failed':
+      return 'Failed';
+    case 'OutcomeUnknown':
+      return 'OutcomeUnknown';
+    default:
+      return 'IntentRecorded';
+  }
+}
+
 export function createOperationStore(options: OperationStoreOptions): ExternalOperationStore {
   const { connection } = options;
   const inTransaction = options.runInTransaction ?? ((work) => runInTransaction(connection, work));
   const inFlightBoundMs = options.inFlightBoundMs ?? DEFAULT_IN_FLIGHT_BOUND_MS;
 
-  const selectById = connection.prepare('SELECT * FROM external_operation WHERE operation_id = ?');
+  const selectById = connection.prepare('SELECT * FROM external_operations WHERE operation_id = ?');
   const insert = connection.prepare(
-    `INSERT INTO external_operation
-       (operation_id, kind, target, expected_refs, correlation_id, status, recorded_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, 'IntentRecorded', ?, ?)`,
+    `INSERT INTO external_operations
+       (operation_id, project_id, kind, target_identity, target, expected_refs, correlation_id,
+        state, status, requested_at, recorded_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, 'InFlight', 'IntentRecorded', ?, ?, ?)`,
   );
 
   const select = (operationId: string): ExternalOperation | null => {
@@ -229,10 +247,13 @@ export function createOperationStore(options: OperationStoreOptions): ExternalOp
       }
       insert.run(
         input.operationId,
+        input.projectId,
         input.kind,
+        input.target,
         input.target,
         JSON.stringify(input.expectedRefs),
         input.correlationId,
+        input.at,
         input.at,
         input.at,
       );
@@ -269,11 +290,22 @@ export function createOperationStore(options: OperationStoreOptions): ExternalOp
         outcome.status === 'Succeeded' ? (outcome.operationRef ?? existing.operationRef) : existing.operationRef;
       connection
         .prepare(
-          `UPDATE external_operation
-              SET status = ?, updated_at = ?, outcome_at = ?, outcome_detail = ?, operation_ref = ?
+          `UPDATE external_operations
+              SET state = ?, status = ?, updated_at = ?, settled_at = ?, outcome_at = ?,
+                  outcome_detail = ?, operation_ref = ?, unknown_since = ?
             WHERE operation_id = ?`,
         )
-        .run(outcome.status, outcome.at, outcome.at, outcome.detail ?? null, operationRef, operationId);
+        .run(
+          schemaStateFor(outcome.status),
+          outcome.status,
+          outcome.at,
+          outcome.at,
+          outcome.at,
+          outcome.detail ?? null,
+          operationRef,
+          outcome.status === 'OutcomeUnknown' ? outcome.at : null,
+          operationId,
+        );
       const updated = select(operationId);
       if (updated === null) throw new Error(`Operation ${operationId} disappeared during the outcome update`);
       return ok(updated);
@@ -283,7 +315,7 @@ export function createOperationStore(options: OperationStoreOptions): ExternalOp
 
   const findByTarget = (kind: string, target: string): readonly ExternalOperation[] =>
     connection
-      .prepare('SELECT * FROM external_operation WHERE kind = ? AND target = ? ORDER BY recorded_at ASC')
+      .prepare('SELECT * FROM external_operations WHERE kind = ? AND target = ? ORDER BY recorded_at ASC')
       .all(kind, target)
       .map(rowToOperation);
 
@@ -292,7 +324,7 @@ export function createOperationStore(options: OperationStoreOptions): ExternalOp
   const pendingReconciliation = (now: Instant, limit = 50): readonly ExternalOperation[] =>
     connection
       .prepare(
-        `SELECT * FROM external_operation
+        `SELECT * FROM external_operations
           WHERE (status = 'OutcomeUnknown' OR (status = 'IntentRecorded' AND updated_at <= ?))
             AND updated_at <= ?
           ORDER BY updated_at ASC LIMIT ?`,

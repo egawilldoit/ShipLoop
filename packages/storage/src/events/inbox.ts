@@ -30,30 +30,12 @@ import { blob, optionalText, requiredNumber, requiredText, runInTransaction } fr
  * DDL for the inbox, published so the migration owner composes it rather than
  * re-deriving a different column set.
  */
-export const INBOX_SCHEMA_SQL = `
-CREATE TABLE IF NOT EXISTS inbox_event (
-  event_id        TEXT PRIMARY KEY,
-  delivery_id     TEXT NOT NULL,
-  provider        TEXT NOT NULL,
-  type            TEXT NOT NULL,
-  correlation_id  TEXT NOT NULL,
-  occurred_at     TEXT NOT NULL,
-  occurred_at_ms  INTEGER NOT NULL,
-  recorded_at     TEXT NOT NULL,
-  sequence        INTEGER NOT NULL,
-  payload_digest  TEXT NOT NULL,
-  payload_bytes   BLOB NOT NULL,
-  processed_at    TEXT,
-  processed_by    TEXT
-);
-CREATE UNIQUE INDEX IF NOT EXISTS inbox_event_delivery
-  ON inbox_event (provider, delivery_id);
-CREATE INDEX IF NOT EXISTS inbox_event_current
-  ON inbox_event (provider, correlation_id, occurred_at_ms, sequence);
-CREATE INDEX IF NOT EXISTS inbox_event_unprocessed
-  ON inbox_event (processed_at, sequence);
-`;
-
+/**
+ * The columns this store depends on are owned by `migrations.ts`; this module
+ * creates nothing, so a drift between the store and the schema is a failing
+ * statement rather than a test that passed against a table the product does
+ * not have.
+ */
 export interface RecordEventInput {
   readonly deliveryId: string;
   /** Verdict computed over `rawPayloadBytes`, never over a re-serialized body. */
@@ -108,13 +90,13 @@ export function eventIdFor(provider: string, deliveryId: string): string {
 
 function rowToEvent(row: SqlRow): InboxEvent {
   return {
-    eventId: requiredText(row, 'event_id'),
+    eventId: requiredText(row, 'inbox_event_id'),
     deliveryId: requiredText(row, 'delivery_id'),
     provider: requiredText(row, 'provider'),
     type: requiredText(row, 'type'),
     correlationId: requiredText(row, 'correlation_id'),
     occurredAt: requiredText(row, 'occurred_at'),
-    recordedAt: requiredText(row, 'recorded_at'),
+    recordedAt: requiredText(row, 'received_at'),
     sequence: requiredNumber(row, 'sequence'),
     payloadDigest: requiredText(row, 'payload_digest'),
     payloadBytes: blob(row, 'payload_bytes'),
@@ -128,24 +110,25 @@ export function createInboxStore(options: InboxOptions): InboxStore {
   const inTransaction = options.runInTransaction ?? ((work) => runInTransaction(connection, work));
   const now = options.now ?? ((): Instant => new Date().toISOString());
 
-  const selectByEventId = connection.prepare('SELECT * FROM inbox_event WHERE event_id = ?');
+  const selectByEventId = connection.prepare('SELECT * FROM inbox_events WHERE inbox_event_id = ?');
   const selectByDelivery = connection.prepare(
-    'SELECT * FROM inbox_event WHERE provider = ? AND delivery_id = ?',
+    'SELECT * FROM inbox_events WHERE provider = ? AND delivery_id = ?',
   );
   const selectCurrentFact = connection.prepare(
-    `SELECT * FROM inbox_event
+    `SELECT * FROM inbox_events
       WHERE provider = ? AND correlation_id = ?
       ORDER BY occurred_at_ms DESC, sequence DESC
       LIMIT 1`,
   );
   const selectNextSequence = connection.prepare(
-    'SELECT COALESCE(MAX(sequence), 0) + 1 AS next_sequence FROM inbox_event',
+    'SELECT COALESCE(MAX(sequence), 0) + 1 AS next_sequence FROM inbox_events',
   );
   const insert = connection.prepare(
-    `INSERT INTO inbox_event
-       (event_id, delivery_id, provider, type, correlation_id, occurred_at, occurred_at_ms,
-        recorded_at, sequence, payload_digest, payload_bytes, processed_at, processed_by)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)`,
+    `INSERT INTO inbox_events
+       (inbox_event_id, delivery_id, provider, type, event_type, dedup_key, correlation_id,
+        occurred_at, occurred_at_ms, received_at, recorded_at, sequence, payload_digest,
+        payload_bytes, processed_at, processed_by)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)`,
   );
 
   const recordEvent = (input: RecordEventInput): StorageResult<RecordEventResult> => {
@@ -191,9 +174,12 @@ export function createInboxStore(options: InboxOptions): InboxStore {
         input.deliveryId,
         input.provider,
         input.type,
+        input.type,
+        eventId,
         input.correlationId,
         input.occurredAt,
         occurredAtMs,
+        recordedAt,
         recordedAt,
         sequence,
         digestOf(input.rawPayloadBytes),
@@ -203,8 +189,8 @@ export function createInboxStore(options: InboxOptions): InboxStore {
       if (recorded === undefined) throw new Error(`Inbox event ${eventId} was not readable after insert`);
       const event = rowToEvent(recorded);
       const current = selectCurrentFact.get(input.provider, input.correlationId);
-      if (current !== undefined && current['event_id'] !== eventId) {
-        return ok({ kind: 'Superseded', event, currentEventId: requiredText(current, 'event_id') });
+      if (current !== undefined && current['inbox_event_id'] !== eventId) {
+        return ok({ kind: 'Superseded', event, currentEventId: requiredText(current, 'inbox_event_id') });
       }
       return ok({ kind: 'Recorded', event });
     });
@@ -212,7 +198,7 @@ export function createInboxStore(options: InboxOptions): InboxStore {
 
   const listUnprocessed = (limit = 100): readonly InboxEvent[] =>
     connection
-      .prepare('SELECT * FROM inbox_event WHERE processed_at IS NULL ORDER BY sequence ASC LIMIT ?')
+      .prepare('SELECT * FROM inbox_events WHERE processed_at IS NULL ORDER BY sequence ASC LIMIT ?')
       .all(limit)
       .map(rowToEvent);
 
@@ -231,7 +217,9 @@ export function createInboxStore(options: InboxOptions): InboxStore {
       }
       if (optionalText(existing, 'processed_at') === null) {
         connection
-          .prepare('UPDATE inbox_event SET processed_at = ?, processed_by = ? WHERE event_id = ?')
+          .prepare(
+            "UPDATE inbox_events SET processed_at = ?, processed_by = ?, processing_state = 'Processed' WHERE inbox_event_id = ?",
+          )
           .run(at, correlationId, eventId);
       }
       const updated = selectByEventId.get(eventId);

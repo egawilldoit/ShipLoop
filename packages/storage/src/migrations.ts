@@ -1,8 +1,9 @@
 import { createHash } from 'node:crypto';
 import type { SQLOutputValue } from 'node:sqlite';
-import { err, invalid, ok, type DomainError, type Result } from '@shiploop/domain';
+import { ATTEMPT_STATES, err, invalid, ok, type DomainError, type Result } from '@shiploop/domain';
 import type { Database } from './db.ts';
 import { TransactionError, withTransaction } from './tx.ts';
+import { JOB_MODES } from './jobs/types.ts';
 
 /**
  * Versioned, forward-only schema for the local SQLite store
@@ -63,17 +64,16 @@ const SELECT_APPLIED = 'SELECT version, name, applied_at, checksum FROM schema_m
 /** RFC 3339 UTC with milliseconds, which also sorts lexicographically. */
 const NOW = `(strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))`;
 
-const ATTEMPT_STATE_VALUES = [
-  'Queued',
-  'Preparing',
-  'Running',
-  'Verifying',
-  'WaitingForOwner',
-  'Paused',
-  'Blocked',
-  'Completed',
-  'Cancelled',
-] as const;
+/**
+ * The attempt lifecycle, taken from the domain rather than restated here.
+ *
+ * Every state CHECK in this file that guards an attempt or a job is derived from
+ * this array, so a new domain state cannot be accepted by a freshly created
+ * database and rejected by one that was migrated before the state existed. A
+ * second, hand-written copy of this list is exactly the "two vocabularies for one
+ * field" defect the project keeps eliminating (R5, ADR 0003).
+ */
+const ATTEMPT_STATE_VALUES = ATTEMPT_STATES;
 
 const ACCEPTANCE_STATE_VALUES = [
   'NotRequested',
@@ -103,19 +103,17 @@ const CHECK_RESULT_VALUES = [
   'NotApplicable',
 ] as const;
 
-const JOB_STATE_VALUES = [
-  'Queued',
-  'Claimed',
-  'Running',
-  'Paused',
-  'Verifying',
-  'WaitingForOwner',
-  'Completed',
-  'Failed',
-  'Cancelled',
-] as const;
-
-const JOB_MODE_VALUES = ['PlanInvestigate', 'Build', 'Test', 'Review'] as const;
+/**
+ * The job modes, taken from the jobs slice's own `JOB_MODES` array.
+ *
+ * The schema previously carried `('PlanInvestigate', 'Build', 'Test', 'Review')`,
+ * which merged `Plan` and `Investigate` into one value. They are separate modes
+ * with different capability grants, so a single value would make a planning run
+ * and an investigation indistinguishable in the durable record (F13-AC3). The
+ * list is imported rather than restated so it cannot drift from the code that
+ * writes it.
+ */
+const JOB_MODE_VALUES = JOB_MODES;
 
 const ATTENTION_KIND_VALUES = [
   'ClarificationRequested',
@@ -407,7 +405,7 @@ CREATE TABLE jobs (
   profile_version_id      TEXT NOT NULL REFERENCES project_profile_versions(profile_version_id) ON DELETE RESTRICT,
   procedure_version_id    TEXT NOT NULL REFERENCES procedure_versions(procedure_version_id) ON DELETE RESTRICT,
   mode                    TEXT NOT NULL ${sqlEnum('mode', JOB_MODE_VALUES)},
-  state                   TEXT NOT NULL DEFAULT 'Queued' ${sqlEnum('state', JOB_STATE_VALUES)},
+  state                   TEXT NOT NULL DEFAULT 'Queued' ${sqlEnum('state', ATTEMPT_STATE_VALUES)},
   operation_id            TEXT NOT NULL UNIQUE,
   correlation_id          TEXT NOT NULL,
   permitted_operations    TEXT NOT NULL DEFAULT '[]',
@@ -420,7 +418,7 @@ CREATE TABLE jobs (
   heartbeat_at            TEXT,
   created_at              TEXT NOT NULL DEFAULT ${NOW},
   updated_at              TEXT NOT NULL DEFAULT ${NOW},
-  CHECK (state NOT IN ('Claimed', 'Running', 'Verifying') OR started_at IS NOT NULL),
+  CHECK (state NOT IN ('Preparing', 'Running', 'Verifying') OR started_at IS NOT NULL),
   CHECK (finished_at IS NULL OR started_at IS NULL OR finished_at >= started_at)
 );
 CREATE INDEX jobs_by_state ON jobs(state, queued_at);
@@ -513,8 +511,6 @@ CREATE TABLE external_operations (
   CHECK (state <> 'OutcomeUnknown' OR unknown_since IS NOT NULL),
   CHECK (state NOT IN ('Succeeded', 'Failed') OR settled_at IS NOT NULL)
 );
-CREATE INDEX external_operations_by_state ON external_operations(state, requested_at);
-CREATE INDEX external_operations_by_work_item ON external_operations(work_item_id, requested_at DESC);
 
 CREATE TABLE candidates (
   candidate_id          TEXT PRIMARY KEY,
@@ -811,6 +807,757 @@ CREATE INDEX audit_log_by_project ON audit_log(project_id, occurred_at DESC);
 CREATE INDEX audit_log_by_subject ON audit_log(subject_kind, subject_id);
 `;
 
+/**
+ * Repository alignment.
+ *
+ * `migrations.ts` and `repositories/core.ts` were authored independently and
+ * disagreed on every table name: the schema created plural tables (`owners`,
+ * `connectors`, ...) while the repositories read and wrote singular ones
+ * (`owner`, `connector`, ...). Every application use case therefore failed with
+ * "no such table", and the repository suite passed only because it created its
+ * own inline fixture schema instead of calling `migrate`.
+ *
+ * This migration resolves the disagreement in ONE direction. `migrations.ts` is
+ * the schema authority, so the plural table names stay and the repositories were
+ * rewritten against them; this migration supplies the columns those repositories
+ * read and write which the earlier migrations did not yet carry.
+ *
+ * Nothing here weakens an existing invariant. Every CHECK, trigger, foreign key
+ * and unique index from versions 1-4 is untouched: the new columns are added
+ * beside them, and the tables that do not exist yet are created with the same
+ * constraints the corresponding code already relied on. The singular tables the
+ * old fixture schema invented (`job`, `coding_slot`, `writer_lease`, ...) were
+ * never part of the migrated schema, so they are added here under the plural
+ * convention rather than left as per-test fiction.
+ *
+ * `ALTER TABLE ADD COLUMN` is used throughout because it is the only schema
+ * change that keeps existing foreign keys pointing at the rebuilt definition.
+ * A `CREATE`/`INSERT`/`DROP`/`RENAME` rebuild cannot be used here: SQLite
+ * re-validates every referencing row against the dropped table, so a rebuild of
+ * a referenced table such as `candidates` or `evidence` fails inside the
+ * transaction this runner wraps each migration in. Added columns carry the same
+ * CHECK constraints the original definitions did, so an abbreviated commit SHA
+ * or a malformed fingerprint is still refused.
+ */
+const MIGRATION_5_REPOSITORY_ALIGNMENT = `
+-- Owner credentials (F01-AC1). Only the domain's self-describing digest is
+-- stored, never the password, and the address is unique because it is the
+-- sign-in identity. The session table below keeps a digest of the session token
+-- for the same reason (F01-AC2).
+ALTER TABLE owners ADD COLUMN email TEXT;
+ALTER TABLE owners ADD COLUMN password_digest TEXT;
+CREATE UNIQUE INDEX owners_by_email ON owners(email) WHERE email IS NOT NULL;
+
+-- Sessions (F01-AC2). 'token_hash' holds a SHA-256 digest, never the token, and
+-- 'rotated_from_session_id' preserves the rotation chain so a rotation can be
+-- audited instead of looking like two unrelated sessions (F32-AC1).
+ALTER TABLE sessions ADD COLUMN token_hash TEXT;
+ALTER TABLE sessions ADD COLUMN rotated_from_session_id TEXT;
+CREATE UNIQUE INDEX sessions_by_token_hash ON sessions(token_hash) WHERE token_hash IS NOT NULL;
+
+-- Project profile versions (F02-AC3). The content is the canonical document the
+-- repository hashes, so 'content_fingerprint' carries the same fingerprint CHECK
+-- as a candidate identity and a truncated value is refused at the column.
+ALTER TABLE project_profile_versions ADD COLUMN version_number INTEGER;
+ALTER TABLE project_profile_versions ADD COLUMN supersedes_version_id TEXT REFERENCES project_profile_versions(profile_version_id);
+ALTER TABLE project_profile_versions ADD COLUMN content_json TEXT;
+ALTER TABLE project_profile_versions ADD COLUMN content_fingerprint TEXT ${fingerprintCheck('content_fingerprint')};
+ALTER TABLE project_profile_versions ADD COLUMN note TEXT;
+ALTER TABLE project_profile_versions ADD COLUMN created_by TEXT;
+
+-- Connectors (F03-AC3). The credential column holds a reference and its digest
+-- only; the CHECK on 'credential_ref' is unchanged and the new digest column is
+-- what an export uses to prove which reference a row used.
+ALTER TABLE connectors ADD COLUMN credential_reference TEXT;
+ALTER TABLE connectors ADD COLUMN credential_reference_digest TEXT;
+ALTER TABLE connectors ADD COLUMN capability_json TEXT;
+ALTER TABLE connectors ADD COLUMN state TEXT CHECK (state IN ('Unconfigured', 'Healthy', 'Degraded', 'Revoked', 'Unreachable'));
+ALTER TABLE connectors ADD COLUMN error TEXT;
+ALTER TABLE connectors ADD COLUMN last_checked_at TEXT;
+ALTER TABLE connectors ADD COLUMN last_success_at TEXT;
+
+-- Procedure and fact versions (F05-AC1, F05-AC4). 'status' keeps the CHECK so a
+-- proposed improvement stays visible to the owner while remaining invisible to a
+-- run; 'content' carries the document the repository fingerprints, and the
+-- approval timestamp column already exists as 'approved_at', which the
+-- repository writes for both an approval and an acceptance.
+ALTER TABLE procedure_versions ADD COLUMN subject_key TEXT;
+ALTER TABLE procedure_versions ADD COLUMN version_number INTEGER;
+ALTER TABLE procedure_versions ADD COLUMN scope TEXT;
+ALTER TABLE procedure_versions ADD COLUMN source_revision TEXT;
+ALTER TABLE procedure_versions ADD COLUMN content TEXT;
+ALTER TABLE procedure_versions ADD COLUMN status TEXT CHECK (status IN ('Proposed', 'Accepted', 'Superseded', 'Retired'));
+ALTER TABLE procedure_versions ADD COLUMN last_verified_revision TEXT;
+ALTER TABLE procedure_versions ADD COLUMN last_verified_at TEXT;
+ALTER TABLE procedure_versions ADD COLUMN created_by TEXT;
+ALTER TABLE procedure_versions ADD COLUMN note TEXT;
+
+-- Raw intake (F06-AC1). 'open_questions' holds canonical JSON; 'raw_request'
+-- keeps its own CHECK and is never written by any repository method. The state
+-- column already exists, so the repository adopts this vocabulary rather than
+-- adding a second one: Received -> Clarifying -> Planned -> Published, with
+-- Abandoned for intake the owner deferred (F06-AC5).
+ALTER TABLE ideas ADD COLUMN kind TEXT;
+ALTER TABLE ideas ADD COLUMN notes TEXT;
+ALTER TABLE ideas ADD COLUMN bug_expected TEXT;
+ALTER TABLE ideas ADD COLUMN bug_actual TEXT;
+ALTER TABLE ideas ADD COLUMN bug_reproduction TEXT;
+ALTER TABLE ideas ADD COLUMN generated_summary TEXT;
+ALTER TABLE ideas ADD COLUMN agreed_brief TEXT;
+ALTER TABLE ideas ADD COLUMN open_questions TEXT;
+ALTER TABLE ideas ADD COLUMN published_work_item_id TEXT REFERENCES work_items(work_item_id);
+ALTER TABLE ideas ADD COLUMN archived_at TEXT;
+ALTER TABLE ideas ADD COLUMN archived_reason TEXT;
+
+-- Attachments (F06-AC1). The row carries a name, a size and a digest; the bytes
+-- live in the artifact directory under 'relative_path'.
+ALTER TABLE idea_attachments ADD COLUMN media_type TEXT;
+ALTER TABLE idea_attachments ADD COLUMN content_digest TEXT;
+ALTER TABLE idea_attachments ADD COLUMN relative_path TEXT;
+
+-- Work mapping (F10). 'publication_state' is the provider OBSERVATION and is a
+-- separate column from 'publication_intent', which records the owner's DECISION,
+-- so an intent to publish can never be read as a confirmed ticket (R1, F10-AC1,
+-- F12-AC5). 'profile_version_id' records the inputs a run was started from, and
+-- 'title' already exists so the repository writes that column directly. The
+-- intent column's own vocabulary is corrected by the rebuild below.
+ALTER TABLE work_items ADD COLUMN profile_version_id TEXT REFERENCES project_profile_versions(profile_version_id);
+ALTER TABLE work_items ADD COLUMN source TEXT;
+ALTER TABLE work_items ADD COLUMN external_issue_id TEXT;
+ALTER TABLE work_items ADD COLUMN external_issue_identifier TEXT;
+ALTER TABLE work_items ADD COLUMN external_issue_url TEXT;
+ALTER TABLE work_items ADD COLUMN publication_state TEXT CHECK (publication_state IN ('Unpublished', 'Publishing', 'Published', 'OutcomeUnknown', 'NotPublishing'));
+ALTER TABLE work_items ADD COLUMN publication_operation_id TEXT;
+ALTER TABLE work_items ADD COLUMN related_work_item_ids TEXT;
+ALTER TABLE work_items ADD COLUMN adoption_json TEXT;
+CREATE UNIQUE INDEX work_items_by_external_issue ON work_items(external_issue_id) WHERE external_issue_id IS NOT NULL;
+
+-- External sync state (F16-AC4). A failed update is a labelled pending state
+-- with its last success time, not a silent retry.
+CREATE TABLE work_item_syncs (
+  work_item_id     TEXT PRIMARY KEY REFERENCES work_items(work_item_id) ON DELETE CASCADE,
+  state            TEXT NOT NULL CHECK (state IN ('NeverAttempted', 'InSync', 'PendingSync', 'Failed')),
+  last_attempt_at  TEXT,
+  last_success_at  TEXT,
+  attempt_count    INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+  last_error       TEXT
+);
+
+-- Scope snapshots (F12-AC1). The immutability triggers installed in version 2
+-- still abort UPDATE and DELETE; the added columns carry the run context the
+-- repository stores alongside the fingerprint.
+ALTER TABLE scope_snapshots ADD COLUMN sequence_number INTEGER;
+ALTER TABLE scope_snapshots ADD COLUMN attempt_id TEXT REFERENCES attempts(attempt_id);
+ALTER TABLE scope_snapshots ADD COLUMN dependency_issue_ids TEXT;
+ALTER TABLE scope_snapshots ADD COLUMN acceptance_criteria TEXT;
+ALTER TABLE scope_snapshots ADD COLUMN profile_version_id TEXT REFERENCES project_profile_versions(profile_version_id);
+ALTER TABLE scope_snapshots ADD COLUMN procedure_version_id TEXT REFERENCES procedure_versions(procedure_version_id);
+ALTER TABLE scope_snapshots ADD COLUMN captured_at TEXT;
+ALTER TABLE scope_snapshots ADD COLUMN correlation_id TEXT;
+CREATE UNIQUE INDEX scope_snapshots_by_work_item_sequence ON scope_snapshots(work_item_id, sequence_number)
+  WHERE sequence_number IS NOT NULL;
+
+-- Attention items (F31-AC3). 'occurrence_count' and 'first_observed_at' are
+-- storage-only bookkeeping so a repeated event can be counted without changing
+-- what the dashboard reads.
+ALTER TABLE attention_items ADD COLUMN occurrence_count INTEGER;
+ALTER TABLE attention_items ADD COLUMN first_observed_at TEXT;
+
+-- Candidates (F20-AC3, F24-AC4). The identity stays decomposed into the
+-- schema's own CHECK-constrained columns, so the commit-SHA length CHECK is
+-- what actually refuses an abbreviated head (R4). The repository reads those
+-- columns back into the domain CandidateIdentity and computes the fingerprint
+-- from them, never accepting one from the caller.
+ALTER TABLE candidates ADD COLUMN target_branch TEXT;
+ALTER TABLE candidates ADD COLUMN recorded_at TEXT;
+ALTER TABLE candidates ADD COLUMN correlation_id TEXT;
+
+-- Evidence (F20-AC3, F25-AC3). 'candidate_fingerprint' already exists with its
+-- fingerprint CHECK and stays the binding: every read filters on it, so a
+-- changed candidate cannot inherit the previous build's results. The result
+-- vocabulary is the domain CHECK_RESULTS, so a check outcome recorded here is
+-- one the domain recognises.
+ALTER TABLE evidence ADD COLUMN kind TEXT;
+ALTER TABLE evidence ADD COLUMN check_name TEXT;
+ALTER TABLE evidence ADD COLUMN result TEXT ${sqlEnum('result', CHECK_RESULT_VALUES)};
+ALTER TABLE evidence ADD COLUMN environment_fingerprint TEXT;
+ALTER TABLE evidence ADD COLUMN recorded_at TEXT;
+ALTER TABLE evidence ADD COLUMN correlation_id TEXT;
+
+-- Owner decisions (F25, F26-AC1, F27-AC3). 'single_use' stays fixed at 1 and
+-- 'consume' still refuses a second use, so a replayed request cannot merge
+-- twice. Attribution and the subject-binding CHECK are added by the rebuild
+-- below: a decision names a real owner, and only an authorization carries a
+-- subject fingerprint (R3).
+ALTER TABLE owner_decisions ADD COLUMN candidate_fingerprint TEXT ${fingerprintCheck('candidate_fingerprint')};
+ALTER TABLE owner_decisions ADD COLUMN scope_fingerprint TEXT ${fingerprintCheck('scope_fingerprint')};
+ALTER TABLE owner_decisions ADD COLUMN note TEXT;
+ALTER TABLE owner_decisions ADD COLUMN invalidated_reason TEXT;
+
+-- The durable job queue (F13, F17). 'jobs.operation_id' is already UNIQUE, so a
+-- repeated start with one operation identity cannot create a second job, and the
+-- state CHECK from version 3 is unchanged.
+ALTER TABLE jobs ADD COLUMN limits TEXT;
+ALTER TABLE jobs ADD COLUMN holder TEXT;
+ALTER TABLE jobs ADD COLUMN last_heartbeat_at TEXT;
+
+-- The durable resume point (F17-AC2). Head and base are full commit SHAs, so
+-- both columns keep a length CHECK: an abbreviation cannot be compared to a
+-- checkout, and the dirty plus untracked inventory is part of the resume point.
+CREATE TABLE job_checkpoints (
+  job_id               TEXT PRIMARY KEY REFERENCES jobs(job_id) ON DELETE CASCADE,
+  checkpoint_id        TEXT NOT NULL,
+  scope_snapshot_id    TEXT NOT NULL,
+  scope_fingerprint    TEXT NOT NULL ${fingerprintCheck('scope_fingerprint')},
+  profile_version_id   TEXT NOT NULL,
+  procedure_version_id TEXT NOT NULL,
+  engine_version       TEXT,
+  workspace_id         TEXT NOT NULL,
+  branch_name          TEXT NOT NULL,
+  worktree_path        TEXT NOT NULL,
+  head_sha             TEXT NOT NULL ${commitShaCheck('head_sha')},
+  base_sha             TEXT NOT NULL ${commitShaCheck('base_sha')},
+  dirty_files          TEXT NOT NULL,
+  untracked_files      TEXT NOT NULL,
+  results              TEXT NOT NULL,
+  feedback             TEXT NOT NULL,
+  blocker              TEXT,
+  next_action          TEXT NOT NULL,
+  recorded_at          TEXT NOT NULL,
+  CHECK (length(trim(next_action)) > 0)
+);
+
+-- The single global coding writer (F13-AC2, F17-AC5). The slot row is a
+-- singleton, so exactly one writer exists; a claim that loses the conditional
+-- UPDATE stays queued rather than failing.
+CREATE TABLE coding_slots (
+  slot_id      INTEGER PRIMARY KEY CHECK (slot_id = 1),
+  job_id       TEXT,
+  holder       TEXT,
+  operation_id TEXT,
+  acquired_at  TEXT,
+  expires_at   TEXT,
+  generation   INTEGER NOT NULL DEFAULT 0
+);
+INSERT INTO coding_slots (slot_id, generation) VALUES (1, 0);
+
+-- Writer ownership per job (F17-AC5). An expired lease is 'ReconciliationRequired'
+-- and grants nothing: expiry proves only that heartbeats stopped.
+CREATE TABLE writer_leases (
+  lease_id                    TEXT PRIMARY KEY,
+  job_id                      TEXT NOT NULL UNIQUE REFERENCES jobs(job_id) ON DELETE CASCADE,
+  holder                      TEXT NOT NULL,
+  operation_id                TEXT NOT NULL,
+  acquired_at                 TEXT NOT NULL,
+  renewed_at                  TEXT NOT NULL,
+  expires_at                  TEXT NOT NULL,
+  state                       TEXT NOT NULL
+                                 CHECK (state IN ('Active', 'Released', 'ReconciliationRequired', 'HolderStoppedConfirmed')),
+  reconciliation_required     INTEGER NOT NULL DEFAULT 0 CHECK (reconciliation_required IN (0, 1)),
+  reconciliation_reason       TEXT,
+  confirmed_stopped_by        TEXT,
+  confirmed_stopped_at        TEXT,
+  confirmed_stopped_evidence  TEXT,
+  CHECK (expires_at > acquired_at),
+  CHECK (state <> 'HolderStoppedConfirmed' OR confirmed_stopped_by IS NOT NULL)
+);
+
+-- Workspace isolation (F14-AC1, F14-AC3). A workspace belongs to one job, and a
+-- port belongs to exactly one workspace, so a collision surfaces as a blocker
+-- instead of silently attaching to an unrelated service.
+CREATE TABLE workspace_locks (
+  workspace_id  TEXT PRIMARY KEY,
+  job_id        TEXT NOT NULL,
+  holder        TEXT NOT NULL,
+  branch_name   TEXT NOT NULL,
+  worktree_path TEXT NOT NULL,
+  acquired_at   TEXT NOT NULL
+);
+
+CREATE TABLE workspace_ports (
+  workspace_id TEXT NOT NULL,
+  service_name TEXT NOT NULL,
+  port         INTEGER NOT NULL CHECK (port > 0 AND port < 65536),
+  job_id       TEXT NOT NULL,
+  holder       TEXT NOT NULL,
+  reserved_at  TEXT NOT NULL,
+  PRIMARY KEY (workspace_id, service_name)
+);
+CREATE UNIQUE INDEX workspace_ports_unique_port ON workspace_ports(port);
+`;
+/**
+ * Durable provider event ingest (F30-AC1, F30-AC2, F30-AC3).
+ *
+ * The payload bytes are stored as a BLOB, not a redacted copy: a recorded
+ * delivery must be re-verifiable later over the exact bytes the signature was
+ * checked against, which is the whole anti-forgery property of the ledger. The
+ * 'occurred_at_ms' column exists beside 'occurred_at' so the newest-fact
+ * comparison orders on an integer rather than on a re-parsed timestamp, and
+ * 'sequence' breaks a tie on identical timestamps so exactly one event wins.
+ *
+ * 'correlation_id' already exists, so the ingest module writes that column
+ * rather than adding a second one. The event identity is likewise the existing
+ * 'inbox_event_id' rather than a new 'event_id' column, and an outbox effect is
+ * an 'outbox_event_id'; the modules were updated to the schema's names instead.
+ */
+const MIGRATION_6_EVENT_LEDGER_ALIGNMENT = `
+ALTER TABLE inbox_events ADD COLUMN type TEXT;
+ALTER TABLE inbox_events ADD COLUMN occurred_at TEXT;
+ALTER TABLE inbox_events ADD COLUMN occurred_at_ms INTEGER;
+ALTER TABLE inbox_events ADD COLUMN recorded_at TEXT;
+ALTER TABLE inbox_events ADD COLUMN sequence INTEGER;
+ALTER TABLE inbox_events ADD COLUMN payload_bytes BLOB;
+ALTER TABLE inbox_events ADD COLUMN processed_by TEXT;
+CREATE UNIQUE INDEX inbox_events_by_event ON inbox_events(inbox_event_id, provider, delivery_id);
+CREATE INDEX inbox_events_by_correlation ON inbox_events(provider, correlation_id, occurred_at_ms, sequence);
+
+-- The transactional outbox (N01-AC3, F29-AC4). 'dedup_key' is UNIQUE, so
+-- re-enqueueing the same intent returns the original effect instead of a second
+-- one, and a published effect must carry its publish time. 'next_attempt_at'
+-- already exists and is what the due set orders on.
+ALTER TABLE outbox_events ADD COLUMN kind TEXT;
+ALTER TABLE outbox_events ADD COLUMN target TEXT;
+ALTER TABLE outbox_events ADD COLUMN payload TEXT;
+ALTER TABLE outbox_events ADD COLUMN operation_id TEXT;
+ALTER TABLE outbox_events ADD COLUMN status TEXT;
+ALTER TABLE outbox_events ADD COLUMN last_success_at TEXT;
+ALTER TABLE outbox_events ADD COLUMN last_failure_category TEXT;
+ALTER TABLE outbox_events ADD COLUMN last_failure_detail TEXT;
+ALTER TABLE outbox_events ADD COLUMN last_attempt_at TEXT;
+ALTER TABLE outbox_events ADD COLUMN expected_refs TEXT;
+ALTER TABLE outbox_events ADD COLUMN succeeded_refs TEXT;
+CREATE INDEX outbox_events_by_operation ON outbox_events(operation_id);
+
+-- The external side-effect ledger (F30-AC5, F28-AC4). Every external write is
+-- bracketed by an intent row written before the call and an outcome row written
+-- after it, so a lost response becomes 'OutcomeUnknown' and the next attempt
+-- reconciles rather than writing again. 'expected_refs' already exists.
+ALTER TABLE external_operations ADD COLUMN target TEXT;
+ALTER TABLE external_operations ADD COLUMN status TEXT;
+ALTER TABLE external_operations ADD COLUMN recorded_at TEXT;
+ALTER TABLE external_operations ADD COLUMN outcome_at TEXT;
+ALTER TABLE external_operations ADD COLUMN outcome_detail TEXT;
+ALTER TABLE external_operations ADD COLUMN operation_ref TEXT;
+`;
+
+/**
+ * Nullable project and issue identity.
+ *
+ * Two columns in versions 1 and 2 are `NOT NULL` where the product requires a
+ * null: `ideas.project_id` because F06-AC1 captures intake with an *optional*
+ * project, and `work_items.issue_id` because F10 separates the intent to publish
+ * from a confirmed ticket, so a work item legitimately exists before any
+ * provider issue does. A repository that could not write either state was
+ * storing something other than the product.
+ *
+ * Relaxing a NOT NULL is not something `ALTER TABLE ADD COLUMN` can express,
+ * and the obvious `CREATE`/`INSERT`/`DROP`/`RENAME` rebuild cannot be used
+ * naively: SQLite re-validates every referencing row against the dropped table,
+ * so the rebuild fails inside the transaction this runner wraps each migration
+ * in. The sequence below therefore stashes the affected rows, empties the child
+ * tables, rebuilds the parent, and restores everything, which is lossless and
+ * leaves `PRAGMA foreign_key_check` empty.
+ *
+ * The child tables are discovered from `PRAGMA foreign_key_list` rather than
+ * named by hand, because a hand-written list would silently miss a table added
+ * later and a rebuild that drops rows is worse than one that refuses.
+ *
+ * The UNIQUE constraints and every CHECK are carried across unchanged; only the
+ * `NOT NULL` markers on those two columns are removed, and the existing
+ * `CHECK (length(trim(issue_id)) > 0)` is kept as a nullable variant so an empty
+ * string is still refused while a genuinely absent issue is allowed.
+ */
+const MIGRATION_7_CONTRACT_ALIGNMENT = `
+-- F06-AC1 captures intake with an OPTIONAL project, and F10 requires a work item
+-- to exist before the provider has an issue for it, so 'ideas.project_id' and
+-- 'work_items.issue_id' are nullable here. The 'length(trim(...)) > 0' CHECKs are
+-- kept as nullable variants, so an empty string is still refused while a
+-- genuinely absent project or issue is allowed.
+CREATE TABLE ideas_nullable (
+  idea_id              TEXT PRIMARY KEY,
+  project_id           TEXT REFERENCES projects(project_id) ON DELETE RESTRICT,
+  raw_request          TEXT NOT NULL,
+  state                TEXT NOT NULL DEFAULT 'Received'
+                         CHECK (state IN ('Received', 'Clarifying', 'Planned', 'Published', 'Abandoned')),
+  created_at           TEXT NOT NULL DEFAULT ${NOW},
+  updated_at           TEXT NOT NULL DEFAULT ${NOW},
+  kind                 TEXT,
+  notes                TEXT,
+  bug_expected         TEXT,
+  bug_actual           TEXT,
+  bug_reproduction     TEXT,
+  generated_summary    TEXT,
+  agreed_brief         TEXT,
+  open_questions       TEXT,
+  published_work_item_id TEXT REFERENCES work_items(work_item_id),
+  archived_at          TEXT,
+  archived_reason      TEXT,
+  CHECK (length(trim(raw_request)) > 0)
+);
+
+-- R2: the owner is provisioned locally and signs in with a password (F01-AC1), so
+-- there is no identity-provider subject to record. The column stays, and stays
+-- unique, because a future external identity must not be attached twice, but
+-- 'provision' writes NULL rather than substituting the owner id: a column that
+-- holds a value it does not mean is worse than an empty one (R2, ADR 0003).
+CREATE TABLE owners_aligned (
+  owner_id         TEXT PRIMARY KEY,
+  identity_subject TEXT UNIQUE,
+  display_name     TEXT,
+  email            TEXT,
+  password_digest  TEXT,
+  created_at       TEXT NOT NULL DEFAULT ${NOW},
+  CHECK (identity_subject IS NULL OR length(trim(identity_subject)) > 0)
+);
+CREATE UNIQUE INDEX owners_by_identity_subject ON owners_aligned(identity_subject)
+  WHERE identity_subject IS NOT NULL;
+
+-- R1: 'publication_intent' is the owner's DECISION and 'publication_state' is the
+-- provider OBSERVATION. Keeping one column for each is what makes "we meant to
+-- publish" impossible to read as "the ticket exists" (F10-AC1, F12-AC5). The
+-- 'DraftPublish' and 'Adopted' values are dropped: 'Adopted' is an origin, and
+-- 'origin' already carries it, so keeping it here would have been the second
+-- vocabulary for one concept.
+CREATE TABLE work_items_aligned (
+  work_item_id           TEXT PRIMARY KEY,
+  project_id             TEXT NOT NULL REFERENCES projects(project_id) ON DELETE RESTRICT,
+  idea_id                TEXT REFERENCES ideas(idea_id) ON DELETE SET NULL,
+  issue_id               TEXT,
+  issue_identifier       TEXT,
+  title                  TEXT,
+  publication_intent     TEXT NOT NULL
+                           CHECK (publication_intent IN ('DoNotPublish', 'PublishWhenAgreed', 'Published')),
+  origin                 TEXT NOT NULL CHECK (origin IN ('Proposed', 'Published', 'Adopted')),
+  created_at             TEXT NOT NULL DEFAULT ${NOW},
+  updated_at             TEXT NOT NULL DEFAULT ${NOW},
+  profile_version_id     TEXT REFERENCES project_profile_versions(profile_version_id),
+  source                 TEXT,
+  external_issue_id      TEXT,
+  external_issue_identifier TEXT,
+  external_issue_url     TEXT,
+  publication_state      TEXT
+                           CHECK (publication_state IN ('Unpublished', 'Publishing', 'Published', 'OutcomeUnknown', 'NotPublishing')),
+  publication_operation_id TEXT,
+  related_work_item_ids  TEXT,
+  adoption_json          TEXT,
+  UNIQUE (project_id, issue_id),
+  CHECK (issue_id IS NULL OR length(trim(issue_id)) > 0)
+);
+
+-- R3: an acceptance says the product behaviour is right and has no authorized
+-- action to fingerprint; only an authorization does. The CHECK below makes that
+-- exact: a subject fingerprint is required precisely for the authorization
+-- decision types. This is stricter than the previous NOT NULL, which forced an
+-- acceptance to invent a subject, while still refusing an authorization that
+-- cannot be bound to one (F26-AC1, F27-AC3).
+--
+-- 'actor_owner_id' is a real foreign key, so a decision is always attributable
+-- and an un-attributable decision is not representable (F32-AC1).
+CREATE TABLE owner_decisions_aligned (
+  decision_id                  TEXT PRIMARY KEY,
+  project_id                   TEXT NOT NULL REFERENCES projects(project_id) ON DELETE RESTRICT,
+  work_item_id                 TEXT REFERENCES work_items(work_item_id) ON DELETE RESTRICT,
+  candidate_id                 TEXT REFERENCES candidates(candidate_id) ON DELETE RESTRICT,
+  scope_snapshot_id            TEXT REFERENCES scope_snapshots(scope_snapshot_id) ON DELETE RESTRICT,
+  actor_owner_id               TEXT NOT NULL REFERENCES owners(owner_id) ON DELETE RESTRICT,
+  decision_type                TEXT NOT NULL
+                                CHECK (decision_type IN ('AcceptProduct', 'RequestChanges', 'AuthorizeMerge', 'AuthorizeRelease', 'AuthorizeMergeAndRelease', 'AuthorizeRecovery', 'ResolveScopeChange')),
+  acceptance_state             TEXT ${nullableEnum('acceptance_state', ACCEPTANCE_STATE_VALUES)},
+  subject_fingerprint          TEXT ${nullableFingerprintCheck('subject_fingerprint')},
+  subject_json                 TEXT NOT NULL,
+  feedback_redacted            TEXT,
+  correlation_id               TEXT NOT NULL,
+  state                        TEXT NOT NULL DEFAULT 'Recorded'
+                                CHECK (state IN ('Recorded', 'Consumed', 'Invalidated', 'Superseded')),
+  single_use                   INTEGER NOT NULL DEFAULT 1 CHECK (single_use = 1),
+  decided_at                   TEXT NOT NULL,
+  consumed_at                  TEXT,
+  invalidated_at               TEXT,
+  invalidation_reason_redacted TEXT,
+  expires_at                   TEXT,
+  created_at                   TEXT NOT NULL DEFAULT ${NOW},
+  candidate_fingerprint        TEXT ${nullableFingerprintCheck('candidate_fingerprint')},
+  scope_fingerprint            TEXT ${nullableFingerprintCheck('scope_fingerprint')},
+  note                         TEXT,
+  invalidated_reason           TEXT,
+  CHECK (candidate_id IS NOT NULL OR scope_snapshot_id IS NOT NULL),
+  CHECK (decision_type IN ('AcceptProduct', 'RequestChanges') OR acceptance_state IS NULL),
+  CHECK (decision_type NOT IN ('AcceptProduct', 'RequestChanges') OR acceptance_state IS NOT NULL),
+  CHECK (state <> 'Consumed' OR consumed_at IS NOT NULL),
+  CHECK (state <> 'Invalidated' OR (invalidated_at IS NOT NULL AND invalidation_reason_redacted IS NOT NULL)),
+  CHECK (decision_type NOT IN ('AcceptProduct', 'RequestChanges') = (subject_fingerprint IS NOT NULL))
+);
+
+-- R4: the schema's own foreign keys stay. F13-AC1 requires a job to record the
+-- work item, the scope snapshot, the profile version and the procedure version
+-- before it is reported as accepted, so 'EnqueueRequest' was extended to carry
+-- them rather than these constraints being relaxed (R4, ADR 0003).
+CREATE TABLE jobs_aligned (
+  job_id                  TEXT PRIMARY KEY,
+  work_item_id            TEXT NOT NULL REFERENCES work_items(work_item_id) ON DELETE RESTRICT,
+  project_id              TEXT NOT NULL REFERENCES projects(project_id) ON DELETE RESTRICT,
+  scope_snapshot_id       TEXT NOT NULL REFERENCES scope_snapshots(scope_snapshot_id) ON DELETE RESTRICT,
+  profile_version_id      TEXT NOT NULL REFERENCES project_profile_versions(profile_version_id) ON DELETE RESTRICT,
+  procedure_version_id    TEXT NOT NULL REFERENCES procedure_versions(procedure_version_id) ON DELETE RESTRICT,
+  mode                    TEXT NOT NULL ${sqlEnum('mode', JOB_MODE_VALUES)},
+  state                   TEXT NOT NULL DEFAULT 'Queued' ${sqlEnum('state', ATTEMPT_STATE_VALUES)},
+  operation_id            TEXT NOT NULL UNIQUE,
+  correlation_id          TEXT NOT NULL,
+  permitted_operations    TEXT NOT NULL DEFAULT '[]',
+  active_budget_ms        INTEGER CHECK (active_budget_ms IS NULL OR active_budget_ms > 0),
+  max_attempts            INTEGER NOT NULL DEFAULT 2 CHECK (max_attempts >= 0),
+  attempt_count           INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+  queued_at               TEXT NOT NULL,
+  started_at              TEXT,
+  finished_at             TEXT,
+  heartbeat_at            TEXT,
+  created_at              TEXT NOT NULL DEFAULT ${NOW},
+  updated_at              TEXT NOT NULL DEFAULT ${NOW},
+  limits                  TEXT,
+  holder                  TEXT,
+  last_heartbeat_at       TEXT,
+  CHECK (state NOT IN ('Preparing', 'Running', 'Verifying') OR started_at IS NOT NULL),
+  CHECK (finished_at IS NULL OR started_at IS NULL OR finished_at >= started_at)
+);
+
+-- The publication outbox (F16-AC4, F28-AC4, F29-AC4). 'OutcomeUnknown' belongs
+-- in this vocabulary: a provider call whose response was lost must not stay
+-- 'Pending', because the next attempt would then look like a first attempt and
+-- publish a second receipt for work that may already be published. Migration 4
+-- is already applied everywhere, so the widened state list is a rebuild here
+-- rather than an edit to that migration.
+CREATE TABLE outbox_events_aligned (
+  outbox_event_id      TEXT PRIMARY KEY,
+  project_id           TEXT REFERENCES projects(project_id) ON DELETE RESTRICT,
+  work_item_id         TEXT REFERENCES work_items(work_item_id) ON DELETE RESTRICT,
+  event_kind           TEXT NOT NULL,
+  dedup_key            TEXT NOT NULL UNIQUE,
+  payload_json         TEXT NOT NULL,
+  state                TEXT NOT NULL DEFAULT 'Pending'
+                          CHECK (state IN ('Pending', 'Publishing', 'Published', 'Failed', 'Abandoned',
+                                           'OutcomeUnknown')),
+  correlation_id       TEXT NOT NULL,
+  attempt_count        INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+  next_attempt_at      TEXT,
+  published_at         TEXT,
+  last_error_redacted  TEXT,
+  created_at           TEXT NOT NULL DEFAULT ${NOW},
+  updated_at           TEXT NOT NULL DEFAULT ${NOW},
+  kind                 TEXT,
+  target               TEXT,
+  payload              TEXT,
+  operation_id         TEXT,
+  status               TEXT,
+  last_success_at      TEXT,
+  last_failure_category TEXT,
+  last_failure_detail  TEXT,
+  last_attempt_at      TEXT,
+  expected_refs        TEXT,
+  succeeded_refs       TEXT,
+  -- Table constraints come last: SQLite stops reading column definitions once a
+  -- table-level constraint appears, so a CHECK in the middle silently turns the
+  -- columns after it into a syntax error rather than a schema.
+  CHECK (state <> 'Published' OR published_at IS NOT NULL)
+);
+CREATE INDEX outbox_events_aligned_by_state ON outbox_events_aligned(state, next_attempt_at);
+CREATE INDEX outbox_events_aligned_by_operation ON outbox_events_aligned(operation_id);
+
+-- The external side-effect ledger (F30-AC5, F28-AC4, F10-AC3, F19-AC3, F26-AC3,
+-- F29-AC4). Every external write is bracketed by an intent row written before
+-- the call and an outcome row written after it, so a lost response becomes
+-- 'OutcomeUnknown' and the next attempt with the same operation identity finds
+-- that row instead of issuing a second write.
+--
+-- The kind vocabulary covers the external writes the product actually performs:
+-- a receipt publish and a managed progress comment are both 'UpdateIssue' to the
+-- provider, but they are different intents and the ledger has to tell them
+-- apart when reconciling (F16-AC4).
+CREATE TABLE external_operations_aligned (
+  operation_id     TEXT PRIMARY KEY,
+  project_id       TEXT NOT NULL REFERENCES projects(project_id) ON DELETE RESTRICT,
+  work_item_id     TEXT REFERENCES work_items(work_item_id) ON DELETE RESTRICT,
+  attempt_id       TEXT REFERENCES attempts(attempt_id) ON DELETE RESTRICT,
+  kind             TEXT NOT NULL
+                     CHECK (kind IN ('PublishIssue', 'CreateBranch', 'CreateDraft', 'UpdateIssue',
+                                     'Merge', 'Deploy', 'Release', 'Redeploy',
+                                     'PublishProposal', 'PullRequestCreate', 'CommentCreate',
+                                     'ProgressComment', 'ReceiptPublish')),
+  target_identity  TEXT NOT NULL,
+  expected_refs    TEXT,
+  state            TEXT NOT NULL DEFAULT 'Planned'
+                     CHECK (state IN ('Planned', 'InFlight', 'Succeeded', 'Failed', 'OutcomeUnknown')),
+  correlation_id   TEXT NOT NULL,
+  requested_at     TEXT NOT NULL,
+  settled_at       TEXT,
+  unknown_since    TEXT,
+  result_json      TEXT,
+  created_at       TEXT NOT NULL DEFAULT ${NOW},
+  updated_at       TEXT NOT NULL DEFAULT ${NOW},
+  target           TEXT,
+  status           TEXT,
+  recorded_at      TEXT,
+  outcome_at       TEXT,
+  outcome_detail   TEXT,
+  operation_ref    TEXT,
+  CHECK (state <> 'OutcomeUnknown' OR unknown_since IS NOT NULL),
+  CHECK (state NOT IN ('Succeeded', 'Failed') OR settled_at IS NOT NULL)
+);
+
+-- R4: the candidate identity is decomposed into the schema's CHECK-constrained
+-- columns. 'identity_json' is gone, so an abbreviated head SHA is refused by the
+-- column rather than merely being recorded and never checked (F17-AC2, F20-AC3).
+CREATE TABLE candidates_aligned (
+  candidate_id            TEXT PRIMARY KEY,
+  work_item_id            TEXT NOT NULL REFERENCES work_items(work_item_id) ON DELETE RESTRICT,
+  project_id              TEXT NOT NULL REFERENCES projects(project_id) ON DELETE RESTRICT,
+  attempt_id              TEXT REFERENCES attempts(attempt_id) ON DELETE RESTRICT,
+  scope_snapshot_id       TEXT NOT NULL REFERENCES scope_snapshots(scope_snapshot_id) ON DELETE RESTRICT,
+  profile_version_id      TEXT NOT NULL REFERENCES project_profile_versions(profile_version_id) ON DELETE RESTRICT,
+  procedure_version_id    TEXT NOT NULL REFERENCES procedure_versions(procedure_version_id) ON DELETE RESTRICT,
+  fingerprint             TEXT NOT NULL UNIQUE ${fingerprintCheck('fingerprint')},
+  head_sha                TEXT NOT NULL ${commitShaCheck('head_sha')},
+  base_sha                TEXT NOT NULL ${commitShaCheck('base_sha')},
+  scope_fingerprint       TEXT NOT NULL ${fingerprintCheck('scope_fingerprint')},
+  environment_fingerprint TEXT NOT NULL ${fingerprintCheck('environment_fingerprint')},
+  policy_fingerprint      TEXT NOT NULL ${fingerprintCheck('policy_fingerprint')},
+  pull_request_id         TEXT,
+  created_at              TEXT NOT NULL DEFAULT ${NOW},
+  superseded_at           TEXT,
+  target_branch           TEXT,
+  recorded_at             TEXT,
+  correlation_id          TEXT
+);
+`;
+
+/**
+ * Child tables that reference `table`, read from the live schema.
+ *
+ * Discovered rather than hard-coded so a future table cannot be missed: a
+ * rebuild that silently dropped rows would be a far worse failure than one that
+ * refused to run.
+ */
+function referencingTables(db: Database, table: string): string[] {
+  const tables = db
+    .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'")
+    .all()
+    .map((row) => row['name'])
+    .filter((name): name is string => typeof name === 'string');
+
+  const referencing: string[] = [];
+  for (const name of tables) {
+    if (name === table) continue;
+    const foreignKeys = db.prepare(`PRAGMA foreign_key_list(${quoteIdentifier(name)})`).all();
+    for (const key of foreignKeys) {
+      if (key['table'] === table) {
+        referencing.push(name);
+        break;
+      }
+    }
+  }
+  return referencing;
+}
+
+function quoteIdentifier(name: string): string {
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) {
+    throw new Error(`Refusing to quote a non-identifier table name: ${name}`);
+  }
+  return `"${name}"`;
+}
+
+function columnNames(db: Database, table: string): string {
+  return db
+    .prepare(`PRAGMA table_info(${quoteIdentifier(table)})`)
+    .all()
+    .map((row) => quoteIdentifier(String(row['name'])))
+    .join(', ');
+}
+
+/**
+ * Rebuilds `ideas` and `work_items` with the nullable identity columns.
+ *
+ * Each table is rebuilt in dependency order and its referencing tables are
+ * stashed around it, so no row is lost and no foreign key is left dangling. The
+ * whole sequence runs inside the migration's own transaction: if any step
+ * throws, the rollback restores the original schema and rows together.
+ */
+function alignContracts(db: Database): void {
+  const rebuilds: readonly { readonly table: string; readonly replacement: string }[] = [
+    { table: 'ideas', replacement: 'ideas_nullable' },
+    { table: 'owners', replacement: 'owners_aligned' },
+    { table: 'work_items', replacement: 'work_items_aligned' },
+    { table: 'outbox_events', replacement: 'outbox_events_aligned' },
+    { table: 'external_operations', replacement: 'external_operations_aligned' },
+    { table: 'owner_decisions', replacement: 'owner_decisions_aligned' },
+    { table: 'jobs', replacement: 'jobs_aligned' },
+    { table: 'candidates', replacement: 'candidates_aligned' },
+  ];
+
+  for (const { table, replacement } of rebuilds) {
+    const children = referencingTables(db, table);
+    const columns = columnNames(db, table);
+
+    db.exec('PRAGMA defer_foreign_keys = ON');
+    for (const child of children) {
+      db.exec(`CREATE TEMP TABLE stash_${child} AS SELECT * FROM ${quoteIdentifier(child)}`);
+    }
+    db.exec(`CREATE TEMP TABLE stash_${table} AS SELECT * FROM ${quoteIdentifier(table)}`);
+    for (const child of children) {
+      db.exec(`DELETE FROM ${quoteIdentifier(child)}`);
+    }
+    db.exec(`DROP TABLE ${quoteIdentifier(table)}`);
+    db.exec(`ALTER TABLE ${quoteIdentifier(replacement)} RENAME TO ${quoteIdentifier(table)}`);
+    db.exec(`INSERT INTO ${quoteIdentifier(table)} (${columns}) SELECT ${columns} FROM stash_${table}`);
+    for (const child of children) {
+      const childColumns = columnNames(db, child);
+      db.exec(
+        `INSERT INTO ${quoteIdentifier(child)} (${childColumns}) SELECT ${childColumns} FROM stash_${child}`,
+      );
+    }
+    db.exec(`DROP TABLE stash_${table}`);
+    for (const child of children) {
+      db.exec(`DROP TABLE stash_${child}`);
+    }
+  }
+
+  // SQLite drops an index and a trigger with the table it belongs to, so every
+  // one defined in versions 1 to 6 that lives on a rebuilt table is recreated
+  // here. The list is explicit rather than derived: a rebuild that silently lost
+  // an index would turn a filtered query into a full scan, and a rebuild that
+  // silently lost the append-only triggers would make a scope snapshot editable
+  // (F12-AC1).
+  const restores: readonly string[] = [
+    'CREATE INDEX IF NOT EXISTS ideas_by_project ON ideas(project_id, state, created_at)',
+    'CREATE INDEX IF NOT EXISTS work_items_by_project ON work_items(project_id, publication_intent, created_at)',
+    'CREATE INDEX IF NOT EXISTS work_items_by_idea ON work_items(idea_id)',
+    'CREATE UNIQUE INDEX IF NOT EXISTS owners_by_email ON owners(email) WHERE email IS NOT NULL',
+    'CREATE UNIQUE INDEX IF NOT EXISTS work_items_by_external_issue ON work_items(external_issue_id) WHERE external_issue_id IS NOT NULL',
+    'CREATE INDEX IF NOT EXISTS outbox_events_by_state ON outbox_events(state, next_attempt_at)',
+    'CREATE INDEX IF NOT EXISTS outbox_events_by_operation ON outbox_events(operation_id)',
+    'CREATE INDEX IF NOT EXISTS external_operations_by_state ON external_operations(state, requested_at)',
+    'CREATE INDEX IF NOT EXISTS external_operations_by_work_item ON external_operations(work_item_id, requested_at DESC)',
+    'CREATE INDEX IF NOT EXISTS jobs_by_state ON jobs(state, queued_at)',
+    'CREATE INDEX IF NOT EXISTS jobs_by_work_item ON jobs(work_item_id, created_at DESC)',
+    'CREATE INDEX IF NOT EXISTS candidates_by_work_item ON candidates(work_item_id, created_at DESC)',
+    'CREATE INDEX IF NOT EXISTS candidates_by_fingerprint ON candidates(fingerprint)',
+    'CREATE INDEX IF NOT EXISTS owner_decisions_by_candidate ON owner_decisions(candidate_id, decided_at DESC)',
+    'CREATE INDEX IF NOT EXISTS owner_decisions_by_work_item ON owner_decisions(work_item_id, decided_at DESC)',
+    'CREATE INDEX IF NOT EXISTS owner_decisions_unconsumed ON owner_decisions(candidate_id) WHERE state = \'Recorded\'',
+    `CREATE TRIGGER IF NOT EXISTS scope_snapshots_immutable_update
+     BEFORE UPDATE ON scope_snapshots
+     BEGIN
+       SELECT RAISE(ABORT, 'scope_snapshots are immutable: record a new snapshot instead');
+     END`,
+    `CREATE TRIGGER IF NOT EXISTS scope_snapshots_immutable_delete
+     BEFORE DELETE ON scope_snapshots
+     BEGIN
+       SELECT RAISE(ABORT, 'scope_snapshots are immutable and retained for history');
+     END`,
+  ];
+  for (const statement of restores) {
+    db.exec(statement);
+  }
+}
+
 const MIGRATIONS: readonly Migration[] = [
   {
     version: 1,
@@ -838,6 +1585,28 @@ const MIGRATIONS: readonly Migration[] = [
     name: 'delivery_attention_and_events',
     up: (db) => {
       db.exec(MIGRATION_4_DELIVERY_ATTENTION_AND_EVENTS);
+    },
+  },
+  {
+    version: 5,
+    name: 'repository_alignment',
+    up: (db) => {
+      db.exec(MIGRATION_5_REPOSITORY_ALIGNMENT);
+    },
+  },
+  {
+    version: 6,
+    name: 'event_ledger_alignment',
+    up: (db) => {
+      db.exec(MIGRATION_6_EVENT_LEDGER_ALIGNMENT);
+    },
+  },
+  {
+    version: 7,
+    name: 'contract_alignment',
+    up: (db) => {
+      db.exec(MIGRATION_7_CONTRACT_ALIGNMENT);
+      alignContracts(db);
     },
   },
 ];
@@ -1090,6 +1859,15 @@ function commitShaCheck(column: string): string {
 
 function fingerprintCheck(column: string): string {
   return `CHECK (${fingerprintCondition(column)})`;
+}
+
+/**
+ * The same restriction for a column that is absent when the concept does not
+ * apply: an acceptance has no authorization subject, so `subject_fingerprint`
+ * is null there and a well-formed fingerprint everywhere else (R3).
+ */
+function nullableFingerprintCheck(column: string): string {
+  return `CHECK (${column} IS NULL OR ${fingerprintCondition(column)})`;
 }
 
 /**

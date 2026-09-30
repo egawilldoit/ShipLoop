@@ -20,10 +20,12 @@ import { DatabaseSync } from 'node:sqlite';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { createInboxStore, digestOf, eventIdFor, INBOX_SCHEMA_SQL, isSuperseded } from './inbox.ts';
-import { createOperationStore, OPERATION_SCHEMA_SQL } from './operations.ts';
+import { openDatabase, type Database } from '../db.ts';
+import { migrate } from '../migrations.ts';
+import { createInboxStore, digestOf, eventIdFor, isSuperseded } from './inbox.ts';
+import { createOperationStore } from './operations.ts';
 import type { RecordIntentInput } from './operations.ts';
-import { backoffForAttempt, createOutboxStore, OUTBOX_SCHEMA_SQL } from './outbox.ts';
+import { backoffForAttempt, createOutboxStore } from './outbox.ts';
 import type { EnqueueEffect } from './outbox.ts';
 import type { ExternalRef, InboxEvent, SqlConnection } from './types.ts';
 
@@ -44,9 +46,12 @@ interface Harness {
 async function harness(options: { readonly recordedAt?: string; readonly location?: string } = {}): Promise<Harness> {
   const workspace = await mkdtemp(join(tmpdir(), 'shiploop-events-'));
   const path = options.location ?? join(workspace, 'events.sqlite');
-  const db = new DatabaseSync(path);
-  db.exec('PRAGMA journal_mode = WAL');
-  db.exec('PRAGMA foreign_keys = ON');
+  const opened = openDatabase(path);
+  assert.ok(opened.ok, `the database could not be opened: ${opened.ok ? '' : opened.error.reason}`);
+  const db: Database = opened.value;
+  const migrated = migrate(db);
+  assert.ok(migrated.ok, `the schema could not be migrated: ${migrated.ok ? '' : migrated.error.reason}`);
+  seedLedgerParents(db);
   const sql: SqlConnection = {
     exec: (statement) => db.exec(statement),
     prepare: (statement) => db.prepare(statement),
@@ -54,9 +59,6 @@ async function harness(options: { readonly recordedAt?: string; readonly locatio
       return db.isTransaction;
     },
   };
-  sql.exec(INBOX_SCHEMA_SQL);
-  sql.exec(OUTBOX_SCHEMA_SQL);
-  sql.exec(OPERATION_SCHEMA_SQL);
   return {
     db,
     sql,
@@ -69,6 +71,18 @@ async function harness(options: { readonly recordedAt?: string; readonly locatio
       await rm(workspace, { recursive: true, force: true });
     },
   };
+}
+
+/**
+ * The rows the event ledger's foreign keys require.
+ *
+ * The schema ties an external operation to a project, so recording an intent
+ * without one is refused. That is the schema making F10-AC3 real: a provider
+ * write is always attributable to the work that authorised it.
+ */
+function seedLedgerParents(db: Database): void {
+  db.prepare('INSERT INTO owners (owner_id, display_name) VALUES (?, ?)').run('event-owner', 'Solo owner');
+  db.prepare('INSERT INTO projects (project_id, name) VALUES (?, ?)').run('event-project', 'Event fixture project');
 }
 
 async function withHarness(work: (context: Harness) => void | Promise<void>): Promise<void> {
@@ -156,9 +170,9 @@ test('an invalid signature is rejected and nothing is recorded (F30-AC1)', async
     assert.equal(result.ok, false);
     if (result.ok) throw new Error('unreachable');
     assert.equal(result.error.code, 'Invalid');
-    assert.equal(countRows({ queries }, 'inbox_event'), 0);
-    assert.equal(countRows({ queries }, 'external_operation'), 0);
-    assert.equal(countRows({ queries }, 'outbox_effect'), 0);
+    assert.equal(countRows({ queries }, 'inbox_events'), 0);
+    assert.equal(countRows({ queries }, 'external_operations'), 0);
+    assert.equal(countRows({ queries }, 'outbox_events'), 0);
     assert.equal(inbox.findByDelivery('linear', 'delivery-invalid'), null);
     assert.equal(outbox.due('2027-01-01T00:00:00.000Z').length, 0);
   });
@@ -184,11 +198,12 @@ test('a valid event is durably recorded before acknowledgement and survives reop
 
     // A separate connection sees the row before recordEvent returned, so the fact is
     // committed rather than buffered in this connection (F30-AC1, N01-AC3).
-    const observer = new DatabaseSync(path);
-    const observerRow = observer
-      .prepare('SELECT payload_digest FROM inbox_event WHERE event_id = ?')
+    const observed = openDatabase(path);
+    assert.ok(observed.ok, `the observer could not be opened: ${observed.ok ? '' : observed.error.reason}`);
+    const observerRow = observed.value
+      .prepare('SELECT payload_digest FROM inbox_events WHERE inbox_event_id = ?')
       .get(event.eventId);
-    observer.close();
+    observed.value.close();
 
     assert.ok(observerRow !== undefined, 'the event must be committed before the caller is told it was accepted');
     assert.equal(observerRow['payload_digest'], digestOf(payload));
@@ -196,7 +211,9 @@ test('a valid event is durably recorded before acknowledgement and survives reop
     first.db.close();
   }
 
-  const reopened = new DatabaseSync(path);
+  const reopenedOpen = openDatabase(path);
+  assert.ok(reopenedOpen.ok, `the database could not be reopened: ${reopenedOpen.ok ? '' : reopenedOpen.error.reason}`);
+  const reopened: Database = reopenedOpen.value;
   const sql: SqlConnection = {
     exec: (statement) => reopened.exec(statement),
     prepare: (statement) => reopened.prepare(statement),
@@ -285,8 +302,8 @@ test('the same delivery id recorded twice yields one row and one effect (F30-AC2
       }
     }
     assert.equal(publishedEffects, 1, 'only the first delivery may produce an effect');
-    assert.equal(countRows(context, 'inbox_event'), 1);
-    assert.equal(context.queries.prepare('SELECT COUNT(*) AS total FROM outbox_effect').get()?.['total'], 1);
+    assert.equal(countRows(context, 'inbox_events'), 1);
+    assert.equal(context.queries.prepare('SELECT COUNT(*) AS total FROM outbox_events').get()?.['total'], 1);
   });
 });
 
@@ -429,7 +446,7 @@ test('an outbox effect enqueued in a committed transaction is present, and a rol
     assert.equal(rolledBack.ok, true, 'enqueue itself succeeds; the rollback removes it');
     assert.equal(outbox.findByDedupKey('dedup_tx_rollback'), null);
     assert.equal(
-      sql.prepare('SELECT COUNT(*) AS total FROM outbox_effect').get()?.['total'],
+      sql.prepare('SELECT COUNT(*) AS total FROM outbox_events').get()?.['total'],
       1,
       'a rolled back transaction leaves no effect behind',
     );
@@ -483,7 +500,7 @@ test('re-enqueueing the same dedup key returns the original effect without a sec
     if (!repeat.ok) throw new Error('unreachable');
     assert.equal(repeat.value.created, false);
     assert.equal(repeat.value.effect.effectId, 'eff_receipt');
-    assert.equal(sql.prepare('SELECT COUNT(*) AS total FROM outbox_effect').get()?.['total'], 1);
+    assert.equal(sql.prepare('SELECT COUNT(*) AS total FROM outbox_events').get()?.['total'], 1);
   });
 });
 
@@ -706,6 +723,7 @@ test('recording intent then OutcomeUnknown, then writing again with the same ope
   await withHarness((context) => {
     const intent: RecordIntentInput = {
       operationId: 'op_merge_1',
+      projectId: 'event-project',
       kind: 'Merge',
       target: 'repo/feature-branch',
       expectedRefs: [{ id: 'sha_base', kind: 'CommitSha', url: null }],
@@ -743,6 +761,7 @@ test('an interruption after the write but before its outcome also blocks a secon
   await withHarness((context) => {
     const intent: RecordIntentInput = {
       operationId: 'op_pr_create',
+      projectId: 'event-project',
       kind: 'PullRequestCreate',
       target: 'repo/feature-branch',
       expectedRefs: [],
@@ -794,6 +813,7 @@ test('a definite failure is retryable, and a success is not (F30-AC5)', async ()
   await withHarness((context) => {
     const intent: RecordIntentInput = {
       operationId: 'op_comment',
+      projectId: 'event-project',
       kind: 'CommentCreate',
       target: 'issue_9',
       expectedRefs: [],
@@ -822,6 +842,7 @@ test('two operation ids for the same target are distinguishable, so a genuinely 
   await withHarness(({ operations }) => {
     const first = operations.recordIntent({
       operationId: 'op_release_a',
+      projectId: 'event-project',
       kind: 'Release',
       target: 'app/production',
       expectedRefs: [],
@@ -830,6 +851,7 @@ test('two operation ids for the same target are distinguishable, so a genuinely 
     });
     const second = operations.recordIntent({
       operationId: 'op_release_b',
+      projectId: 'event-project',
       kind: 'Release',
       target: 'app/production',
       expectedRefs: [],
@@ -858,6 +880,7 @@ test('two operation ids for the same target are distinguishable, so a genuinely 
 
     const reused = operations.recordIntent({
       operationId: 'op_release_a',
+      projectId: 'event-project',
       kind: 'Merge',
       target: 'app/production',
       expectedRefs: [],
@@ -893,6 +916,7 @@ test('a release receipt retry does not republish a duplicate receipt (F29-AC4)',
     outbox.enqueue(receipt);
     operations.recordIntent({
       operationId: 'op_receipt',
+      projectId: 'event-project',
       kind: 'ReceiptPublish',
       target: 'rcpt_1',
       expectedRefs: [],
@@ -924,7 +948,7 @@ test('a release receipt retry does not republish a duplicate receipt (F29-AC4)',
       ['eff_receipt'],
       'one effect means one published receipt',
     );
-    assert.equal(sql.prepare('SELECT COUNT(*) AS total FROM outbox_effect').get()?.['total'], 1);
+    assert.equal(sql.prepare('SELECT COUNT(*) AS total FROM outbox_events').get()?.['total'], 1);
     assert.deepEqual(outbox.unpublishedRefs('eff_receipt'), []);
     assert.deepEqual(outbox.pendingSync(), []);
   });

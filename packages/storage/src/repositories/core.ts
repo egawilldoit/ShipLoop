@@ -31,11 +31,13 @@ import {
   subjectFingerprint,
 } from '@shiploop/domain';
 import type {
+  AcceptanceState,
   AttentionItemId,
   AttemptId,
   AuthorizationSubject,
   CandidateId,
   CheckResult,
+  CommitSha,
   ConnectorId,
   DecisionId,
   DomainError,
@@ -77,10 +79,13 @@ import type {
   OwnerDecisionRecord,
   OwnerDecisionState,
   OwnerDecisionStore,
+  OwnerCredentialInput,
+  OwnerCredentialRecord,
   OwnerDecisionType,
   OwnerRecord,
   OwnerSession,
   OwnerStore,
+  ProcedureSource,
   ProcedureStatus,
   ProcedureStore,
   ProcedureVersion,
@@ -266,7 +271,7 @@ abstract class SqlRepository {
   }
 }
 
-const OWNER_COLUMNS = 'owner_id, display_name, created_at';
+const OWNER_COLUMNS = 'owner_id, identity_subject, display_name, email, password_digest, created_at';
 const SESSION_COLUMNS =
   'session_id, owner_id, token_hash, issued_at, expires_at, revoked_at, rotated_from_session_id';
 
@@ -274,7 +279,16 @@ function toOwner(row: SqlRow): OwnerRecord {
   return {
     ownerId: requiredText(row, 'owner_id') as OwnerId,
     displayName: requiredText(row, 'display_name'),
+    email: nullableText(row, 'email'),
     createdAt: requiredText(row, 'created_at'),
+  };
+}
+
+function toCredential(row: SqlRow): OwnerCredentialRecord {
+  return {
+    ownerId: requiredText(row, 'owner_id') as OwnerId,
+    email: requiredText(row, 'email'),
+    passwordDigest: requiredText(row, 'password_digest'),
   };
 }
 
@@ -291,29 +305,57 @@ function toSession(row: SqlRow): OwnerSession {
 }
 
 /**
- * The provisioned owner and their sessions (F01-AC1, F01-AC2).
+ * The provisioned owner, their credentials and their sessions (F01-AC1, F01-AC2).
  *
  * There is one provisioned owner, so provisioning twice is a conflict rather
  * than a second identity. Revoking writes `revoked_at`, and `authenticate`
  * refuses a revoked or expired session, which is what makes signing out stop
  * privileged use instead of only removing a cookie.
+ *
+ * Credentials live on the owner row rather than in a separate table: the
+ * migrated schema owns this entity, and a credential with no owner row would be
+ * an identity the product cannot authorize. Only the domain's self-describing
+ * digest is stored, so the plaintext password has no path to a column, a log or
+ * a backup. The address is the sign-in identity and is unique, which is what
+ * makes "unknown address" and "wrong password" the same question to ask
+ * (N02-AC1).
  */
 export class OwnerRepository extends SqlRepository implements OwnerStore {
-  provision(ownerId: OwnerId, displayName: string, createdAt: string): Result<OwnerRecord> {
+  provision(
+    ownerId: OwnerId,
+    displayName: string,
+    createdAt: string,
+    credential?: OwnerCredentialInput,
+  ): Result<OwnerRecord> {
     return this.attempt('provision owner', () =>
       this.bounded(() => {
-        const existing = this.statement(`SELECT ${OWNER_COLUMNS} FROM owner WHERE owner_id = ?`).get(ownerId);
+        const existing = this.statement(`SELECT ${OWNER_COLUMNS} FROM owners WHERE owner_id = ?`).get(ownerId);
         if (existing !== undefined) {
           return err(
             conflict('The owner is already provisioned.', 'no owner', requiredText(existing, 'owner_id')),
           );
         }
+        const email = credential?.email.trim().toLowerCase() ?? null;
+        if (credential !== undefined && (email === null || email === '' || credential.passwordDigest === '')) {
+          return err(
+            invalid('An owner credential needs an email address and a password digest.', [
+              { path: 'email', message: 'Required.' },
+              { path: 'passwordDigest', message: 'Required.' },
+            ]),
+          );
+        }
         this.statement(
-          'INSERT INTO owner (owner_id, display_name, created_at) VALUES (?, ?, ?)',
-        ).run(ownerId, displayName, createdAt);
+          'INSERT INTO owners (owner_id, identity_subject, display_name, email, password_digest, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+        // `identity_subject` names the subject an identity PROVIDER knows this
+        // owner by. A locally provisioned owner has no such subject, so the
+        // column is left NULL rather than filled with the owner id: a value
+        // there would claim an external link that does not exist, and a later
+        // sign-in would trust it (F01-AC1, ADR 0003 R2).
+        ).run(ownerId, null, displayName, email, credential?.passwordDigest ?? null, createdAt);
         return ok<OwnerRecord>({
           ownerId,
           displayName,
+          email,
           createdAt,
         });
       }),
@@ -323,9 +365,71 @@ export class OwnerRepository extends SqlRepository implements OwnerStore {
   current(): Result<OwnerRecord | null> {
     return this.attempt('read the provisioned owner', () => {
       const row = this.statement(
-        `SELECT ${OWNER_COLUMNS} FROM owner ORDER BY created_at ASC, owner_id ASC LIMIT 1`,
+        `SELECT ${OWNER_COLUMNS} FROM owners ORDER BY created_at ASC, owner_id ASC LIMIT 1`,
       ).get();
       return ok(row === undefined ? null : toOwner(row));
+    });
+  }
+
+  /**
+   * Records the owner's credential after provisioning.
+   *
+   * A second write is refused rather than overwriting, because a silent
+   * replacement would let a caller change the identity the owner signs in with
+   * without that being an explicit act.
+   */
+  setCredential(input: OwnerCredentialInput): Result<OwnerCredentialRecord> {
+    return this.attempt('record owner credential', () =>
+      this.bounded(() => {
+        const email = input.email.trim().toLowerCase();
+        if (email === '' || input.passwordDigest === '') {
+          return err(
+            invalid('An owner credential needs an email address and a password digest.', [
+              { path: 'email', message: 'Required.' },
+              { path: 'passwordDigest', message: 'Required.' },
+            ]),
+          );
+        }
+        const owner = this.statement('SELECT owner_id, email, password_digest FROM owners WHERE owner_id = ?').get(
+          input.ownerId,
+        );
+        if (owner === undefined) return err(notFound('Owner', input.ownerId));
+        if (nullableText(owner, 'password_digest') !== null) {
+          return err(
+            conflict('This owner already has a credential; it was not overwritten.', 'no credential', input.email),
+          );
+        }
+        this.statement('UPDATE owners SET email = ?, password_digest = ? WHERE owner_id = ?').run(
+          email,
+          input.passwordDigest,
+          input.ownerId,
+        );
+        return ok(toCredential({ ...owner, email, password_digest: input.passwordDigest }));
+      }),
+    );
+  }
+
+  /**
+   * Looks a credential up by address.
+   *
+   * Lookups are by normalised address so an unknown address and a wrong
+   * password are indistinguishable to the caller (N02-AC1).
+   */
+  findCredentialByEmail(email: string): Result<OwnerCredentialRecord | null> {
+    return this.attempt('read owner credential by email', () => {
+      const row = this.statement(
+        'SELECT owner_id, email, password_digest FROM owners WHERE email = ?',
+      ).get(email.trim().toLowerCase());
+      return ok(row === undefined ? null : toCredential(row));
+    });
+  }
+
+  findCredentialByOwnerId(ownerId: OwnerId): Result<OwnerCredentialRecord | null> {
+    return this.attempt('read owner credential by owner', () => {
+      const row = this.statement(
+        'SELECT owner_id, email, password_digest FROM owners WHERE owner_id = ? AND password_digest IS NOT NULL',
+      ).get(ownerId);
+      return ok(row === undefined ? null : toCredential(row));
     });
   }
 
@@ -335,14 +439,14 @@ export class OwnerRepository extends SqlRepository implements OwnerStore {
         if (input.token === '') {
           return err(invalid('A session token is required.', [{ path: 'token', message: 'Required.' }]));
         }
-        const owner = this.statement(`SELECT ${OWNER_COLUMNS} FROM owner WHERE owner_id = ?`).get(
+        const owner = this.statement(`SELECT ${OWNER_COLUMNS} FROM owners WHERE owner_id = ?`).get(
           input.ownerId,
         );
         if (owner === undefined) return err(notFound('Owner', input.ownerId));
         this.statement(
-          `INSERT INTO owner_session (${SESSION_COLUMNS}) VALUES (?, ?, ?, ?, ?, NULL, NULL)`,
+          `INSERT INTO sessions (${SESSION_COLUMNS}) VALUES (?, ?, ?, ?, ?, NULL, NULL)`,
         ).run(newId<'SessionId'>(), input.ownerId, sessionTokenHash(input.token), input.issuedAt, input.expiresAt);
-        const created = this.statement(`SELECT ${SESSION_COLUMNS} FROM owner_session WHERE token_hash = ?`).get(
+        const created = this.statement(`SELECT ${SESSION_COLUMNS} FROM sessions WHERE token_hash = ?`).get(
           sessionTokenHash(input.token),
         );
         if (created === undefined) return err(notFound('Session', 'created session'));
@@ -353,7 +457,7 @@ export class OwnerRepository extends SqlRepository implements OwnerStore {
 
   authenticate(token: string, now: string): Result<OwnerSession> {
     return this.attempt('authenticate owner session', () => {
-      const row = this.statement(`SELECT ${SESSION_COLUMNS} FROM owner_session WHERE token_hash = ?`).get(
+      const row = this.statement(`SELECT ${SESSION_COLUMNS} FROM sessions WHERE token_hash = ?`).get(
         sessionTokenHash(token),
       );
       if (row === undefined) {
@@ -390,9 +494,9 @@ export class OwnerRepository extends SqlRepository implements OwnerStore {
           ]));
         }
         this.statement(
-          'UPDATE owner_session SET revoked_at = ? WHERE token_hash = ? AND revoked_at IS NULL',
+          'UPDATE sessions SET revoked_at = ? WHERE token_hash = ? AND revoked_at IS NULL',
         ).run(input.issuedAt, current.value.tokenHash);
-        this.statement(`INSERT INTO owner_session (${SESSION_COLUMNS}) VALUES (?, ?, ?, ?, ?, NULL, ?)`).run(
+        this.statement(`INSERT INTO sessions (${SESSION_COLUMNS}) VALUES (?, ?, ?, ?, ?, NULL, ?)`).run(
           newId<'SessionId'>(),
           current.value.ownerId,
           nextHash,
@@ -400,7 +504,7 @@ export class OwnerRepository extends SqlRepository implements OwnerStore {
           input.expiresAt,
           current.value.sessionId,
         );
-        const created = this.statement(`SELECT ${SESSION_COLUMNS} FROM owner_session WHERE token_hash = ?`).get(
+        const created = this.statement(`SELECT ${SESSION_COLUMNS} FROM sessions WHERE token_hash = ?`).get(
           nextHash,
         );
         if (created === undefined) return err(notFound('Session', 'rotated session'));
@@ -413,15 +517,15 @@ export class OwnerRepository extends SqlRepository implements OwnerStore {
     return this.attempt('revoke owner session', () =>
       this.bounded(() => {
         const hash = sessionTokenHash(token);
-        const row = this.statement(`SELECT ${SESSION_COLUMNS} FROM owner_session WHERE token_hash = ?`).get(hash);
+        const row = this.statement(`SELECT ${SESSION_COLUMNS} FROM sessions WHERE token_hash = ?`).get(hash);
         if (row === undefined) return err(notFound('Session', 'unknown token'));
         const session = toSession(row);
         if (session.revokedAt !== null) return ok(session);
-        this.statement('UPDATE owner_session SET revoked_at = ? WHERE session_id = ?').run(
+        this.statement('UPDATE sessions SET revoked_at = ? WHERE session_id = ?').run(
           revokedAt,
           session.sessionId,
         );
-        const updated = this.statement(`SELECT ${SESSION_COLUMNS} FROM owner_session WHERE session_id = ?`).get(
+        const updated = this.statement(`SELECT ${SESSION_COLUMNS} FROM sessions WHERE session_id = ?`).get(
           session.sessionId,
         );
         if (updated === undefined) return err(notFound('Session', session.sessionId));
@@ -433,7 +537,7 @@ export class OwnerRepository extends SqlRepository implements OwnerStore {
   revokeAllSessions(ownerId: OwnerId, revokedAt: string): Result<number> {
     return this.attempt('revoke every owner session', () => {
       const changes = this.statement(
-        'UPDATE owner_session SET revoked_at = ? WHERE owner_id = ? AND revoked_at IS NULL',
+        'UPDATE sessions SET revoked_at = ? WHERE owner_id = ? AND revoked_at IS NULL',
       ).run(revokedAt, ownerId);
       return ok(changeCount(changes.changes));
     });
@@ -441,14 +545,14 @@ export class OwnerRepository extends SqlRepository implements OwnerStore {
 }
 
 const PROFILE_COLUMNS =
-  'profile_version_id, project_id, version_number, supersedes_version_id, content_json, content_fingerprint, note, created_at, created_by';
+  'profile_version_id, project_id, version, supersedes_version_id, content_json, content_fingerprint, note, created_at, created_by';
 
 function toProfileVersion(row: SqlRow): ProjectProfileVersion {
   const supersedes = nullableText(row, 'supersedes_version_id');
   return {
     profileVersionId: requiredText(row, 'profile_version_id') as ProfileVersionId,
     projectId: requiredText(row, 'project_id') as ProjectId,
-    versionNumber: requiredInteger(row, 'version_number'),
+    versionNumber: requiredInteger(row, 'version'),
     supersedesVersionId: supersedes === null ? null : (supersedes as ProfileVersionId),
     content: parseJson<ProjectProfileContent>(row, 'content_json'),
     contentFingerprint: requiredText(row, 'content_fingerprint') as Fingerprint,
@@ -471,9 +575,9 @@ export class ProjectProfileRepository extends SqlRepository implements ProjectPr
     return this.attempt('save project profile version', () =>
       this.bounded(() => {
         const newest = this.statement(
-          'SELECT profile_version_id, version_number FROM project_profile_version WHERE project_id = ? ORDER BY version_number DESC LIMIT 1',
+          'SELECT profile_version_id, version FROM project_profile_versions WHERE project_id = ? ORDER BY version DESC LIMIT 1',
         ).get(input.projectId);
-        const newestNumber = newest === undefined ? 0 : requiredInteger(newest, 'version_number');
+        const newestNumber = newest === undefined ? 0 : requiredInteger(newest, 'version');
         if (input.expectedVersionNumber !== null && input.expectedVersionNumber !== newestNumber) {
           return err(
             conflict(
@@ -487,7 +591,7 @@ export class ProjectProfileRepository extends SqlRepository implements ProjectPr
         const supersedes = newest === undefined ? null : requiredText(newest, 'profile_version_id');
         const contentFingerprint = fingerprint(input.content);
         this.statement(
-          `INSERT INTO project_profile_version (${PROFILE_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          `INSERT INTO project_profile_versions (${PROFILE_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         ).run(
           versionId,
           input.projectId,
@@ -500,7 +604,7 @@ export class ProjectProfileRepository extends SqlRepository implements ProjectPr
           input.createdBy,
         );
         const created = this.statement(
-          `SELECT ${PROFILE_COLUMNS} FROM project_profile_version WHERE profile_version_id = ?`,
+          `SELECT ${PROFILE_COLUMNS} FROM project_profile_versions WHERE profile_version_id = ?`,
         ).get(versionId);
         if (created === undefined) return err(notFound('Profile version', versionId));
         return ok(toProfileVersion(created));
@@ -511,7 +615,7 @@ export class ProjectProfileRepository extends SqlRepository implements ProjectPr
   getVersion(profileVersionId: ProfileVersionId): Result<ProjectProfileVersion> {
     return this.attempt('read project profile version', () => {
       const row = this.statement(
-        `SELECT ${PROFILE_COLUMNS} FROM project_profile_version WHERE profile_version_id = ?`,
+        `SELECT ${PROFILE_COLUMNS} FROM project_profile_versions WHERE profile_version_id = ?`,
       ).get(profileVersionId);
       if (row === undefined) return err(notFound('Profile version', profileVersionId));
       return ok(toProfileVersion(row));
@@ -521,7 +625,7 @@ export class ProjectProfileRepository extends SqlRepository implements ProjectPr
   currentVersion(projectId: ProjectId): Result<ProjectProfileVersion | null> {
     return this.attempt('read the current project profile version', () => {
       const row = this.statement(
-        `SELECT ${PROFILE_COLUMNS} FROM project_profile_version WHERE project_id = ? ORDER BY version_number DESC LIMIT 1`,
+        `SELECT ${PROFILE_COLUMNS} FROM project_profile_versions WHERE project_id = ? ORDER BY version DESC LIMIT 1`,
       ).get(projectId);
       return ok(row === undefined ? null : toProfileVersion(row));
     });
@@ -530,7 +634,7 @@ export class ProjectProfileRepository extends SqlRepository implements ProjectPr
   listVersions(projectId: ProjectId): Result<readonly ProjectProfileVersion[]> {
     return this.attempt('list project profile versions', () => {
       const rows = this.statement(
-        `SELECT ${PROFILE_COLUMNS} FROM project_profile_version WHERE project_id = ? ORDER BY version_number ASC`,
+        `SELECT ${PROFILE_COLUMNS} FROM project_profile_versions WHERE project_id = ? ORDER BY version ASC`,
       ).all(projectId);
       return ok(rows.map(toProfileVersion));
     });
@@ -542,7 +646,7 @@ export class ProjectProfileRepository extends SqlRepository implements ProjectPr
   ): Result<readonly ProjectProfileVersion[]> {
     return this.attempt('list later project profile versions', () => {
       const rows = this.statement(
-        `SELECT ${PROFILE_COLUMNS} FROM project_profile_version WHERE project_id = ? AND version_number > ? ORDER BY version_number ASC`,
+        `SELECT ${PROFILE_COLUMNS} FROM project_profile_versions WHERE project_id = ? AND version > ? ORDER BY version ASC`,
       ).all(projectId, versionNumber);
       return ok(rows.map(toProfileVersion));
     });
@@ -550,7 +654,7 @@ export class ProjectProfileRepository extends SqlRepository implements ProjectPr
 }
 
 const CONNECTOR_COLUMNS =
-  'connector_id, project_id, provider, kind, resource_scope, credential_reference, credential_reference_digest, capability_json, state, error, last_checked_at, last_success_at, created_at, updated_at';
+  'connector_id, project_id, provider, kind, resource_scope, credential_ref, credential_reference_digest, capability_json, state, error, last_checked_at, last_success_at, created_at, updated_at';
 
 const CONNECTOR_KINDS: readonly string[] = ['Ticket', 'Git', 'Deployment', 'Engine'];
 const CONNECTOR_STATES: readonly string[] = ['Unconfigured', 'Healthy', 'Degraded', 'Revoked', 'Unreachable'];
@@ -562,7 +666,7 @@ function toConnector(row: SqlRow): ConnectorRecord {
     provider: requiredText(row, 'provider'),
     kind: requiredText(row, 'kind') as ConnectorRecord['kind'],
     resourceScope: requiredText(row, 'resource_scope'),
-    credentialReference: requiredText(row, 'credential_reference'),
+    credentialReference: requiredText(row, 'credential_ref'),
     credentialReferenceDigest: requiredText(row, 'credential_reference_digest'),
     declarations: parseJson<ConnectorRecord['declarations']>(row, 'capability_json'),
     state: requiredText(row, 'state') as ConnectorState,
@@ -613,12 +717,12 @@ export class ConnectorRepository extends SqlRepository implements ConnectorStore
         }
         const digest = createHash('sha256').update(input.credentialReference, 'utf8').digest('hex');
         const existing = this.statement(
-          `SELECT ${CONNECTOR_COLUMNS} FROM connector WHERE project_id = ? AND kind = ?`,
+          `SELECT ${CONNECTOR_COLUMNS} FROM connectors WHERE project_id = ? AND kind = ?`,
         ).get(input.projectId, input.kind);
         const connectorId = existing === undefined ? newId<'ConnectorId'>() : requiredText(existing, 'connector_id');
         if (existing === undefined) {
           this.statement(
-            `INSERT INTO connector (${CONNECTOR_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)`,
+            `INSERT INTO connectors (${CONNECTOR_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)`,
           ).run(
             connectorId,
             input.projectId,
@@ -635,7 +739,7 @@ export class ConnectorRepository extends SqlRepository implements ConnectorStore
           );
         } else {
           this.statement(
-            'UPDATE connector SET provider = ?, resource_scope = ?, credential_reference = ?, credential_reference_digest = ?, capability_json = ?, state = ?, error = ?, updated_at = ? WHERE connector_id = ?',
+            'UPDATE connectors SET provider = ?, resource_scope = ?, credential_reference = ?, credential_reference_digest = ?, capability_json = ?, state = ?, error = ?, updated_at = ? WHERE connector_id = ?',
           ).run(
             input.provider,
             input.resourceScope,
@@ -649,7 +753,7 @@ export class ConnectorRepository extends SqlRepository implements ConnectorStore
           );
         }
         const saved = this.statement(
-          `SELECT ${CONNECTOR_COLUMNS} FROM connector WHERE connector_id = ?`,
+          `SELECT ${CONNECTOR_COLUMNS} FROM connectors WHERE connector_id = ?`,
         ).get(connectorId);
         if (saved === undefined) return err(notFound('Connector', connectorId));
         return ok(toConnector(saved));
@@ -659,7 +763,7 @@ export class ConnectorRepository extends SqlRepository implements ConnectorStore
 
   get(connectorId: ConnectorId): Result<ConnectorRecord> {
     return this.attempt('read connector', () => {
-      const row = this.statement(`SELECT ${CONNECTOR_COLUMNS} FROM connector WHERE connector_id = ?`).get(
+      const row = this.statement(`SELECT ${CONNECTOR_COLUMNS} FROM connectors WHERE connector_id = ?`).get(
         connectorId,
       );
       if (row === undefined) return err(notFound('Connector', connectorId));
@@ -670,7 +774,7 @@ export class ConnectorRepository extends SqlRepository implements ConnectorStore
   findByKind(projectId: ProjectId, kind: ConnectorRecord['kind']): Result<ConnectorRecord | null> {
     return this.attempt('read connector by kind', () => {
       const row = this.statement(
-        `SELECT ${CONNECTOR_COLUMNS} FROM connector WHERE project_id = ? AND kind = ?`,
+        `SELECT ${CONNECTOR_COLUMNS} FROM connectors WHERE project_id = ? AND kind = ?`,
       ).get(projectId, kind);
       return ok(row === undefined ? null : toConnector(row));
     });
@@ -679,7 +783,7 @@ export class ConnectorRepository extends SqlRepository implements ConnectorStore
   listForProject(projectId: ProjectId): Result<readonly ConnectorRecord[]> {
     return this.attempt('list project connectors', () => {
       const rows = this.statement(
-        `SELECT ${CONNECTOR_COLUMNS} FROM connector WHERE project_id = ? ORDER BY kind ASC`,
+        `SELECT ${CONNECTOR_COLUMNS} FROM connectors WHERE project_id = ? ORDER BY kind ASC`,
       ).all(projectId);
       return ok(rows.map(toConnector));
     });
@@ -696,7 +800,7 @@ export class ConnectorRepository extends SqlRepository implements ConnectorStore
     return this.attempt('record connector check', () =>
       this.bounded(() => {
         const existing = this.statement(
-          `SELECT ${CONNECTOR_COLUMNS} FROM connector WHERE connector_id = ?`,
+          `SELECT ${CONNECTOR_COLUMNS} FROM connectors WHERE connector_id = ?`,
         ).get(connectorId);
         if (existing === undefined) return err(notFound('Connector', connectorId));
         const declarations =
@@ -704,7 +808,7 @@ export class ConnectorRepository extends SqlRepository implements ConnectorStore
             ? requiredText(existing, 'capability_json')
             : canonicalize(result.declarations);
         this.statement(
-          'UPDATE connector SET capability_json = ?, state = ?, error = ?, last_checked_at = ?, last_success_at = ?, updated_at = ? WHERE connector_id = ?',
+          'UPDATE connectors SET capability_json = ?, state = ?, error = ?, last_checked_at = ?, last_success_at = ?, updated_at = ? WHERE connector_id = ?',
         ).run(
           declarations,
           result.state,
@@ -715,7 +819,7 @@ export class ConnectorRepository extends SqlRepository implements ConnectorStore
           connectorId,
         );
         const updated = this.statement(
-          `SELECT ${CONNECTOR_COLUMNS} FROM connector WHERE connector_id = ?`,
+          `SELECT ${CONNECTOR_COLUMNS} FROM connectors WHERE connector_id = ?`,
         ).get(connectorId);
         if (updated === undefined) return err(notFound('Connector', connectorId));
         return ok(toConnector(updated));
@@ -727,14 +831,14 @@ export class ConnectorRepository extends SqlRepository implements ConnectorStore
     return this.attempt('revoke connector', () =>
       this.bounded(() => {
         const existing = this.statement(
-          `SELECT ${CONNECTOR_COLUMNS} FROM connector WHERE connector_id = ?`,
+          `SELECT ${CONNECTOR_COLUMNS} FROM connectors WHERE connector_id = ?`,
         ).get(connectorId);
         if (existing === undefined) return err(notFound('Connector', connectorId));
         this.statement(
-          'UPDATE connector SET state = ?, error = ?, updated_at = ? WHERE connector_id = ?',
+          'UPDATE connectors SET state = ?, error = ?, updated_at = ? WHERE connector_id = ?',
         ).run('Revoked', reason, revokedAt, connectorId);
         const updated = this.statement(
-          `SELECT ${CONNECTOR_COLUMNS} FROM connector WHERE connector_id = ?`,
+          `SELECT ${CONNECTOR_COLUMNS} FROM connectors WHERE connector_id = ?`,
         ).get(connectorId);
         if (updated === undefined) return err(notFound('Connector', connectorId));
         return ok(toConnector(updated));
@@ -745,7 +849,7 @@ export class ConnectorRepository extends SqlRepository implements ConnectorStore
   capabilitySummary(connectorId: ConnectorId): Result<CapabilitySummary> {
     return this.attempt('read connector capabilities', () => {
       const row = this.statement(
-        `SELECT ${CONNECTOR_COLUMNS} FROM connector WHERE connector_id = ?`,
+        `SELECT ${CONNECTOR_COLUMNS} FROM connectors WHERE connector_id = ?`,
       ).get(connectorId);
       if (row === undefined) return err(notFound('Connector', connectorId));
       const record = toConnector(row);
@@ -760,7 +864,7 @@ export class ConnectorRepository extends SqlRepository implements ConnectorStore
 }
 
 const PROCEDURE_COLUMNS =
-  'procedure_version_id, project_id, subject_key, version_number, kind, scope, source, source_revision, content, content_fingerprint, status, last_verified_revision, last_verified_at, accepted_at, created_at, created_by, note';
+  'procedure_version_id, project_id, subject_key, version, kind, scope, source, source_revision, content, content_fingerprint, status, last_verified_revision, last_verified_at, approved_at, created_at, created_by, note';
 
 const PROCEDURE_STATUSES: readonly string[] = ['Proposed', 'Accepted', 'Superseded', 'Retired'];
 
@@ -769,17 +873,17 @@ function toProcedureVersion(row: SqlRow): ProcedureVersion {
     procedureVersionId: requiredText(row, 'procedure_version_id') as ProcedureVersionId,
     projectId: requiredText(row, 'project_id') as ProjectId,
     subjectKey: requiredText(row, 'subject_key'),
-    versionNumber: requiredInteger(row, 'version_number'),
+    versionNumber: requiredInteger(row, 'version'),
     kind: requiredText(row, 'kind') as ProcedureVersion['kind'],
     scope: requiredText(row, 'scope'),
-    source: requiredText(row, 'source'),
+    source: requiredText(row, 'source') as ProcedureSource,
     sourceRevision: nullableText(row, 'source_revision'),
     content: requiredText(row, 'content'),
     contentFingerprint: requiredText(row, 'content_fingerprint') as Fingerprint,
     status: requiredText(row, 'status') as ProcedureStatus,
     lastVerifiedRevision: nullableText(row, 'last_verified_revision'),
     lastVerifiedAt: nullableText(row, 'last_verified_at'),
-    acceptedAt: nullableText(row, 'accepted_at'),
+    acceptedAt: nullableText(row, 'approved_at'),
     createdAt: requiredText(row, 'created_at'),
     createdBy: requiredText(row, 'created_by'),
     note: nullableText(row, 'note'),
@@ -805,9 +909,9 @@ export class ProcedureRepository extends SqlRepository implements ProcedureStore
           ]));
         }
         const newest = this.statement(
-          'SELECT version_number FROM procedure_version WHERE project_id = ? AND subject_key = ? ORDER BY version_number DESC LIMIT 1',
+          'SELECT version FROM procedure_versions WHERE project_id = ? AND subject_key = ? ORDER BY version DESC LIMIT 1',
         ).get(input.projectId, input.subjectKey);
-        const newestNumber = newest === undefined ? 0 : requiredInteger(newest, 'version_number');
+        const newestNumber = newest === undefined ? 0 : requiredInteger(newest, 'version');
         if (input.expectedVersionNumber !== null && input.expectedVersionNumber !== newestNumber) {
           return err(
             conflict(
@@ -819,12 +923,12 @@ export class ProcedureRepository extends SqlRepository implements ProcedureStore
         }
         if (input.status === 'Accepted') {
           this.statement(
-            "UPDATE procedure_version SET status = 'Superseded' WHERE project_id = ? AND subject_key = ? AND status = 'Accepted'",
+            "UPDATE procedure_versions SET status = 'Superseded' WHERE project_id = ? AND subject_key = ? AND status = 'Accepted'",
           ).run(input.projectId, input.subjectKey);
         }
         const versionId = newId<'ProcedureVersionId'>();
         this.statement(
-          `INSERT INTO procedure_version (${PROCEDURE_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?)`,
+          `INSERT INTO procedure_versions (${PROCEDURE_COLUMNS}, content_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?)`,
         ).run(
           versionId,
           input.projectId,
@@ -841,9 +945,10 @@ export class ProcedureRepository extends SqlRepository implements ProcedureStore
           input.createdAt,
           input.createdBy,
           input.note,
+          canonicalize(input.content),
         );
         const created = this.statement(
-          `SELECT ${PROCEDURE_COLUMNS} FROM procedure_version WHERE procedure_version_id = ?`,
+          `SELECT ${PROCEDURE_COLUMNS} FROM procedure_versions WHERE procedure_version_id = ?`,
         ).get(versionId);
         if (created === undefined) return err(notFound('Procedure version', versionId));
         return ok(toProcedureVersion(created));
@@ -855,7 +960,7 @@ export class ProcedureRepository extends SqlRepository implements ProcedureStore
     return this.attempt('accept procedure version', () =>
       this.bounded(() => {
         const row = this.statement(
-          `SELECT ${PROCEDURE_COLUMNS} FROM procedure_version WHERE procedure_version_id = ?`,
+          `SELECT ${PROCEDURE_COLUMNS} FROM procedure_versions WHERE procedure_version_id = ?`,
         ).get(procedureVersionId);
         if (row === undefined) return err(notFound('Procedure version', procedureVersionId));
         const target = toProcedureVersion(row);
@@ -865,13 +970,13 @@ export class ProcedureRepository extends SqlRepository implements ProcedureStore
           );
         }
         this.statement(
-          "UPDATE procedure_version SET status = 'Superseded' WHERE project_id = ? AND subject_key = ? AND status = 'Accepted' AND procedure_version_id <> ?",
+          "UPDATE procedure_versions SET status = 'Superseded' WHERE project_id = ? AND subject_key = ? AND status = 'Accepted' AND procedure_version_id <> ?",
         ).run(target.projectId, target.subjectKey, procedureVersionId);
         this.statement(
-          'UPDATE procedure_version SET status = ?, accepted_at = ? WHERE procedure_version_id = ?',
+          'UPDATE procedure_versions SET status = ?, approved_at = ? WHERE procedure_version_id = ?',
         ).run('Accepted', acceptedAt, procedureVersionId);
         const updated = this.statement(
-          `SELECT ${PROCEDURE_COLUMNS} FROM procedure_version WHERE procedure_version_id = ?`,
+          `SELECT ${PROCEDURE_COLUMNS} FROM procedure_versions WHERE procedure_version_id = ?`,
         ).get(procedureVersionId);
         if (updated === undefined) return err(notFound('Procedure version', procedureVersionId));
         return ok(toProcedureVersion(updated));
@@ -882,7 +987,7 @@ export class ProcedureRepository extends SqlRepository implements ProcedureStore
   getVersion(procedureVersionId: ProcedureVersionId): Result<ProcedureVersion> {
     return this.attempt('read procedure version', () => {
       const row = this.statement(
-        `SELECT ${PROCEDURE_COLUMNS} FROM procedure_version WHERE procedure_version_id = ?`,
+        `SELECT ${PROCEDURE_COLUMNS} FROM procedure_versions WHERE procedure_version_id = ?`,
       ).get(procedureVersionId);
       if (row === undefined) return err(notFound('Procedure version', procedureVersionId));
       return ok(toProcedureVersion(row));
@@ -892,7 +997,7 @@ export class ProcedureRepository extends SqlRepository implements ProcedureStore
   currentVersion(projectId: ProjectId, subjectKey: string): Result<ProcedureVersion | null> {
     return this.attempt('read the current procedure version', () => {
       const row = this.statement(
-        `SELECT ${PROCEDURE_COLUMNS} FROM procedure_version WHERE project_id = ? AND subject_key = ? AND status = 'Accepted' ORDER BY version_number DESC LIMIT 1`,
+        `SELECT ${PROCEDURE_COLUMNS} FROM procedure_versions WHERE project_id = ? AND subject_key = ? AND status = 'Accepted' ORDER BY version DESC LIMIT 1`,
       ).get(projectId, subjectKey);
       return ok(row === undefined ? null : toProcedureVersion(row));
     });
@@ -901,7 +1006,7 @@ export class ProcedureRepository extends SqlRepository implements ProcedureStore
   listVersions(projectId: ProjectId, subjectKey: string): Result<readonly ProcedureVersion[]> {
     return this.attempt('list procedure versions', () => {
       const rows = this.statement(
-        `SELECT ${PROCEDURE_COLUMNS} FROM procedure_version WHERE project_id = ? AND subject_key = ? ORDER BY version_number ASC`,
+        `SELECT ${PROCEDURE_COLUMNS} FROM procedure_versions WHERE project_id = ? AND subject_key = ? ORDER BY version ASC`,
       ).all(projectId, subjectKey);
       return ok(rows.map(toProcedureVersion));
     });
@@ -910,7 +1015,7 @@ export class ProcedureRepository extends SqlRepository implements ProcedureStore
   listProposed(projectId: ProjectId): Result<readonly ProcedureVersion[]> {
     return this.attempt('list proposed procedure versions', () => {
       const rows = this.statement(
-        `SELECT ${PROCEDURE_COLUMNS} FROM procedure_version WHERE project_id = ? AND status = 'Proposed' ORDER BY created_at ASC, version_number ASC`,
+        `SELECT ${PROCEDURE_COLUMNS} FROM procedure_versions WHERE project_id = ? AND status = 'Proposed' ORDER BY created_at ASC, version ASC`,
       ).all(projectId);
       return ok(rows.map(toProcedureVersion));
     });
@@ -924,14 +1029,14 @@ export class ProcedureRepository extends SqlRepository implements ProcedureStore
     return this.attempt('record procedure verification', () =>
       this.bounded(() => {
         const existing = this.statement(
-          'SELECT procedure_version_id FROM procedure_version WHERE procedure_version_id = ?',
+          'SELECT procedure_version_id FROM procedure_versions WHERE procedure_version_id = ?',
         ).get(procedureVersionId);
         if (existing === undefined) return err(notFound('Procedure version', procedureVersionId));
         this.statement(
-          'UPDATE procedure_version SET last_verified_revision = ?, last_verified_at = ? WHERE procedure_version_id = ?',
+          'UPDATE procedure_versions SET last_verified_revision = ?, last_verified_at = ? WHERE procedure_version_id = ?',
         ).run(revision, verifiedAt, procedureVersionId);
         const updated = this.statement(
-          `SELECT ${PROCEDURE_COLUMNS} FROM procedure_version WHERE procedure_version_id = ?`,
+          `SELECT ${PROCEDURE_COLUMNS} FROM procedure_versions WHERE procedure_version_id = ?`,
         ).get(procedureVersionId);
         if (updated === undefined) return err(notFound('Procedure version', procedureVersionId));
         return ok(toProcedureVersion(updated));
@@ -987,7 +1092,7 @@ export class IdeaRepository extends SqlRepository implements IdeaStore {
       }
       const ideaId = newId<'IdeaId'>();
       this.statement(
-        `INSERT INTO idea (${IDEA_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, 'Captured', NULL, NULL, NULL, ?, ?)`,
+        `INSERT INTO ideas (${IDEA_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, 'Received', NULL, NULL, NULL, ?, ?)`,
       ).run(
         ideaId,
         input.projectId,
@@ -1001,7 +1106,7 @@ export class IdeaRepository extends SqlRepository implements IdeaStore {
         input.capturedAt,
         input.capturedAt,
       );
-      const created = this.statement(`SELECT ${IDEA_COLUMNS} FROM idea WHERE idea_id = ?`).get(ideaId);
+      const created = this.statement(`SELECT ${IDEA_COLUMNS} FROM ideas WHERE idea_id = ?`).get(ideaId);
       if (created === undefined) return err(notFound('Idea', ideaId));
       return ok(toIdea(created));
     });
@@ -1009,7 +1114,7 @@ export class IdeaRepository extends SqlRepository implements IdeaStore {
 
   get(ideaId: IdeaId): Result<IdeaRecord> {
     return this.attempt('read idea', () => {
-      const row = this.statement(`SELECT ${IDEA_COLUMNS} FROM idea WHERE idea_id = ?`).get(ideaId);
+      const row = this.statement(`SELECT ${IDEA_COLUMNS} FROM ideas WHERE idea_id = ?`).get(ideaId);
       if (row === undefined) return err(notFound('Idea', ideaId));
       return ok(toIdea(row));
     });
@@ -1032,7 +1137,7 @@ export class IdeaRepository extends SqlRepository implements IdeaStore {
       }
       const where = clauses.length === 0 ? '' : ` WHERE ${clauses.join(' AND ')}`;
       const rows = this.statement(
-        `SELECT ${IDEA_COLUMNS} FROM idea${where} ORDER BY created_at ASC, idea_id ASC`,
+        `SELECT ${IDEA_COLUMNS} FROM ideas${where} ORDER BY created_at ASC, idea_id ASC`,
       ).all(...parameters);
       return ok(rows.map(toIdea));
     });
@@ -1043,10 +1148,10 @@ export class IdeaRepository extends SqlRepository implements IdeaStore {
       this.bounded(() => {
         const idea = this.get(ideaId);
         if (!idea.ok) return idea;
-        if (idea.value.state === 'Archived') {
-          return err(conflict('An archived idea cannot be summarised.', 'active', 'Archived'));
+        if (idea.value.state === 'Abandoned') {
+          return err(conflict('An abandoned idea cannot be summarised.', 'active', 'Abandoned'));
         }
-        this.statement('UPDATE idea SET generated_summary = ?, updated_at = ? WHERE idea_id = ?').run(
+        this.statement('UPDATE ideas SET generated_summary = ?, updated_at = ? WHERE idea_id = ?').run(
           summary,
           at,
           ideaId,
@@ -1066,11 +1171,11 @@ export class IdeaRepository extends SqlRepository implements IdeaStore {
       this.bounded(() => {
         const idea = this.get(ideaId);
         if (!idea.ok) return idea;
-        if (idea.value.state === 'Archived') {
-          return err(conflict('An archived idea cannot be clarified.', 'active', 'Archived'));
+        if (idea.value.state === 'Abandoned') {
+          return err(conflict('An abandoned idea cannot be clarified.', 'active', 'Abandoned'));
         }
         this.statement(
-          "UPDATE idea SET agreed_brief = ?, open_questions = ?, state = 'Agreed', updated_at = ? WHERE idea_id = ?",
+          "UPDATE ideas SET agreed_brief = ?, open_questions = ?, state = 'Planned', updated_at = ? WHERE idea_id = ?",
         ).run(brief, canonicalize(openQuestions), at, ideaId);
         return this.get(ideaId);
       }),
@@ -1079,14 +1184,18 @@ export class IdeaRepository extends SqlRepository implements IdeaStore {
 
   addAttachment(input: AddAttachmentInput): Result<IdeaAttachment> {
     return this.attempt('add idea attachment', () => {
-      const idea = this.statement('SELECT idea_id FROM idea WHERE idea_id = ?').get(input.ideaId);
+      const idea = this.statement('SELECT idea_id FROM ideas WHERE idea_id = ?').get(input.ideaId);
       if (idea === undefined) return err(notFound('Idea', input.ideaId));
       const attachmentId = newId<'IdeaAttachmentId'>();
+      // 'artifact_ref' is where the bytes live; 'relative_path' is the same
+      // reference as the caller states it, so the row records the pointer once
+      // and the digest proves what the pointer resolved to (F06-AC1).
       this.statement(
-        'INSERT INTO idea_attachment (attachment_id, idea_id, file_name, media_type, byte_size, content_digest, relative_path, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+        'INSERT INTO idea_attachments (attachment_id, idea_id, artifact_ref, file_name, media_type, byte_size, content_digest, relative_path, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
       ).run(
         attachmentId,
         input.ideaId,
+        input.relativePath,
         input.fileName,
         input.mediaType,
         input.byteSize,
@@ -1095,7 +1204,7 @@ export class IdeaRepository extends SqlRepository implements IdeaStore {
         input.createdAt,
       );
       const created = this.statement(
-        'SELECT attachment_id, idea_id, file_name, media_type, byte_size, content_digest, relative_path, created_at FROM idea_attachment WHERE attachment_id = ?',
+        'SELECT attachment_id, idea_id, file_name, media_type, byte_size, content_digest, relative_path, created_at FROM idea_attachments WHERE attachment_id = ?',
       ).get(attachmentId);
       if (created === undefined) return err(notFound('Idea attachment', attachmentId));
       return ok(toAttachment(created));
@@ -1105,7 +1214,7 @@ export class IdeaRepository extends SqlRepository implements IdeaStore {
   listAttachments(ideaId: IdeaId): Result<readonly IdeaAttachment[]> {
     return this.attempt('list idea attachments', () => {
       const rows = this.statement(
-        'SELECT attachment_id, idea_id, file_name, media_type, byte_size, content_digest, relative_path, created_at FROM idea_attachment WHERE idea_id = ? ORDER BY created_at ASC, attachment_id ASC',
+        'SELECT attachment_id, idea_id, file_name, media_type, byte_size, content_digest, relative_path, created_at FROM idea_attachments WHERE idea_id = ? ORDER BY created_at ASC, attachment_id ASC',
       ).all(ideaId);
       return ok(rows.map(toAttachment));
     });
@@ -1117,7 +1226,7 @@ export class IdeaRepository extends SqlRepository implements IdeaStore {
         const idea = this.get(ideaId);
         if (!idea.ok) return idea;
         this.statement(
-          "UPDATE idea SET state = 'Published', published_work_item_id = ?, archived_at = NULL, archived_reason = NULL, updated_at = ? WHERE idea_id = ?",
+          "UPDATE ideas SET state = 'Published', published_work_item_id = ?, archived_at = NULL, archived_reason = NULL, updated_at = ? WHERE idea_id = ?",
         ).run(workItemId, at, ideaId);
         return this.get(ideaId);
       }),
@@ -1139,7 +1248,7 @@ export class IdeaRepository extends SqlRepository implements IdeaStore {
           );
         }
         this.statement(
-          "UPDATE idea SET state = 'Archived', archived_at = ?, archived_reason = ?, updated_at = ? WHERE idea_id = ?",
+          "UPDATE ideas SET state = 'Abandoned', archived_at = ?, archived_reason = ?, updated_at = ? WHERE idea_id = ?",
         ).run(at, reason, at, ideaId);
         return this.get(ideaId);
       }),
@@ -1161,7 +1270,7 @@ function toAttachment(row: SqlRow): IdeaAttachment {
 }
 
 const WORK_ITEM_COLUMNS =
-  'work_item_id, project_id, profile_version_id, source, title, external_issue_id, external_issue_identifier, external_issue_url, publication_intent, publication_state, publication_operation_id, related_work_item_ids, adoption_json, created_at, updated_at';
+  'work_item_id, project_id, profile_version_id, source, origin, title, external_issue_id, external_issue_identifier, external_issue_url, publication_intent, publication_state, publication_operation_id, related_work_item_ids, adoption_json, created_at, updated_at';
 
 const PUBLICATION_STATES: readonly string[] = [
   'Unpublished',
@@ -1170,6 +1279,18 @@ const PUBLICATION_STATES: readonly string[] = [
   'OutcomeUnknown',
   'NotPublishing',
 ];
+
+/**
+ * The durable origin of a work item, derived from how it entered the system.
+ *
+ * The schema records origin separately from publication intent: an adopted
+ * issue already exists at the provider, while anything ShipLoop proposed began
+ * here and may never be published at all (F11, F10). The two are recorded
+ * independently so "we wrote it" can never be read as "the provider has it".
+ */
+function originFor(source: WorkItemRecord['source']): 'Proposed' | 'Published' | 'Adopted' {
+  return source === 'AdoptedIssue' ? 'Adopted' : 'Proposed';
+}
 
 function toWorkItem(row: SqlRow): WorkItemRecord {
   const externalIssueId = nullableText(row, 'external_issue_id');
@@ -1242,7 +1363,7 @@ export class WorkItemRepository extends SqlRepository implements WorkItemStore {
         const workItemId = newId<'WorkItemId'>();
         if (input.externalIssueId !== null) {
           const existing = this.statement(
-            'SELECT work_item_id FROM work_item WHERE external_issue_id = ?',
+            'SELECT work_item_id FROM work_items WHERE external_issue_id = ?',
           ).get(input.externalIssueId);
           if (existing !== undefined) {
             return err(
@@ -1253,12 +1374,13 @@ export class WorkItemRepository extends SqlRepository implements WorkItemStore {
         const publicationState: PublicationState =
           input.publicationIntent === 'DoNotPublish' ? 'NotPublishing' : 'Unpublished';
         this.statement(
-          `INSERT INTO work_item (${WORK_ITEM_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)`,
+          `INSERT INTO work_items (${WORK_ITEM_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)`,
         ).run(
           workItemId,
           input.projectId,
           input.profileVersionId,
           input.source,
+          originFor(input.source),
           input.title,
           input.externalIssueId,
           input.externalIssueIdentifier,
@@ -1270,7 +1392,7 @@ export class WorkItemRepository extends SqlRepository implements WorkItemStore {
           input.at,
           input.at,
         );
-        const created = this.statement(`SELECT ${WORK_ITEM_COLUMNS} FROM work_item WHERE work_item_id = ?`).get(
+        const created = this.statement(`SELECT ${WORK_ITEM_COLUMNS} FROM work_items WHERE work_item_id = ?`).get(
           workItemId,
         );
         if (created === undefined) return err(notFound('Work item', workItemId));
@@ -1281,7 +1403,7 @@ export class WorkItemRepository extends SqlRepository implements WorkItemStore {
 
   get(workItemId: WorkItemId): Result<WorkItemRecord> {
     return this.attempt('read work item', () => {
-      const row = this.statement(`SELECT ${WORK_ITEM_COLUMNS} FROM work_item WHERE work_item_id = ?`).get(
+      const row = this.statement(`SELECT ${WORK_ITEM_COLUMNS} FROM work_items WHERE work_item_id = ?`).get(
         workItemId,
       );
       if (row === undefined) return err(notFound('Work item', workItemId));
@@ -1292,7 +1414,7 @@ export class WorkItemRepository extends SqlRepository implements WorkItemStore {
   findByExternalIssueId(externalIssueId: string): Result<WorkItemRecord | null> {
     return this.attempt('read work item by external issue', () => {
       const row = this.statement(
-        `SELECT ${WORK_ITEM_COLUMNS} FROM work_item WHERE external_issue_id = ?`,
+        `SELECT ${WORK_ITEM_COLUMNS} FROM work_items WHERE external_issue_id = ?`,
       ).get(externalIssueId);
       return ok(row === undefined ? null : toWorkItem(row));
     });
@@ -1301,7 +1423,7 @@ export class WorkItemRepository extends SqlRepository implements WorkItemStore {
   listForProject(projectId: ProjectId): Result<readonly WorkItemRecord[]> {
     return this.attempt('list project work items', () => {
       const rows = this.statement(
-        `SELECT ${WORK_ITEM_COLUMNS} FROM work_item WHERE project_id = ? ORDER BY created_at ASC, work_item_id ASC`,
+        `SELECT ${WORK_ITEM_COLUMNS} FROM work_items WHERE project_id = ? ORDER BY created_at ASC, work_item_id ASC`,
       ).all(projectId);
       return ok(rows.map(toWorkItem));
     });
@@ -1321,12 +1443,12 @@ export class WorkItemRepository extends SqlRepository implements WorkItemStore {
           ]));
         }
         const existing = this.statement(
-          'SELECT work_item_id, publication_intent FROM work_item WHERE work_item_id = ?',
+          'SELECT work_item_id, publication_intent FROM work_items WHERE work_item_id = ?',
         ).get(workItemId);
         if (existing === undefined) return err(notFound('Work item', workItemId));
         const previousIntent = requiredText(existing, 'publication_intent');
         this.statement(
-          'UPDATE work_item SET publication_state = ?, publication_operation_id = ?, publication_intent = ?, updated_at = ? WHERE work_item_id = ?',
+          'UPDATE work_items SET publication_state = ?, publication_operation_id = ?, publication_intent = ?, updated_at = ? WHERE work_item_id = ?',
         ).run(
           state,
           operationId,
@@ -1342,12 +1464,12 @@ export class WorkItemRepository extends SqlRepository implements WorkItemStore {
   recordSyncResult(input: RecordSyncResultInput): Result<WorkItemSync> {
     return this.attempt('record external sync result', () =>
       this.bounded(() => {
-        const work = this.statement('SELECT work_item_id FROM work_item WHERE work_item_id = ?').get(
+        const work = this.statement('SELECT work_item_id FROM work_items WHERE work_item_id = ?').get(
           input.workItemId,
         );
         if (work === undefined) return err(notFound('Work item', input.workItemId));
         const existing = this.statement(
-          'SELECT work_item_id, state, last_attempt_at, last_success_at, attempt_count, last_error FROM work_item_sync WHERE work_item_id = ?',
+          'SELECT work_item_id, state, last_attempt_at, last_success_at, attempt_count, last_error FROM work_item_syncs WHERE work_item_id = ?',
         ).get(input.workItemId);
         const previous = existing === undefined ? null : toWorkItemSync(existing);
         const state = input.succeeded ? 'InSync' : 'PendingSync';
@@ -1355,15 +1477,15 @@ export class WorkItemRepository extends SqlRepository implements WorkItemStore {
         const lastSuccessAt = input.succeeded ? input.attemptedAt : previous?.lastSuccessAt ?? null;
         if (previous === null) {
           this.statement(
-            'INSERT INTO work_item_sync (work_item_id, state, last_attempt_at, last_success_at, attempt_count, last_error) VALUES (?, ?, ?, ?, ?, ?)',
+            'INSERT INTO work_item_syncs (work_item_id, state, last_attempt_at, last_success_at, attempt_count, last_error) VALUES (?, ?, ?, ?, ?, ?)',
           ).run(input.workItemId, state, input.attemptedAt, lastSuccessAt, attemptCount, input.error);
         } else {
           this.statement(
-            'UPDATE work_item_sync SET state = ?, last_attempt_at = ?, last_success_at = ?, attempt_count = ?, last_error = ? WHERE work_item_id = ?',
+            'UPDATE work_item_syncs SET state = ?, last_attempt_at = ?, last_success_at = ?, attempt_count = ?, last_error = ? WHERE work_item_id = ?',
           ).run(state, input.attemptedAt, lastSuccessAt, attemptCount, input.error, input.workItemId);
         }
         const saved = this.statement(
-          'SELECT work_item_id, state, last_attempt_at, last_success_at, attempt_count, last_error FROM work_item_sync WHERE work_item_id = ?',
+          'SELECT work_item_id, state, last_attempt_at, last_success_at, attempt_count, last_error FROM work_item_syncs WHERE work_item_id = ?',
         ).get(input.workItemId);
         if (saved === undefined) return err(notFound('Work item sync', input.workItemId));
         return ok(toWorkItemSync(saved));
@@ -1374,7 +1496,7 @@ export class WorkItemRepository extends SqlRepository implements WorkItemStore {
   getSync(workItemId: WorkItemId): Result<WorkItemSync | null> {
     return this.attempt('read external sync state', () => {
       const row = this.statement(
-        'SELECT work_item_id, state, last_attempt_at, last_success_at, attempt_count, last_error FROM work_item_sync WHERE work_item_id = ?',
+        'SELECT work_item_id, state, last_attempt_at, last_success_at, attempt_count, last_error FROM work_item_syncs WHERE work_item_id = ?',
       ).get(workItemId);
       return ok(row === undefined ? null : toWorkItemSync(row));
     });
@@ -1390,17 +1512,17 @@ export class WorkItemRepository extends SqlRepository implements WorkItemStore {
   appendScopeSnapshot(input: AppendScopeSnapshotInput): Result<ScopeSnapshotRecord> {
     return this.attempt('append scope snapshot', () =>
       this.bounded(() => {
-        const work = this.statement('SELECT work_item_id FROM work_item WHERE work_item_id = ?').get(
+        const work = this.statement('SELECT work_item_id, project_id FROM work_items WHERE work_item_id = ?').get(
           input.scope.workItemId,
         );
         if (work === undefined) return err(notFound('Work item', input.scope.workItemId));
         const newest = this.statement(
-          'SELECT COALESCE(MAX(sequence_number), 0) AS sequence FROM scope_snapshot WHERE work_item_id = ?',
+          'SELECT COALESCE(MAX(sequence_number), 0) AS sequence FROM scope_snapshots WHERE work_item_id = ?',
         ).get(input.scope.workItemId);
         const sequenceNumber = (newest === undefined ? 0 : requiredInteger(newest, 'sequence')) + 1;
         const snapshotId = newId<'ScopeSnapshotId'>();
         this.statement(
-          `INSERT INTO scope_snapshot (${SNAPSHOT_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          `INSERT INTO scope_snapshots (${SNAPSHOT_COLUMNS}, project_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         ).run(
           snapshotId,
           input.scope.workItemId,
@@ -1420,9 +1542,10 @@ export class WorkItemRepository extends SqlRepository implements WorkItemStore {
           input.procedureVersionId,
           input.capturedAt,
           input.correlationId,
+          requiredText(work, 'project_id'),
         );
         const created = this.statement(
-          `SELECT ${SNAPSHOT_COLUMNS} FROM scope_snapshot WHERE scope_snapshot_id = ?`,
+          `SELECT ${SNAPSHOT_COLUMNS} FROM scope_snapshots WHERE scope_snapshot_id = ?`,
         ).get(snapshotId);
         if (created === undefined) return err(notFound('Scope snapshot', snapshotId));
         return ok(toScopeSnapshot(created));
@@ -1432,7 +1555,7 @@ export class WorkItemRepository extends SqlRepository implements WorkItemStore {
 
   getScopeSnapshot(scopeSnapshotId: ScopeSnapshotId): Result<ScopeSnapshotRecord> {
     return this.attempt('read scope snapshot', () => {
-      const row = this.statement(`SELECT ${SNAPSHOT_COLUMNS} FROM scope_snapshot WHERE scope_snapshot_id = ?`).get(
+      const row = this.statement(`SELECT ${SNAPSHOT_COLUMNS} FROM scope_snapshots WHERE scope_snapshot_id = ?`).get(
         scopeSnapshotId,
       );
       if (row === undefined) return err(notFound('Scope snapshot', scopeSnapshotId));
@@ -1443,7 +1566,7 @@ export class WorkItemRepository extends SqlRepository implements WorkItemStore {
   latestScopeSnapshot(workItemId: WorkItemId): Result<ScopeSnapshotRecord | null> {
     return this.attempt('read the latest scope snapshot', () => {
       const row = this.statement(
-        `SELECT ${SNAPSHOT_COLUMNS} FROM scope_snapshot WHERE work_item_id = ? ORDER BY sequence_number DESC LIMIT 1`,
+        `SELECT ${SNAPSHOT_COLUMNS} FROM scope_snapshots WHERE work_item_id = ? ORDER BY sequence_number DESC LIMIT 1`,
       ).get(workItemId);
       return ok(row === undefined ? null : toScopeSnapshot(row));
     });
@@ -1452,7 +1575,7 @@ export class WorkItemRepository extends SqlRepository implements WorkItemStore {
   listScopeSnapshots(workItemId: WorkItemId): Result<readonly ScopeSnapshotRecord[]> {
     return this.attempt('list scope snapshots', () => {
       const rows = this.statement(
-        `SELECT ${SNAPSHOT_COLUMNS} FROM scope_snapshot WHERE work_item_id = ? ORDER BY sequence_number ASC`,
+        `SELECT ${SNAPSHOT_COLUMNS} FROM scope_snapshots WHERE work_item_id = ? ORDER BY sequence_number ASC`,
       ).all(workItemId);
       return ok(rows.map(toScopeSnapshot));
     });
@@ -1514,13 +1637,13 @@ export class AttentionItemRepository extends SqlRepository implements AttentionI
   upsert(input: UpsertAttentionItemInput): Result<AttentionItemRecord> {
     return this.attempt('record attention item', () =>
       this.bounded(() => {
-        const existing = this.statement(`SELECT ${ATTENTION_COLUMNS} FROM attention_item WHERE dedup_key = ?`).get(
+        const existing = this.statement(`SELECT ${ATTENTION_COLUMNS} FROM attention_items WHERE dedup_key = ?`).get(
           input.dedupKey,
         );
         if (existing === undefined) {
           const attentionItemId = newId<'AttentionItemId'>();
           this.statement(
-            `INSERT INTO attention_item (${ATTENTION_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            `INSERT INTO attention_items (${ATTENTION_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           ).run(
             attentionItemId,
             input.dedupKey,
@@ -1543,7 +1666,7 @@ export class AttentionItemRepository extends SqlRepository implements AttentionI
         } else {
           const previous = toAttentionItem(existing);
           this.statement(
-            'UPDATE attention_item SET kind = ?, state = ?, project_id = ?, work_item_id = ?, issue_identifier = ?, title = ?, blocker = ?, next_action = ?, updated_at = ?, acknowledged_at = ?, acknowledged_by = ?, candidate_fingerprint = ?, occurrence_count = ? WHERE attention_item_id = ?',
+            'UPDATE attention_items SET kind = ?, state = ?, project_id = ?, work_item_id = ?, issue_identifier = ?, title = ?, blocker = ?, next_action = ?, updated_at = ?, acknowledged_at = ?, acknowledged_by = ?, candidate_fingerprint = ?, occurrence_count = ? WHERE attention_item_id = ?',
           ).run(
             input.kind,
             input.resolved ? 'Resolved' : previous.state,
@@ -1561,7 +1684,7 @@ export class AttentionItemRepository extends SqlRepository implements AttentionI
             previous.attentionItemId,
           );
         }
-        const saved = this.statement(`SELECT ${ATTENTION_COLUMNS} FROM attention_item WHERE dedup_key = ?`).get(
+        const saved = this.statement(`SELECT ${ATTENTION_COLUMNS} FROM attention_items WHERE dedup_key = ?`).get(
           input.dedupKey,
         );
         if (saved === undefined) return err(notFound('Attention item', input.dedupKey));
@@ -1574,7 +1697,7 @@ export class AttentionItemRepository extends SqlRepository implements AttentionI
     return this.attempt('acknowledge attention item', () =>
       this.bounded(() => {
         const existing = this.statement(
-          `SELECT ${ATTENTION_COLUMNS} FROM attention_item WHERE attention_item_id = ?`,
+          `SELECT ${ATTENTION_COLUMNS} FROM attention_items WHERE attention_item_id = ?`,
         ).get(attentionItemId);
         if (existing === undefined) return err(notFound('Attention item', attentionItemId));
         const previous = toAttentionItem(existing);
@@ -1582,10 +1705,10 @@ export class AttentionItemRepository extends SqlRepository implements AttentionI
           return err(conflict('A resolved attention item cannot be acknowledged.', 'Open', 'Resolved'));
         }
         this.statement(
-          "UPDATE attention_item SET state = 'Acknowledged', acknowledged_at = ?, acknowledged_by = ?, updated_at = ? WHERE attention_item_id = ?",
+          "UPDATE attention_items SET state = 'Acknowledged', acknowledged_at = ?, acknowledged_by = ?, updated_at = ? WHERE attention_item_id = ?",
         ).run(at, actor, at, attentionItemId);
         const saved = this.statement(
-          `SELECT ${ATTENTION_COLUMNS} FROM attention_item WHERE attention_item_id = ?`,
+          `SELECT ${ATTENTION_COLUMNS} FROM attention_items WHERE attention_item_id = ?`,
         ).get(attentionItemId);
         if (saved === undefined) return err(notFound('Attention item', attentionItemId));
         return ok(toAttentionItem(saved));
@@ -1597,14 +1720,14 @@ export class AttentionItemRepository extends SqlRepository implements AttentionI
     return this.attempt('resolve attention item', () =>
       this.bounded(() => {
         const existing = this.statement(
-          `SELECT ${ATTENTION_COLUMNS} FROM attention_item WHERE attention_item_id = ?`,
+          `SELECT ${ATTENTION_COLUMNS} FROM attention_items WHERE attention_item_id = ?`,
         ).get(attentionItemId);
         if (existing === undefined) return err(notFound('Attention item', attentionItemId));
         this.statement(
-          "UPDATE attention_item SET state = 'Resolved', acknowledged_at = NULL, acknowledged_by = NULL, updated_at = ? WHERE attention_item_id = ?",
+          "UPDATE attention_items SET state = 'Resolved', acknowledged_at = NULL, acknowledged_by = NULL, updated_at = ? WHERE attention_item_id = ?",
         ).run(at, attentionItemId);
         const saved = this.statement(
-          `SELECT ${ATTENTION_COLUMNS} FROM attention_item WHERE attention_item_id = ?`,
+          `SELECT ${ATTENTION_COLUMNS} FROM attention_items WHERE attention_item_id = ?`,
         ).get(attentionItemId);
         if (saved === undefined) return err(notFound('Attention item', attentionItemId));
         return ok(toAttentionItem(saved));
@@ -1614,7 +1737,7 @@ export class AttentionItemRepository extends SqlRepository implements AttentionI
 
   get(attentionItemId: AttentionItemId): Result<AttentionItemRecord> {
     return this.attempt('read attention item', () => {
-      const row = this.statement(`SELECT ${ATTENTION_COLUMNS} FROM attention_item WHERE attention_item_id = ?`).get(
+      const row = this.statement(`SELECT ${ATTENTION_COLUMNS} FROM attention_items WHERE attention_item_id = ?`).get(
         attentionItemId,
       );
       if (row === undefined) return err(notFound('Attention item', attentionItemId));
@@ -1632,10 +1755,10 @@ export class AttentionItemRepository extends SqlRepository implements AttentionI
       const rows =
         state === null
           ? this.statement(
-              `SELECT ${ATTENTION_COLUMNS} FROM attention_item ORDER BY created_at ASC, attention_item_id ASC`,
+              `SELECT ${ATTENTION_COLUMNS} FROM attention_items ORDER BY created_at ASC, attention_item_id ASC`,
             ).all()
           : this.statement(
-              `SELECT ${ATTENTION_COLUMNS} FROM attention_item WHERE state = ? ORDER BY created_at ASC, attention_item_id ASC`,
+              `SELECT ${ATTENTION_COLUMNS} FROM attention_items WHERE state = ? ORDER BY created_at ASC, attention_item_id ASC`,
             ).all(state);
       return ok(rows.map(toAttentionItem));
     });
@@ -1643,16 +1766,37 @@ export class AttentionItemRepository extends SqlRepository implements AttentionI
 }
 
 const CANDIDATE_COLUMNS =
-  'candidate_id, attempt_id, work_item_id, candidate_fingerprint, identity_json, pull_request_id, target_branch, recorded_at, correlation_id';
+  'candidate_id, attempt_id, work_item_id, fingerprint, head_sha, base_sha, scope_fingerprint, environment_fingerprint, policy_fingerprint, profile_version_id, procedure_version_id, project_id, scope_snapshot_id, pull_request_id, target_branch, recorded_at, correlation_id';
 
-function toCandidate(row: SqlRow): CandidateRecord {
+/**
+ * Rebuilds the domain `CandidateIdentity` from the stored columns.
+ *
+ * The identity is read back out of the individual columns rather than from a
+ * stored JSON blob, so what the caller sees is exactly what the schema CHECKed.
+ * That is the point of decomposing it (R4): an abbreviated head SHA cannot
+ * reach this point at all, because the column refuses it on the way in.
+ *
+ * `components` live in `candidate_components` and are read separately by
+ * `attachComponents`, so a candidate's component identities are stored against
+ * the same candidate row rather than inside an uncheckable document.
+ */
+function toCandidate(row: SqlRow, components: CandidateRecord['identity']['components']): CandidateRecord {
   const attemptId = nullableText(row, 'attempt_id');
   return {
     candidateId: requiredText(row, 'candidate_id') as CandidateId,
     attemptId: attemptId === null ? null : (attemptId as AttemptId),
     workItemId: requiredText(row, 'work_item_id') as WorkItemId,
-    candidateFingerprint: requiredText(row, 'candidate_fingerprint') as Fingerprint,
-    identity: parseJson<CandidateRecord['identity']>(row, 'identity_json'),
+    candidateFingerprint: requiredText(row, 'fingerprint') as Fingerprint,
+    identity: {
+      headSha: requiredText(row, 'head_sha') as CommitSha,
+      baseSha: requiredText(row, 'base_sha') as CommitSha,
+      scopeFingerprint: requiredText(row, 'scope_fingerprint') as Fingerprint,
+      profileVersionId: requiredText(row, 'profile_version_id'),
+      procedureVersionId: requiredText(row, 'procedure_version_id'),
+      environmentFingerprint: requiredText(row, 'environment_fingerprint') as Fingerprint,
+      policyFingerprint: requiredText(row, 'policy_fingerprint') as Fingerprint,
+      components,
+    },
     pullRequestId: nullableText(row, 'pull_request_id'),
     targetBranch: requiredText(row, 'target_branch'),
     recordedAt: requiredText(row, 'recorded_at'),
@@ -1669,61 +1813,168 @@ function toCandidate(row: SqlRow): CandidateRecord {
  */
 export class CandidateRepository extends SqlRepository implements CandidateStore {
   record(input: RecordCandidateInput): Result<CandidateRecord> {
-    return this.attempt('record candidate', () => {
-      const candidateId = newId<'CandidateId'>();
-      const computed = candidateFingerprint(input.identity);
-      this.statement(
-        `INSERT INTO candidate (${CANDIDATE_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      ).run(
-        candidateId,
-        input.attemptId,
-        input.workItemId,
-        computed,
-        canonicalize(input.identity),
-        input.pullRequestId,
-        input.targetBranch,
-        input.recordedAt,
-        input.correlationId,
-      );
-      const created = this.statement(`SELECT ${CANDIDATE_COLUMNS} FROM candidate WHERE candidate_id = ?`).get(
-        candidateId,
-      );
-      if (created === undefined) return err(notFound('Candidate', candidateId));
-      return ok(toCandidate(created));
-    });
+    return this.attempt('record candidate', () =>
+      this.bounded(() => {
+        // The scope snapshot a candidate was built from is what makes the
+        // candidate's evidence and staleness checkable at all (F12-AC1, F20-AC3).
+        // It is resolved from the work item rather than trusted from the caller,
+        // so a candidate cannot claim a snapshot belonging to different work.
+        const snapshot = this.statement(
+          'SELECT scope_snapshot_id, project_id FROM scope_snapshots WHERE work_item_id = ? ORDER BY created_at DESC, scope_snapshot_id DESC LIMIT 1',
+        ).get(input.workItemId);
+        if (snapshot === undefined) {
+          return err(
+            notFound('Scope snapshot', `for work item ${input.workItemId}`),
+          );
+        }
+        const candidateId = newId<'CandidateId'>();
+        const computed = candidateFingerprint(input.identity);
+        this.statement(
+          `INSERT INTO candidates (${CANDIDATE_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        ).run(
+          candidateId,
+          input.attemptId,
+          input.workItemId,
+          computed,
+          input.identity.headSha,
+          input.identity.baseSha,
+          input.identity.scopeFingerprint,
+          input.identity.environmentFingerprint,
+          input.identity.policyFingerprint,
+          input.identity.profileVersionId,
+          input.identity.procedureVersionId,
+          requiredText(snapshot, 'project_id'),
+          requiredText(snapshot, 'scope_snapshot_id'),
+          input.pullRequestId,
+          input.targetBranch,
+          input.recordedAt,
+          input.correlationId,
+        );
+        for (const component of input.identity.components) {
+          this.statement(
+            'INSERT INTO candidate_components (candidate_id, component, deployment_id, deployment_url, environment) VALUES (?, ?, ?, ?, ?)',
+          ).run(
+            candidateId,
+            component.component,
+            component.deploymentId,
+            component.deploymentUrl,
+            component.environment,
+          );
+        }
+        const created = this.statement(`SELECT ${CANDIDATE_COLUMNS} FROM candidates WHERE candidate_id = ?`).get(
+          candidateId,
+        );
+        if (created === undefined) return err(notFound('Candidate', candidateId));
+        return ok(toCandidate(created, input.identity.components));
+      }),
+    );
   }
 
   get(candidateId: CandidateId): Result<CandidateRecord> {
     return this.attempt('read candidate', () => {
-      const row = this.statement(`SELECT ${CANDIDATE_COLUMNS} FROM candidate WHERE candidate_id = ?`).get(
+      const row = this.statement(`SELECT ${CANDIDATE_COLUMNS} FROM candidates WHERE candidate_id = ?`).get(
         candidateId,
       );
       if (row === undefined) return err(notFound('Candidate', candidateId));
-      return ok(toCandidate(row));
+      return ok(toCandidate(row, this.componentsOf(candidateId)));
     });
   }
 
   findByFingerprint(candidateFingerprint: Fingerprint): Result<CandidateRecord | null> {
     return this.attempt('read candidate by fingerprint', () => {
       const row = this.statement(
-        `SELECT ${CANDIDATE_COLUMNS} FROM candidate WHERE candidate_fingerprint = ? ORDER BY recorded_at DESC, candidate_id DESC LIMIT 1`,
+        `SELECT ${CANDIDATE_COLUMNS} FROM candidates WHERE fingerprint = ? ORDER BY recorded_at DESC, candidate_id DESC LIMIT 1`,
       ).get(candidateFingerprint);
-      return ok(row === undefined ? null : toCandidate(row));
+      if (row === undefined) return ok(null);
+      const candidateId = requiredText(row, 'candidate_id') as CandidateId;
+      return ok(toCandidate(row, this.componentsOf(candidateId)));
     });
   }
 
   listForWorkItem(workItemId: WorkItemId): Result<readonly CandidateRecord[]> {
     return this.attempt('list candidates for work', () => {
       const rows = this.statement(
-        `SELECT ${CANDIDATE_COLUMNS} FROM candidate WHERE work_item_id = ? ORDER BY recorded_at ASC, candidate_id ASC`,
+        `SELECT ${CANDIDATE_COLUMNS} FROM candidates WHERE work_item_id = ? ORDER BY recorded_at ASC, candidate_id ASC`,
       ).all(workItemId);
-      return ok(rows.map(toCandidate));
+      return ok(
+        rows.map((row) =>
+          toCandidate(row, this.componentsOf(requiredText(row, 'candidate_id') as CandidateId)),
+        ),
+      );
     });
+  }
+
+  /** Component identities, read from the rows the schema stores them in. */
+  private componentsOf(candidateId: CandidateId): CandidateRecord['identity']['components'] {
+    const rows = this.statement(
+      'SELECT component, deployment_id, deployment_url, environment FROM candidate_components WHERE candidate_id = ? ORDER BY component ASC',
+    ).all(candidateId);
+    return rows.map((row) => ({
+      component: requiredText(row, 'component'),
+      deploymentId: nullableText(row, 'deployment_id'),
+      deploymentUrl: nullableText(row, 'deployment_url'),
+      environment: requiredText(row, 'environment'),
+    }));
   }
 }
 
 const EVIDENCE_COLUMNS =
-  'evidence_id, candidate_id, candidate_fingerprint, kind, criterion_id, check_id, check_name, result, observed_at, environment_fingerprint, scope_fingerprint, artifact_ref, detail, recorded_at, correlation_id';
+  'evidence_id, candidate_id, candidate_fingerprint, kind, criterion_id, check_id, check_name, result, observed_at, environment_fingerprint, scope_fingerprint, artifact_ref, detail_redacted, recorded_at, correlation_id';
+
+/**
+ * The write order, which adds the NOT NULL columns the schema requires and the
+ * ones resolved from the candidate.
+ *
+ * `status` and `method_kind` are the criterion-facing vocabularies the schema
+ * already CHECKs, so a stored result is one the domain recognises; `created_at`
+ * and `updated_at` reuse the observation time, which is when the fact became
+ * true for the evidence binding (F20-AC3).
+ */
+const EVIDENCE_WRITE_COLUMNS =
+  'evidence_id, candidate_id, work_item_id, project_id, candidate_fingerprint, scope_fingerprint, criterion_id, method_kind, kind, check_id, check_name, status, result, observed_at, environment_fingerprint, artifact_ref, detail_redacted, recorded_at, correlation_id, created_at, updated_at';
+
+/**
+ * The domain criterion-evidence method for a stored evidence kind.
+ *
+ * The schema CHECKs `method_kind`, and a browser, API or live-smoke observation
+ * is evidence a check produced, so all four record an automated check; the
+ * distinction the owner sees lives in `kind`.
+ */
+function methodKindFor(_kind: string): string {
+  return 'AutomatedCheck';
+}
+
+/**
+ * The criterion status implied by a check result.
+ *
+ * `Passed` is the only result that verifies a criterion; every other result
+ * leaves it unverified, and saying so is what stops a required check that never
+ * ran from being read as a pass (F20-AC2, F23-AC1).
+ */
+function statusFor(result: CheckResult): string {
+  return result === 'Passed' ? 'Verified' : 'Untested';
+}
+
+/**
+ * Where a check ran.
+ *
+ * The schema CHECKs this list, and the origin is a fact about the observer
+ * rather than about the evidence: a browser or API observation is still a check
+ * that ran, and recording it as one is what lets a required check be reasoned
+ * about uniformly (F20-AC2).
+ */
+function checkOriginFor(kind: string): string {
+  switch (kind) {
+    case 'BrowserEvidence':
+      return 'BrowserEvidence';
+    case 'ApiEvidence':
+      return 'ApiEvidence';
+    case 'LiveSmoke':
+      return 'LiveSmoke';
+    default:
+      return 'LocalCheck';
+  }
+}
 
 const EVIDENCE_KINDS: readonly string[] = ['CheckResult', 'BrowserEvidence', 'ApiEvidence', 'LiveSmoke'];
 
@@ -1734,7 +1985,7 @@ function toEvidence(row: SqlRow): EvidenceRecord {
   const environmentFingerprint = nullableText(row, 'environment_fingerprint');
   const scopeFingerprint = nullableText(row, 'scope_fingerprint');
   const artifactRef = nullableText(row, 'artifact_ref');
-  const detail = nullableText(row, 'detail');
+  const detail = nullableText(row, 'detail_redacted');
   return {
     evidenceId: requiredText(row, 'evidence_id') as EvidenceId,
     candidateId: requiredText(row, 'candidate_id') as CandidateId,
@@ -1779,29 +2030,74 @@ export class EvidenceRepository extends SqlRepository implements EvidenceStore {
           { path: 'result', message: `Must be one of ${CHECK_RESULTS.join(', ')}.` },
         ]));
       }
+      // The work item, project and scope revision are resolved from the candidate
+      // rather than taken from the caller, so evidence cannot be filed against a
+      // scope the candidate was not built from (F20-AC3, F25-AC3).
       const candidate = this.statement(
-        'SELECT candidate_id FROM candidate WHERE candidate_fingerprint = ? ORDER BY recorded_at DESC LIMIT 1',
+        'SELECT candidate_id, work_item_id, project_id, scope_fingerprint FROM candidates WHERE fingerprint = ? ORDER BY recorded_at DESC LIMIT 1',
       ).get(input.candidateFingerprint);
       if (candidate === undefined) {
         return err(notFound('Candidate', input.candidateFingerprint));
       }
+      if (input.criterionId === null) {
+        return err(
+          invalid('Evidence is recorded against an acceptance criterion.', [
+            { path: 'criterionId', message: 'Required.' },
+          ]),
+        );
+      }
+      // The check is recorded first, in its own right, because the schema binds
+      // evidence to a real check row: a result that is not attached to the
+      // check that produced it is exactly the claim F20-AC2 exists to refuse.
+      // Recording it here keeps that pairing a property of the write rather than
+      // of the caller's ordering.
+      if (input.checkId !== null) {
+        this.statement(
+          `INSERT INTO checks (check_id, candidate_id, work_item_id, project_id, candidate_fingerprint, name, origin, required, result, started_at, ended_at, artifact_ref, detail_redacted)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)
+             ON CONFLICT(check_id) DO NOTHING`,
+        ).run(
+          input.checkId,
+          requiredText(candidate, 'candidate_id'),
+          requiredText(candidate, 'work_item_id'),
+          requiredText(candidate, 'project_id'),
+          input.candidateFingerprint,
+          input.checkName,
+          checkOriginFor(input.kind),
+          input.result,
+          input.observedAt ?? input.recordedAt,
+          input.observedAt,
+          input.artifactRef,
+          input.detail,
+        );
+      }
+
       const evidenceId = newId<'EvidenceId'>();
-      this.statement(`INSERT INTO evidence (${EVIDENCE_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+      this.statement(
+        `INSERT INTO evidence (${EVIDENCE_WRITE_COLUMNS})
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
         evidenceId,
         requiredText(candidate, 'candidate_id'),
+        requiredText(candidate, 'work_item_id'),
+        requiredText(candidate, 'project_id'),
         input.candidateFingerprint,
-        input.kind,
+        requiredText(candidate, 'scope_fingerprint'),
         input.criterionId,
+        methodKindFor(input.kind),
+        input.kind,
         input.checkId,
         input.checkName,
+        statusFor(input.result),
         input.result,
         input.observedAt,
         input.environmentFingerprint,
-        input.scopeFingerprint,
         input.artifactRef,
         input.detail,
         input.recordedAt,
         input.correlationId,
+        input.observedAt,
+        input.observedAt,
       );
       const created = this.statement(`SELECT ${EVIDENCE_COLUMNS} FROM evidence WHERE evidence_id = ?`).get(
         evidenceId,
@@ -1844,15 +2140,35 @@ export class EvidenceRepository extends SqlRepository implements EvidenceStore {
 }
 
 const DECISION_COLUMNS =
-  'decision_id, work_item_id, candidate_fingerprint, scope_fingerprint, actor, decision_type, subject_json, subject_fingerprint, note, state, consumed_at, invalidated_at, invalidated_reason, created_at, correlation_id';
+  'decision_id, work_item_id, candidate_fingerprint, scope_fingerprint, actor_owner_id, decision_type, acceptance_state, subject_json, subject_fingerprint, note, state, consumed_at, invalidated_at, invalidation_reason_redacted, created_at, correlation_id';
 
-const DECISION_TYPES: readonly string[] = [
-  'Accepted',
-  'ChangesRequested',
-  'AuthorizedMerge',
-  'AuthorizedRelease',
-  'AuthorizedRecoveryRedeploy',
+/**
+ * The decision vocabulary, and with it which of the two columns the schema
+ * requires.
+ *
+ * An acceptance or a change request carries an acceptance state and no subject;
+ * an authorization carries a subject fingerprint and no acceptance state. The
+ * schema CHECKs that pairing, so the two lists are stated here once and the
+ * repository derives which column to write from the type rather than letting a
+ * caller pair them wrongly (R3).
+ */
+const ACCEPTANCE_DECISION_TYPES: readonly OwnerDecisionType[] = ['AcceptProduct', 'RequestChanges'];
+const AUTHORIZATION_DECISION_TYPES: readonly OwnerDecisionType[] = [
+  'AuthorizeMerge',
+  'AuthorizeRelease',
+  'AuthorizeMergeAndRelease',
+  'AuthorizeRecovery',
+  'ResolveScopeChange',
 ];
+const DECISION_TYPES: readonly OwnerDecisionType[] = [
+  ...ACCEPTANCE_DECISION_TYPES,
+  ...AUTHORIZATION_DECISION_TYPES,
+];
+
+/** True for the decision types that authorize an action rather than accept a result. */
+function isAuthorizationDecision(decisionType: OwnerDecisionType): boolean {
+  return AUTHORIZATION_DECISION_TYPES.includes(decisionType);
+}
 
 function toDecision(row: SqlRow): OwnerDecisionRecord {
   const workItemId = nullableText(row, 'work_item_id');
@@ -1861,18 +2177,19 @@ function toDecision(row: SqlRow): OwnerDecisionRecord {
     workItemId: workItemId === null ? null : (workItemId as WorkItemId),
     candidateFingerprint: requiredText(row, 'candidate_fingerprint') as Fingerprint,
     scopeFingerprint: requiredText(row, 'scope_fingerprint') as Fingerprint,
-    actor: requiredText(row, 'actor'),
+    actorOwnerId: requiredText(row, 'actor_owner_id') as OwnerId,
     decisionType: requiredText(row, 'decision_type') as OwnerDecisionType,
     subject: parseJson<AuthorizationSubject | null>(row, 'subject_json'),
     subjectFingerprint: ((): Fingerprint | null => {
       const value = nullableText(row, 'subject_fingerprint');
       return value === null ? null : (value as Fingerprint);
     })(),
+    acceptanceState: nullableText(row, 'acceptance_state') as AcceptanceState | null,
     note: nullableText(row, 'note'),
     state: requiredText(row, 'state') as OwnerDecisionState,
     consumedAt: nullableText(row, 'consumed_at'),
     invalidatedAt: nullableText(row, 'invalidated_at'),
-    invalidatedReason: nullableText(row, 'invalidated_reason'),
+    invalidatedReason: nullableText(row, 'invalidation_reason_redacted'),
     createdAt: requiredText(row, 'created_at'),
     correlationId: nullableText(row, 'correlation_id'),
   };
@@ -1882,10 +2199,12 @@ interface DecisionInsert {
   readonly workItemId: WorkItemId | null;
   readonly candidateFingerprint: Fingerprint;
   readonly scopeFingerprint: Fingerprint;
-  readonly actor: string;
+  readonly actorOwnerId: OwnerId;
   readonly decisionType: OwnerDecisionType;
   readonly subject: AuthorizationSubject | null;
   readonly subjectFingerprint: Fingerprint | null;
+  /** Set only for an acceptance or a change request; null for an authorization. */
+  readonly acceptanceState: AcceptanceState | null;
   readonly note: string | null;
   readonly createdAt: string;
   readonly correlationId: string | null;
@@ -1908,10 +2227,11 @@ export class OwnerDecisionRepository extends SqlRepository implements OwnerDecis
       workItemId: input.workItemId,
       candidateFingerprint: input.candidateFingerprint,
       scopeFingerprint: input.scopeFingerprint,
-      actor: input.actor,
-      decisionType: 'Accepted',
+      actorOwnerId: input.actorOwnerId,
+      decisionType: 'AcceptProduct',
       subject: null,
       subjectFingerprint: null,
+      acceptanceState: 'Accepted',
       note: input.note,
       createdAt: input.createdAt,
       correlationId: input.correlationId,
@@ -1923,10 +2243,11 @@ export class OwnerDecisionRepository extends SqlRepository implements OwnerDecis
       workItemId: input.workItemId,
       candidateFingerprint: input.candidateFingerprint,
       scopeFingerprint: input.scopeFingerprint,
-      actor: input.actor,
-      decisionType: 'ChangesRequested',
+      actorOwnerId: input.actorOwnerId,
+      decisionType: 'RequestChanges',
       subject: null,
       subjectFingerprint: null,
+      acceptanceState: 'ChangesRequested',
       note: input.feedback,
       createdAt: input.createdAt,
       correlationId: input.correlationId,
@@ -1938,10 +2259,11 @@ export class OwnerDecisionRepository extends SqlRepository implements OwnerDecis
       workItemId: input.workItemId,
       candidateFingerprint: input.candidateFingerprint,
       scopeFingerprint: input.scopeFingerprint,
-      actor: input.actor,
+      actorOwnerId: input.actorOwnerId,
       decisionType: input.decisionType,
       subject: input.subject,
       subjectFingerprint: subjectFingerprint(input.subject),
+      acceptanceState: null,
       note: input.note,
       createdAt: input.createdAt,
       correlationId: input.correlationId,
@@ -1949,45 +2271,79 @@ export class OwnerDecisionRepository extends SqlRepository implements OwnerDecis
   }
 
   private insert(row: DecisionInsert): Result<OwnerDecisionRecord> {
-    return this.attempt('record owner decision', () => {
-      if (row.actor.trim() === '') {
-        return err(invalid('A decision needs an authenticated actor.', [
-          { path: 'actor', message: 'Required.' },
-        ]));
-      }
-      if (!DECISION_TYPES.includes(row.decisionType)) {
-        return err(invalid(`Unknown decision type: ${row.decisionType}`, [
-          { path: 'decisionType', message: `Must be one of ${DECISION_TYPES.join(', ')}.` },
-        ]));
-      }
-      const decisionId = newId<'DecisionId'>();
-      this.statement(
-        `INSERT INTO owner_decision (${DECISION_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'Recorded', NULL, NULL, NULL, ?, ?)`,
-      ).run(
-        decisionId,
-        row.workItemId,
-        row.candidateFingerprint,
-        row.scopeFingerprint,
-        row.actor,
-        row.decisionType,
-        canonicalize(row.subject),
-        row.subjectFingerprint,
-        row.note,
-        row.createdAt,
-        row.correlationId,
-      );
-      const created = this.statement(`SELECT ${DECISION_COLUMNS} FROM owner_decision WHERE decision_id = ?`).get(
-        decisionId,
-      );
-      if (created === undefined) return err(notFound('Owner decision', decisionId));
-      return ok(toDecision(created));
-    });
+    return this.attempt('record owner decision', () =>
+      this.bounded(() => {
+        if (!DECISION_TYPES.includes(row.decisionType)) {
+          return err(invalid(`Unknown decision type: ${row.decisionType}`, [
+            { path: 'decisionType', message: `Must be one of ${DECISION_TYPES.join(', ')}.` },
+          ]));
+        }
+        // The decision is bound to a real candidate row, not to a fingerprint the
+        // caller supplied, so the row the schema requires always names the
+        // candidate the owner was actually looking at.
+        const candidate = this.statement(
+          'SELECT candidate_id FROM candidates WHERE fingerprint = ? ORDER BY recorded_at DESC, candidate_id DESC LIMIT 1',
+        ).get(row.candidateFingerprint);
+        if (candidate === undefined) {
+          return err(notFound('Candidate', row.candidateFingerprint));
+        }
+        const candidateId = requiredText(candidate, 'candidate_id');
+        const projectId = this.statement(
+          'SELECT project_id FROM candidates WHERE candidate_id = ?',
+        ).get(candidateId);
+        if (projectId === undefined) return err(notFound('Candidate', candidateId));
+
+        const authorization = isAuthorizationDecision(row.decisionType);
+        if (authorization && row.subjectFingerprint === null) {
+          return err(
+            invalid('An authorization must record the subject fingerprint it authorizes.', [
+              { path: 'subjectFingerprint', message: 'Required for an authorization.' },
+            ]),
+          );
+        }
+        if (!authorization && row.acceptanceState === null) {
+          return err(
+            invalid('An acceptance must record the acceptance state it reached.', [
+              { path: 'acceptanceState', message: 'Required for an acceptance.' },
+            ]),
+          );
+        }
+
+        const decisionId = newId<'DecisionId'>();
+        this.statement(
+          `INSERT INTO owner_decisions (${DECISION_COLUMNS}, project_id, candidate_id, single_use, decided_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Recorded', NULL, NULL, NULL, ?, ?, ?, ?, 1, ?)`,
+        ).run(
+          decisionId,
+          row.workItemId,
+          row.candidateFingerprint,
+          row.scopeFingerprint,
+          row.actorOwnerId,
+          row.decisionType,
+          row.acceptanceState,
+          canonicalize(row.subject),
+          row.subjectFingerprint,
+          row.note,
+          row.createdAt,
+          row.correlationId,
+          requiredText(projectId, 'project_id'),
+          candidateId,
+          row.createdAt,
+        );
+        const created = this.statement(`SELECT ${DECISION_COLUMNS} FROM owner_decisions WHERE decision_id = ?`).get(
+          decisionId,
+        );
+        if (created === undefined) return err(notFound('Owner decision', decisionId));
+        return ok(toDecision(created));
+      }),
+    );
   }
+
 
   consume(decisionId: DecisionId, consumedAt: string): Result<OwnerDecisionRecord> {
     return this.attempt('consume owner decision', () =>
       this.bounded(() => {
-        const existing = this.statement(`SELECT ${DECISION_COLUMNS} FROM owner_decision WHERE decision_id = ?`).get(
+        const existing = this.statement(`SELECT ${DECISION_COLUMNS} FROM owner_decisions WHERE decision_id = ?`).get(
           decisionId,
         );
         if (existing === undefined) return err(notFound('Owner decision', decisionId));
@@ -1996,9 +2352,9 @@ export class OwnerDecisionRepository extends SqlRepository implements OwnerDecis
           return err(conflict('This decision is no longer usable.', 'Recorded', decision.state));
         }
         this.statement(
-          "UPDATE owner_decision SET state = 'Consumed', consumed_at = ? WHERE decision_id = ?",
+          "UPDATE owner_decisions SET state = 'Consumed', consumed_at = ? WHERE decision_id = ?",
         ).run(consumedAt, decisionId);
-        const updated = this.statement(`SELECT ${DECISION_COLUMNS} FROM owner_decision WHERE decision_id = ?`).get(
+        const updated = this.statement(`SELECT ${DECISION_COLUMNS} FROM owner_decisions WHERE decision_id = ?`).get(
           decisionId,
         );
         if (updated === undefined) return err(notFound('Owner decision', decisionId));
@@ -2010,7 +2366,7 @@ export class OwnerDecisionRepository extends SqlRepository implements OwnerDecis
   invalidate(decisionId: DecisionId, reason: string, at: string): Result<OwnerDecisionRecord> {
     return this.attempt('invalidate owner decision', () =>
       this.bounded(() => {
-        const existing = this.statement(`SELECT ${DECISION_COLUMNS} FROM owner_decision WHERE decision_id = ?`).get(
+        const existing = this.statement(`SELECT ${DECISION_COLUMNS} FROM owner_decisions WHERE decision_id = ?`).get(
           decisionId,
         );
         if (existing === undefined) return err(notFound('Owner decision', decisionId));
@@ -2019,9 +2375,9 @@ export class OwnerDecisionRepository extends SqlRepository implements OwnerDecis
           return err(conflict('A consumed decision cannot be invalidated.', 'Recorded', 'Consumed'));
         }
         this.statement(
-          "UPDATE owner_decision SET state = 'Invalidated', invalidated_at = ?, invalidated_reason = ? WHERE decision_id = ?",
+          "UPDATE owner_decisions SET state = 'Invalidated', invalidated_at = ?, invalidation_reason_redacted = ? WHERE decision_id = ?",
         ).run(at, reason, decisionId);
-        const updated = this.statement(`SELECT ${DECISION_COLUMNS} FROM owner_decision WHERE decision_id = ?`).get(
+        const updated = this.statement(`SELECT ${DECISION_COLUMNS} FROM owner_decisions WHERE decision_id = ?`).get(
           decisionId,
         );
         if (updated === undefined) return err(notFound('Owner decision', decisionId));
@@ -2032,7 +2388,7 @@ export class OwnerDecisionRepository extends SqlRepository implements OwnerDecis
 
   get(decisionId: DecisionId): Result<OwnerDecisionRecord> {
     return this.attempt('read owner decision', () => {
-      const row = this.statement(`SELECT ${DECISION_COLUMNS} FROM owner_decision WHERE decision_id = ?`).get(
+      const row = this.statement(`SELECT ${DECISION_COLUMNS} FROM owner_decisions WHERE decision_id = ?`).get(
         decisionId,
       );
       if (row === undefined) return err(notFound('Owner decision', decisionId));
@@ -2043,7 +2399,7 @@ export class OwnerDecisionRepository extends SqlRepository implements OwnerDecis
   listForWorkItem(workItemId: WorkItemId): Result<readonly OwnerDecisionRecord[]> {
     return this.attempt('list owner decisions for work', () => {
       const rows = this.statement(
-        `SELECT ${DECISION_COLUMNS} FROM owner_decision WHERE work_item_id = ? ORDER BY created_at ASC, decision_id ASC`,
+        `SELECT ${DECISION_COLUMNS} FROM owner_decisions WHERE work_item_id = ? ORDER BY created_at ASC, decision_id ASC`,
       ).all(workItemId);
       return ok(rows.map(toDecision));
     });
@@ -2052,7 +2408,7 @@ export class OwnerDecisionRepository extends SqlRepository implements OwnerDecis
   listUnconsumed(candidateFingerprint: Fingerprint): Result<readonly OwnerDecisionRecord[]> {
     return this.attempt('list unconsumed decisions for a candidate', () => {
       const rows = this.statement(
-        `SELECT ${DECISION_COLUMNS} FROM owner_decision WHERE candidate_fingerprint = ? AND state = 'Recorded' ORDER BY created_at ASC, decision_id ASC`,
+        `SELECT ${DECISION_COLUMNS} FROM owner_decisions WHERE candidate_fingerprint = ? AND state = 'Recorded' ORDER BY created_at ASC, decision_id ASC`,
       ).all(candidateFingerprint);
       return ok(rows.map(toDecision));
     });

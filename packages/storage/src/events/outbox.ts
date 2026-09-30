@@ -31,31 +31,12 @@ import { instantAfterMs, jsonArray, optionalText, requiredNumber, requiredText, 
  * DDL for the outbox, published so the migration owner composes it rather than
  * re-deriving a different column set.
  */
-export const OUTBOX_SCHEMA_SQL = `
-CREATE TABLE IF NOT EXISTS outbox_effect (
-  effect_id             TEXT PRIMARY KEY,
-  dedup_key             TEXT NOT NULL,
-  kind                  TEXT NOT NULL,
-  target                TEXT NOT NULL,
-  payload               TEXT NOT NULL,
-  correlation_id        TEXT NOT NULL,
-  operation_id          TEXT NOT NULL,
-  status                TEXT NOT NULL,
-  attempt_count         INTEGER NOT NULL,
-  last_success_at       TEXT,
-  next_attempt_at       TEXT NOT NULL,
-  last_failure_category TEXT NOT NULL,
-  last_failure_detail   TEXT,
-  last_attempt_at       TEXT,
-  expected_refs         TEXT NOT NULL,
-  succeeded_refs        TEXT NOT NULL,
-  created_at            TEXT NOT NULL
-);
-CREATE UNIQUE INDEX IF NOT EXISTS outbox_effect_dedup ON outbox_effect (dedup_key);
-CREATE INDEX IF NOT EXISTS outbox_effect_due ON outbox_effect (status, next_attempt_at);
-CREATE INDEX IF NOT EXISTS outbox_effect_operation ON outbox_effect (operation_id);
-`;
-
+/**
+ * The columns this store depends on are owned by `migrations.ts`; this module
+ * creates nothing, so a drift between the store and the schema is a failing
+ * statement rather than a test that passed against a table the product does
+ * not have.
+ */
 export interface EnqueueEffect {
   readonly effectId: string;
   /** Stable intent identity. Re-enqueueing the same key returns the existing effect. */
@@ -132,21 +113,52 @@ export interface OutboxOptions {
   readonly runInTransaction?: TransactionRunner;
 }
 
+/**
+ * The schema's own effect state, which is the publication half of the story.
+ *
+ * The store's `status` is what the delivery loop reasons about; the schema's
+ * `state` is what the durable index reads, and a succeeded effect must carry its
+ * publish time so a half-written publication is distinguishable from a
+ * published one (N01-AC3).
+ */
+function schemaStateFor(status: OutboxStatus): string {
+  switch (status) {
+    case 'Succeeded':
+      return 'Published';
+    case 'OutcomeUnknown':
+      return 'OutcomeUnknown';
+    default:
+      return 'Pending';
+  }
+}
+
+/** Reads the store's status back out of the schema's state column. */
+function statusFrom(state: string | null): OutboxStatus {
+  switch (state) {
+    case 'Published':
+      return 'Succeeded';
+    case 'OutcomeUnknown':
+      return 'OutcomeUnknown';
+    default:
+      return 'PendingSync';
+  }
+}
+
 function rowToEffect(row: SqlRow): OutboxEffect {
   return {
-    effectId: requiredText(row, 'effect_id'),
+    effectId: requiredText(row, 'outbox_event_id'),
     dedupKey: requiredText(row, 'dedup_key'),
-    kind: requiredText(row, 'kind'),
+    kind: requiredText(row, 'event_kind'),
     target: requiredText(row, 'target'),
-    payload: requiredText(row, 'payload'),
+    payload: requiredText(row, 'payload_json'),
     correlationId: requiredText(row, 'correlation_id'),
     operationId: requiredText(row, 'operation_id'),
-    status: requiredText(row, 'status') as OutboxStatus,
+    status: statusFrom(optionalText(row, 'state')),
     attemptCount: requiredNumber(row, 'attempt_count'),
     lastSuccessAt: optionalText(row, 'last_success_at'),
     nextAttemptAt: requiredText(row, 'next_attempt_at'),
     lastFailureCategory: requiredText(row, 'last_failure_category') as FailureCategory,
-    lastFailureDetail: optionalText(row, 'last_failure_detail'),
+    lastFailureDetail: optionalText(row, 'last_error_redacted'),
     lastAttemptAt: optionalText(row, 'last_attempt_at'),
     expectedRefs: jsonArray(requiredText(row, 'expected_refs')),
     succeededRefs: jsonArray(requiredText(row, 'succeeded_refs')),
@@ -175,20 +187,20 @@ export function createOutboxStore(options: OutboxOptions): OutboxStore {
   const { connection } = options;
   const inTransaction = options.runInTransaction ?? ((work) => runInTransaction(connection, work));
 
-  const selectById = connection.prepare('SELECT * FROM outbox_effect WHERE effect_id = ?');
-  const selectByDedup = connection.prepare('SELECT * FROM outbox_effect WHERE dedup_key = ?');
+  const selectById = connection.prepare('SELECT * FROM outbox_events WHERE outbox_event_id = ?');
+  const selectByDedup = connection.prepare('SELECT * FROM outbox_events WHERE dedup_key = ?');
   const insert = connection.prepare(
-    `INSERT INTO outbox_effect
-       (effect_id, dedup_key, kind, target, payload, correlation_id, operation_id, status,
-        attempt_count, last_success_at, next_attempt_at, last_failure_category, last_failure_detail,
-        last_attempt_at, expected_refs, succeeded_refs, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, 'PendingSync', 0, NULL, ?, 'None', NULL, NULL, ?, '[]', ?)`,
+    `INSERT INTO outbox_events
+       (outbox_event_id, dedup_key, event_kind, kind, target, payload_json, payload, correlation_id,
+        operation_id, state, status, attempt_count, last_success_at, next_attempt_at,
+        last_failure_category, last_failure_detail, last_attempt_at, expected_refs, succeeded_refs, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'Pending', 'PendingSync', 0, NULL, ?, 'None', NULL, NULL, ?, '[]', ?)`,
   );
   const updateStatus = connection.prepare(
-    `UPDATE outbox_effect
-        SET status = ?, last_success_at = ?, next_attempt_at = ?, last_failure_category = ?,
-            last_failure_detail = ?, succeeded_refs = ?
-      WHERE effect_id = ?`,
+    `UPDATE outbox_events
+        SET state = ?, status = ?, last_success_at = ?, next_attempt_at = ?, last_failure_category = ?,
+            last_failure_detail = ?, succeeded_refs = ?, published_at = ?, last_error_redacted = ?
+      WHERE outbox_event_id = ?`,
   );
 
   const enqueue = (
@@ -210,7 +222,9 @@ export function createOutboxStore(options: OutboxOptions): OutboxStore {
       effect.effectId,
       effect.dedupKey,
       effect.kind,
+      effect.kind,
       effect.target,
+      effect.payload,
       effect.payload,
       effect.correlationId,
       effect.operationId,
@@ -226,7 +240,7 @@ export function createOutboxStore(options: OutboxOptions): OutboxStore {
   const due = (now: Instant, limit = 25): readonly OutboxEffect[] =>
     connection
       .prepare(
-        `SELECT * FROM outbox_effect
+        `SELECT * FROM outbox_events
           WHERE status = 'PendingSync' AND next_attempt_at <= ?
           ORDER BY next_attempt_at ASC, created_at ASC LIMIT ?`,
       )
@@ -277,12 +291,15 @@ export function createOutboxStore(options: OutboxOptions): OutboxStore {
       if (!loaded.ok) return loaded;
       const next = apply(loaded.value.effect);
       updateStatus.run(
+        schemaStateFor(next.status),
         next.status,
         next.lastSuccessAt,
         next.nextAttemptAt,
         next.lastFailureCategory,
         next.lastFailureDetail,
         JSON.stringify(next.succeededRefs),
+        next.status === 'Succeeded' ? next.lastSuccessAt : null,
+        next.lastFailureDetail,
         effectId,
       );
       return ok(readBack(effectId));
@@ -294,7 +311,7 @@ export function createOutboxStore(options: OutboxOptions): OutboxStore {
       if (!loaded.ok) return loaded;
       const { effect } = loaded.value;
       connection
-        .prepare('UPDATE outbox_effect SET attempt_count = ?, last_attempt_at = ? WHERE effect_id = ?')
+        .prepare('UPDATE outbox_events SET attempt_count = ?, last_attempt_at = ? WHERE outbox_event_id = ?')
         .run(effect.attemptCount + 1, at, effectId);
       return ok(readBack(effectId));
     });
@@ -336,7 +353,7 @@ export function createOutboxStore(options: OutboxOptions): OutboxStore {
 
   const pendingSync = (limit = 100): readonly OutboxEffect[] =>
     connection
-      .prepare(`SELECT * FROM outbox_effect WHERE status <> 'Succeeded' ORDER BY next_attempt_at ASC LIMIT ?`)
+      .prepare(`SELECT * FROM outbox_events WHERE status <> 'Succeeded' ORDER BY next_attempt_at ASC LIMIT ?`)
       .all(limit)
       .map(rowToEffect);
 
@@ -347,7 +364,7 @@ export function createOutboxStore(options: OutboxOptions): OutboxStore {
 
   const findByOperation = (operationId: string): readonly OutboxEffect[] =>
     connection
-      .prepare('SELECT * FROM outbox_effect WHERE operation_id = ? ORDER BY created_at ASC')
+      .prepare('SELECT * FROM outbox_events WHERE operation_id = ? ORDER BY created_at ASC')
       .all(operationId)
       .map(rowToEffect);
 

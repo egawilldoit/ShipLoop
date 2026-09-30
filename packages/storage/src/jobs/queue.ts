@@ -94,55 +94,19 @@ import {
  */
 
 /**
- * The job tables this slice reads, with the columns it depends on.
+ * The job tables this slice reads.
  *
- * `migrations.ts` owns the schema and this module does not create tables. The
- * literal is exported so the test that must prove behaviour without a migration
- * runner applies exactly these columns, and so a drift between this module and
- * the migration is a visible diff rather than a runtime failure.
+ * `migrations.ts` owns the schema and this module creates nothing. The names are
+ * exported so a drift between this module and the migration is a visible diff
+ * rather than a runtime "no such table" in a test that otherwise looks healthy.
  */
-export const JOB_SCHEMA_CONTRACT = {
-  job: [
-    `CREATE TABLE job (
-       job_id TEXT PRIMARY KEY,
-       operation_id TEXT NOT NULL UNIQUE,
-       mode TEXT NOT NULL,
-       scope_snapshot_id TEXT NOT NULL,
-       project_id TEXT NOT NULL,
-       state TEXT NOT NULL,
-       limits TEXT NOT NULL,
-       permitted_operations TEXT NOT NULL,
-       holder TEXT,
-       attempt_count INTEGER NOT NULL DEFAULT 0,
-       last_heartbeat_at TEXT,
-       created_at TEXT NOT NULL,
-       updated_at TEXT NOT NULL
-     )`,
-    'CREATE INDEX job_by_state ON job (state, created_at)',
-  ],
-  jobCheckpoint: [
-    `CREATE TABLE job_checkpoint (
-       job_id TEXT PRIMARY KEY,
-       checkpoint_id TEXT NOT NULL,
-       scope_snapshot_id TEXT NOT NULL,
-       scope_fingerprint TEXT NOT NULL,
-       profile_version_id TEXT NOT NULL,
-       procedure_version_id TEXT NOT NULL,
-       engine_version TEXT,
-       workspace_id TEXT NOT NULL,
-       branch_name TEXT NOT NULL,
-       worktree_path TEXT NOT NULL,
-       head_sha TEXT NOT NULL,
-       base_sha TEXT NOT NULL,
-       dirty_files TEXT NOT NULL,
-       untracked_files TEXT NOT NULL,
-       results TEXT NOT NULL,
-       feedback TEXT NOT NULL,
-       blocker TEXT,
-       next_action TEXT NOT NULL,
-       recorded_at TEXT NOT NULL
-     )`,
-  ],
+export const JOB_TABLES = {
+  jobs: 'jobs',
+  jobCheckpoints: 'job_checkpoints',
+  writerLeases: 'writer_leases',
+  codingSlots: 'coding_slots',
+  workspaceLocks: 'workspace_locks',
+  workspacePorts: 'workspace_ports',
 } as const;
 
 /** What a claim of the single global coding writer produced. */
@@ -233,45 +197,58 @@ function jobFromRow(row: SqlRow): JobRecord {
     jobId: readText(row, 'job_id') as JobId,
     operationId: readText(row, 'operation_id') as OperationId,
     mode: mode as JobMode,
+    workItemId: readText(row, 'work_item_id'),
     scopeSnapshotId: readText(row, 'scope_snapshot_id') as ScopeSnapshotId,
     projectId: readText(row, 'project_id') as ProjectId,
+    profileVersionId: readText(row, 'profile_version_id'),
+    procedureVersionId: readText(row, 'procedure_version_id'),
     state,
+    correlationId: readText(row, 'correlation_id'),
     limits,
     permittedOperations: decodeOperations(readOptionalText(row, 'permitted_operations')),
     holder: readOptionalText(row, 'holder'),
     attemptCount: readInteger(row, 'attempt_count'),
-    createdAt: readText(row, 'created_at'),
+    createdAt: readText(row, 'queued_at'),
     updatedAt: readText(row, 'updated_at'),
   };
 }
 
 function readJobRow(connection: SqlConnection, jobId: JobId): SqlRow | undefined {
-  return connection.prepare('SELECT * FROM job WHERE job_id = ?').get(jobId);
+  return connection.prepare('SELECT * FROM jobs WHERE job_id = ?').get(jobId);
 }
 
 function readJobByOperation(connection: SqlConnection, operationId: OperationId): SqlRow | undefined {
-  return connection.prepare('SELECT * FROM job WHERE operation_id = ?').get(operationId);
+  return connection.prepare('SELECT * FROM jobs WHERE operation_id = ?').get(operationId);
 }
 
 function writeJobOnConnection(connection: SqlConnection, job: JobRecord): void {
   connection
     .prepare(
-      `INSERT INTO job (
-         job_id, operation_id, mode, scope_snapshot_id, project_id, state,
-         limits, permitted_operations, holder, attempt_count, created_at, updated_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO jobs (
+         job_id, operation_id, mode, work_item_id, scope_snapshot_id, project_id,
+         profile_version_id, procedure_version_id, state, correlation_id, queued_at,
+         limits, permitted_operations, holder, attempt_count, active_budget_ms,
+         max_attempts, created_at, updated_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
     .run(
       job.jobId,
       job.operationId,
       job.mode,
+      job.workItemId,
       job.scopeSnapshotId,
       job.projectId,
+      job.profileVersionId,
+      job.procedureVersionId,
       job.state,
+      job.correlationId,
+      job.createdAt,
       encodeLimits(job.limits),
       encodeOperations(job.permittedOperations),
       job.holder,
       job.attemptCount,
+      job.limits.activeExecutionMs,
+      job.limits.maxAttempts,
       job.createdAt,
       job.updatedAt,
     );
@@ -346,7 +323,7 @@ function checkpointFromRow(row: SqlRow): JobCheckpoint {
 function writeCheckpointOnConnection(connection: SqlConnection, checkpoint: JobCheckpoint): void {
   connection
     .prepare(
-      `INSERT INTO job_checkpoint (
+      `INSERT INTO job_checkpoints (
          job_id, checkpoint_id, scope_snapshot_id, scope_fingerprint,
          profile_version_id, procedure_version_id, engine_version,
          workspace_id, branch_name, worktree_path, head_sha, base_sha,
@@ -436,9 +413,13 @@ export function createJobQueue(store: JobQueueStore): JobQueue {
           jobId: request.jobId,
           operationId: request.operationId,
           mode: request.mode,
+          workItemId: request.workItemId,
           scopeSnapshotId: request.scopeSnapshotId,
           projectId: request.projectId,
+          profileVersionId: request.profileVersionId,
+          procedureVersionId: request.procedureVersionId,
           state: 'Queued',
+          correlationId: request.correlationId ?? request.operationId,
           limits,
           permittedOperations: grant.value,
           holder: null,
@@ -473,7 +454,7 @@ export function createJobQueue(store: JobQueueStore): JobQueue {
 
         const row = connection
           .prepare(
-            `SELECT * FROM job
+            `SELECT * FROM jobs
               WHERE state = 'Queued' AND (? IS NULL OR project_id = ?)
               ORDER BY created_at ASC, job_id ASC
               LIMIT 1`,
@@ -537,7 +518,7 @@ export function createJobQueue(store: JobQueueStore): JobQueue {
         });
         if (!renewed.ok) return renewed;
         connection
-          .prepare('UPDATE job SET last_heartbeat_at = ?, updated_at = ? WHERE job_id = ?')
+          .prepare('UPDATE jobs SET last_heartbeat_at = ?, updated_at = ? WHERE job_id = ?')
           .run(request.now, request.now, request.jobId);
         return renewed;
       }),
@@ -658,7 +639,7 @@ export function createJobQueue(store: JobQueueStore): JobQueue {
       }
       const where = clauses.length === 0 ? '' : ` WHERE ${clauses.join(' AND ')}`;
       const rows = connection
-        .prepare(`SELECT * FROM job${where} ORDER BY created_at ASC, job_id ASC`)
+        .prepare(`SELECT * FROM jobs${where} ORDER BY created_at ASC, job_id ASC`)
         .all(...parameters);
       return ok(rows.map(jobFromRow));
     });
@@ -673,7 +654,7 @@ export function createJobQueue(store: JobQueueStore): JobQueue {
 
   function readCheckpoint(jobId: JobId): Result<JobCheckpoint | null, DomainError> {
     return guard(() => {
-      const row = connection.prepare('SELECT * FROM job_checkpoint WHERE job_id = ?').get(jobId);
+      const row = connection.prepare('SELECT * FROM job_checkpoints WHERE job_id = ?').get(jobId);
       return ok(row === undefined ? null : checkpointFromRow(row));
     });
   }
@@ -689,7 +670,7 @@ export function createJobQueue(store: JobQueueStore): JobQueue {
     return guard(() => {
       const rows = connection
         .prepare(
-          `SELECT job_id, holder, renewed_at, expires_at FROM writer_lease
+          `SELECT job_id, holder, renewed_at, expires_at FROM writer_leases
             WHERE state = 'Active' AND expires_at <= ?
             ORDER BY job_id ASC`,
         )
@@ -856,12 +837,13 @@ function moveToRunningOnConnection(
   if (!running.ok) return running;
   connection
     .prepare(
-      `UPDATE job
+      `UPDATE jobs
           SET state = ?, holder = ?, attempt_count = attempt_count + 1,
-              last_heartbeat_at = ?, updated_at = ?
+              last_heartbeat_at = ?, updated_at = ?,
+              started_at = COALESCE(started_at, ?)
         WHERE job_id = ?`,
     )
-    .run('Running', candidate.holder, candidate.now, candidate.now, job.jobId);
+    .run('Running', candidate.holder, candidate.now, candidate.now, candidate.now, job.jobId);
   return ok({
     ...job,
     state: 'Running',
@@ -870,6 +852,16 @@ function moveToRunningOnConnection(
     updatedAt: candidate.now,
   });
 }
+
+/** States in which a job is consuming execution capacity, so it has a start time. */
+const ACTIVE_STATES: ReadonlySet<AttemptState> = new Set<AttemptState>([
+  'Preparing',
+  'Running',
+  'Verifying',
+]);
+
+/** States in which a job is no longer in flight, so it has a finish time. */
+const FINISHED_STATES: ReadonlySet<AttemptState> = new Set<AttemptState>(['Completed', 'Cancelled']);
 
 /** States in which the job is no longer the active writer, so the holder is dropped. */
 const STATES_WITHOUT_WRITER: ReadonlySet<AttemptState> = new Set<AttemptState>([
@@ -913,13 +905,27 @@ function updateJobStateOnConnection(
   state: AttemptState,
   now: string,
 ): Result<null, DomainError> {
+  // A job that is actually doing work records when it started, and a job that
+  // has finished records when it stopped. The schema CHECKs both, which is what
+  // makes "running" mean "running since" rather than just a label (F13-AC1).
   connection
     .prepare(
-      `UPDATE job
-          SET state = ?, holder = CASE WHEN ? THEN NULL ELSE holder END, updated_at = ?
+      `UPDATE jobs
+          SET state = ?, holder = CASE WHEN ? THEN NULL ELSE holder END, updated_at = ?,
+              started_at = CASE WHEN ? THEN COALESCE(started_at, ?) ELSE started_at END,
+              finished_at = CASE WHEN ? THEN ? ELSE finished_at END
         WHERE job_id = ?`,
     )
-    .run(state, STATES_WITHOUT_WRITER.has(state) ? 1 : 0, now, jobId);
+    .run(
+      state,
+      STATES_WITHOUT_WRITER.has(state) ? 1 : 0,
+      now,
+      ACTIVE_STATES.has(state) ? 1 : 0,
+      now,
+      FINISHED_STATES.has(state) ? 1 : 0,
+      now,
+      jobId,
+    );
   return ok(null);
 }
 

@@ -312,9 +312,19 @@ export interface JobRecord {
   readonly jobId: JobId;
   readonly operationId: OperationId;
   readonly mode: JobMode;
+  readonly workItemId: string;
   readonly scopeSnapshotId: ScopeSnapshotId;
   readonly projectId: ProjectId;
+  readonly profileVersionId: string;
+  readonly procedureVersionId: string;
   readonly state: AttemptState;
+  /**
+   * Correlation identity for this run.
+   *
+   * Defaults to the operation identity, which is the same execution attempt,
+   * and can be a distinct value when one run is the part of a larger flow.
+   */
+  readonly correlationId: string;
   readonly limits: JobLimits;
   readonly permittedOperations: readonly JobOperation[];
   readonly holder: string | null;
@@ -323,14 +333,29 @@ export interface JobRecord {
   readonly updatedAt: string;
 }
 
-/** The request that starts work (F13-AC1). */
+/**
+ * The request that starts work (F13-AC1).
+ *
+ * The work item, the scope snapshot, the profile version and the procedure
+ * version are all named here because a job is only resumable if the inputs it
+ * was started from are recorded before it is reported as accepted. The schema
+ * requires them NOT NULL for the same reason, so the two agree rather than one
+ * being relaxed to suit the other (R4, ADR 0003).
+ */
 export interface EnqueueRequest {
   readonly operationId: OperationId;
   readonly mode: JobMode;
+  readonly workItemId: string;
   readonly scopeSnapshotId: ScopeSnapshotId;
   readonly projectId: ProjectId;
+  /** Profile version the run reads its provider references from (F02-AC3). */
+  readonly profileVersionId: string;
+  /** Procedure version the run reads its recipe from (F05-AC1). */
+  readonly procedureVersionId: string;
   readonly jobId: JobId;
   readonly now: string;
+  /** Defaults to the operation identity when the run is not part of a larger flow. */
+  readonly correlationId?: string;
   readonly limits: JobLimits | null;
   readonly permittedOperations: readonly JobOperation[] | null;
 }

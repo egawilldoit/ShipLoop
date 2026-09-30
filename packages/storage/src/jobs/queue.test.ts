@@ -2,12 +2,22 @@ import assert from 'node:assert/strict';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 import { Worker } from 'node:worker_threads';
-import type { CommitSha, Fingerprint, JobId, OperationId, ProjectId, ScopeSnapshotId } from '@shiploop/domain';
-import { LEASE_SCHEMA_CONTRACT, createLeaseManager, type LeaseManager } from './lease.ts';
-import { JOB_SCHEMA_CONTRACT, createJobQueue, type JobQueue } from './queue.ts';
+import { ATTEMPT_STATES } from '@shiploop/domain';
+import type {
+  AttemptState,
+  CommitSha,
+  Fingerprint,
+  JobId,
+  OperationId,
+  ProjectId,
+  ScopeSnapshotId,
+} from '@shiploop/domain';
+import { openDatabase, type Database } from '../db.ts';
+import { migrate } from '../migrations.ts';
+import { createLeaseManager, type LeaseManager } from './lease.ts';
+import { createJobQueue, type JobQueue } from './queue.ts';
 import {
   DEFAULT_JOB_LIMITS,
   MODE_PERMITTED_OPERATIONS,
@@ -17,35 +27,102 @@ import {
   type JobOperation,
 } from './types.ts';
 
-/**
- * The schema the statements in `queue.ts` and `lease.ts` execute against.
- *
- * `db.ts`, `migrations.ts` and `tx.ts` do not exist in this branch: another
- * agent owns them on a different branch. Applying the exported contract literals
- * inline is what lets these tests exercise the real SQL rather than a mock, and
- * it keeps the columns under test identical to the columns the modules name.
- *
- * Each `LEASE_SCHEMA_CONTRACT` value is a `<table>(<columns>)` body that already
- * names its own table, so only the `CREATE TABLE` verb is added here.
- */
-const TEST_SCHEMA: readonly string[] = [
-  ...JOB_SCHEMA_CONTRACT.job,
-  ...JOB_SCHEMA_CONTRACT.jobCheckpoint,
-  ...Object.values(LEASE_SCHEMA_CONTRACT).map((body) => `CREATE TABLE ${body}`),
-  'CREATE INDEX job_by_operation ON job (operation_id)',
-];
-
 const T0 = '2026-03-01T10:00:00.000Z';
 const HEAD_SHA = 'a'.repeat(40) as CommitSha;
 const BASE_SHA = 'b'.repeat(40) as CommitSha;
 const FINGERPRINT = `fp_${'c'.repeat(32)}` as Fingerprint;
+const SCOPE_FINGERPRINT = FINGERPRINT;
+
+/**
+ * Behavioural proof for the durable job queue, against the REAL schema.
+ *
+ * The suite used to apply its own `JOB_SCHEMA_CONTRACT` literals before each
+ * test, so it exercised SQL that `migrations.ts` never created: the queue read
+ * and wrote singular tables (`job`, `coding_slot`, `writer_lease`) that the
+ * migrated schema does not have. Every assertion here now runs against a
+ * database built by the production migration runner, so a statement that no
+ * longer matches the schema fails here rather than at the first `claimNext` in
+ * an application.
+ *
+ * The foreign keys are real, because `openDatabase` turns them on. A job records
+ * the work item, scope snapshot, profile version and procedure version it is
+ * running against (R4, F13-AC1), so the fixture creates exactly those parents
+ * and nothing more: creating a project is a separate use case, not a queue
+ * responsibility.
+ */
+const FIXTURE_PROJECT = '0a5f1c22-0000-4000-8000-0000000000f1' as ProjectId;
+const OTHER_FIXTURE_PROJECT = '0a5f1c22-0000-4000-8000-0000000000f2' as ProjectId;
+const OTHER_PROFILE_VERSION = 'profile-version-other';
+
+/**
+ * A legal route from `Queued` to each terminal state.
+ *
+ * The queue validates transitions against the domain table before it writes, so
+ * reaching a state directly would test the lifecycle rather than the column. The
+ * route keeps the assertion about what the schema can store.
+ */
+const STATE_PATH: Readonly<Record<string, readonly AttemptState[]>> = {
+  Preparing: ['Preparing'],
+  Running: ['Preparing', 'Running'],
+  Verifying: ['Preparing', 'Running', 'Verifying'],
+  WaitingForOwner: ['Preparing', 'Running', 'WaitingForOwner'],
+  Paused: ['Preparing', 'Running', 'Paused'],
+  Blocked: ['Preparing', 'Blocked'],
+  Completed: ['Preparing', 'Running', 'Completed'],
+  Cancelled: ['Cancelled'],
+  Queued: [],
+};
+const FIXTURE_OWNER = '00000000-0000-4000-8000-00000000f001';
+const PROFILE_VERSION = 'profile-version-fixture';
+const PROCEDURE_VERSION = 'procedure-version-fixture';
+const CONTENT_FINGERPRINT = `fp_${'d'.repeat(32)}` as Fingerprint;
+
+/** A migrated database with the parents every job row references. */
+function seed(db: Database): void {
+  db.prepare('INSERT INTO owners (owner_id, display_name) VALUES (?, ?)').run(FIXTURE_OWNER, 'Solo owner');
+  db.prepare('INSERT INTO projects (project_id, name) VALUES (?, ?)').run(FIXTURE_PROJECT, 'Fixture project');
+  db.prepare('INSERT INTO projects (project_id, name) VALUES (?, ?)').run(OTHER_FIXTURE_PROJECT, 'Second fixture project');
+  db.prepare(
+    `INSERT INTO project_profile_versions (profile_version_id, project_id, version, content_json, content_fingerprint, created_by)
+     VALUES (?, ?, 1, '{}', ?, ?)`,
+  ).run(PROFILE_VERSION, FIXTURE_PROJECT, CONTENT_FINGERPRINT, FIXTURE_OWNER);
+  db.prepare(
+    `INSERT INTO procedure_versions (procedure_version_id, project_id, version, kind, source, content_json, content_fingerprint, created_by)
+     VALUES (?, ?, 1, 'Procedure', 'Owner', '{}', ?, ?)`,
+  ).run(PROCEDURE_VERSION, FIXTURE_PROJECT, CONTENT_FINGERPRINT, FIXTURE_OWNER);
+  db.prepare(
+    `INSERT INTO work_items (work_item_id, project_id, issue_id, publication_intent, origin, profile_version_id)
+     VALUES (?, ?, ?, 'PublishWhenAgreed', 'Proposed', ?)`,
+  ).run('work-item-fixture', FIXTURE_PROJECT, 'issue-fixture', PROFILE_VERSION);
+  db.prepare(
+    `INSERT INTO scope_snapshots (scope_snapshot_id, work_item_id, project_id, issue_id, description, scope_fingerprint, retrieved_at, profile_version_id, procedure_version_id)
+     VALUES (?, ?, ?, ?, 'Fixture scope', ?, ?, ?, ?)`,
+  ).run('snap-1', 'work-item-fixture', FIXTURE_PROJECT, 'issue-fixture', SCOPE_FINGERPRINT, T0, PROFILE_VERSION, PROCEDURE_VERSION);
+  // A second project with its own work item and snapshot, so filtering the
+  // attention dashboard by project is a real distinction and not a label.
+  db.prepare(
+    `INSERT INTO project_profile_versions (profile_version_id, project_id, version, content_json, content_fingerprint, created_by)
+     VALUES (?, ?, 1, '{}', ?, ?)`,
+  ).run(OTHER_PROFILE_VERSION, OTHER_FIXTURE_PROJECT, CONTENT_FINGERPRINT, FIXTURE_OWNER);
+  db.prepare(
+    `INSERT INTO work_items (work_item_id, project_id, issue_id, publication_intent, origin, profile_version_id)
+     VALUES (?, ?, ?, 'PublishWhenAgreed', 'Proposed', ?)`,
+  ).run('work-item-other', OTHER_FIXTURE_PROJECT, 'issue-other', OTHER_PROFILE_VERSION);
+  db.prepare(
+    `INSERT INTO scope_snapshots (scope_snapshot_id, work_item_id, project_id, issue_id, description, scope_fingerprint, retrieved_at, profile_version_id, procedure_version_id)
+     VALUES (?, ?, ?, ?, 'Other scope', ?, ?, ?, ?)`,
+  ).run('snap-other', 'work-item-other', OTHER_FIXTURE_PROJECT, 'issue-other', SCOPE_FINGERPRINT, T0, OTHER_PROFILE_VERSION, PROCEDURE_VERSION);
+}
 
 function enqueueRequest(overrides: Partial<EnqueueRequest> = {}): EnqueueRequest {
   return {
     operationId: 'op-build-1' as OperationId,
     mode: 'Build',
+    workItemId: 'work-item-fixture',
     scopeSnapshotId: 'snap-1' as ScopeSnapshotId,
-    projectId: 'proj-1' as ProjectId,
+    projectId: FIXTURE_PROJECT,
+    profileVersionId: PROFILE_VERSION,
+    procedureVersionId: PROCEDURE_VERSION,
     jobId: 'job-1' as JobId,
     now: T0,
     limits: DEFAULT_JOB_LIMITS,
@@ -78,11 +155,12 @@ async function withDatabase(
   const directory = await mkdtemp(join(tmpdir(), 'shiploop-queue-'));
   const file = join(directory, 'queue.db');
   try {
-    const connection = new DatabaseSync(file);
-    connection.exec('PRAGMA journal_mode = WAL');
-    connection.exec('PRAGMA foreign_keys = ON');
-    for (const statement of TEST_SCHEMA) connection.exec(statement);
-    connection.prepare('INSERT INTO coding_slot (slot_id, generation) VALUES (1, 0)').run();
+    const opened = openDatabase(file);
+    assert.ok(opened.ok, `the database could not be opened: ${opened.ok ? '' : opened.error.reason}`);
+    const connection = opened.value;
+    const migrated = migrate(connection);
+    assert.ok(migrated.ok, `the schema could not be migrated: ${migrated.ok ? '' : migrated.error.reason}`);
+    seed(connection);
     await run(
       createJobQueue({ connection }),
       createLeaseManager({ connection }),
@@ -137,7 +215,9 @@ test('enqueue records the job durably before returning success', async () => {
     assert.equal(outcome.job.mode, 'Build');
     assert.equal(outcome.job.operationId, 'op-build-1');
     assert.equal(outcome.job.scopeSnapshotId, 'snap-1');
-    assert.equal(outcome.job.projectId, 'proj-1');
+    assert.equal(outcome.job.workItemId, 'work-item-fixture');
+    assert.equal(outcome.job.profileVersionId, PROFILE_VERSION);
+    assert.equal(outcome.job.projectId, FIXTURE_PROJECT);
     assert.deepEqual(outcome.job.limits, DEFAULT_JOB_LIMITS);
     assert.equal(outcome.job.attemptCount, 0);
     assert.equal(outcome.job.holder, null);
@@ -182,12 +262,15 @@ test('two concurrent claims against one file yield exactly one writer', async (t
      * sequential correctness. Threads are what make the write lock and the
      * conditional slot update contend for real.
      */
+    // The worker imports the two real modules by absolute URL so it opens a
+    // genuine second connection to the same file, which is what makes the write
+    // lock and the conditional slot update contend rather than interleave.
     const workerSource = `
       import { parentPort, workerData } from 'node:worker_threads';
-      import { DatabaseSync } from 'node:sqlite';
-      const module = await import(workerData.queueModule);
-      const connection = new DatabaseSync(workerData.file);
-      const queue = module.createJobQueue({ connection });
+      const { openDatabase } = await import(workerData.dbModule);
+      const { createJobQueue } = await import(workerData.queueModule);
+      const connection = openDatabase(workerData.file).value;
+      const queue = createJobQueue({ connection });
       const result = queue.claimNext({
         holder: workerData.holder, now: workerData.now, leaseTtlMs: 120000, projectId: null,
       });
@@ -195,13 +278,14 @@ test('two concurrent claims against one file yield exactly one writer', async (t
       parentPort.postMessage(result);
     `;
     const queueModule = new URL('./queue.ts', import.meta.url).href;
+    const dbModule = new URL('../db.ts', import.meta.url).href;
 
     const claimInThread = (holder: string) =>
       new Promise<ClaimMessage>(
         (resolve, reject) => {
           const worker = new Worker(
             new URL(`data:text/javascript,${encodeURIComponent(workerSource)}`),
-            { workerData: { file, queueModule, holder, now: T0 } },
+            { workerData: { file, queueModule, dbModule, holder, now: T0 } },
           );
           worker.once('message', (message: ClaimMessage) => {
             void worker.terminate();
@@ -507,10 +591,12 @@ test('jobs, their state and their checkpoints survive close and reopen', async (
   const directory = await mkdtemp(join(tmpdir(), 'shiploop-durable-'));
   const file = join(directory, 'queue.db');
   try {
-    const first = new DatabaseSync(file);
-    first.exec('PRAGMA journal_mode = WAL');
-    for (const statement of TEST_SCHEMA) first.exec(statement);
-    first.prepare('INSERT INTO coding_slot (slot_id, generation) VALUES (1, 0)').run();
+    const opened = openDatabase(file);
+    assert.ok(opened.ok, `the database could not be opened: ${opened.ok ? '' : opened.error.reason}`);
+    const first = opened.value;
+    const migrated = migrate(first);
+    assert.ok(migrated.ok, `the schema could not be migrated: ${migrated.ok ? '' : migrated.error.reason}`);
+    seed(first);
 
     const before = createJobQueue({ connection: first });
     expectOk(before.enqueue(enqueueRequest()));
@@ -542,7 +628,9 @@ test('jobs, their state and their checkpoints survive close and reopen', async (
     );
     first.close();
 
-    const second = new DatabaseSync(file);
+    const reopened = openDatabase(file);
+    assert.ok(reopened.ok, `the database could not be reopened: ${reopened.ok ? '' : reopened.error.reason}`);
+    const second = reopened.value;
     const after = createJobQueue({ connection: second });
 
     const running = expectJob(after, 'job-1' as JobId);
@@ -608,7 +696,10 @@ test('listJobs filters the attention dashboard view by state and project', async
         enqueueRequest({
           operationId: 'op-other' as OperationId,
           jobId: 'job-2' as JobId,
-          projectId: 'proj-2' as ProjectId,
+          projectId: OTHER_FIXTURE_PROJECT,
+          workItemId: 'work-item-other',
+          scopeSnapshotId: 'snap-other' as ScopeSnapshotId,
+          profileVersionId: OTHER_PROFILE_VERSION,
           now: '2026-03-01T10:00:02.000Z',
         }),
       ),
@@ -617,8 +708,8 @@ test('listJobs filters the attention dashboard view by state and project', async
 
     assert.equal(expectOk(queue.listJobs({ states: ['Queued'], projectId: null })).length, 1);
     assert.equal(expectOk(queue.listJobs({ states: ['Running'], projectId: null })).length, 1);
-    assert.equal(expectOk(queue.listJobs({ states: ['Running'], projectId: 'proj-2' as ProjectId })).length, 0);
-    assert.equal(expectOk(queue.listJobs({ states: null, projectId: 'proj-2' as ProjectId })).length, 1);
+    assert.equal(expectOk(queue.listJobs({ states: ['Running'], projectId: OTHER_FIXTURE_PROJECT })).length, 0);
+    assert.equal(expectOk(queue.listJobs({ states: null, projectId: OTHER_FIXTURE_PROJECT })).length, 1);
 
     const rejected = queue.listJobs({ states: ['NotAState' as never], projectId: null });
     assert.equal(rejected.ok, false);
@@ -631,5 +722,61 @@ test('listJobs filters the attention dashboard view by state and project', async
     const illegal = queue.markState({ jobId: 'job-2' as JobId, state: 'Running', now: T0 });
     assert.equal(illegal.ok, false);
     assert.equal(illegal.ok ? '' : illegal.error.code, 'Invalid');
+  });
+});
+
+/**
+ * The schema's job state vocabulary is the domain's, exactly (R5, ADR 0003).
+ *
+ * A hand-written second list is how "the queue says Claimed and the domain says
+ * Preparing" happens: both tables look right, the two disagree, and a resumed run
+ * is written to a state the lifecycle forbids. This asserts the sets are EQUAL in
+ * both directions, so a state added to the domain cannot be silently accepted by
+ * a fresh database and rejected by a migrated one, and a state left behind in the
+ * schema cannot claim to be a lifecycle state at all.
+ */
+test("the schema's accepted job states are exactly the domain attempt states (R5)", async () => {
+  await withDatabase(async (queue) => {
+    expectOk(queue.enqueue(enqueueRequest()));
+
+    const accepted = new Set<string>();
+    for (const state of ATTEMPT_STATES) {
+      // Each state needs its own work item, because a job row is bound to one.
+      const outcome = expectOk(
+        queue.enqueue(
+          enqueueRequest({
+            operationId: `op-state-${state}` as OperationId,
+            jobId: `job-state-${state}` as JobId,
+          }),
+        ),
+      );
+      // The queue validates a transition against the domain lifecycle before it
+      // writes, so reaching a state directly would test that table rather than
+      // the column. Following a legal route keeps the assertion about what the
+      // schema is able to store.
+      let moved = { ok: true, value: outcome.job } as ReturnType<typeof queue.markState>;
+      for (const next of STATE_PATH[state] ?? []) {
+        if (!moved.ok) break;
+        moved = queue.markState({ jobId: outcome.job.jobId, state: next, now: T0 });
+      }
+      if (moved.ok && moved.value.state === state) accepted.add(state);
+    }
+
+    assert.deepEqual(
+      [...accepted].sort(),
+      [...ATTEMPT_STATES].sort(),
+      'every domain attempt state must be storable, and no others',
+    );
+
+    // The two states the schema used to allow and the domain does not define:
+    // 'Claimed' is a lease fact and 'Failed' is an attempt outcome, not a job state.
+    for (const state of ['Claimed', 'Failed']) {
+      const rejected = queue.markState({
+        jobId: 'job-1' as JobId,
+        state: state as never,
+        now: T0,
+      });
+      assert.equal(rejected.ok, false, `${state} must not be a domain attempt state`);
+    }
   });
 });

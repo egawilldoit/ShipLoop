@@ -14,6 +14,7 @@
  */
 
 import type {
+  AcceptanceState,
   AttentionItem,
   AttentionItemId,
   AttentionKind,
@@ -87,7 +88,36 @@ export interface StorageTransactions {
 export interface OwnerRecord {
   readonly ownerId: OwnerId;
   readonly displayName: string;
+  /** Sign-in address, or null when the owner was provisioned without one. */
+  readonly email: string | null;
   readonly createdAt: string;
+}
+
+/**
+ * The credential supplied when the owner is provisioned or updated.
+ *
+ * `passwordDigest` is the domain's encoded form, never a plaintext password:
+ * the repository stores what it is given and cannot verify a password, which
+ * keeps the hashing cost and its parameters in one place (F01-AC1).
+ */
+export interface OwnerCredentialInput {
+  readonly ownerId: OwnerId;
+  readonly email: string;
+  readonly passwordDigest: string;
+}
+
+/**
+ * A stored credential, as the repository returns it.
+ *
+ * Only the digest is ever read back, so this type cannot carry a plaintext
+ * password even by accident. The encoded form is the domain's own
+ * self-describing string, which is what lets a stronger cost be recognised
+ * later without a migration guess (F01-AC1).
+ */
+export interface OwnerCredentialRecord {
+  readonly ownerId: OwnerId;
+  readonly email: string;
+  readonly passwordDigest: string;
 }
 
 /**
@@ -243,7 +273,24 @@ export interface ConnectorCheckResult {
  */
 export type ProcedureStatus = 'Proposed' | 'Accepted' | 'Superseded' | 'Retired';
 
-export type ProcedureKind = 'ProjectFact' | 'Procedure' | 'Decision';
+/**
+ * What a versioned fact or procedure is.
+ *
+ * The two values are the ones `procedure_versions.kind` accepts in the migrated
+ * schema and the two mvp-spec section 7 names. Storage and the schema state the
+ * same vocabulary deliberately: a third kind that the column would refuse would
+ * make "valid to the domain, rejected by the database" expressible.
+ */
+export type ProcedureKind = 'Procedure' | 'Fact';
+
+/**
+ * Who authored a version.
+ *
+ * This is the schema's provenance enum, not a free-text note: whether a fact
+ * came from the owner, the repository or a provider determines how much
+ * authority a run may give it. The prose description belongs in `note`.
+ */
+export type ProcedureSource = 'Owner' | 'Repository' | 'Provider';
 
 export interface ProcedureVersion {
   readonly procedureVersionId: ProcedureVersionId;
@@ -253,7 +300,7 @@ export interface ProcedureVersion {
   readonly versionNumber: number;
   readonly kind: ProcedureKind;
   readonly scope: string;
-  readonly source: string;
+  readonly source: ProcedureSource;
   readonly sourceRevision: string | null;
   readonly content: string;
   readonly contentFingerprint: Fingerprint;
@@ -272,7 +319,7 @@ export interface AppendProcedureVersionInput {
   readonly subjectKey: string;
   readonly kind: ProcedureKind;
   readonly scope: string;
-  readonly source: string;
+  readonly source: ProcedureSource;
   readonly sourceRevision: string | null;
   readonly content: string;
   readonly status: ProcedureStatus;
@@ -284,7 +331,17 @@ export interface AppendProcedureVersionInput {
 
 export type IdeaKind = 'FeatureRequest' | 'Bug';
 
-export type IdeaState = 'Captured' | 'Clarifying' | 'Agreed' | 'Published' | 'Archived';
+/**
+ * Intake lifecycle.
+ *
+ * The vocabulary is the one `ideas.state` allows in the migrated schema, not a
+ * parallel list: an intake arrives `Received`, is `Clarifying` while the owner
+ * answers questions, becomes `Planned` once a brief is agreed, is `Published`
+ * once it produced work, and is `Abandoned` when the owner deferred it. The
+ * storage layer and the schema state the same five values deliberately, so a
+ * lifecycle state cannot be valid to the domain and rejected by the column.
+ */
+export type IdeaState = 'Received' | 'Clarifying' | 'Planned' | 'Published' | 'Abandoned';
 
 /**
  * Raw intake.
@@ -575,12 +632,26 @@ export interface RecordEvidenceInput {
   readonly correlationId: string | null;
 }
 
+/**
+ * What the owner decided.
+ *
+ * The vocabulary is the one `owner_decisions.decision_type` accepts in the
+ * migrated schema, and it separates the two permissions the product keeps
+ * distinct: `AcceptProduct` and `RequestChanges` say the behaviour is right or
+ * is not, and carry an acceptance state instead of a subject; the `Authorize*`
+ * types say "perform this exact action against this exact identity", and carry
+ * a subject fingerprint instead (F25, F26-AC1). A decision type is what tells
+ * the schema which of those two columns is required, so the two vocabularies
+ * cannot drift.
+ */
 export type OwnerDecisionType =
-  | 'Accepted'
-  | 'ChangesRequested'
-  | 'AuthorizedMerge'
-  | 'AuthorizedRelease'
-  | 'AuthorizedRecoveryRedeploy';
+  | 'AcceptProduct'
+  | 'RequestChanges'
+  | 'AuthorizeMerge'
+  | 'AuthorizeRelease'
+  | 'AuthorizeMergeAndRelease'
+  | 'AuthorizeRecovery'
+  | 'ResolveScopeChange';
 
 export type OwnerDecisionState = 'Recorded' | 'Consumed' | 'Invalidated';
 
@@ -598,10 +669,26 @@ export interface OwnerDecisionRecord {
   readonly workItemId: WorkItemId | null;
   readonly candidateFingerprint: Fingerprint;
   readonly scopeFingerprint: Fingerprint;
-  readonly actor: string;
+  /**
+   * The owner who made this decision.
+   *
+   * A real owner identity rather than a display string: the schema stores it as
+   * a foreign key, so a decision nobody can be held to is not representable
+   * (F32-AC1).
+   */
+  readonly actorOwnerId: OwnerId;
   readonly decisionType: OwnerDecisionType;
   readonly subject: AuthorizationSubject | null;
+  /**
+   * Present exactly for an authorization.
+   *
+   * The schema CHECKs this pairing, so an authorization can never be recorded
+   * without the subject it authorizes and an acceptance never carries a subject
+   * it does not have (F26-AC1, R3).
+   */
   readonly subjectFingerprint: Fingerprint | null;
+  /** Present exactly for an acceptance or a change request (F25). */
+  readonly acceptanceState: AcceptanceState | null;
   readonly note: string | null;
   readonly state: OwnerDecisionState;
   readonly consumedAt: string | null;
@@ -615,7 +702,7 @@ export interface RecordAcceptanceInput {
   readonly workItemId: WorkItemId;
   readonly candidateFingerprint: Fingerprint;
   readonly scopeFingerprint: Fingerprint;
-  readonly actor: string;
+  readonly actorOwnerId: OwnerId;
   readonly note: string | null;
   readonly createdAt: string;
   readonly correlationId: string | null;
@@ -625,14 +712,14 @@ export interface RecordChangesRequestedInput {
   readonly workItemId: WorkItemId;
   readonly candidateFingerprint: Fingerprint;
   readonly scopeFingerprint: Fingerprint;
-  readonly actor: string;
+  readonly actorOwnerId: OwnerId;
   readonly feedback: string;
   readonly createdAt: string;
   readonly correlationId: string | null;
 }
 
 export interface RecordAuthorizationInput extends RecordAcceptanceInput {
-  readonly decisionType: 'AuthorizedMerge' | 'AuthorizedRelease' | 'AuthorizedRecoveryRedeploy';
+  readonly decisionType: 'AuthorizeMerge' | 'AuthorizeRelease' | 'AuthorizeMergeAndRelease' | 'AuthorizeRecovery';
   readonly subject: AuthorizationSubject;
 }
 
@@ -646,8 +733,16 @@ export interface RecordAuthorizationInput extends RecordAcceptanceInput {
  * for the owner.
  */
 export interface OwnerStore {
-  provision(ownerId: OwnerId, displayName: string, createdAt: string): Result<OwnerRecord>;
+  provision(
+    ownerId: OwnerId,
+    displayName: string,
+    createdAt: string,
+    credential?: OwnerCredentialInput,
+  ): Result<OwnerRecord>;
   current(): Result<OwnerRecord | null>;
+  setCredential(input: OwnerCredentialInput): Result<OwnerCredentialRecord>;
+  findCredentialByEmail(email: string): Result<OwnerCredentialRecord | null>;
+  findCredentialByOwnerId(ownerId: OwnerId): Result<OwnerCredentialRecord | null>;
   createSession(input: CreateSessionInput): Result<OwnerSession>;
   authenticate(token: string, now: string): Result<OwnerSession>;
   rotateSession(input: RotateSessionInput): Result<OwnerSession>;

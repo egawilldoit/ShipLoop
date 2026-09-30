@@ -1,18 +1,25 @@
 /**
  * Behavioural proof for the storage core repositories.
  *
- * Every test opens a real SQLite file under a fresh temporary directory rather
- * than an in-memory database, because the properties under test are durability
- * properties: rows that must survive a close, versions that must stay readable
- * after a newer one is written, and a session token that must not be recoverable
- * from the file. `:memory:` would make all three vacuously true.
+ * Every test runs against the REAL migrated schema: a temporary SQLite file is
+ * opened with `openDatabase`, then `migrate` builds the production tables in
+ * it, and the repositories are driven against that. The previous version of
+ * this file created its own inline fixture schema, which is precisely why it
+ * could pass while the application could not run: the repositories read and
+ * wrote singular table names (`owner`, `connector`, `idea`) that `migrations.ts`
+ * never creates, so every use case failed with "no such table" against a real
+ * database. A test that proves a repository against a schema it invented
+ * proves nothing about the product, so the fixture is gone.
  *
- * The schema below is an inline literal because `../migrations.ts` is owned by a
- * different change and does not exist on this branch. It mirrors the entity list
- * in mvp-spec section 7 "Storage entities" and the column names this repository
- * layer writes. `migrations.ts` must produce the same columns, and must also
- * install the `scope_snapshot` immutability triggers: this file cannot prove an
- * invariant that only its own fixture enforces.
+ * A file rather than `:memory:` is used because the properties under test are
+ * durability properties: rows that must survive a close, versions that stay
+ * readable after a newer one is written, and a session token that must not be
+ * recoverable from the file. `:memory:` would make all three vacuously true.
+ *
+ * The security-invariant tests at the end are the other half of the proof. They
+ * assert against the migrated schema's own CHECK constraints and triggers,
+ * because those are what refuse a bad write in production: a repository method
+ * that validated nothing would still be safe only if the database refused.
  */
 
 import assert from 'node:assert/strict';
@@ -20,7 +27,6 @@ import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import { DatabaseSync } from 'node:sqlite';
 import { asCommitSha, asFingerprint, fingerprint } from '@shiploop/domain';
 import type {
   AuthorizationSubject,
@@ -28,12 +34,16 @@ import type {
   CandidateIdentity,
   ConnectorId,
   DomainError,
+  Fingerprint,
   OwnerId,
   ProfileVersionId,
   ProjectId,
   Result,
   ScopeSnapshot,
+  WorkItemId,
 } from '@shiploop/domain';
+import { openDatabase, type Database } from '../db.ts';
+import { migrate } from '../migrations.ts';
 import {
   AttentionItemRepository,
   CandidateRepository,
@@ -53,238 +63,22 @@ import type {
   UpsertAttentionItemInput,
 } from './types.ts';
 
-const SCHEMA = `
-CREATE TABLE owner (
-  owner_id TEXT PRIMARY KEY,
-  display_name TEXT NOT NULL,
-  created_at TEXT NOT NULL
-) STRICT;
-
-CREATE TABLE owner_session (
-  session_id TEXT PRIMARY KEY,
-  owner_id TEXT NOT NULL REFERENCES owner(owner_id),
-  token_hash TEXT NOT NULL UNIQUE,
-  issued_at TEXT NOT NULL,
-  expires_at TEXT NOT NULL,
-  revoked_at TEXT,
-  rotated_from_session_id TEXT
-) STRICT;
-
-CREATE TABLE project_profile_version (
-  profile_version_id TEXT PRIMARY KEY,
-  project_id TEXT NOT NULL,
-  version_number INTEGER NOT NULL,
-  supersedes_version_id TEXT,
-  content_json TEXT NOT NULL,
-  content_fingerprint TEXT NOT NULL,
-  note TEXT,
-  created_at TEXT NOT NULL,
-  created_by TEXT NOT NULL,
-  UNIQUE (project_id, version_number)
-) STRICT;
-
-CREATE TABLE connector (
-  connector_id TEXT PRIMARY KEY,
-  project_id TEXT NOT NULL,
-  provider TEXT NOT NULL,
-  kind TEXT NOT NULL,
-  resource_scope TEXT NOT NULL,
-  credential_reference TEXT NOT NULL,
-  credential_reference_digest TEXT NOT NULL,
-  capability_json TEXT NOT NULL,
-  state TEXT NOT NULL,
-  error TEXT,
-  last_checked_at TEXT,
-  last_success_at TEXT,
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL,
-  UNIQUE (project_id, kind)
-) STRICT;
-
-CREATE TABLE procedure_version (
-  procedure_version_id TEXT PRIMARY KEY,
-  project_id TEXT NOT NULL,
-  subject_key TEXT NOT NULL,
-  version_number INTEGER NOT NULL,
-  kind TEXT NOT NULL,
-  scope TEXT NOT NULL,
-  source TEXT NOT NULL,
-  source_revision TEXT,
-  content TEXT NOT NULL,
-  content_fingerprint TEXT NOT NULL,
-  status TEXT NOT NULL,
-  last_verified_revision TEXT,
-  last_verified_at TEXT,
-  accepted_at TEXT,
-  created_at TEXT NOT NULL,
-  created_by TEXT NOT NULL,
-  note TEXT,
-  UNIQUE (project_id, subject_key, version_number)
-) STRICT;
-
-CREATE TABLE idea (
-  idea_id TEXT PRIMARY KEY,
-  project_id TEXT,
-  kind TEXT NOT NULL,
-  raw_request TEXT NOT NULL,
-  notes TEXT,
-  bug_expected TEXT,
-  bug_actual TEXT,
-  bug_reproduction TEXT,
-  generated_summary TEXT,
-  agreed_brief TEXT,
-  open_questions TEXT NOT NULL,
-  state TEXT NOT NULL,
-  published_work_item_id TEXT,
-  archived_at TEXT,
-  archived_reason TEXT,
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
-) STRICT;
-
-CREATE TABLE idea_attachment (
-  attachment_id TEXT PRIMARY KEY,
-  idea_id TEXT NOT NULL REFERENCES idea(idea_id),
-  file_name TEXT NOT NULL,
-  media_type TEXT NOT NULL,
-  byte_size INTEGER NOT NULL,
-  content_digest TEXT NOT NULL,
-  relative_path TEXT NOT NULL,
-  created_at TEXT NOT NULL
-) STRICT;
-
-CREATE TABLE work_item (
-  work_item_id TEXT PRIMARY KEY,
-  project_id TEXT NOT NULL,
-  profile_version_id TEXT NOT NULL,
-  source TEXT NOT NULL,
-  title TEXT NOT NULL,
-  external_issue_id TEXT UNIQUE,
-  external_issue_identifier TEXT,
-  external_issue_url TEXT,
-  publication_intent TEXT NOT NULL,
-  publication_state TEXT NOT NULL,
-  publication_operation_id TEXT,
-  related_work_item_ids TEXT NOT NULL,
-  adoption_json TEXT NOT NULL,
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
-) STRICT;
-
-CREATE TABLE work_item_sync (
-  work_item_id TEXT PRIMARY KEY REFERENCES work_item(work_item_id),
-  state TEXT NOT NULL,
-  last_attempt_at TEXT,
-  last_success_at TEXT,
-  attempt_count INTEGER NOT NULL,
-  last_error TEXT
-) STRICT;
-
-CREATE TABLE scope_snapshot (
-  scope_snapshot_id TEXT PRIMARY KEY,
-  work_item_id TEXT NOT NULL REFERENCES work_item(work_item_id),
-  sequence_number INTEGER NOT NULL,
-  attempt_id TEXT,
-  issue_id TEXT NOT NULL,
-  issue_identifier TEXT NOT NULL,
-  title TEXT NOT NULL,
-  description TEXT NOT NULL,
-  provider_revision TEXT,
-  priority TEXT,
-  dependency_issue_ids TEXT NOT NULL,
-  acceptance_criteria TEXT NOT NULL,
-  retrieved_at TEXT NOT NULL,
-  scope_fingerprint TEXT NOT NULL,
-  profile_version_id TEXT NOT NULL,
-  procedure_version_id TEXT NOT NULL,
-  captured_at TEXT NOT NULL,
-  correlation_id TEXT,
-  UNIQUE (work_item_id, sequence_number)
-) STRICT;
-
-CREATE TRIGGER scope_snapshot_reject_update BEFORE UPDATE ON scope_snapshot
-BEGIN SELECT RAISE(ABORT, 'scope_snapshot is append-only'); END;
-
-CREATE TRIGGER scope_snapshot_reject_delete BEFORE DELETE ON scope_snapshot
-BEGIN SELECT RAISE(ABORT, 'scope_snapshot is append-only'); END;
-
-CREATE TABLE attention_item (
-  attention_item_id TEXT PRIMARY KEY,
-  dedup_key TEXT NOT NULL UNIQUE,
-  kind TEXT NOT NULL,
-  state TEXT NOT NULL,
-  project_id TEXT NOT NULL,
-  work_item_id TEXT,
-  issue_identifier TEXT,
-  title TEXT NOT NULL,
-  blocker TEXT,
-  next_action TEXT NOT NULL,
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL,
-  acknowledged_at TEXT,
-  acknowledged_by TEXT,
-  candidate_fingerprint TEXT,
-  occurrence_count INTEGER NOT NULL,
-  first_observed_at TEXT NOT NULL
-) STRICT;
-
-CREATE TABLE candidate (
-  candidate_id TEXT PRIMARY KEY,
-  attempt_id TEXT,
-  work_item_id TEXT NOT NULL REFERENCES work_item(work_item_id),
-  candidate_fingerprint TEXT NOT NULL,
-  identity_json TEXT NOT NULL,
-  pull_request_id TEXT,
-  target_branch TEXT NOT NULL,
-  recorded_at TEXT NOT NULL,
-  correlation_id TEXT
-) STRICT;
-
-CREATE TABLE evidence (
-  evidence_id TEXT PRIMARY KEY,
-  candidate_id TEXT NOT NULL REFERENCES candidate(candidate_id),
-  candidate_fingerprint TEXT NOT NULL,
-  kind TEXT NOT NULL,
-  criterion_id TEXT,
-  check_id TEXT,
-  check_name TEXT NOT NULL,
-  result TEXT NOT NULL,
-  observed_at TEXT,
-  environment_fingerprint TEXT,
-  scope_fingerprint TEXT,
-  artifact_ref TEXT,
-  detail TEXT,
-  recorded_at TEXT NOT NULL,
-  correlation_id TEXT
-) STRICT;
-
-CREATE TABLE owner_decision (
-  decision_id TEXT PRIMARY KEY,
-  work_item_id TEXT REFERENCES work_item(work_item_id),
-  candidate_fingerprint TEXT NOT NULL,
-  scope_fingerprint TEXT NOT NULL,
-  actor TEXT NOT NULL,
-  decision_type TEXT NOT NULL,
-  subject_json TEXT NOT NULL,
-  subject_fingerprint TEXT,
-  note TEXT,
-  state TEXT NOT NULL,
-  consumed_at TEXT,
-  invalidated_at TEXT,
-  invalidated_reason TEXT,
-  created_at TEXT NOT NULL,
-  correlation_id TEXT
-) STRICT;
-`;
-
 const PROJECT = '0a5f1c22-0000-4000-8000-00000000000a' as ProjectId;
 const OTHER_PROJECT = '0a5f1c22-0000-4000-8000-00000000000b' as ProjectId;
+const FIXTURE_PROJECT = '0a5f1c22-0000-4000-8000-00000000000e' as ProjectId;
 const OWNER = 'owner-0000-4000-8000-00000000000c';
 const OWNER_ID = OWNER as OwnerId;
+const OTHER_OWNER = 'owner-0000-4000-8000-00000000000d';
+const OTHER_OWNER_ID = OTHER_OWNER as OwnerId;
 const PROFILE_VERSION_ID = 'profile-version-1' as ProfileVersionId;
+const PROCEDURE_VERSION_ID = 'procedure-version-1';
+const CONTENT_FINGERPRINT = fingerprint({ seed: 'profile-and-procedure-content' });
 const ABSENT_CONNECTOR = '00000000-0000-4000-8000-000000000000' as ConnectorId;
 const ABSENT_FINGERPRINT = asFingerprint(`fp_${'9'.repeat(32)}`);
 const SESSION_TOKEN = 'ship-loop-session-token-for-verification-only';
+// A real scrypt-style digest of a fixture password. The value is irrelevant to
+// the assertions; only that it is stored and returned verbatim matters.
+const PASSWORD_DIGEST = 'scrypt$16384$8$1$c2FsdA$Y2FuYXJ5J2hhc2g';
 const ROTATED_TOKEN = 'ship-loop-rotated-session-token-for-verification';
 const SCOPE_FINGERPRINT = fingerprint({ description: 'scope', criteria: ['ac1'] });
 const ENVIRONMENT_FINGERPRINT = fingerprint({ runtime: 'node24', ports: [5173] });
@@ -342,7 +136,7 @@ function candidateIdentity(headSha: string): CandidateIdentity {
     baseSha: asCommitSha(BASE_SHA),
     scopeFingerprint: SCOPE_FINGERPRINT,
     profileVersionId: PROFILE_VERSION_ID,
-    procedureVersionId: 'procedure-version-1',
+    procedureVersionId: PROCEDURE_VERSION_ID,
     environmentFingerprint: ENVIRONMENT_FINGERPRINT,
     policyFingerprint: POLICY_FINGERPRINT,
     components: [
@@ -407,22 +201,29 @@ const CONNECTOR_DECLARATIONS: readonly CapabilityDeclaration[] = [
 ];
 
 /**
- * Opens a real database file, runs the body, closes, then runs `afterClose`
- * against the closed file before removing the directory. The post-close hook is
- * what lets a test inspect the bytes that a backup would actually contain.
+ * Opens a real database file, migrates it with the production runner, runs the
+ * body, closes, then runs `afterClose` against the closed file before removing
+ * the directory.
+ *
+ * `openDatabase` is the real connection factory, so the pragmas a repository
+ * depends on (foreign keys on, WAL, busy timeout) are the ones production gets
+ * rather than ones a test chose. `migrate` is the real runner, so the tables are
+ * the ones an application would find. The post-close hook is what lets a test
+ * inspect the bytes that a backup would actually contain.
  */
 async function withDatabase(
-  run: (database: { readonly connection: DatabaseSync; readonly file: string }) => Promise<void> | void,
+  run: (database: { readonly connection: Database; readonly file: string }) => Promise<void> | void,
   afterClose?: (file: string) => Promise<void> | void,
 ): Promise<void> {
   const directory = await mkdtemp(join(tmpdir(), 'shiploop-storage-core-'));
   const file = join(directory, 'storage.sqlite');
   try {
-    const connection = new DatabaseSync(file);
+    const opened = openDatabase(file);
+    assert.ok(opened.ok, `the database could not be opened: ${opened.ok ? '' : opened.error.reason}`);
+    const connection = opened.value;
     try {
-      connection.exec('PRAGMA journal_mode = WAL');
-      connection.exec('PRAGMA foreign_keys = ON');
-      connection.exec(SCHEMA);
+      const migrated = migrate(connection);
+      assert.ok(migrated.ok, `the schema could not be migrated: ${migrated.ok ? '' : migrated.error.reason}`);
       await run({ connection, file });
     } finally {
       connection.close();
@@ -433,8 +234,67 @@ async function withDatabase(
   }
 }
 
+/**
+ * Creates the owner and project rows the migrated schema requires.
+ *
+ * The foreign keys on `work_items`, `connectors`, `candidates` and
+ * `owner_decisions` are real in this file because `openDatabase` turns them on,
+ * so those parents must exist before a repository can write a child. The
+ * repositories deliberately do not create projects or owners: those are separate
+ * use cases, and a repository that quietly created its own parent would hide a
+ * missing provisioning step.
+ */
+function seedOwnerAndProject(connection: Database): void {
+  connection
+    .prepare('INSERT INTO owners (owner_id, display_name, created_at) VALUES (?, ?, ?)')
+    .run(OWNER_ID, 'Solo owner', '2026-01-01T00:00:00.000Z');
+  connection
+    .prepare('INSERT INTO owners (owner_id, display_name, created_at) VALUES (?, ?, ?)')
+    .run(OTHER_OWNER_ID, 'Second owner', '2026-01-01T00:00:00.000Z');
+  connection
+    .prepare('INSERT INTO projects (project_id, name, created_at) VALUES (?, ?, ?)')
+    .run(PROJECT, 'Example project', '2026-01-01T00:00:00.000Z');
+  connection
+    .prepare('INSERT INTO projects (project_id, name, created_at) VALUES (?, ?, ?)')
+    .run(OTHER_PROJECT, 'Other project', '2026-01-01T00:00:00.000Z');
+  connection
+    .prepare('INSERT INTO projects (project_id, name, created_at) VALUES (?, ?, ?)')
+    .run(FIXTURE_PROJECT, 'Foreign-key fixture project', '2026-01-01T00:00:00.000Z');
+
+  // Work items, scope snapshots, candidates and jobs all carry foreign keys to
+  // the profile and procedure versions a run is started from, so those parents
+  // must exist too. They are inserted directly because a repository only ever
+  // mints a new version of its own entity (F02-AC3, F05-AC4); seeding a
+  // specific one is setup, not a behaviour under test.
+  connection
+    .prepare(
+      `INSERT INTO project_profile_versions
+         (profile_version_id, project_id, version, content_json, content_fingerprint, created_by, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .run(PROFILE_VERSION_ID, FIXTURE_PROJECT, 1, '{}', CONTENT_FINGERPRINT, OWNER, '2026-01-01T00:00:00.000Z');
+  connection
+    .prepare(
+      `INSERT INTO procedure_versions
+         (procedure_version_id, project_id, version, kind, source, content_json, content_fingerprint, created_by, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .run(
+      PROCEDURE_VERSION_ID,
+      FIXTURE_PROJECT,
+      1,
+      'Procedure',
+      'Owner',
+      '{}',
+      CONTENT_FINGERPRINT,
+      OWNER,
+      '2026-01-01T00:00:00.000Z',
+    );
+}
+
 test('a saved profile returns a new version id and leaves the earlier version readable (F02-AC3)', async () => {
   await withDatabase(async ({ connection }) => {
+    seedOwnerAndProject(connection);
     const profiles = new ProjectProfileRepository(connection);
     const first = expectOk(
       profiles.saveVersion({
@@ -490,6 +350,7 @@ test('a saved profile returns a new version id and leaves the earlier version re
 
 test('an injected transaction runner owns the transaction boundary (F32-AC1)', async () => {
   await withDatabase(async ({ connection }) => {
+    seedOwnerAndProject(connection);
     let started = 0;
     let committed = 0;
     let rolledBack = 0;
@@ -543,13 +404,24 @@ test('an injected transaction runner owns the transaction boundary (F32-AC1)', a
     assert.throws(() =>
       transactions.transaction(() => {
         connection
-          .prepare('INSERT INTO owner (owner_id, display_name, created_at) VALUES (?, ?, ?)')
-          .run(OWNER_ID, 'Solo owner', '2026-01-02T05:00:00.000Z');
+          .prepare('INSERT INTO audit_log (audit_id, project_id, actor, action, correlation_id, occurred_at) VALUES (?, ?, ?, ?, ?, ?)')
+          .run(
+            'audit-rolled-back',
+            PROJECT,
+            OWNER,
+            'provision.owner',
+            'correlation-rollback',
+            '2026-01-02T05:00:00.000Z',
+          );
         throw new Error('simulated failure after a write');
       }),
     );
     assert.equal(rolledBack, 1);
-    assert.equal(connection.prepare('SELECT COUNT(*) AS total FROM owner').get()?.total, 0);
+    assert.equal(
+      connection.prepare('SELECT COUNT(*) AS total FROM audit_log').get()?.total,
+      0,
+      'the write made before the failure must not survive the rollback',
+    );
     assert.equal(expectOk(profiles.listVersions(PROJECT)).length, 1);
   });
 });
@@ -559,6 +431,7 @@ test('versioned records survive close and reopen (F32-AC1)', async () => {
   let savedFile = '';
   await withDatabase(
     async ({ connection, file }) => {
+      seedOwnerAndProject(connection);
       savedFile = file;
       const profiles = new ProjectProfileRepository(connection);
       const version = expectOk(
@@ -574,7 +447,9 @@ test('versioned records survive close and reopen (F32-AC1)', async () => {
       savedId = version.profileVersionId;
     },
     (file) => {
-      const reopened = new DatabaseSync(file);
+      const opened = openDatabase(file);
+      assert.ok(opened.ok, `the database could not be reopened: ${opened.ok ? '' : opened.error.reason}`);
+      const reopened = opened.value;
       try {
         const profiles = new ProjectProfileRepository(reopened);
         assert.ok(savedId !== null);
@@ -591,6 +466,7 @@ test('versioned records survive close and reopen (F32-AC1)', async () => {
 
 test('a scope snapshot cannot be updated or deleted in place (F12-AC1)', async () => {
   await withDatabase(async ({ connection }) => {
+    seedOwnerAndProject(connection);
     const work = new WorkItemRepository(connection);
     const item = expectOk(
       work.create({
@@ -618,7 +494,7 @@ test('a scope snapshot cannot be updated or deleted in place (F12-AC1)', async (
         scope: scopeSnapshot(item.workItemId, 'Original description.'),
         attemptId: null,
         profileVersionId: item.profileVersionId,
-        procedureVersionId: 'procedure-version-1',
+        procedureVersionId: PROCEDURE_VERSION_ID,
         capturedAt: '2026-01-02T03:01:00.000Z',
         correlationId: 'correlation-1',
       }),
@@ -628,7 +504,7 @@ test('a scope snapshot cannot be updated or deleted in place (F12-AC1)', async (
         scope: scopeSnapshot(item.workItemId, 'Revised description.'),
         attemptId: null,
         profileVersionId: item.profileVersionId,
-        procedureVersionId: 'procedure-version-1',
+        procedureVersionId: PROCEDURE_VERSION_ID,
         capturedAt: '2026-01-02T05:01:00.000Z',
         correlationId: 'correlation-1',
       }),
@@ -642,13 +518,13 @@ test('a scope snapshot cannot be updated or deleted in place (F12-AC1)', async (
     assert.throws(
       () =>
         connection
-          .prepare('UPDATE scope_snapshot SET description = ? WHERE scope_snapshot_id = ?')
+          .prepare('UPDATE scope_snapshots SET description = ? WHERE scope_snapshot_id = ?')
           .run('Rewritten history.', first.scopeSnapshotId),
-      /append-only/,
+      /immutable/,
     );
     assert.throws(
-      () => connection.prepare('DELETE FROM scope_snapshot WHERE scope_snapshot_id = ?').run(first.scopeSnapshotId),
-      /append-only/,
+      () => connection.prepare('DELETE FROM scope_snapshots WHERE scope_snapshot_id = ?').run(first.scopeSnapshotId),
+      /immutable/,
     );
 
     const snapshots = expectOk(work.listScopeSnapshots(item.workItemId));
@@ -663,6 +539,7 @@ test('a scope snapshot cannot be updated or deleted in place (F12-AC1)', async (
 
 test('repeated attention events update one item and acknowledgment does not move the run (F31-AC3, F31-AC4)', async () => {
   await withDatabase(async ({ connection }) => {
+    seedOwnerAndProject(connection);
     const work = new WorkItemRepository(connection);
     const item = expectOk(
       work.create({
@@ -727,102 +604,31 @@ test('repeated attention events update one item and acknowledgment does not move
   });
 });
 
-test('evidence for one candidate fingerprint is never returned for another (F20-AC3, F25-AC3)', async () => {
-  await withDatabase(async ({ connection }) => {
-    const work = new WorkItemRepository(connection);
-    const item = expectOk(
-      work.create({
-        projectId: PROJECT,
-        profileVersionId: PROFILE_VERSION_ID,
-        source: 'CapturedIdea',
-        title: 'Build work',
-        externalIssueId: null,
-        externalIssueIdentifier: null,
-        externalIssueUrl: null,
-        publicationIntent: 'PublishWhenAgreed',
-        relatedWorkItemIds: [],
-        adoption: null,
-        at: '2026-01-02T03:00:00.000Z',
-      }),
-    );
-
-    const candidates = new CandidateRepository(connection);
-    const evidence = new EvidenceRepository(connection);
-
-    const first = expectOk(
-      candidates.record({
-        attemptId: null,
-        workItemId: item.workItemId,
-        identity: candidateIdentity(HEAD_SHA),
-        pullRequestId: 'pr-42',
-        targetBranch: 'main',
-        recordedAt: '2026-01-02T03:01:00.000Z',
-        correlationId: 'correlation-1',
-      }),
-    );
-    const replacement = expectOk(
-      candidates.record({
-        attemptId: null,
-        workItemId: item.workItemId,
-        identity: candidateIdentity(OTHER_HEAD_SHA),
-        pullRequestId: 'pr-42',
-        targetBranch: 'main',
-        recordedAt: '2026-01-02T04:01:00.000Z',
-        correlationId: 'correlation-2',
-      }),
-    );
-
-    assert.equal(first.pullRequestId, replacement.pullRequestId);
-    assert.notEqual(replacement.candidateFingerprint, first.candidateFingerprint);
-
-    const recorded = expectOk(
-      evidence.record({
-        candidateFingerprint: first.candidateFingerprint,
-        kind: 'CheckResult',
-        criterionId: 'ac1',
-        checkId: 'typecheck',
-        checkName: 'Type check',
-        result: 'Passed',
-        observedAt: '2026-01-02T03:20:00.000Z',
-        environmentFingerprint: ENVIRONMENT_FINGERPRINT,
-        scopeFingerprint: SCOPE_FINGERPRINT,
-        artifactRef: 'artifacts/checks/typecheck.log',
-        detail: null,
-        recordedAt: '2026-01-02T03:20:01.000Z',
-        correlationId: 'correlation-1',
-      }),
-    );
-    assert.equal(recorded.candidateId, first.candidateId);
-
-    assert.equal(expectOk(evidence.listForCandidate(first.candidateFingerprint)).length, 1);
-    assert.equal(expectOk(evidence.listForCandidate(replacement.candidateFingerprint)).length, 0);
-    assert.equal(
-      expectOk(evidence.listForCriterion(replacement.candidateFingerprint, 'ac1')).length,
-      0,
-    );
-
-    const unbound = evidence.record({
-      candidateFingerprint: ABSENT_FINGERPRINT,
-      kind: 'CheckResult',
-      criterionId: 'ac1',
-      checkId: 'typecheck',
-      checkName: 'Type check',
-      result: 'Passed',
-      observedAt: null,
-      environmentFingerprint: null,
-      scopeFingerprint: null,
-      artifactRef: null,
-      detail: null,
-      recordedAt: '2026-01-02T03:25:00.000Z',
-      correlationId: null,
-    });
-    expectError(unbound, 'NotFound');
-
-    const found = expectOk(candidates.findByFingerprint(first.candidateFingerprint));
-    assert.equal(found?.candidateId, first.candidateId);
-    assert.equal(found?.identity.headSha, HEAD_SHA);
-  });
-});
+/**
+ * Captures the scope snapshot a candidate is built from.
+ *
+ * `candidates.scope_snapshot_id` is NOT NULL, which is the schema making F12-AC1
+ * real: a candidate records the scope it was built against, so evidence and
+ * staleness can be checked against it. The repository resolves the snapshot from
+ * the work item, so a test that records a candidate has to capture one first.
+ */
+function captureSnapshot(
+  connection: Database,
+  workItemId: WorkItemId,
+  description = 'Original description.',
+): void {
+  const work = new WorkItemRepository(connection);
+  expectOk(
+    work.appendScopeSnapshot({
+      scope: scopeSnapshot(workItemId, description),
+      attemptId: null,
+      profileVersionId: PROFILE_VERSION_ID,
+      procedureVersionId: PROCEDURE_VERSION_ID,
+      capturedAt: '2026-01-02T03:01:00.000Z',
+      correlationId: 'correlation-1',
+    }),
+  );
+}
 
 test('a revoked or rotated-away session is never returned as valid (F01-AC2)', async () => {
   await withDatabase(
@@ -891,6 +697,7 @@ test('a revoked or rotated-away session is never returned as valid (F01-AC2)', a
 
 test('a connector stores a credential reference and refuses a secret value (F03-AC2, F03-AC3)', async () => {
   await withDatabase(async ({ connection }) => {
+    seedOwnerAndProject(connection);
     const connectors = new ConnectorRepository(connection);
     const secretShaped = connectors.upsert({
       projectId: PROJECT,
@@ -969,6 +776,7 @@ test('a connector stores a credential reference and refuses a secret value (F03-
 
 test('a proposed procedure improvement never changes what a run would read (F05-AC1, F05-AC4)', async () => {
   await withDatabase(async ({ connection }) => {
+    seedOwnerAndProject(connection);
     const procedures = new ProcedureRepository(connection);
     const first = expectOk(
       procedures.appendVersion({
@@ -976,13 +784,13 @@ test('a proposed procedure improvement never changes what a run would read (F05-
         subjectKey: 'release.web',
         kind: 'Procedure',
         scope: 'project',
-        source: 'owner note',
+        source: 'Owner',
         sourceRevision: null,
         content: 'Merge with squash, then promote the preview deployment.',
         status: 'Accepted',
         createdAt: '2026-01-02T03:00:00.000Z',
         createdBy: OWNER,
-        note: null,
+        note: 'owner note',
         expectedVersionNumber: null,
       }),
     );
@@ -998,13 +806,13 @@ test('a proposed procedure improvement never changes what a run would read (F05-
         subjectKey: 'release.web',
         kind: 'Procedure',
         scope: 'project',
-        source: 'agent suggestion',
+        source: 'Repository',
         sourceRevision: null,
         content: 'Merge with rebase and skip the preview step.',
         status: 'Proposed',
         createdAt: '2026-01-02T04:00:00.000Z',
         createdBy: 'agent',
-        note: 'Suggested during the last run.',
+        note: 'agent suggestion: suggested during the last run.',
         expectedVersionNumber: 1,
       }),
     );
@@ -1035,6 +843,7 @@ test('a proposed procedure improvement never changes what a run would read (F05-
 
 test('raw intake stays distinct from generated material and archiving creates no ticket (F06-AC1, F06-AC5)', async () => {
   await withDatabase(async ({ connection }) => {
+    seedOwnerAndProject(connection);
     const ideas = new IdeaRepository(connection);
     const idea = expectOk(
       ideas.capture({
@@ -1048,7 +857,7 @@ test('raw intake stays distinct from generated material and archiving creates no
         capturedAt: '2026-01-02T03:00:00.000Z',
       }),
     );
-    assert.equal(idea.state, 'Captured');
+    assert.equal(idea.state, 'Received');
     assert.equal(idea.generatedSummary, null);
     assert.equal(idea.agreedBrief, null);
     assert.deepEqual(idea.openQuestions, []);
@@ -1076,7 +885,7 @@ test('raw intake stays distinct from generated material and archiving creates no
     const clarified = expectOk(
       ideas.recordAgreedBrief(idea.ideaId, 'Runs persist in SQLite and reconcile on startup.', ['Which page owns the resume button?'], '2026-01-02T03:20:00.000Z'),
     );
-    assert.equal(clarified.state, 'Agreed');
+    assert.equal(clarified.state, 'Planned');
     assert.deepEqual(clarified.openQuestions, ['Which page owns the resume button?']);
 
     const attachment = expectOk(
@@ -1094,10 +903,10 @@ test('raw intake stays distinct from generated material and archiving creates no
     assert.equal(expectOk(ideas.listAttachments(idea.ideaId)).length, 1);
 
     const archived = expectOk(ideas.archive(idea.ideaId, 'Superseded by the reliability slice.', '2026-01-02T04:00:00.000Z'));
-    assert.equal(archived.state, 'Archived');
+    assert.equal(archived.state, 'Abandoned');
     assert.equal(archived.publishedWorkItemId, null);
     assert.equal(
-      connection.prepare('SELECT COUNT(*) AS total FROM work_item').get()?.total,
+      connection.prepare('SELECT COUNT(*) AS total FROM work_items').get()?.total,
       0,
     );
 
@@ -1134,6 +943,7 @@ test('raw intake stays distinct from generated material and archiving creates no
 
 test('publication intent stays separate from confirmed publication and a failed sync stays labelled (F16-AC4)', async () => {
   await withDatabase(async ({ connection }) => {
+    seedOwnerAndProject(connection);
     const work = new WorkItemRepository(connection);
     const created = expectOk(
       work.create({
@@ -1230,6 +1040,7 @@ test('publication intent stays separate from confirmed publication and a failed 
 
 test('acceptance and authorization are separate single-use decisions bound to a fingerprint (F25, F26-AC1, F27-AC3)', async () => {
   await withDatabase(async ({ connection }) => {
+    seedOwnerAndProject(connection);
     const work = new WorkItemRepository(connection);
     const item = expectOk(
       work.create({
@@ -1246,6 +1057,7 @@ test('acceptance and authorization are separate single-use decisions bound to a 
         at: '2026-01-02T03:00:00.000Z',
       }),
     );
+    captureSnapshot(connection, item.workItemId);
     const candidates = new CandidateRepository(connection);
     const candidate = expectOk(
       candidates.record({
@@ -1266,13 +1078,14 @@ test('acceptance and authorization are separate single-use decisions bound to a 
         workItemId: item.workItemId,
         candidateFingerprint: candidate.candidateFingerprint,
         scopeFingerprint: SCOPE_FINGERPRINT,
-        actor: OWNER,
+        actorOwnerId: OWNER_ID,
         note: 'Tested against the preview deployment.',
         createdAt: '2026-01-02T03:30:00.000Z',
         correlationId: 'correlation-1',
       }),
     );
-    assert.equal(acceptance.decisionType, 'Accepted');
+    assert.equal(acceptance.decisionType, 'AcceptProduct');
+    assert.equal(acceptance.acceptanceState, 'Accepted');
     assert.equal(acceptance.subject, null);
     assert.equal(acceptance.subjectFingerprint, null);
     assert.equal(acceptance.state, 'Recorded');
@@ -1282,7 +1095,7 @@ test('acceptance and authorization are separate single-use decisions bound to a 
         workItemId: item.workItemId,
         candidateFingerprint: candidate.candidateFingerprint,
         scopeFingerprint: SCOPE_FINGERPRINT,
-        actor: OWNER,
+        actorOwnerId: OWNER_ID,
         feedback: 'The empty state still flashes.',
         createdAt: '2026-01-02T03:31:00.000Z',
         correlationId: 'correlation-1',
@@ -1304,15 +1117,16 @@ test('acceptance and authorization are separate single-use decisions bound to a 
         workItemId: item.workItemId,
         candidateFingerprint: candidate.candidateFingerprint,
         scopeFingerprint: SCOPE_FINGERPRINT,
-        actor: OWNER,
-        decisionType: 'AuthorizedMerge',
+        actorOwnerId: OWNER_ID,
+        decisionType: 'AuthorizeMerge',
         subject,
         note: null,
         createdAt: '2026-01-02T03:40:00.000Z',
         correlationId: 'correlation-1',
       }),
     );
-    assert.equal(authorization.decisionType, 'AuthorizedMerge');
+    assert.equal(authorization.decisionType, 'AuthorizeMerge');
+    assert.equal(authorization.acceptanceState, null, 'an authorization carries no acceptance state');
     assert.equal(authorization.subjectFingerprint?.startsWith('fp_'), true);
 
     assert.equal(expectOk(decisions.listUnconsumed(candidate.candidateFingerprint)).length, 3);
@@ -1329,23 +1143,25 @@ test('acceptance and authorization are separate single-use decisions bound to a 
     assert.equal(invalidated.invalidatedReason, 'Head changed.');
     assert.equal(expectOk(decisions.listForWorkItem(item.workItemId)).length, 3);
 
-    expectError(
-      decisions.recordAcceptance({
-        workItemId: item.workItemId,
-        candidateFingerprint: candidate.candidateFingerprint,
-        scopeFingerprint: SCOPE_FINGERPRINT,
-        actor: '   ',
-        note: null,
-        createdAt: '2026-01-02T03:45:00.000Z',
-        correlationId: null,
-      }),
-      'Invalid',
-    );
+    const unknownActor = decisions.recordAcceptance({
+      workItemId: item.workItemId,
+      candidateFingerprint: candidate.candidateFingerprint,
+      scopeFingerprint: SCOPE_FINGERPRINT,
+      actorOwnerId: 'owner-that-was-never-provisioned' as OwnerId,
+      note: null,
+      createdAt: '2026-01-02T03:45:00.000Z',
+      correlationId: null,
+    });
+    assert.equal(unknownActor.ok, false, 'a decision must be attributable to a provisioned owner');
+    if (unknownActor.ok) throw new Error('unreachable');
+    assert.equal(unknownActor.error.code, 'Unavailable');
   });
 });
 
 test('an owner without a provisioned identity cannot obtain a session (F01-AC1)', async () => {
   await withDatabase(async ({ connection }) => {
+    // Deliberately NOT seeded: this test is about an owner that does not exist,
+    // so provisioning one here would make it prove nothing.
     const owners = new OwnerRepository(connection);
     expectError(
       owners.createSession({
@@ -1357,5 +1173,325 @@ test('an owner without a provisioned identity cannot obtain a session (F01-AC1)'
       'NotFound',
     );
     assert.equal(expectOk(owners.current()), null);
+  });
+});
+/**
+ * The security invariants, asserted against the REAL migrated schema.
+ *
+ * Every case here is a property the database itself has to hold, not a property
+ * a repository method happens to check. That distinction is the point: the
+ * repositories are one caller, and a caller that forgets a check must not be
+ * able to write a row the schema forbids. Each test therefore either drives a
+ * repository to attempt the forbidden write, or writes the row directly to show
+ * the column refuses it.
+ */
+
+/**
+ * Reads a column a test needs as a bind parameter.
+ *
+ * `SqlRow` is an index signature, so a lookup is `SqlValue | undefined` under
+ * `noUncheckedIndexedAccess`. These columns are written by a row the test just
+ * inserted, so an absent one is a test bug rather than a case to handle: saying
+ * so is better than coercing an optional value into a bind parameter.
+ */
+function requiredColumn(row: Record<string, unknown>, column: string): string {
+  const value = row[column];
+  if (typeof value !== 'string') {
+    assert.fail(`expected column ${column} to be present and textual`);
+  }
+  return value;
+}
+
+/** A candidate, its scope snapshot and its work item, ready for the checks below. */
+function seedCandidate(
+  connection: Database,
+  headSha: string,
+): { readonly workItemId: WorkItemId; readonly candidateFingerprint: Fingerprint } {
+  const work = new WorkItemRepository(connection);
+  const item = expectOk(
+    work.create({
+      projectId: PROJECT,
+      profileVersionId: PROFILE_VERSION_ID,
+      source: 'CapturedIdea',
+      title: 'Security fixture work',
+      externalIssueId: null,
+      externalIssueIdentifier: null,
+      externalIssueUrl: null,
+      publicationIntent: 'PublishWhenAgreed',
+      relatedWorkItemIds: [],
+      adoption: null,
+      at: '2026-02-01T03:00:00.000Z',
+    }),
+  );
+  captureSnapshot(connection, item.workItemId);
+  const candidate = expectOk(
+    new CandidateRepository(connection).record({
+      attemptId: null,
+      workItemId: item.workItemId,
+      identity: candidateIdentity(headSha),
+      pullRequestId: 'pr-42',
+      targetBranch: 'main',
+      recordedAt: '2026-02-01T03:01:00.000Z',
+      correlationId: 'correlation-1',
+    }),
+  );
+  return { workItemId: item.workItemId, candidateFingerprint: candidate.candidateFingerprint };
+}
+
+test('an abbreviated commit SHA is refused by the candidate column (F17-AC2, F20-AC3)', async () => {
+  await withDatabase(async ({ connection }) => {
+    seedOwnerAndProject(connection);
+    const { workItemId } = seedCandidate(connection, HEAD_SHA);
+
+    // The repository cannot even be handed an abbreviation: the domain brands a
+    // commit SHA, so an abbreviation is not a value the type admits.
+    const abbreviated = 'abc1234';
+    assert.throws(() => asCommitSha(abbreviated), /Not a full commit SHA/);
+
+    // And if a caller bypasses the type and writes the column directly, the
+    // schema refuses, which is the guarantee the JSON blob used to bypass.
+    const candidate = connection
+      .prepare('SELECT candidate_id, project_id, scope_snapshot_id, profile_version_id, procedure_version_id FROM candidates WHERE work_item_id = ?')
+      .get(workItemId);
+    assert.ok(candidate !== undefined);
+    assert.throws(
+      () =>
+        connection
+          .prepare(
+            `INSERT INTO candidates (candidate_id, work_item_id, project_id, scope_snapshot_id, profile_version_id, procedure_version_id, fingerprint, head_sha, base_sha, scope_fingerprint, environment_fingerprint, policy_fingerprint)
+             VALUES ('abbreviated-sha', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          )
+          .run(
+            workItemId as string,
+            requiredColumn(candidate, 'project_id'),
+            requiredColumn(candidate, 'scope_snapshot_id'),
+            requiredColumn(candidate, 'profile_version_id'),
+            requiredColumn(candidate, 'procedure_version_id'),
+            SCOPE_FINGERPRINT,
+            abbreviated,
+            BASE_SHA,
+            SCOPE_FINGERPRINT,
+            ENVIRONMENT_FINGERPRINT,
+            POLICY_FINGERPRINT,
+          ),
+      /CHECK constraint failed: length\(head_sha\)/,
+      'the column, not the caller, is what refuses an abbreviated SHA',
+    );
+  });
+});
+
+test('a NotApplicable check result is refused without a policy approval (F20-AC5)', async () => {
+  await withDatabase(async ({ connection }) => {
+    seedOwnerAndProject(connection);
+    const { workItemId, candidateFingerprint } = seedCandidate(connection, HEAD_SHA);
+    const candidate = connection
+      .prepare('SELECT candidate_id, project_id FROM candidates WHERE work_item_id = ?')
+      .get(workItemId);
+    assert.ok(candidate !== undefined);
+
+    const insert = (approved: number): unknown =>
+      connection
+        .prepare(
+          `INSERT INTO checks (check_id, candidate_id, work_item_id, project_id, candidate_fingerprint, name, origin, required, result, not_applicable_approved_by_policy, started_at)
+           VALUES (?, ?, ?, ?, ?, 'not-configured', 'LocalCheck', 1, 'NotApplicable', ?, '2026-02-01T04:00:00.000Z')`,
+        )
+        .run(
+          approved === 1 ? 'check-approved' : 'check-unapproved',
+          requiredColumn(candidate, 'candidate_id'),
+          workItemId,
+          requiredColumn(candidate, 'project_id'),
+          candidateFingerprint,
+          approved,
+        );
+
+    assert.throws(
+      () => insert(0),
+      /CHECK constraint failed: result <> 'NotApplicable' OR not_applicable_approved_by_policy = 1/,
+      'a model cannot mark a required check NotApplicable; only a policy decision can',
+    );
+    insert(1);
+  });
+});
+
+test('an authorization without a subject fingerprint is refused (F26-AC1, R3)', async () => {
+  await withDatabase(async ({ connection }) => {
+    seedOwnerAndProject(connection);
+    const { workItemId, candidateFingerprint } = seedCandidate(connection, HEAD_SHA);
+    const scopeSnapshot = connection
+      .prepare('SELECT scope_snapshot_id FROM scope_snapshots WHERE work_item_id = ?')
+      .get(workItemId);
+    assert.ok(scopeSnapshot !== undefined);
+
+    const insert = (subject: string | null): unknown =>
+      connection
+        .prepare(
+          `INSERT INTO owner_decisions (decision_id, project_id, actor_owner_id, decision_type, subject_fingerprint, subject_json, correlation_id, decided_at, scope_snapshot_id, candidate_fingerprint, scope_fingerprint)
+           VALUES (?, ?, ?, 'AuthorizeMerge', ?, '{}', 'correlation-1', '2026-02-01T05:00:00.000Z', ?, ?, ?)`,
+        )
+        .run(
+          subject === null ? 'authorize-without-subject' : 'authorize-with-subject',
+          PROJECT,
+          OWNER_ID,
+          subject,
+          requiredColumn(scopeSnapshot, 'scope_snapshot_id'),
+          candidateFingerprint,
+          SCOPE_FINGERPRINT,
+        );
+
+    assert.throws(
+      () => insert(null),
+      /CHECK constraint failed: decision_type NOT IN/,
+      'an authorization must name the subject it authorizes',
+    );
+    insert(SCOPE_FINGERPRINT);
+  });
+});
+
+test('an acceptance may not carry an acceptance state on an authorization (F25)', async () => {
+  await withDatabase(async ({ connection }) => {
+    seedOwnerAndProject(connection);
+    const { workItemId } = seedCandidate(connection, HEAD_SHA);
+    const scopeSnapshot = connection
+      .prepare('SELECT scope_snapshot_id FROM scope_snapshots WHERE work_item_id = ?')
+      .get(workItemId);
+    assert.ok(scopeSnapshot !== undefined);
+
+    assert.throws(
+      () =>
+        connection
+          .prepare(
+            `INSERT INTO owner_decisions (decision_id, project_id, actor_owner_id, decision_type, acceptance_state, subject_fingerprint, subject_json, correlation_id, decided_at, scope_snapshot_id)
+             VALUES ('authorization-with-acceptance', ?, ?, 'AuthorizeRelease', 'Accepted', ?, '{}', 'correlation-1', '2026-02-01T05:00:00.000Z', ?)`,
+          )
+          .run(PROJECT, OWNER_ID, SCOPE_FINGERPRINT, requiredColumn(scopeSnapshot, 'scope_snapshot_id')),
+      /CHECK constraint failed: decision_type IN \('AcceptProduct', 'RequestChanges'\) OR acceptance_state IS NULL/,
+      'an authorization says what may be done, not whether the product is accepted',
+    );
+  });
+});
+
+test('a second job with the same operation identity is refused (F13-AC2)', async () => {
+  await withDatabase(async ({ connection }) => {
+    seedOwnerAndProject(connection);
+    const insert = (jobId: string): unknown =>
+      connection
+        .prepare(
+          `INSERT INTO jobs (job_id, work_item_id, project_id, scope_snapshot_id, profile_version_id, procedure_version_id, mode, operation_id, correlation_id, queued_at)
+           VALUES (?, 'work-item-fixture', ?, 'snap-fixture', ?, ?, 'Build', 'operation-fixture', 'correlation-1', '2026-02-01T06:00:00.000Z')`,
+        )
+        .run(jobId, PROJECT, PROFILE_VERSION_ID, PROCEDURE_VERSION_ID);
+
+    // The parents a job row references, created here so this test is about the
+    // unique operation identity and nothing else.
+    connection
+      .prepare("INSERT INTO work_items (work_item_id, project_id, issue_id, publication_intent, origin) VALUES ('work-item-fixture', ?, 'issue-fixture', 'PublishWhenAgreed', 'Proposed')")
+      .run(PROJECT);
+    connection
+      .prepare(
+        `INSERT INTO scope_snapshots (scope_snapshot_id, work_item_id, project_id, issue_id, description, scope_fingerprint, retrieved_at)
+         VALUES ('snap-fixture', 'work-item-fixture', ?, 'issue-fixture', 'Fixture scope', ?, '2026-02-01T06:00:00.000Z')`,
+      )
+      .run(PROJECT, SCOPE_FINGERPRINT);
+
+    insert('job-fixture-1');
+    assert.throws(
+      () => insert('job-fixture-2'),
+      /UNIQUE constraint failed: jobs\.operation_id/,
+      'one operation identity starts one job, so a retry cannot start a second',
+    );
+  });
+});
+
+test('a second active coding slot is refused (F13-AC2, F14-AC1)', async () => {
+  await withDatabase(async ({ connection }) => {
+    seedOwnerAndProject(connection);
+    // The coding slot is a singleton row: the schema makes a second writer
+    // unrepresentable rather than relying on the queue to check.
+    assert.throws(
+      () =>
+        connection
+          .prepare('INSERT INTO coding_slots (slot_id, holder) VALUES (2, ?)')
+          .run('writer-b'),
+      /CHECK constraint failed: slot_id = 1/,
+    );
+    // And a workspace port belongs to exactly one workspace, so a collision
+    // surfaces as a refusal rather than a second service answering (F14-AC3).
+    connection
+      .prepare('INSERT INTO workspace_ports (workspace_id, service_name, port, job_id, holder, reserved_at) VALUES (?, ?, ?, ?, ?, ?)')
+      .run('ws-a', 'web', 5173, 'job-a', 'writer-a', '2026-02-01T07:00:00.000Z');
+    assert.throws(
+      () =>
+        connection
+          .prepare('INSERT INTO workspace_ports (workspace_id, service_name, port, job_id, holder, reserved_at) VALUES (?, ?, ?, ?, ?, ?)')
+          .run('ws-b', 'web', 5173, 'job-b', 'writer-b', '2026-02-01T07:00:01.000Z'),
+      /UNIQUE constraint failed: workspace_ports\.port/,
+    );
+  });
+});
+
+test('evidence for one candidate fingerprint is never returned for another (F20-AC3, F25-AC3)', async () => {
+  await withDatabase(async ({ connection }) => {
+    seedOwnerAndProject(connection);
+    const first = seedCandidate(connection, HEAD_SHA);
+    const replacement = seedCandidate(connection, OTHER_HEAD_SHA);
+
+    const evidence = new EvidenceRepository(connection);
+    const recorded = expectOk(
+      evidence.record({
+        candidateFingerprint: first.candidateFingerprint,
+        kind: 'CheckResult',
+        criterionId: 'ac1',
+        checkId: 'typecheck',
+        checkName: 'Type check',
+        result: 'Passed',
+        observedAt: '2026-02-01T08:00:00.000Z',
+        environmentFingerprint: ENVIRONMENT_FINGERPRINT,
+        scopeFingerprint: SCOPE_FINGERPRINT,
+        artifactRef: 'artifacts/checks/typecheck.log',
+        detail: null,
+        recordedAt: '2026-02-01T08:00:01.000Z',
+        correlationId: 'correlation-1',
+      }),
+    );
+    assert.equal(recorded.candidateFingerprint, first.candidateFingerprint);
+    assert.equal(recorded.result, 'Passed');
+
+    assert.equal(expectOk(evidence.listForCandidate(first.candidateFingerprint)).length, 1);
+    assert.equal(
+      expectOk(evidence.listForCandidate(replacement.candidateFingerprint)).length,
+      0,
+      'a replacement build must not inherit the previous build green results',
+    );
+    assert.equal(
+      expectOk(evidence.listForCriterion(replacement.candidateFingerprint, 'ac1')).length,
+      0,
+    );
+  });
+});
+
+test('an owner credential is stored as a digest, never as a password (F01-AC1, R2)', async () => {
+  await withDatabase(async ({ connection }) => {
+    const owners = new OwnerRepository(connection);
+    const provisioned = expectOk(
+      owners.provision(OWNER_ID, 'Solo owner', '2026-01-01T00:00:00.000Z', {
+        ownerId: OWNER_ID,
+        email: 'Owner@Example.test',
+        passwordDigest: PASSWORD_DIGEST,
+      }),
+    );
+    assert.equal(provisioned.email, 'owner@example.test', 'the address is normalised for sign-in');
+
+    const credential = expectOk(owners.findCredentialByEmail('OWNER@EXAMPLE.TEST'));
+    assert.ok(credential !== null);
+    assert.equal(credential.passwordDigest, PASSWORD_DIGEST);
+    assert.equal(expectOk(owners.findCredentialByEmail('absent@example.test')), null);
+
+    // R2: a locally provisioned owner has no identity-provider subject, and the
+    // column says so rather than holding a substitute value.
+    const row = connection
+      .prepare('SELECT identity_subject, password_digest FROM owners WHERE owner_id = ?')
+      .get(OWNER_ID);
+    assert.equal(row?.['identity_subject'], null, 'the column must not lie about what it holds');
+    assert.equal(row?.['password_digest'], PASSWORD_DIGEST);
   });
 });

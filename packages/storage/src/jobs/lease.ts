@@ -270,14 +270,14 @@ export function leaseDispositionOf(lease: WriterLease, now: string): LeaseDispos
 export function ensureCodingSlotOnConnection(connection: SqlConnection, transaction: TransactionRunner): void {
   transaction(connection, () => {
     connection
-      .prepare('INSERT OR IGNORE INTO coding_slot (slot_id, generation) VALUES (?, 0)')
+      .prepare('INSERT OR IGNORE INTO coding_slots (slot_id, generation) VALUES (?, 0)')
       .run(CODING_SLOT_ROW_ID);
   });
 }
 
 /** Reads the single global coding slot. */
 export function readSlotOnConnection(connection: SqlConnection): import('./types.ts').CodingSlot {
-  const row = connection.prepare('SELECT * FROM coding_slot WHERE slot_id = ?').get(CODING_SLOT_ROW_ID);
+  const row = connection.prepare('SELECT * FROM coding_slots WHERE slot_id = ?').get(CODING_SLOT_ROW_ID);
   if (row === undefined) {
     throw new Error('The coding slot row is missing; seed it before claiming work.');
   }
@@ -296,7 +296,7 @@ export function readSlotOnConnection(connection: SqlConnection): import('./types
 
 /** Reads the durable lease for a job, or null when none was ever written. */
 export function readLeaseOnConnection(connection: SqlConnection, jobId: JobId): WriterLease | null {
-  const row = connection.prepare('SELECT * FROM writer_lease WHERE job_id = ?').get(jobId);
+  const row = connection.prepare('SELECT * FROM writer_leases WHERE job_id = ?').get(jobId);
   if (row === undefined) return null;
   return {
     leaseId: readText(row, 'lease_id'),
@@ -327,7 +327,7 @@ export function readLeaseOnConnection(connection: SqlConnection, jobId: JobId): 
 export function writeLeaseOnConnection(connection: SqlConnection, lease: WriterLease): void {
   connection
     .prepare(
-      `INSERT INTO writer_lease (
+      `INSERT INTO writer_leases (
          lease_id, job_id, holder, operation_id, acquired_at, renewed_at, expires_at,
          state, reconciliation_required, reconciliation_reason,
          confirmed_stopped_by, confirmed_stopped_at, confirmed_stopped_evidence
@@ -378,7 +378,7 @@ export function claimSlotOnConnection(
 ): Result<import('./types.ts').CodingSlot, DomainError> {
   const outcome = connection
     .prepare(
-      `UPDATE coding_slot
+      `UPDATE coding_slots
          SET job_id = ?, holder = ?, operation_id = ?, acquired_at = ?, expires_at = ?, generation = generation + 1
        WHERE slot_id = ? AND (holder IS NULL OR holder = ?)`,
     )
@@ -399,7 +399,7 @@ export function claimSlotOnConnection(
 /** Extends the slot's visible expiry to match its lease. */
 export function extendSlotOnConnection(connection: SqlConnection, jobId: JobId, expiresAt: string): void {
   connection
-    .prepare('UPDATE coding_slot SET expires_at = ? WHERE slot_id = ? AND job_id = ?')
+    .prepare('UPDATE coding_slots SET expires_at = ? WHERE slot_id = ? AND job_id = ?')
     .run(expiresAt, CODING_SLOT_ROW_ID, jobId);
 }
 
@@ -407,7 +407,7 @@ export function extendSlotOnConnection(connection: SqlConnection, jobId: JobId, 
 export function releaseSlotOnConnection(connection: SqlConnection, jobId: JobId, holder: string): void {
   const outcome = connection
     .prepare(
-      'UPDATE coding_slot SET job_id = NULL, holder = NULL, operation_id = NULL, acquired_at = NULL, expires_at = NULL, generation = generation + 1 WHERE slot_id = ? AND job_id = ? AND holder = ?',
+      'UPDATE coding_slots SET job_id = NULL, holder = NULL, operation_id = NULL, acquired_at = NULL, expires_at = NULL, generation = generation + 1 WHERE slot_id = ? AND job_id = ? AND holder = ?',
     )
     .run(CODING_SLOT_ROW_ID, jobId, holder);
   if (Number(outcome.changes) === 0) {
@@ -484,11 +484,11 @@ export function moveJobStateOnConnection(
   jobState: AttemptState,
   now: string,
 ): Result<null, DomainError> {
-  const current = connection.prepare('SELECT state FROM job WHERE job_id = ?').get(jobId);
+  const current = connection.prepare('SELECT state FROM jobs WHERE job_id = ?').get(jobId);
   if (current === undefined) return ok(null);
   const transition = assertTransition('attempt', readText(current, 'state'), jobState);
   if (!transition.ok) return transition;
-  connection.prepare('UPDATE job SET state = ?, holder = NULL, updated_at = ? WHERE job_id = ?').run(jobState, now, jobId);
+  connection.prepare('UPDATE jobs SET state = ?, holder = NULL, updated_at = ? WHERE job_id = ?').run(jobState, now, jobId);
   return ok(null);
 }
 
@@ -504,7 +504,7 @@ function workspaceLockFrom(row: SqlRow): WorkspaceLockRecord {
 }
 
 function readPortOwnerOnConnection(connection: SqlConnection, port: number): PortReservation | null {
-  const row = connection.prepare('SELECT * FROM workspace_port WHERE port = ?').get(port);
+  const row = connection.prepare('SELECT * FROM workspace_ports WHERE port = ?').get(port);
   if (row === undefined) return null;
   return {
     workspaceId: readText(row, 'workspace_id'),
@@ -791,7 +791,7 @@ export function createLeaseManager(store: LeaseStore): LeaseManager {
         for (const allocation of request.allocations) {
           connection
             .prepare(
-              `INSERT INTO workspace_port (workspace_id, service_name, port, job_id, holder, reserved_at)
+              `INSERT INTO workspace_ports (workspace_id, service_name, port, job_id, holder, reserved_at)
                VALUES (?, ?, ?, ?, ?, ?)
                ON CONFLICT(workspace_id, service_name) DO UPDATE SET
                  port = excluded.port, job_id = excluded.job_id, holder = excluded.holder, reserved_at = excluded.reserved_at`,
@@ -820,7 +820,7 @@ export function createLeaseManager(store: LeaseStore): LeaseManager {
   function acquireWorkspaceLock(request: AcquireWorkspaceLockRequest): Result<WorkspaceLockRecord, DomainError> {
     return guard(() =>
       transaction(connection, () => {
-        const existing = connection.prepare('SELECT * FROM workspace_lock WHERE workspace_id = ?').get(request.workspaceId);
+        const existing = connection.prepare('SELECT * FROM workspace_locks WHERE workspace_id = ?').get(request.workspaceId);
         if (existing !== undefined) {
           const lock = workspaceLockFrom(existing);
           if (lock.holder !== request.holder || lock.jobId !== request.jobId) {
@@ -836,10 +836,10 @@ export function createLeaseManager(store: LeaseStore): LeaseManager {
         }
         connection
           .prepare(
-            'INSERT INTO workspace_lock (workspace_id, job_id, holder, branch_name, worktree_path, acquired_at) VALUES (?, ?, ?, ?, ?, ?)',
+            'INSERT INTO workspace_locks (workspace_id, job_id, holder, branch_name, worktree_path, acquired_at) VALUES (?, ?, ?, ?, ?, ?)',
           )
           .run(request.workspaceId, request.jobId, request.holder, request.branchName, request.worktreePath, request.now);
-        const stored = connection.prepare('SELECT * FROM workspace_lock WHERE workspace_id = ?').get(request.workspaceId);
+        const stored = connection.prepare('SELECT * FROM workspace_locks WHERE workspace_id = ?').get(request.workspaceId);
         if (stored === undefined) throw new Error('The workspace lock was unreadable immediately after insert.');
         return ok(workspaceLockFrom(stored));
       }),
