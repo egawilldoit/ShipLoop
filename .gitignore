@@ -6,3 +6,7 @@ coverage/
 .env.*
 !.env.example
 *.log
+.shiploop-artifacts/
+.shiploop-dev/
+playwright-report/
+test-results/

@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "profiles": {
+    "foundation": {
+      "stage": "foundation",
+      "commands": [
+        {
+          "id": "foundation-check",
+          "argv": [
+            "node",
+            "scripts/check.mjs"
+          ],
+          "timeoutMs": 60000,
+          "maxOutputBytes": 65536
+        },
+        {
+          "id": "tooling-tests",
+          "argv": [
+            "node",
+            "--test",
+            "scripts/tests/runner.test.mjs",
+            "scripts/tests/verify.test.mjs"
+          ],
+          "timeoutMs": 60000,
+          "maxOutputBytes": 65536
+        }
+      ]
+    },
+    "application": {
+      "stage": "application",
+      "blockedReason": "No application exists yet. Add real lint, typecheck, unit/integration, build and browser E2E gates with the first runnable application slice.",
+      "commands": []
+    }
+  }
+}

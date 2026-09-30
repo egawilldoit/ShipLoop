@@ -2,5 +2,15 @@
   "name": "shiploop",
   "version": "0.0.0",
   "private": true,
-  "packageManager": "pnpm@11.15.0"
+  "packageManager": "pnpm@11.15.0",
+  "engines": {
+    "node": ">=24 <25"
+  },
+  "scripts": {
+    "doctor": "node scripts/doctor.mjs",
+    "check": "node scripts/check.mjs",
+    "test": "node --test scripts/tests/*.test.mjs",
+    "verify": "node scripts/verify.mjs foundation",
+    "verify:app": "node scripts/verify.mjs application"
+  }
 }
