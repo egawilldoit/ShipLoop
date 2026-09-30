@@ -16,8 +16,10 @@ export interface RedactionRule {
 export const DEFAULT_REDACTION_RULES: readonly RedactionRule[] = [
   { label: 'linear-api-key', pattern: /\blin_(?:api|oauth)_[A-Za-z0-9]{8,}\b/g },
   { label: 'github-token', pattern: /\b(?:gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{20,})\b/g },
-  { label: 'openai-key', pattern: /\bsk-(?:proj-)?[A-Za-z0-9_-]{16,}\b/g },
+  // Anthropic keys are matched before OpenAI keys because the general sk- pattern
+  // also matches sk-ant-…, which would otherwise label the wrong provider.
   { label: 'anthropic-key', pattern: /\bsk-ant-[A-Za-z0-9_-]{16,}\b/g },
+  { label: 'openai-key', pattern: /\bsk-(?!ant-)(?:proj-)?[A-Za-z0-9_-]{16,}\b/g },
   { label: 'google-api-key', pattern: /\bAIza[A-Za-z0-9_-]{20,}\b/g },
   { label: 'slack-token', pattern: /\bxox[abprs]-[A-Za-z0-9-]{10,}\b/g },
   { label: 'generic-bearer', pattern: /\b[Bb]earer\s+[A-Za-z0-9._~+/-]{16,}=*/g },
@@ -64,15 +66,21 @@ export function redactDeep<T>(value: T, rules: readonly RedactionRule[] = DEFAUL
  *
  * Redaction of patterns cannot catch a secret that has an unusual shape, so a
  * credential reference is dropped structurally as well.
+ *
+ * `SECRET_KEY_ALWAYS` words have no legitimate non-credential data field, so they
+ * are stripped wherever they appear in the key. `SECRET_KEY_SUFFIX` words are only
+ * stripped when they END the key, because a name such as `tokenCount` is real data
+ * that an export carrying a full evidence index must keep (F32-AC2).
  */
-const SECRET_KEY = /(?:token|secret|password|passphrase|credential|api[-_]?key|authorization|cookie)/i;
+const SECRET_KEY_ALWAYS = /(?:secret|password|passphrase|credential|privatekey|private_key)/i;
+const SECRET_KEY_SUFFIX = /(?:^|[-_.])(?:token|tokens|apikey|api_key|authorization|cookie|cookies)$/i;
 
 export function stripSecretFields<T>(value: T): T {
   if (Array.isArray(value)) return value.map((entry) => stripSecretFields(entry)) as unknown as T;
   if (value && typeof value === 'object') {
     const output: Record<string, unknown> = {};
     for (const [key, member] of Object.entries(value as Record<string, unknown>)) {
-      if (SECRET_KEY.test(key)) continue;
+      if (SECRET_KEY_ALWAYS.test(key) || SECRET_KEY_SUFFIX.test(key)) continue;
       output[key] = stripSecretFields(member);
     }
     return output as unknown as T;

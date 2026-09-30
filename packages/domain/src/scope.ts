@@ -97,6 +97,10 @@ export function compareScope(recorded: ScopeSnapshot, current: ScopeSnapshot): S
   for (const dependency of current.dependencyIssueIds) {
     if (!recordedDependencies.has(dependency)) materialDifferences.push(`dependencies.added.${dependency}`);
   }
+  const currentDependencies = new Set(current.dependencyIssueIds);
+  for (const dependency of recorded.dependencyIssueIds) {
+    if (!currentDependencies.has(dependency)) materialDifferences.push(`dependencies.removed.${dependency}`);
+  }
 
   if (recorded.title !== current.title) cosmeticDifferences.push('title');
   if (recorded.priority !== current.priority) cosmeticDifferences.push('priority');
@@ -135,6 +139,11 @@ export interface RunStartContext {
 /**
  * The full captured run context (F12-AC1): issue content, semantic fingerprint,
  * retrieval time and the selected profile/procedure versions.
+ *
+ * The snapshot collections are frozen on capture. The `readonly` types alone would
+ * let a storage adapter hand back a mutable decoded record and silently change the
+ * scope after the fingerprint was recorded, which would corrupt the history this
+ * snapshot exists to preserve.
  */
 export interface CapturedRunContext {
   readonly scope: ScopeSnapshot;
@@ -149,9 +158,16 @@ export function captureRunContext(
   context: RunStartContext,
   capturedAt: string,
 ): CapturedRunContext {
+  const scope: ScopeSnapshot = {
+    ...context.scope,
+    dependencyIssueIds: Object.freeze([...context.scope.dependencyIssueIds]),
+    acceptanceCriteria: Object.freeze(
+      context.scope.acceptanceCriteria.map((criterion) => Object.freeze({ ...criterion })),
+    ),
+  };
   return {
-    scope: context.scope,
-    scopeFingerprintValue: scopeFingerprint(context.scope),
+    scope,
+    scopeFingerprintValue: scopeFingerprint(scope),
     baseSha: context.baseSha,
     profileVersionId: context.profileVersionId,
     procedureVersionId: context.procedureVersionId,

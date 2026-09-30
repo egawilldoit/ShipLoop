@@ -38,6 +38,8 @@ export interface OwnerAuthorization {
   readonly authorizationId: string;
   readonly ownerId: string;
   readonly issuedAt: string;
+  /** Instant after which the authorization may no longer be consumed. */
+  readonly expiresAt: string;
   readonly subject: AuthorizationSubject;
   readonly subjectFingerprint: Fingerprint;
   readonly state: AuthorizationState;
@@ -50,7 +52,6 @@ export interface OwnerAuthorization {
 export type AuthorizationRejection =
   | 'SubjectChanged'
   | 'AlreadyConsumed'
-  | 'NotAuthorized'
   | 'Expired'
   | 'OwnerMismatch';
 
@@ -93,6 +94,13 @@ export function checkAuthorization(input: {
   if (authorization.state === 'Expired') {
     return { valid: false, rejection: 'Expired', reason: 'Authorization expired before it was used.' };
   }
+  if (input.now >= authorization.expiresAt) {
+    return {
+      valid: false,
+      rejection: 'Expired',
+      reason: `Authorization expired at ${authorization.expiresAt}; it is now ${input.now}.`,
+    };
+  }
   if (authorization.subjectFingerprint !== subjectFingerprint(proposed)) {
     return {
       valid: false,
@@ -102,6 +110,21 @@ export function checkAuthorization(input: {
     };
   }
   return { valid: true, authorization };
+}
+
+/**
+ * Records the single permitted use of an authorization.
+ *
+ * Enforcing the Authorized -> Consumed flip here, rather than leaving it to each
+ * caller's memory, is what makes the single-use promise hold even when a delivery
+ * path forgets to set it.
+ */
+export function consumeAuthorization(
+  authorization: OwnerAuthorization,
+  consumedAt: string,
+): OwnerAuthorization {
+  if (authorization.state !== 'Authorized') return authorization;
+  return { ...authorization, state: 'Consumed', consumedAt };
 }
 
 export function subjectFingerprint(subject: AuthorizationSubject): Fingerprint {

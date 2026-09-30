@@ -12,6 +12,7 @@ import type { Fingerprint } from './ids.ts';
  */
 
 export type AttentionKind =
+  | 'RunProgress'
   | 'ClarificationRequested'
   | 'Blocker'
   | 'ReadyForYourTest'
@@ -48,6 +49,7 @@ export interface AttentionItem {
 }
 
 const KIND_TO_BUCKET: Readonly<Record<AttentionKind, AttentionBucket>> = {
+  RunProgress: 'Working',
   ClarificationRequested: 'NeedsYourInput',
   Blocker: 'NeedsYourInput',
   ReadyForYourTest: 'ReadyForYourTest',
@@ -68,44 +70,60 @@ export function dedupKeyFor(kind: AttentionKind, subject: string): string {
   return `${kind}:${subject}`;
 }
 
+export interface AttentionObservation {
+  readonly attentionItemId: string;
+  readonly dedupKey: string;
+  readonly kind: AttentionKind;
+  readonly projectId: string;
+  readonly workItemId: string | null;
+  readonly issueIdentifier: string | null;
+  readonly title: string;
+  readonly blocker: string | null;
+  readonly nextAction: string;
+  readonly now: string;
+  /** Resolves when the underlying blocker is genuinely gone. */
+  readonly resolved?: boolean;
+  readonly candidateFingerprint: Fingerprint | null;
+}
+
 /**
  * Merges a new observation into the existing item list.
+ *
+ * Only the declared `AttentionItem` fields are carried across. Spreading the
+ * observation envelope instead would persist the control fields (`now`,
+ * `resolved`) into every stored, exported and serialized record.
  *
  * An existing open or acknowledged item with the same dedup key is updated in
  * place, preserving its identity and acknowledgment, rather than appended.
  */
 export function upsertAttentionItem(
   existing: readonly AttentionItem[],
-  incoming: Omit<AttentionItem, 'createdAt' | 'updatedAt' | 'state' | 'acknowledgedAt' | 'acknowledgedBy' | 'attentionItemId'> & {
-    readonly now: string;
-    readonly attentionItemId: string;
-    /** Resolves when the underlying blocker is genuinely gone. */
-    readonly resolved?: boolean;
-  },
+  incoming: AttentionObservation,
 ): readonly AttentionItem[] {
-  const index = existing.findIndex((item) => item.dedupKey === incoming.dedupKey);
+  const { now, resolved, attentionItemId: proposedId, ...fields } = incoming;
+  const index = existing.findIndex((item) => item.dedupKey === fields.dedupKey);
   const shared = {
-    ...incoming,
-    state: (incoming.resolved ? 'Resolved' : 'Open') as AttentionState,
+    ...fields,
+    state: (resolved === true ? 'Resolved' : 'Open') as AttentionState,
     acknowledgedAt: null,
     acknowledgedBy: null,
   };
   if (index === -1) {
-    return [...existing, { ...shared, createdAt: incoming.now, updatedAt: incoming.now }];
+    return [...existing, { ...shared, attentionItemId: proposedId, createdAt: now, updatedAt: now }];
   }
   const previous = existing[index];
   if (previous) {
-    const resolved = incoming.resolved === true;
+    const isResolved = resolved === true;
     const updated: AttentionItem = {
       ...previous,
       ...shared,
       attentionItemId: previous.attentionItemId,
       createdAt: previous.createdAt,
       // Acknowledgment survives a repeated observation of the same condition.
-      state: resolved ? 'Resolved' : previous.state,
-      acknowledgedAt: resolved ? null : previous.acknowledgedAt,
-      acknowledgedBy: resolved ? null : previous.acknowledgedBy,
-      updatedAt: incoming.now,
+      state: isResolved ? 'Resolved' : previous.state,
+      acknowledgedAt: isResolved ? null : previous.acknowledgedAt,
+      acknowledgedBy: isResolved ? null : previous.acknowledgedBy,
+      updatedAt: now,
     };
     return [...existing.slice(0, index), updated, ...existing.slice(index + 1)];
   }

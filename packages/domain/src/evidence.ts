@@ -31,8 +31,22 @@ export function isTerminalSuccess(result: CheckResult): boolean {
   return result === 'Passed';
 }
 
-export function isBlocking(result: CheckResult): boolean {
+/**
+ * Whether a result blocks delivery.
+ *
+ * NotApplicable blocks unless a policy decision approved it. The approval is a
+ * separate argument rather than a property of the result string, because only a
+ * policy decision can grant it and a bare result cannot prove that (F20-AC5).
+ */
+export function isBlocking(result: CheckResult, approvedByPolicy = false): boolean {
+  if (result === 'NotApplicable') return !approvedByPolicy;
   return result === 'Failed' || result === 'Missing' || result === 'Stale';
+}
+
+/** Whether a recorded check counts as satisfied for delivery purposes. */
+export function isSatisfied(check: Pick<CheckRecord, 'result' | 'notApplicableApprovedByPolicy'>): boolean {
+  return check.result === 'Passed' ||
+    (check.result === 'NotApplicable' && check.notApplicableApprovedByPolicy);
 }
 
 export interface CheckRecord {
@@ -142,8 +156,12 @@ export function deliveryEligible(input: {
     if (!check.required) continue;
     if (check.candidateFingerprint !== input.currentCandidateFingerprint) {
       reasons.push(`Required check "${check.name}" belongs to a different candidate.`);
-    } else if (check.result !== 'Passed') {
-      reasons.push(`Required check "${check.name}" is ${check.result}, not Passed.`);
+    } else if (!isSatisfied(check)) {
+      reasons.push(
+        check.result === 'NotApplicable'
+          ? `Required check "${check.name}" is NotApplicable without a policy approval.`
+          : `Required check "${check.name}" is ${check.result}, not Passed.`,
+      );
     }
   }
   if (input.acceptanceCandidateFingerprint !== input.currentCandidateFingerprint) {

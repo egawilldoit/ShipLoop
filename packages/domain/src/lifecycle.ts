@@ -47,10 +47,10 @@ export type DeliveryState = (typeof DELIVERY_STATES)[number];
 /**
  * Allowed attempt transitions.
  *
- * Cancellation is reachable from every non-terminal state because the owner must
- * always be able to stop work. Resuming a Paused job returns to Running rather
- * than Queued: the workspace and checkpoint already exist, so the job does not
- * need to re-enter the queue (F17-AC3).
+ * Cancellation is reachable from every state in which work is still in flight.
+ * Resuming a Paused job returns to Running rather than Queued: the workspace and
+ * checkpoint already exist, so the job does not need to re-enter the queue
+ * (F17-AC3). Completed is excluded because nothing is in flight to cancel.
  */
 const ATTEMPT_TRANSITIONS: Readonly<Record<AttemptState, readonly AttemptState[]>> = {
   Queued: ['Preparing', 'Cancelled', 'Blocked'],
@@ -87,9 +87,10 @@ const DELIVERY_TRANSITIONS: Readonly<Record<DeliveryState, readonly DeliveryStat
   Failed: ['Authorized', 'NotAuthorized', 'Releasing'],
   /**
    * Reconciliation is the only way out. Moving straight to Released would be the
-   * blind repetition the specification forbids (F28-AC4, F30-AC5).
+   * blind repetition the specification forbids (F28-AC4, F30-AC5), so a lost
+   * response must first be resolved into the state it actually reached.
    */
-  OutcomeUnknown: ['Merged', 'Releasing', 'Released', 'Failed', 'Authorized'],
+  OutcomeUnknown: ['Merged', 'Releasing', 'Failed', 'Authorized'],
 };
 
 export type TransitionDimension = 'attempt' | 'acceptance' | 'delivery';
@@ -125,14 +126,14 @@ export function assertTransition(
   from: string,
   to: string,
 ): Result<{ readonly from: string; readonly to: string }> {
-  if (from === to) {
-    return ok({ from, to });
-  }
   const allowed = tableFor(dimension)[from];
   if (allowed === undefined) {
     return err(invalid(`Unknown ${dimension} state: ${from}`, [
       { path: dimension, message: `Not a valid ${dimension} state.` },
     ]));
+  }
+  if (from === to) {
+    return ok({ from, to });
   }
   if (!allowed.includes(to)) {
     return err(

@@ -126,10 +126,13 @@ export function assessStaleness(
   if (recorded.policyFingerprint !== current.policyFingerprint) reasons.push('PolicyChanged');
 
   const recordedComponents = new Map(recorded.components.map((entry) => [entry.component, entry]));
+  const note = (reason: StaleReason): void => {
+    if (!reasons.includes(reason)) reasons.push(reason);
+  };
   for (const component of current.components ?? []) {
     const previous = recordedComponents.get(component.component);
     if (!previous) {
-      reasons.push('ComponentChanged');
+      note('ComponentChanged');
       componentDetail.push({ component: component.component, reason: 'ComponentChanged' });
       continue;
     }
@@ -138,13 +141,13 @@ export function assessStaleness(
       previous.deploymentUrl !== component.deploymentUrl ||
       previous.environment !== component.environment;
     if (replaced) {
-      if (!reasons.includes('DeploymentReplaced')) reasons.push('DeploymentReplaced');
+      note('DeploymentReplaced');
       componentDetail.push({ component: component.component, reason: 'DeploymentReplaced' });
     }
   }
   for (const component of recorded.components) {
     if (!(current.components ?? []).some((entry) => entry.component === component.component)) {
-      reasons.push('ComponentChanged');
+      note('ComponentChanged');
       componentDetail.push({ component: component.component, reason: 'ComponentChanged' });
     }
   }
