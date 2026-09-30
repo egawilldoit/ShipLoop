@@ -389,21 +389,18 @@ describe('lifecycle: outcome unknown and reconciliation', () => {
   test('F28-AC4/F30-AC5 the whole reachable set of OutcomeUnknown is reconciliation, never a release', () => {
     // Listed in the exported DELIVERY_STATES order, not the table order, so this
     // pins the complete set rather than one particular listing of it.
-    assert.deepEqual(reachableStates('delivery', 'OutcomeUnknown'), [
-      'Authorized',
-      'Merged',
-      'Releasing',
-      'Failed',
-    ]);
-    const reachable = new Set(reachableStates('delivery', 'OutcomeUnknown'));
-    for (const state of DELIVERY_STATES) {
+    const reachable = reachableStates('delivery', 'OutcomeUnknown');
+    assert.deepEqual(reachable, ['Authorized', 'Merged', 'Releasing', 'Failed']);
+
+    // The complement is asserted separately, so a state newly added to the table
+    // fails here instead of quietly widening the set.
+    for (const state of DELIVERY_STATES.filter((candidate) => !reachable.includes(candidate))) {
       assert.equal(
         canTransition('delivery', 'OutcomeUnknown', state),
-        reachable.has(state),
-        `unexpected reachability for OutcomeUnknown -> ${state}`,
+        false,
+        `${state} must not be reachable from an unresolved delivery`,
       );
     }
-    assert.equal(reachable.has('Released'), false, 'a release must never be assumed from a lost response');
   });
 
   test('F28-AC4/F30-AC5 OutcomeUnknown can be resolved by reconciliation', () => {

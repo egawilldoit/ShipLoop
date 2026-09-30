@@ -79,6 +79,14 @@ export function redactDeep<T>(value: T, rules: readonly RedactionRule[] = DEFAUL
  * `accessToken` and `apiTokens`. It errs towards stripping: a field whose name
  * happens to end in a credential noun is dropped, which costs an export a
  * column, whereas a missed spelling leaks the credential itself.
+ *
+ * This is a structural backstop, not the primary control: `redact` on the values
+ * is what removes an actual credential, and it recognises value shapes this key
+ * rule cannot. The known residual gap is a credential noun that is neither
+ * trailing nor one of the always-match words, such as `tokenValue` or
+ * `credentialsSnapshot`, which are kept. Closing it would need a blocklist of
+ * descriptive suffixes (count, policy, status, index) that rots as fields are
+ * added, so the gap is recorded here rather than papered over.
  */
 const SECRET_KEY_ALWAYS = /(?:secret|password|passphrase|private[-_]?key)/i;
 const SECRET_KEY_TRAILING =

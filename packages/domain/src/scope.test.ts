@@ -16,7 +16,7 @@ import {
   materialScopeFingerprint,
   scopeFingerprint,
 } from './scope.ts';
-import type { ScopeCriterion, ScopeSnapshot } from './scope.ts';
+import type { ScopeChangeKind, ScopeCriterion, ScopeSnapshot } from './scope.ts';
 
 const BASE_SHA: CommitSha = asCommitSha('0123456789abcdef0123456789abcdef01234567');
 
@@ -262,24 +262,41 @@ describe('scope comparison: material', () => {
   });
 
   test('F12-AC2 - Unchanged is only returned when the two fingerprints actually agree', () => {
-    const samples: readonly ScopeSnapshot[] = [
-      withScope({}),
-      withScope({ dependencyIssueIds: [] }),
-      withScope({ dependencyIssueIds: ['ENG-101', 'ENG-100'] }),
-      withScope({ description: 'Retries must be cancelable.' }),
-      withScope({ acceptanceCriteria: [CRITERION_ONE] }),
-      withScope({ title: 'Renamed' }),
+    // A comparison whose own two fingerprints disagree was self-contradictory: it
+    // reported Unchanged while carrying a different fingerprint on each side. Every
+    // sample below is asserted unconditionally, so a silent sample cannot pass.
+    const samples: readonly { readonly snapshot: ScopeSnapshot; readonly kind: ScopeChangeKind }[] = [
+      { snapshot: withScope({}), kind: 'Unchanged' },
+      { snapshot: withScope({ dependencyIssueIds: [] }), kind: 'Material' },
+      { snapshot: withScope({ dependencyIssueIds: ['ENG-101', 'ENG-100'] }), kind: 'Unchanged' },
+      { snapshot: withScope({ description: 'Retries must be cancelable.' }), kind: 'Material' },
+      { snapshot: withScope({ acceptanceCriteria: [CRITERION_ONE] }), kind: 'Material' },
+      { snapshot: withScope({ title: 'Renamed' }), kind: 'Cosmetic' },
     ];
-    for (const current of samples) {
-      const comparison = compareScope(RECORDED, current);
-      const fingerprintsAgree = comparison.recordedFingerprint === comparison.currentFingerprint;
-      if (!fingerprintsAgree) {
-        assert.equal(
-          comparison.kind,
-          'Material',
-          `differing fingerprints must never be reported as ${comparison.kind}`,
+
+    for (const { snapshot, kind } of samples) {
+      const comparison = compareScope(RECORDED, snapshot);
+      assert.equal(comparison.kind, kind, `unexpected kind for ${JSON.stringify(snapshot.dependencyIssueIds)}`);
+      if (kind === 'Unchanged') {
+        assert.equal(comparison.recordedFingerprint, comparison.currentFingerprint);
+        assert.deepEqual(comparison.materialDifferences, []);
+      } else if (kind === 'Material') {
+        assert.notEqual(
+          comparison.recordedFingerprint,
+          comparison.currentFingerprint,
+          'a material difference must be visible in the fingerprints',
         );
         assert.ok(comparison.materialDifferences.length > 0, 'Material must carry at least one difference');
+      } else {
+        // F12-AC3: a cosmetic field is excluded from the fingerprint, so Cosmetic
+        // and Unchanged are the only kinds whose two fingerprints agree.
+        assert.equal(
+          comparison.recordedFingerprint,
+          comparison.currentFingerprint,
+          'a cosmetic difference must not change the semantic fingerprint',
+        );
+        assert.deepEqual(comparison.materialDifferences, []);
+        assert.ok(comparison.cosmeticDifferences.length > 0, 'Cosmetic must carry at least one difference');
       }
     }
   });
