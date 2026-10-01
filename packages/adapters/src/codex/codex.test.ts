@@ -24,7 +24,7 @@
 
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -37,14 +37,22 @@ import type { AdapterContext, EngineEvent, ResumeEngineSessionRequest } from '..
 import {
   CODEX_SANDBOX_MODES,
   CODEX_VERIFIED_VERSION,
+  CodexClient,
+  ENGINE_ENVIRONMENT_VARIABLES,
   MINIMUM_CODEX_VERSION,
+  attemptKeyOf,
   buildArgv,
   checkCodexVersion,
+  defaultEngineStateRoot,
+  engineEnvironment,
+  engineStateLayout,
   parseCodexVersion,
+  prepareEngineState,
   resolveSandboxMode,
   spawnTrackedGroup,
   stopCodexProcess,
   type CodexProcess,
+  type EngineStateLayout,
 } from './client.ts';
 import { CodexEngineAdapter, missingRolloutDetail, renderPrompt } from './adapter.ts';
 import {
@@ -70,6 +78,17 @@ const CREDENTIAL_CANARY = ['sk', 'proj', 'C'.repeat(26)].join('-');
 
 function tempDir(): string {
   return mkdtempSync(join(tmpdir(), 'shiploop-codex-test-'));
+}
+
+/**
+ * The environment a non-Codex child in these tests is spawned with.
+ *
+ * The shutdown and stdout proofs below are about the transport, not about the allowlist, but
+ * they still spawn a real child, and `spawnTrackedGroup` takes the environment from its caller
+ * precisely so no spawn in this file can fall back to inheriting the test runner's.
+ */
+function childEnvironment(workspace: string): NodeJS.ProcessEnv {
+  return engineEnvironment(process.env, engineStateLayout({ stateRoot: join(workspace, 'state'), attempt: workspace }));
 }
 
 /**
@@ -787,6 +806,7 @@ test('F17-AC1 the tracked group is reported gone only after it is observed gone'
   const tracked = spawnTrackedGroup(
     [process.execPath, '-e', 'const {spawn}=require("node:child_process");spawn(process.execPath,["-e","process.on(\'SIGTERM\',()=>{});setTimeout(()=>{},600000)"],{stdio:"ignore"});process.on(\'SIGTERM\',()=>{});setTimeout(()=>{},600000)'],
     workspace,
+    childEnvironment(workspace),
   );
   try {
     assert.equal(tracked.ok, true);
@@ -814,6 +834,7 @@ test('F17-AC1 a group that answers SIGTERM is reported as a graceful stop with n
   const tracked = spawnTrackedGroup(
     [process.execPath, '-e', 'process.on("SIGTERM",()=>process.exit(0));setTimeout(()=>{},600000)'],
     workspace,
+    childEnvironment(workspace),
   );
   try {
     assert.equal(tracked.ok, true);
@@ -833,6 +854,7 @@ test('F15-AC1 the transport reads a real subprocess stdout in order and ends whe
   const tracked = spawnTrackedGroup(
     [process.execPath, '-e', 'process.stdout.write("one\\ntwo\\nthree\\n");setTimeout(()=>{},50)'],
     workspace,
+    childEnvironment(workspace),
   );
   try {
     assert.equal(tracked.ok, true);
@@ -1039,47 +1061,333 @@ test('F15-AC4 a live resume continues the recorded conversation in place', async
 });
 
 /* -------------------------------------------------------------------------- */
-/* Ambient credential inheritance (F03-AC5, N02-AC3)                          */
+/* The engine environment is an allowlist (F03-AC5, N02-AC3)                   */
 /* -------------------------------------------------------------------------- */
 
-test('the engine process is not handed the operator\'s ambient credentials', async () => {
-  // The engine runs as the same uid as the worker and can read any file the worker can, so an
-  // inherited variable is a credential handed to code the owner is being asked to trust with
-  // their repository. This asserts on the real child, not on the function's arguments.
-  const root = mkdtempSync(join(tmpdir(), 'shiploop-env-'));
-  const probe = join(root, 'env.sh');
+/**
+ * Variables the child is not allowed to have, whatever they look like.
+ *
+ * `DATABASE_URL` is here because it points at the authoritative store rather than at a
+ * credential: a read of it is a read of the whole product's state, and a write through it is a
+ * write to every candidate. The pointer variables are here for the other reason — each names a
+ * *file* the engine would read a credential out of, which no amount of variable scrubbing
+ * addresses.
+ */
+const FORBIDDEN_IN_CHILD = [
+  'DATABASE_URL',
+  'NETRC',
+  'GIT_CONFIG_GLOBAL',
+  'GIT_CONFIG_NOSYSTEM',
+  'GIT_ASKPASS',
+  'SSH_ASKPASS',
+  'GIT_SSH_COMMAND',
+  'SSH_AUTH_SOCK',
+  'XDG_CONFIG_HOME',
+  'AWS_PROFILE',
+  'AWS_SHARED_CREDENTIALS_FILE',
+  'LINEAR_API_KEY',
+  'GH_TOKEN',
+  'GITHUB_TOKEN',
+  // A name no denylist of credentials contains and no human would guess from the word "token".
+  'SHIPLOOP_SIDE_CHANNEL',
+  'ZSH_THEME_HINTS',
+] as const;
+
+/**
+ * A child that reports what it was actually handed.
+ *
+ * One `env` dump rather than one probe per variable name: `env -0` separates entries with a NUL,
+ * so a name that never existed in the parent cannot be confused with one the parent held empty,
+ * and a single spawn proves the whole allowlist instead of one name per test run.
+ */
+function envReportingProbe(dir: string): string {
+  const probe = join(dir, 'env-report.sh');
   writeFileSync(
     probe,
     [
       '#!/bin/sh',
-      'for name in LINEAR_API_KEY GH_TOKEN GITHUB_TOKEN SHIPLOOP_SECRET SSH_AUTH_SOCK; do',
-      '  if printenv "$name" >/dev/null 2>&1; then printf "LEAK %s\\n" "$name"; fi',
-      'done',
-      'printf "PATH_SET %s\\n" "${PATH:+yes}"',
-      'printf "REPORT %s\\n" "$1"',
+      // `env -0` separates entries with a NUL, so a name that never existed in the parent cannot
+      // be confused with one the parent held empty; the markers are emitted in the same shape so
+      // one parse reads the whole report.
+      'if env -0 2>/dev/null; then :; else env; fi',
+      'printf "HOME_IS=%s\\n" "$HOME"',
+      'printf "CODEX_HOME_IS=%s\\n" "${CODEX_HOME:-unset}"',
+      'printf "PATH_SET=%s\\n" "${PATH:+yes}"',
     ].join('\n'),
+    'utf8',
   );
   chmodSync(probe, 0o755);
+  return probe;
+}
 
-  const previous: Record<string, string | undefined> = {
-    LINEAR_API_KEY: process.env['LINEAR_API_KEY'],
-    // Assembled at runtime so the policy linter does not read a credential-shaped literal
-    // in tracked source; the value's shape is irrelevant because only its presence matters.
-    GH_TOKEN: ['ghp', 'shipLoopMustNotLeak'].join('_'),
-    SHIPLOOP_SECRET: 'must-not-leak',
+/** Names and values the child reported, parsed from a NUL- or newline-separated dump. */
+function environmentOf(report: string): Record<string, string> {
+  const parsed: Record<string, string> = {};
+  for (const entry of report.split('\0').join('\n').split('\n')) {
+    const separator = entry.indexOf('=');
+    if (separator <= 0) continue;
+    parsed[entry.slice(0, separator)] = entry.slice(separator + 1);
+  }
+  return parsed;
+}
+
+interface SeededRun {
+  readonly childEnvironment: Record<string, string>;
+  readonly parentNames: readonly string[];
+  readonly layout: EngineStateLayout;
+  readonly operatorHome: string;
+  readonly report: string;
+}
+
+/**
+ * Runs the reporting probe once with a set of variables seeded into the worker environment.
+ *
+ * `process.env` is the real parent the shipped `start` reads, so this is the same input the
+ * product hands the allowlist; seeding and restoring is what keeps the assertion about the
+ * allowlist rather than about this machine's shell.
+ */
+async function runProbeWithSeededParent(
+  seeded: Readonly<Record<string, string>>,
+  extra?: (dir: string) => string,
+): Promise<SeededRun> {
+  const root = mkdtempSync(join(tmpdir(), 'shiploop-env-'));
+  const operatorHome = join(root, 'operator-home');
+  const workspace = join(root, 'worktrees', 'job-1');
+  mkdirSync(operatorHome, { recursive: true });
+  mkdirSync(workspace, { recursive: true });
+  const probe = extra?.(root) ?? envReportingProbe(root);
+
+  const previous = new Map<string, string | undefined>();
+  const seed: Record<string, string> = {
+    // An operator `~/.codex/config.toml` on this host sets `sandbox_mode =
+    // unrestricted `sandbox_mode` with `approval_policy = "never"`. A child that could reach it would
+    // run unrestricted, which is why `CODEX_HOME` below is asserted against the operator's.
+    CODEX_HOME: join(operatorHome, '.codex'),
+    HOME: operatorHome,
+    ...seeded,
   };
-  for (const [name, value] of Object.entries(previous)) {
-    if (value === undefined) continue;
+  for (const [name, value] of Object.entries(seed)) {
+    previous.set(name, process.env[name]);
     process.env[name] = value;
   }
   try {
-    const started = spawnTrackedGroup([probe, 'child'], root);
+    const state = prepareEngineState({ stateRoot: join(root, 'state'), attempt: workspace });
+    assert.ok(state.ok, 'the ShipLoop-owned engine state was created');
+    if (!state.ok) throw new Error('unreachable');
+    const started = spawnTrackedGroup([probe, 'child'], workspace, engineEnvironment(process.env, state.value));
     assert.ok(started.ok, 'the probe process started');
-    const output = (await readAllLines(started.value)).join('\n');
-    assert.ok(!output.includes('LEAK LINEAR_API_KEY'), `LINEAR_API_KEY reached the child: ${output}`);
-    assert.ok(!output.includes('LEAK GH_TOKEN'), `GH_TOKEN reached the child: ${output}`);
-    assert.ok(!output.includes('LEAK SHIPLOOP_SECRET'), `SHIPLOOP_SECRET reached the child: ${output}`);
-    assert.ok(output.includes('PATH_SET yes'), `the child still needs a PATH: ${output}`);
+    if (!started.ok) throw new Error('unreachable');
+    const report = (await readAllLines(started.value)).join('\n');
+    return {
+      childEnvironment: environmentOf(report),
+      parentNames: Object.keys(seed),
+      layout: state.value,
+      operatorHome,
+      report,
+    };
+  } finally {
+    for (const [name, value] of previous) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+test('F03-AC5, N02-AC3 the engine child is given an allowlist: an unknown variable name does not reach it', async () => {
+  // The seeded names are deliberately unremarkable. A denylist drops what it recognises and
+  // forwards the rest, so the test is only meaningful if the names it uses are names no
+  // credential pattern would match: `ZSH_THEME_HINTS` and `SHIPLOOP_SIDE_CHANNEL` are the two
+  // that make reverting to the denylist fail rather than silently pass (F03-AC5).
+  const run = await runProbeWithSeededParent({
+    ZSH_THEME_HINTS: 'some-shell-state',
+    SHIPLOOP_SIDE_CHANNEL: 'open',
+  });
+
+  assert.equal(run.childEnvironment['ZSH_THEME_HINTS'], undefined, `an unknown variable reached the child: ${run.report}`);
+  assert.equal(run.childEnvironment['SHIPLOOP_SIDE_CHANNEL'], undefined, `an unknown variable reached the child: ${run.report}`);
+  assert.ok(!run.report.includes('SHIPLOOP_SIDE_CHANNEL'), `the child was handed the operator's environment: ${run.report}`);
+
+  // What the engine does need is still there, so the allowlist is not simply an empty one.
+  assert.equal(run.childEnvironment['PATH_SET'], 'yes', 'the engine still needs a PATH to run');
+  assert.equal(run.childEnvironment['HOME_IS'], run.layout.home);
+  assert.equal(run.childEnvironment['CODEX_HOME_IS'], run.layout.codexHome);
+});
+
+test('F03-AC5 the authoritative store is not reachable from the engine environment', async () => {
+  const run = await runProbeWithSeededParent({
+    DATABASE_URL: 'file:///home/ubuntu/projects/ShipLoop/.state/shiploop.db',
+  });
+  assert.ok(run.parentNames.includes('DATABASE_URL'), 'the control really did seed DATABASE_URL into the parent');
+  assert.equal(run.childEnvironment['DATABASE_URL'], undefined, `DATABASE_URL reached the child: ${run.report}`);
+  assert.ok(!run.report.includes('DATABASE_URL'), `DATABASE_URL reached the child: ${run.report}`);
+});
+
+test('F03-AC5 a credential-FILE pointer is not reachable from the engine environment', async () => {
+  // These name a file rather than a secret, so no regex over variable names would ever catch
+  // them, and each one is a path the engine would read a credential out of.
+  const run = await runProbeWithSeededParent({
+    NETRC: '/home/ubuntu/.netrc',
+    GIT_CONFIG_GLOBAL: '/home/ubuntu/.gitconfig',
+    GIT_CONFIG_NOSYSTEM: '1',
+    GIT_ASKPASS: '/usr/bin/ssh-askpass',
+    SSH_ASKPASS: '/usr/bin/ssh-askpass',
+    GIT_SSH_COMMAND: 'ssh -i /home/ubuntu/.ssh/id_ed25519',
+    SSH_AUTH_SOCK: '/tmp/ssh-agent.sock',
+    XDG_CONFIG_HOME: '/home/ubuntu/.config',
+  });
+  for (const name of [
+    'NETRC',
+    'GIT_CONFIG_GLOBAL',
+    'GIT_CONFIG_NOSYSTEM',
+    'GIT_ASKPASS',
+    'SSH_ASKPASS',
+    'GIT_SSH_COMMAND',
+    'SSH_AUTH_SOCK',
+    'XDG_CONFIG_HOME',
+  ]) {
+    assert.equal(run.childEnvironment[name], undefined, `${name} reached the child: ${run.report}`);
+  }
+});
+
+test('F03-AC5 the engine HOME is a ShipLoop directory for this attempt, not the operator\'s home', async () => {
+  const run = await runProbeWithSeededParent({});
+  assert.notEqual(run.childEnvironment['HOME'], run.operatorHome, 'the child inherited the operator HOME');
+  assert.notEqual(run.childEnvironment['HOME'], process.env['HOME'], 'the child inherited the worker HOME');
+  assert.ok(
+    run.childEnvironment['HOME']?.startsWith(run.layout.stateRoot) ?? false,
+    `HOME must live under the ShipLoop state root: ${String(run.childEnvironment['HOME'])}`,
+  );
+  // Two attempts of the same shape get different homes, so one attempt cannot read another's.
+  assert.notEqual(attemptKeyOf('/a/worktrees/one'), attemptKeyOf('/a/worktrees/two'));
+  assert.equal(attemptKeyOf('/a/worktrees/one'), attemptKeyOf('/a/worktrees/one'), 'a resumed attempt must find its own home again');
+});
+
+test('F03-AC5 a credential seeded in the operator\'s home does not resolve from the child', async () => {
+  // Seeded under three names a coding session would plausibly reach for. The child is asked
+  // exactly as code inside the session would ask: through its own `$HOME`. The residual
+  // same-uid exposure to an absolute path is stated in the module comment and is not what this
+  // assertion claims.
+  const credential = ['sk', 'proj', 'C'.repeat(26)].join('-');
+  const run = await runProbeWithSeededParent(
+    {},
+    (root) => {
+      const operatorHome = join(root, 'operator-home');
+      mkdirSync(join(operatorHome, '.ssh'), { recursive: true });
+      writeFileSync(join(operatorHome, '.netrc'), `machine api.github.com login x password ${credential}\n`, 'utf8');
+      writeFileSync(join(operatorHome, '.ssh', 'id_ed25519'), credential, 'utf8');
+      writeFileSync(join(operatorHome, '.git-credentials'), `https://x:${credential}@github.com\n`, 'utf8');
+      const probe = join(root, 'home-read.sh');
+      writeFileSync(
+        probe,
+        [
+          '#!/bin/sh',
+          'for file in .netrc .ssh/id_ed25519 .git-credentials; do',
+          '  if [ -r "$HOME/$file" ]; then printf "READABLE %s\\n" "$file"; else printf "ABSENT %s\\n" "$file"; fi',
+          'done',
+          'printf "HOME_IS %s\\n" "$HOME"',
+        ].join('\n'),
+        'utf8',
+      );
+      chmodSync(probe, 0o755);
+      return probe;
+    },
+  );
+
+  assert.ok(!run.report.includes('READABLE'), `the child resolved an operator credential through HOME: ${run.report}`);
+  for (const file of ['.netrc', '.ssh/id_ed25519', '.git-credentials']) {
+    assert.ok(run.report.includes(`ABSENT ${file}`), `${file} was readable from the child: ${run.report}`);
+  }
+  assert.ok(!run.report.includes(credential), `the credential itself was read: ${run.report}`);
+  assert.notEqual(run.childEnvironment['HOME'], run.operatorHome);
+});
+
+test('F03-AC5 CODEX_HOME is a ShipLoop directory, so the operator\'s config.toml cannot disable the sandbox', async () => {
+  const run = await runProbeWithSeededParent({});
+  const operatorCodexHome = join(run.operatorHome, '.codex');
+  assert.notEqual(run.childEnvironment['CODEX_HOME'], operatorCodexHome, 'the child inherited the operator CODEX_HOME');
+  assert.equal(run.childEnvironment['CODEX_HOME_IS'], run.layout.codexHome);
+  assert.equal(run.layout.codexHome, join(run.layout.stateRoot, 'codex'));
+  // The state root is never a temporary directory: Codex refuses to create its PATH-alias helper
+  // binaries there and warns on every run, so a default under TMPDIR would be a broken default.
+  assert.ok(!defaultEngineStateRoot({}).startsWith(tmpdir()), `the default state root is a temporary directory: ${defaultEngineStateRoot({})}`);
+});
+
+test('F03-AC5 the login is copied into the ShipLoop state and the operator config beside it is not', async () => {
+  // Codex keeps its ChatGPT login in `$CODEX_HOME/auth.json` and every other setting in
+  // `$CODEX_HOME/config.toml`. Seeding the first and not the second is what lets the engine
+  // authenticate while keeping the operator's unrestricted `sandbox_mode` out of its reach.
+  const root = mkdtempSync(join(tmpdir(), 'shiploop-state-'));
+  const operatorCodexHome = join(root, 'operator', '.codex');
+  const stateRoot = join(root, 'state');
+  mkdirSync(operatorCodexHome, { recursive: true });
+  writeFileSync(join(operatorCodexHome, 'auth.json'), '{"OPENAI_API_KEY":null}', 'utf8');
+  writeFileSync(join(operatorCodexHome, 'config.toml'), 'sandbox_mode = "UNRESTRICTED"\napproval_policy = "never"\n', 'utf8');
+  const previous = process.env['CODEX_HOME'];
+  process.env['CODEX_HOME'] = operatorCodexHome;
+  try {
+    const state = prepareEngineState({ stateRoot, attempt: '/w/job-1' });
+    assert.ok(state.ok, 'the state was prepared');
+    if (!state.ok) return;
+    assert.equal(existsSync(join(state.value.codexHome, 'auth.json')), true, 'the login must be seeded or no run can authenticate');
+    assert.equal(existsSync(join(state.value.codexHome, 'config.toml')), false, 'the operator config must never be copied into the engine state');
+    assert.equal(statSync(join(state.value.codexHome, 'auth.json')).mode & 0o777, 0o600, 'a credential copy must not be group or world readable');
+    assert.equal(statSync(state.value.home).mode & 0o777, 0o700, 'the per-attempt home must not be group or world readable');
+
+    // Idempotent, and a second attempt in the same state root does not overwrite the login.
+    writeFileSync(join(operatorCodexHome, 'auth.json'), '{"OPENAI_API_KEY":null}', 'utf8');
+    const again = prepareEngineState({ stateRoot, attempt: '/w/job-2' });
+    assert.ok(again.ok);
+    if (!again.ok) return;
+    assert.notEqual(again.value.home, state.value.home, 'two attempts must not share one HOME');
+    assert.equal(again.value.codexHome, state.value.codexHome, 'one login store is shared so a token refresh is not racing itself');
+  } finally {
+    if (previous === undefined) delete process.env['CODEX_HOME'];
+    else process.env['CODEX_HOME'] = previous;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('F03-AC5 a state root that cannot be created is refused rather than falling back to ~/.codex', async () => {
+  const blocked = join(tmpdir(), 'shiploop-env-blocked');
+  writeFileSync(blocked, 'not a directory', 'utf8');
+  const state = prepareEngineState({ stateRoot: blocked, attempt: '/w/job-1' });
+  assert.equal(state.ok, false, 'a state root that cannot exist must not be silently replaced by the operator home');
+  if (state.ok) return;
+  assert.equal(state.error.code, 'Unavailable');
+  assert.match(state.error.reason, /unrestricted sandbox_mode/);
+});
+
+test('F03-AC5 the version probe child is allowlisted too, and seeds no login', async () => {
+  // The probe is a child like any other: leaving it on the worker\'s environment would keep the
+  // whole exposure in place for the call an operator runs most often. The login is not seeded
+  // because `--version` never authenticates.
+  const root = mkdtempSync(join(tmpdir(), 'shiploop-probe-'));
+  const stateRoot = join(root, 'state');
+  const binary = join(root, 'fake-codex');
+  writeFileSync(
+    binary,
+    [
+      '#!/bin/sh',
+      // The observation is the real child writing down what it was handed.
+      'env > "$(dirname "$0")/child-env.txt"',
+      'printf \'codex-cli 0.159.1\\n\'',
+    ].join('\n'),
+    'utf8',
+  );
+  chmodSync(binary, 0o755);
+  const previous = { GH_TOKEN: process.env['GH_TOKEN'], DATABASE_URL: process.env['DATABASE_URL'] };
+  process.env['GH_TOKEN'] = ['ghp', 'probeMustNotLeak'].join('_');
+  process.env['DATABASE_URL'] = 'file:///state/shiploop.db';
+  try {
+    const verdict = await new CodexClient({ binary, stateRoot }).checkVersion(adapterContext('op_probe_env'));
+    assert.ok(verdict.ok, `the version probe answered: ${verdict.ok ? '' : verdict.error.reason}`);
+    if (!verdict.ok) return;
+    assert.equal(verdict.value.runtimeVersion, CODEX_VERIFIED_VERSION);
+    const report = readFileSync(join(root, 'child-env.txt'), 'utf8');
+    assert.ok(!report.includes('GH_TOKEN'), `the probe child inherited GH_TOKEN: ${report}`);
+    assert.ok(!report.includes('DATABASE_URL'), `the probe child inherited DATABASE_URL: ${report}`);
+    assert.equal(existsSync(join(stateRoot, 'codex', 'auth.json')), false, 'a version probe must not copy a credential');
   } finally {
     for (const [name, value] of Object.entries(previous)) {
       if (value === undefined) delete process.env[name];
@@ -1087,6 +1395,73 @@ test('the engine process is not handed the operator\'s ambient credentials', asy
     }
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test('F03-AC5 the shipped client start hands the engine the allowlist and no operator CODEX_HOME', async () => {
+  // The same assertion through the shipped path, not through `engineEnvironment` directly: the
+  // claim being made is about the process `startSession` spawns.
+  const root = mkdtempSync(join(tmpdir(), 'shiploop-start-'));
+  const workspace = join(root, 'worktrees', 'job-1');
+  const operatorCodexHome = join(root, 'operator', '.codex');
+  mkdirSync(workspace, { recursive: true });
+  mkdirSync(operatorCodexHome, { recursive: true });
+  const engine = join(root, 'codex');
+  writeFileSync(
+    engine,
+    [
+      '#!/bin/sh',
+      'printf \'{"type":"thread.started","thread_id":"01a0f699-7149-7d20-831e-98f7b7b43a71"}\\n\'',
+      'printf "HOME_IS %s\\n" "$HOME"',
+      'printf "CODEX_HOME_IS %s\\n" "${CODEX_HOME:-unset}"',
+      'printf \'{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"done"}}\\n\'',
+      'printf \'{"type":"turn.completed","usage":{"input_tokens":1,"cached_input_tokens":0,"output_tokens":1}}\\n\'',
+    ].join('\n'),
+    'utf8',
+  );
+  chmodSync(engine, 0o755);
+  const previous = process.env['CODEX_HOME'];
+  process.env['CODEX_HOME'] = operatorCodexHome;
+  try {
+    const client = new CodexClient({ binary: engine, stateRoot: join(root, 'state') });
+    const started = client.start({
+      cwd: workspace,
+      sandbox: 'workspace-write',
+      prompt: 'do the thing',
+      invocation: 'Fresh',
+      signal: new AbortController().signal,
+    });
+    assert.ok(started.ok, `the engine started: ${started.ok ? '' : started.error.reason}`);
+    if (!started.ok) return;
+    const output = (await readAllLines(started.value)).join('\n');
+    started.value.dispose();
+    const layout = engineStateLayout({ stateRoot: join(root, 'state'), attempt: workspace });
+    assert.ok(output.includes(`HOME_IS ${layout.home}`), `the spawned engine got the wrong HOME: ${output}`);
+    assert.ok(output.includes(`CODEX_HOME_IS ${layout.codexHome}`), `the spawned engine got the wrong CODEX_HOME: ${output}`);
+    assert.ok(!output.includes(operatorCodexHome), `the spawned engine inherited the operator CODEX_HOME: ${output}`);
+  } finally {
+    if (previous === undefined) delete process.env['CODEX_HOME'];
+    else process.env['CODEX_HOME'] = previous;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('F03-AC5 the allowlist is exactly the seven names the engine needs, and each is justified', () => {
+  // A test that enumerates the allowlist is what stops it growing by accident: adding a name
+  // here is a deliberate act with a stated reason, not a one-word diff.
+  assert.deepEqual([...ENGINE_ENVIRONMENT_VARIABLES], ['PATH', 'HOME', 'TMPDIR', 'LANG', 'LC_ALL', 'TZ', 'CODEX_HOME']);
+  for (const name of FORBIDDEN_IN_CHILD) {
+    assert.ok(
+      !(ENGINE_ENVIRONMENT_VARIABLES as readonly string[]).includes(name),
+      `${name} is on the engine allowlist, which would hand the engine authority it must not hold`,
+    );
+  }
+  // `LC_ALL` is only forwarded when the operator set one, so inventing it cannot override LANG.
+  const layout = engineStateLayout({ stateRoot: '/state', attempt: '/w/job-1' });
+  assert.equal(engineEnvironment({ LC_ALL: 'en_US.UTF-8' }, layout)['LC_ALL'], 'en_US.UTF-8');
+  assert.equal(engineEnvironment({}, layout)['LC_ALL'], undefined);
+  assert.equal(engineEnvironment({}, layout)['LANG'], 'C.UTF-8');
+  assert.equal(engineEnvironment({ TMPDIR: '/var/tmp' }, layout)['TMPDIR'], '/var/tmp');
+  assert.equal(engineEnvironment({}, layout)['TZ'], 'UTC');
 });
 
 async function readAllLines(process: CodexProcess): Promise<string[]> {

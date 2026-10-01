@@ -31,9 +31,41 @@
  * to the same group, and reports which one ended it. Nothing here matches on a command name, a
  * port or a pattern, so a concurrent Codex run belonging to someone else is unreachable from
  * this adapter (F17-AC1, F17-AC5).
+ *
+ * **The environment is an allowlist of seven names.** `engineEnvironment` builds the child's
+ * environment from scratch: it copies nothing it was not asked for and forwards nothing whose
+ * name is not in {@link ENGINE_ENVIRONMENT_VARIABLES}. The earlier version of this file did the
+ * opposite — it started from `process.env` and dropped names matching two regexes — which fails
+ * open in the one direction that matters, because a credential whose name nobody anticipated is
+ * still handed to code the owner is being asked to trust with their repository. A denylist of
+ * known credential names cannot be complete; an allowlist is complete by construction, and the
+ * test in `codex.test.ts` is written so that reverting to the denylist makes it fail (F03-AC5,
+ * N02-AC3).
+ *
+ * **`CODEX_HOME` is ShipLoop-owned, never the operator's.** Two facts forced this. First,
+ * Codex reads its own configuration from `$CODEX_HOME/config.toml`, and on this host that file
+ * sets an unrestricted `sandbox_mode` together with `approval_policy = "never"` for every
+ * trusted project, this repository included — so inheriting the operator's `CODEX_HOME` would
+ * hand the engine a configuration that disables the sandbox the flag above requests. Second, Codex keeps
+ * its ChatGPT login in `$CODEX_HOME/auth.json`, so pointing `CODEX_HOME` at an empty directory
+ * without seeding anything turns every run into a `401`. {@link prepareEngineState} therefore
+ * creates a state root this product owns and copies **only** `auth.json` into it; the operator's
+ * `config.toml`, trusted-project list, model preferences, MCP servers and hooks are simply not
+ * there to be inherited.
+ *
+ * The residual exposure is stated rather than hidden: the child runs as the same uid as the
+ * worker, so an absolute path to `~/.codex/auth.json` or `~/.ssh/id_ed25519` is still readable.
+ * What the allowlist removes is the ambient *channel* — the operator's session cookies, `gh`
+ * tokens, `LINEAR_API_KEY`, `DATABASE_URL`, netrc and askpass pointers — and what the ShipLoop
+ * `HOME` removes is the ambient *directory*. Same-uid isolation is a separate change, recorded
+ * in `docs/evidence/2026-10-01-credential-separation.md`.
  */
 
 import { spawn, type ChildProcessByStdio } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import { chmodSync, copyFileSync, existsSync, mkdirSync, statSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
+import { join } from 'node:path';
 import type { Readable } from 'node:stream';
 
 import { err, ok, type Result } from '@shiploop/domain';
@@ -67,6 +99,14 @@ export interface CodexClientOptions {
   readonly binary: string;
   /** Model passed as `-m`. Null uses whatever the operator profile selects. */
   readonly model?: string | null;
+  /**
+   * Absolute root of the ShipLoop-owned directory holding engine state.
+   *
+   * Defaults to `<XDG_STATE_HOME or ~/.local/state>/shiploop/codex`. It must not live under
+   * `TMPDIR`: Codex refuses to create its PATH-alias helper binaries beneath a temporary
+   * directory and warns on every run when it has to (measured on 0.159.1).
+   */
+  readonly stateRoot?: string;
   /** Bound on one graceful shutdown before the group is killed. */
   readonly gracefulStopMs?: number;
   /** Bound on waiting for a killed group to disappear. */
@@ -285,7 +325,13 @@ export class CodexClient {
     return ok(checkCodexVersion(version));
   }
 
-  /** Spawns a Codex session as the leader of its own process group. */
+  /**
+   * Spawns a Codex session as the leader of its own process group.
+   *
+   * The ShipLoop-owned state is created first, because the engine's environment cannot be
+   * assembled without it and because a failure to create it must be a refusal rather than a
+   * fallback onto the operator's `~/.codex`.
+   */
   start(request: CodexSpawnRequest): Result<CodexProcess> {
     if (request.invocation === 'Resume' && request.priorSessionId === undefined) {
       return err(
@@ -296,6 +342,11 @@ export class CodexClient {
         ),
       );
     }
+    const state = prepareEngineState({
+      stateRoot: this.options.stateRoot,
+      attempt: request.cwd,
+    });
+    if (!state.ok) return err(state.error);
     const argv = buildArgv({
       sandbox: request.sandbox,
       invocation: request.invocation,
@@ -307,7 +358,11 @@ export class CodexClient {
       ...(request.priorSessionId === undefined ? {} : { priorSessionId: request.priorSessionId }),
     });
 
-    const tracked = spawnTrackedGroup([this.options.binary, ...argv], request.cwd);
+    const tracked = spawnTrackedGroup(
+      [this.options.binary, ...argv],
+      request.cwd,
+      engineEnvironment(process.env, state.value),
+    );
     if (tracked.ok) return tracked;
     return err(
       mapCodexVersionProbeFailure(
@@ -324,19 +379,36 @@ export class CodexClient {
    * The probe is not spawned detached: it is a single short-lived `codex --version` with no
    * descendants, and the caller only needs its exit status and stdout. If it overruns, the child
    * itself is killed and the call fails rather than waiting.
+   *
+   * It runs with the same allowlist as a session. A probe inherits an environment exactly like
+   * any other child, so leaving it on `process.env` would keep the whole exposure in place for
+   * the one call an operator most often runs by hand. The login is deliberately **not** seeded
+   * for a version probe: `--version` never authenticates, and copying a credential for a call
+   * that cannot use it would be a credential on disk for nothing.
    */
   private probe(
     argv: readonly string[],
     timeoutMs: number,
     redact: (text: string) => string,
   ): Promise<Result<{ readonly stdout: string; readonly stderr: string; readonly exitCode: number | null }>> {
+    const state = prepareEngineState({
+      stateRoot: this.options.stateRoot,
+      attempt: `codex-version-probe:${this.options.binary}`,
+      seedAuthFrom: null,
+    });
+    if (!state.ok) return Promise.resolve(err(state.error));
+    const environment = engineEnvironment(process.env, state.value);
     return new Promise((resolve) => {
       let stdout = '';
       let stderr = '';
       let settled = false;
       let child: CodexChildProcess;
       try {
-        child = spawn(this.options.binary, [...argv], { stdio: ['ignore', 'pipe', 'pipe'], shell: false });
+        child = spawn(this.options.binary, [...argv], {
+          stdio: ['ignore', 'pipe', 'pipe'],
+          shell: false,
+          env: environment,
+        });
       } catch (cause) {
         resolve(err(mapCodexVersionProbeFailure(describe(cause), null, redact)));
         return;
@@ -395,45 +467,195 @@ function signalGroup(child: CodexChildProcess, signal: NodeJS.Signals): void {
 }
 
 /**
- * Spawns any argv as the leader of its own process group.
+ * The only variables the engine process receives.
+ *
+ * Every entry is here because the engine demonstrably needs it on 0.159.1, measured on this
+ * host, and nothing else is here because nothing else was needed to run `codex --version` and
+ * one bounded `codex exec` to completion under exactly this set:
+ *
+ * - `PATH` — Codex resolves its own Linux sandbox helper and the `git` and shell tools the
+ *   session runs from it. Removing it makes the engine unable to start its sandbox.
+ * - `HOME` — required by `git`, by every tool the session may run, and by Node itself. It is
+ *   **not** the operator's home: {@link engineStateLayout} points it at a ShipLoop-owned
+ *   directory created for that attempt, so no operator credential resolves through `$HOME`.
+ * - `TMPDIR` — where Codex and its sandbox stage files. Defaults to the OS temporary directory.
+ * - `LANG` and `LC_ALL` — Codex refuses to assume a UTF-8 locale and prints
+ *   `locale is not UTF-8 - unicode glyphs may render incorrectly` when neither is usable, so
+ *   the operator's locale is forwarded rather than invented.
+ * - `TZ` — timestamps in the engine's own output are rendered through it.
+ * - `CODEX_HOME` — where Codex reads `auth.json` and writes rollouts. It points at a directory
+ *   this product created, never at the operator's `~/.codex`; see the module comment for why
+ *   inheriting that one would disable the sandbox.
+ *
+ * Deliberately absent, each because inheriting it hands the engine authority or a pointer to
+ * authority: every other provider credential (`GH_TOKEN`, `LINEAR_API_KEY`, …), `DATABASE_URL`
+ * (the authoritative store), the credential-FILE pointers (`NETRC`, `GIT_CONFIG_GLOBAL`,
+ * `GIT_CONFIG_NOSYSTEM`, `GIT_ASKPASS`, `SSH_ASKPASS`, `GIT_SSH_COMMAND`, `SSH_AUTH_SOCK`,
+ * `XDG_CONFIG_HOME`), the AWS profile selectors, the proxy variables (a proxy URL is a
+ * credential and it redirects the engine's traffic), and any operator Codex override such as
+ * `CODEX_MANAGED_BY_NPM` or `CONFIG_PROFILE`.
+ */
+export const ENGINE_ENVIRONMENT_VARIABLES = ['PATH', 'HOME', 'TMPDIR', 'LANG', 'LC_ALL', 'TZ', 'CODEX_HOME'] as const;
+
+/** The engine's own state directory: its login, its rollouts, and nothing the operator wrote. */
+export const ENGINE_CODEX_HOME_DIRECTORY = 'codex';
+
+/** Per-attempt home directories live under here, one per workspace, never the operator's. */
+export const ENGINE_HOME_DIRECTORY = 'home';
+
+export interface EngineStateLayout {
+  /** Absolute, ShipLoop-owned root. Created with mode 0700. */
+  readonly stateRoot: string;
+  /** `CODEX_HOME` for every attempt: one login, one rollout store, no operator config. */
+  readonly codexHome: string;
+  /** `HOME` for this attempt alone. */
+  readonly home: string;
+  /** The directory name the attempt key produced, for diagnostics. */
+  readonly attemptKey: string;
+}
+
+/** The default state root: XDG state, never a temporary directory. */
+export function defaultEngineStateRoot(parent: NodeJS.ProcessEnv = process.env): string {
+  const xdg = parent['XDG_STATE_HOME'];
+  const base = typeof xdg === 'string' && xdg.length > 0 ? xdg : join(homedir(), '.local', 'state');
+  return join(base, 'shiploop', 'codex');
+}
+
+/**
+ * The directory key one attempt's `HOME` is derived from.
+ *
+ * The workspace path, not the operation id: an attempt that is interrupted and later resumed
+ * reconnects to the same worktree (`<attemptRoot>/worktrees/<workspaceId>`), so the same attempt
+ * finds the same `HOME`, while two concurrent attempts get two. A short digest is used because
+ * a workspace path is a path, and a directory named after a path is a path traversal waiting to
+ * happen.
+ */
+export function attemptKeyOf(attempt: string): string {
+  return createHash('sha256').update(attempt).digest('hex').slice(0, 32);
+}
+
+/** Resolves the three directories one attempt runs against, without creating anything. */
+export function engineStateLayout(options: {
+  readonly stateRoot?: string | undefined;
+  readonly attempt: string;
+}): EngineStateLayout {
+  const stateRoot = options.stateRoot ?? defaultEngineStateRoot();
+  const attemptKey = attemptKeyOf(options.attempt);
+  return {
+    stateRoot,
+    codexHome: join(stateRoot, ENGINE_CODEX_HOME_DIRECTORY),
+    home: join(stateRoot, ENGINE_HOME_DIRECTORY, attemptKey),
+    attemptKey,
+  };
+}
+
+/**
+ * Creates the directories the engine runs against and returns them.
+ *
+ * Mode 0700 because the state root holds the engine's login: a directory the operator's other
+ * accounts can list is a directory they can read a credential out of. Idempotent, and it copies
+ * the operator's `auth.json` when there is one and the destination has none or an older copy —
+ * a token the operator re-authenticated in place would otherwise leave the engine holding a
+ * refresh token that has already been consumed.
+ *
+ * A failure here is a refusal, not a warning: a run whose `CODEX_HOME` could not be created
+ * would otherwise fall back to `~/.codex` and inherit that file's unrestricted sandbox mode.
+ */
+export function prepareEngineState(
+  options: { readonly stateRoot?: string | undefined; readonly attempt: string; readonly seedAuthFrom?: string | null | undefined },
+): Result<EngineStateLayout> {
+  const layout = engineStateLayout(options);
+  try {
+    mkdirSync(layout.stateRoot, { recursive: true, mode: 0o700 });
+    mkdirSync(layout.codexHome, { recursive: true, mode: 0o700 });
+    mkdirSync(layout.home, { recursive: true, mode: 0o700 });
+    chmodSync(layout.home, 0o700);
+  } catch (cause) {
+    return err({
+      code: 'Unavailable',
+      reason: `the ShipLoop-owned engine state directory ${layout.stateRoot} could not be created (${describe(cause)}). Running without it would make the engine fall back to the operator's ~/.codex, whose config.toml sets an unrestricted sandbox_mode and approval_policy = "never" on this host, so the attempt is refused rather than started (F03-AC5).`,
+    });
+  }
+
+  const source = options.seedAuthFrom === undefined ? operatorCodexAuthPath() : options.seedAuthFrom;
+  if (source === null) return ok(layout);
+  try {
+    if (!existsSync(source)) return ok(layout);
+    const sourceStat = statSync(source);
+    const destination = join(layout.codexHome, 'auth.json');
+    const destinationStat = existsSync(destination) ? statSync(destination) : null;
+    if (destinationStat !== null && destinationStat.size === sourceStat.size && destinationStat.mtimeMs >= sourceStat.mtimeMs) {
+      return ok(layout);
+    }
+    copyFileSync(source, destination);
+    chmodSync(destination, 0o600);
+  } catch (cause) {
+    return err({
+      code: 'Unavailable',
+      reason: `the Codex login at ${source} could not be copied into ${layout.codexHome} (${describe(cause)}). Without it every run would be refused by the provider as unauthenticated, so this is reported rather than left to fail as a 401 (F03-AC5).`,
+    });
+  }
+  return ok(layout);
+}
+
+/**
+ * Where the operator keeps their Codex login, when they have one.
+ *
+ * Read from `CODEX_HOME` when the worker was started with it and from `~/.codex` otherwise,
+ * because that is where `codex login` puts `auth.json`. Only the file name is used; the
+ * operator's `config.toml` next to it is deliberately never copied.
+ */
+function operatorCodexAuthPath(parent: NodeJS.ProcessEnv = process.env): string | null {
+  const configured = parent['CODEX_HOME'];
+  const codexHome = typeof configured === 'string' && configured.length > 0 ? configured : join(homedir(), '.codex');
+  return join(codexHome, 'auth.json');
+}
+
+/**
+ * The child's entire environment: seven names, and the value of each is named here.
+ *
+ * `HOME` and `CODEX_HOME` are *computed*, never copied — copying the operator's `HOME` is
+ * precisely the failure this function exists to prevent, and copying the operator's `CODEX_HOME`
+ * would carry that unrestricted `sandbox_mode` with it.
+ */
+export function engineEnvironment(
+  parent: NodeJS.ProcessEnv,
+  layout: EngineStateLayout,
+): NodeJS.ProcessEnv {
+  const lang = parent['LANG'] ?? parent['LC_ALL'] ?? 'C.UTF-8';
+  const environment: NodeJS.ProcessEnv = {
+    PATH: parent['PATH'] ?? '/usr/local/bin:/usr/bin:/bin',
+    HOME: layout.home,
+    TMPDIR: parent['TMPDIR'] ?? tmpdir(),
+    LANG: lang,
+    TZ: parent['TZ'] ?? 'UTC',
+    CODEX_HOME: layout.codexHome,
+  };
+  // `LC_ALL` only when the operator set one: inventing it would override `LANG` and change the
+  // engine's rendering, which is a configuration decision this adapter does not get to make.
+  if (typeof parent['LC_ALL'] === 'string' && parent['LC_ALL'].length > 0) {
+    environment['LC_ALL'] = parent['LC_ALL'];
+  }
+  return environment;
+}
+
+/**
+ * Spawns any argv as the leader of its own process group, with an environment the caller chose.
  *
  * Exported separately from {@link CodexClient.start} so the shutdown contract can be proven
  * against a trivial `node -e` process group rather than by spending engine quota on every test
- * run. The Codex-specific argv construction stays inside `start`, and this function is the only
- * place a process is ever created, so there is one implementation of "detached, stdin closed, no
- * shell, one tracked group" rather than two that could drift.
- */
-/**
- * Variables whose presence would hand the engine an ambient credential.
+ * run. The Codex-specific argv and environment construction stay inside `start`, and this
+ * function is the only place a process is ever created, so there is one implementation of
+ * "detached, stdin closed, no shell, one tracked group" rather than two that could drift.
  *
- * The list is a denylist over names, deliberately in addition to the scrub below, so a
- * variable added to the operator's shell after this was written is still caught. It cannot be
- * exhaustive — a secret can arrive under any name — which is why the worker-side scrub and the
- * separate-identity decision in docs/evidence/2026-10-01-credential-separation.md are the
- * durable answer and this is defence in depth, not the boundary itself.
+ * `environment` is required rather than defaulted. A default of `process.env` here would put
+ * the inheritance this module exists to remove back in one line, and it would be invisible.
  */
-const CREDENTIAL_VARIABLE = /^(?:.*_)?(?:TOKEN|SECRET|PASSWORD|PASS|APIKEY|API_KEY|CREDENTIALS?|PRIVATE_KEY|SESSION)$/i;
-const CREDENTIAL_AGENT = /^(?:SSH_AUTH_SOCK|GIT_ASKPASS|SSH_ASKPASS|GIT_CONFIG_GLOBAL)$/;
-
-/** The engine receives a PATH and nothing that carries authority. */
-function engineEnvironment(parent: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-  const scrubbed: NodeJS.ProcessEnv = {
-    PATH: parent['PATH'] ?? '/usr/local/bin:/usr/bin:/bin',
-    HOME: parent['HOME'] ?? '/tmp',
-    TMPDIR: parent['TMPDIR'] ?? '/tmp',
-    LANG: parent['LANG'] ?? 'C.UTF-8',
-    TZ: parent['TZ'] ?? 'UTC',
-    CODEX_HOME: parent['CODEX_HOME'] ?? '',
-  };
-  for (const [name, value] of Object.entries(parent)) {
-    if (value === undefined) continue;
-    if (CREDENTIAL_VARIABLE.test(name) || CREDENTIAL_AGENT.test(name)) continue;
-    scrubbed[name] = value;
-  }
-  return scrubbed;
-}
-
-export function spawnTrackedGroup(argv: readonly string[], cwd: string): Result<CodexProcess> {
+export function spawnTrackedGroup(
+  argv: readonly string[],
+  cwd: string,
+  environment: NodeJS.ProcessEnv,
+): Result<CodexProcess> {
   let child: CodexChildProcess;
   try {
     child = spawn(argv[0] ?? '', [...argv.slice(1)], {
@@ -445,12 +667,12 @@ export function spawnTrackedGroup(argv: readonly string[], cwd: string): Result<
       // that never writes would leave the session waiting on input it will never send.
       stdio: ['ignore', 'pipe', 'pipe'],
       shell: false,
-      // The engine must not inherit the operator's ambient authority. It runs as the same uid
-      // and can read any file the worker can, so an inherited `LINEAR_API_KEY`, `GH_TOKEN` or
-      // `SSH_AUTH_SOCK` is a credential handed to code the owner is being asked to trust with
-      // their repository. Only what the attempt needs is passed, and anything that looks like
-      // an ambient credential is removed rather than forwarded (F03-AC5, N02-AC3).
-      env: engineEnvironment(process.env),
+      // An explicit environment, never an inherited one. The engine runs as the same uid and can
+      // read any file the worker can, so an inherited `GH_TOKEN`, `LINEAR_API_KEY`,
+      // `DATABASE_URL` or `SSH_AUTH_SOCK` is authority handed to code the owner is being asked to
+      // trust with their repository. The map is the allowlist in `engineEnvironment` and nothing
+      // else reaches this child (F03-AC5, N02-AC3).
+      env: environment,
     });
   } catch (cause) {
     return err({ code: 'Unavailable', reason: `the process could not be spawned (${describe(cause)})` });

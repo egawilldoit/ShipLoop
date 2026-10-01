@@ -21,10 +21,39 @@
  *    "SHA that pull request head must match to allow merge".** So a genuine compare-and-set
  *    head precondition exists and is used whenever the caller pins one (F26-AC3).
  * 4. **Branch protection is off and no rulesets exist on this repository**
- *    (`main` is `protected: false`, `GET /rulesets` returned `[]`), so nothing at the
- *    provider would have refused a merge. That is exactly why the capability declaration
- *    must not be read as a boundary, and `README.md` states which token permissions were
- *    verified rather than assumed.
+ *    (`main` is `protected: false`, `GET /branches/main/protection` returned HTTP 404
+ *    `{"message":"Branch not protected",…}`, and `GET /rulesets?includes_parents=true`
+ *    returned `[]`), so nothing at the provider would have refused a merge. That is exactly why
+ *    the capability declaration must not be read as a boundary, and `README.md` states which
+ *    token permissions were verified rather than assumed.
+ *
+ * **The policy read is for the MERGE TARGET, and it distinguishes four answers.**
+ * `approvalRules` used to read `branches/{request.branch}/protection` — the *feature* branch,
+ * which is the one branch a repository is least likely to protect, so the read was guaranteed to
+ * report nothing exactly when the target's rule was the one that mattered (F26-AC5). It now reads
+ * the target branch the request names and folds in the repository's rulesets, because a ruleset
+ * can require reviews and status checks with no branch protection in existence at all.
+ *
+ * The four answers are kept apart, and collapsing any two of them is the failure mode this
+ * replaced:
+ *
+ * - **confirmed absent** — HTTP 404 `Branch not protected` on the target and no applicable active
+ *   ruleset. Nothing is added to `reviews`.
+ * - **confirmed present** — a requirement is unmet, so an `ApprovalRulePending` names the target,
+ *   every source that contributed the requirement and the strictest count.
+ * - **not permitted** — HTTP 403. Reading protection and rulesets needs administration this
+ *   credential may not hold, and *that is not evidence of absence*. It is `Blocked` with the
+ *   provider's own message, so a merge cannot be authorized on a policy nobody read.
+ * - **not known** — a timeout, a 5xx or a rate limit. `Unavailable`/`RateLimited` becomes the same
+ *   `Blocked`, because a policy that was never read is not an unprotected branch (F26-AC5).
+ *
+ * **An approval is counted the way the provider would count it.** GitHub returns one record per
+ * review *event*, so the same reviewer appears repeatedly — measured live on
+ * `egawilldoit/token-observatory#20`, where `MORTAKI0` submitted six `COMMENTED` records for one
+ * `commit_id` — and an approval carries the `commit_id` it approved. Counting records would let a
+ * single reviewer satisfy a two-review rule and would treat an approval of an older commit as
+ * current, so `countCurrentApprovals` keeps the **last** record per reviewer, counts it only when
+ * its `commit_id` is the head being merged, and names what it excluded.
  *
  * `Stale` is derived, never guessed. A required check name reported on the base commit but
  * not on the candidate head has not been rerun for this candidate, so it is `Stale`; a
@@ -110,6 +139,8 @@ const REF_SEGMENT = /^[A-Za-z0-9._\-/]+$/;
 const MAX_PULL_REQUESTS = 100;
 const MAX_CHECK_RUNS = 100;
 const MAX_REVIEWS = 100;
+/** Bound on the rulesets one repository or organisation listing can contribute. */
+const MAX_RULESETS = 100;
 /**
  * Bound on the commits a range read returns.
  *
@@ -425,6 +456,14 @@ interface ReviewShape {
   readonly state: string;
   readonly reviewer: string;
   readonly submittedAt: string | null;
+  /**
+   * The commit this review was submitted against, which is how freshness is decided.
+   *
+   * Measured live on `egawilldoit/token-observatory#20`: every record carries the full `commit_id`
+   * it approved. It is null only when the provider omitted it, and an approval that cannot be tied
+   * to a commit is not counted — a guess in that direction would be an approval of nothing.
+   */
+  readonly commitId: string | null;
 }
 
 function readReview(value: unknown): ReviewShape | null {
@@ -436,7 +475,277 @@ function readReview(value: unknown): ReviewShape | null {
     state,
     reviewer: str(field(field(value, 'user'), 'login')) ?? 'unknown',
     submittedAt: str(field(value, 'submitted_at')),
+    commitId: str(field(value, 'commit_id')),
   };
+}
+
+/* -------------------------------------------------------------------------- */
+/* Branch policy on the merge target (F26-AC5)                                  */
+/* -------------------------------------------------------------------------- */
+
+/** What branch protection alone requires of a review on one branch. */
+interface BranchProtectionReviewRules {
+  readonly requiredApprovals: number;
+  readonly dismissStaleReviews: boolean;
+  readonly requireCodeOwnerReviews: boolean;
+  readonly requireLastPushApproval: boolean;
+  /** Users, teams and apps only a maintainer may dismiss a review on behalf of. */
+  readonly dismissalRestrictions: readonly string[];
+  /** Status-check contexts the provider will not merge without. */
+  readonly statusChecks: readonly string[];
+}
+
+function emptyReviewRules(): BranchProtectionReviewRules {
+  return {
+    requiredApprovals: 0,
+    dismissStaleReviews: false,
+    requireCodeOwnerReviews: false,
+    requireLastPushApproval: false,
+    dismissalRestrictions: [],
+    statusChecks: [],
+  };
+}
+
+/** One ruleset that is enforced on the merge target. */
+interface ApplicableRuleset {
+  readonly name: string;
+  readonly requiredApprovals: number;
+  readonly statusChecks: readonly string[];
+  readonly dismissStaleReviews: boolean;
+  readonly requireCodeOwnerReviews: boolean;
+  readonly requireLastPushApproval: boolean;
+  readonly bypassActors: readonly string[];
+}
+
+/** The effective policy on the merge target, with every source that contributed to it. */
+interface MergePolicy {
+  /** The strictest single requirement: GitHub enforces every source, so the largest binds. */
+  readonly requiredApprovals: number;
+  readonly approvalSources: readonly string[];
+  readonly requiredChecks: readonly string[];
+  readonly bypassActors: readonly string[];
+  readonly dismissalRestrictions: readonly string[];
+  readonly dismissesStaleReviews: readonly string[];
+  readonly requireCodeOwnerReviews: readonly string[];
+  readonly requireLastPushApproval: readonly string[];
+  readonly sources: readonly string[];
+}
+
+/** Who a dismissal restriction or bypass allowance names, read through the boundary readers. */
+function actorNames(value: unknown): readonly string[] {
+  const names: string[] = [];
+  for (const [key, loginKey] of [
+    ['users', 'login'],
+    ['teams', 'slug'],
+    ['apps', 'slug'],
+  ] as const) {
+    for (const actor of arrayOf(field(value, key))) {
+      const name = str(field(actor, loginKey));
+      if (name !== null) names.push(`${key.slice(0, -1)} ${name}`);
+    }
+  }
+  return names;
+}
+
+/**
+ * Who may merge without satisfying a ruleset.
+ *
+ * `bypass_actors` is what makes an authorization worth nothing if the holder is one of these, so
+ * it is read rather than left out of the report.
+ */
+function bypassActorNames(value: unknown): readonly string[] {
+  const names: string[] = [];
+  for (const actor of arrayOf(value)) {
+    const mode = str(field(actor, 'bypass_mode'));
+    const id = providerIdentity(field(actor, 'actor_id'));
+    if (mode === 'always' && id !== null) names.push(`actor ${id} (bypass mode always)`);
+  }
+  return names;
+}
+
+/**
+ * The status-check contexts a protection or ruleset requires.
+ *
+ * `contexts` and `checks` are both read because GitHub reports the same requirement twice: the
+ * live capture of `egawilldoit/Ega-House-Platform/branches/main/protection` carried all fifteen
+ * names in `contexts` and again in `checks[].context`.
+ */
+function requiredCheckContexts(value: unknown): readonly string[] {
+  const contexts: string[] = [];
+  for (const context of arrayOf(field(value, 'contexts'))) {
+    const name = str(context);
+    if (name !== null) contexts.push(name);
+  }
+  for (const check of arrayOf(field(value, 'checks'))) {
+    const name = str(field(check, 'context'));
+    if (name !== null) contexts.push(name);
+  }
+  return [...new Set(contexts)];
+}
+
+/**
+ * Whether a ruleset's `ref_name` condition covers this branch.
+ *
+ * GitHub expresses the condition as minimatch patterns over `refs/heads/<name>` plus two
+ * shorthands, both observed live: the ruleset on `egawilldoit/Ega-House-Platform` carries
+ * `{"ref_name":{"include":["~DEFAULT_BRANCH"],"exclude":[]}}`. A condition with no `include` list
+ * matches every ref, which is how a repository-wide ruleset is expressed.
+ */
+export function rulesetCoversRef(ruleset: unknown, target: string, defaultBranch: string): boolean {
+  const conditions = field(ruleset, 'conditions');
+  if (conditions === undefined) return true;
+  const refName = field(conditions, 'ref_name');
+  if (refName === undefined) return true;
+  const include = arrayOf(field(refName, 'include'));
+  if (include.length === 0) return true;
+  const exclude = arrayOf(field(refName, 'exclude'));
+  const ref = `refs/heads/${target}`;
+  if (exclude.some((pattern) => refPatternMatches(str(pattern), ref, defaultBranch))) return false;
+  return include.some((pattern) => refPatternMatches(str(pattern), ref, defaultBranch));
+}
+
+/** One `ref_name` pattern, with GitHub's two shorthands. Never a general glob engine. */
+function refPatternMatches(pattern: string | null, ref: string, defaultBranch: string): boolean {
+  if (pattern === null) return false;
+  if (pattern === '~ALL') return true;
+  if (pattern === '~DEFAULT_BRANCH') return ref === `refs/heads/${defaultBranch}`;
+  // A pattern may be written with or without the `refs/heads/` prefix; both name the same branch.
+  const candidates = pattern.startsWith('refs/') ? [pattern] : [pattern, `refs/heads/${pattern}`];
+  return candidates.some((candidate) => minimatch(candidate, ref));
+}
+
+/**
+ * The subset of minimatch a `ref_name` condition uses: `*` within a segment, `**` across them,
+ * `?` for one character. Anything else is a literal, because a permissive glob is how a
+ * repository-wide rule would be reported as applying to one branch by accident.
+ */
+function minimatch(pattern: string, value: string): boolean {
+  const escaped = pattern
+    .replace(/[.+^${}()|[\]\\]/g, '\\$&')
+    .replace(/\*\*/g, ' ')
+    .replace(/\*/g, '[^/]*')
+    .replace(/ /g, '.*')
+    .replace(/\?/g, '[^/]');
+  return new RegExp(`^${escaped}$`).test(value);
+}
+
+/**
+ * A policy read that never happened, reported as the blocker it is.
+ *
+ * `Blocked` rather than `Unavailable` because the thing missing is a fact — whether the merge
+ * target is protected — and no retry inside the adapter can supply it. Reporting a 403 as an
+ * unprotected branch is the failure F26-AC5 exists to prevent: the owner would authorize a merge
+ * against a rule nobody read.
+ */
+function unreadablePolicy(
+  context: AdapterContext,
+  cause: DomainError,
+  target: string,
+  what: string,
+): DomainError {
+  return blocked(
+    context.redact(
+      `The ${what} of ${target} could not be read, so the provider's approval requirement for that branch is unknown rather than absent: ${cause.reason}`,
+    ),
+    [
+      {
+        name: 'MergePolicyUnreadable',
+        detail: `Reading ${what} for ${target} failed with ${cause.code}. GitHub answers 404 "Branch not protected" when a branch is genuinely unprotected, so a ${cause.code} here is a refusal or a fault and never evidence of absence.`,
+        remedy: 'Grant the connector credential read access to administration on this repository (a token with `repo` and repository administration, or a GitHub App installation with the relevant read permission), then re-read provider state. Merges must not be authorized while the policy is unread.',
+      },
+    ],
+  );
+}
+
+/** What the adapter counted, and what it refused to count and why. */
+interface ApprovalTally {
+  readonly counted: readonly string[];
+  readonly stale: readonly string[];
+  readonly withoutCommit: readonly string[];
+  readonly superseded: readonly string[];
+  readonly withdrawn: readonly string[];
+}
+
+/**
+ * Current approvals, deduplicated by reviewer and tied to the head being merged.
+ *
+ * GitHub returns one record per review *event*, not per reviewer: the live capture of
+ * `egawilldoit/token-observatory#20` holds six `COMMENTED` records from one `MORTAKI0` for one
+ * `commit_id`, and `#19` holds records against two different `commit_id`s. Counting records would
+ * let one person satisfy a two-review rule, and counting every record would let an approval of an
+ * earlier commit pass as an approval of this one. The last record per reviewer is that person's
+ * current decision — the list is chronological — and it counts only when it approved the head.
+ */
+function countCurrentApprovals(reviews: readonly ReviewShape[], headSha: string | null): ApprovalTally {
+  const latest = new Map<string, ReviewShape>();
+  const duplicates = new Set<string>();
+  for (const review of reviews) {
+    if (latest.has(review.reviewer)) duplicates.add(review.reviewer);
+    latest.set(review.reviewer, review);
+  }
+  const counted: string[] = [];
+  const stale: string[] = [];
+  const withoutCommit: string[] = [];
+  const withdrawn: string[] = [];
+  for (const review of latest.values()) {
+    if (review.state.toUpperCase() !== 'APPROVED') {
+      withdrawn.push(`${review.reviewer} (${review.state.toLowerCase()})`);
+      continue;
+    }
+    if (headSha === null) {
+      withoutCommit.push(review.reviewer);
+      continue;
+    }
+    if (review.commitId === null) {
+      withoutCommit.push(review.reviewer);
+      continue;
+    }
+    if (review.commitId !== headSha) {
+      stale.push(`${review.reviewer} (approved ${review.commitId.slice(0, 12)}, head is ${headSha.slice(0, 12)})`);
+      continue;
+    }
+    counted.push(review.reviewer);
+  }
+  return {
+    counted: counted.sort(),
+    stale: stale.sort(),
+    withoutCommit: withoutCommit.sort(),
+    superseded: [...duplicates].sort(),
+    withdrawn: withdrawn.sort(),
+  };
+}
+
+/** The one sentence an owner reads, naming the target, every source and every exclusion. */
+function approvalRuleDetail(target: string, policy: MergePolicy, tally: ApprovalTally): string {
+  const parts: string[] = [
+    `The provider requires ${String(policy.requiredApprovals)} approving review(s) on ${target} and ${String(tally.counted.length)} current approval(s) count towards it (${policy.approvalSources.join('; ') || 'an unnamed rule'}).`,
+    'The provider, not ShipLoop, is the authority on whether this is satisfied (F26-AC5).',
+  ];
+  if (policy.dismissesStaleReviews.length > 0) {
+    parts.push(`${policy.dismissesStaleReviews.join('; ')} dismisses reviews when the head moves.`);
+  }
+  if (policy.requireCodeOwnerReviews.length > 0) {
+    parts.push(`${policy.requireCodeOwnerReviews.join('; ')} additionally requires an approving review from a code owner, which this read cannot evaluate.`);
+  }
+  if (policy.requireLastPushApproval.length > 0) {
+    parts.push(`${policy.requireLastPushApproval.join('; ')} requires the last pusher to approve, so an author who pushes cannot satisfy its own rule.`);
+  }
+  if (policy.dismissalRestrictions.length > 0) {
+    parts.push(`Only ${policy.dismissalRestrictions.join(', ')} may dismiss a review on this branch.`);
+  }
+  if (tally.superseded.length > 0) {
+    parts.push(`Repeated review records from ${tally.superseded.join(', ')} were reduced to their latest decision, so one reviewer counts once.`);
+  }
+  if (tally.stale.length > 0) {
+    parts.push(`Not counted as current: ${tally.stale.join(', ')}.`);
+  }
+  if (tally.withoutCommit.length > 0) {
+    parts.push(`Not counted because GitHub reported no commit for them: ${tally.withoutCommit.join(', ')}.`);
+  }
+  if (tally.withdrawn.length > 0) {
+    parts.push(`Latest decision is not an approval: ${tally.withdrawn.join(', ')}.`);
+  }
+  return parts.join(' ');
 }
 
 /* -------------------------------------------------------------------------- */
@@ -930,11 +1239,29 @@ export class GitHubGitAdapter implements GitAdapter {
     const pullRequest = await this.latestPullRequest(context, names.value, branch.value);
     if (!pullRequest.ok) return pullRequest;
     let submittedReviews: readonly GitReviewState[] = [];
+    let reviewShapes: readonly ReviewShape[] = [];
     if (pullRequest.value !== null) {
       const reviews = await this.reviewsRead(context, names.value, pullRequest.value);
       if (!reviews.ok) return reviews;
-      submittedReviews = reviews.value;
+      reviewShapes = reviews.value.shapes;
+      submittedReviews = reviews.value.states;
     }
+
+    // The policy is read for the branch the change would land on, not the branch it came from.
+    // F26-AC5 asks what the provider will require at the merge, and a repository protects its
+    // default branch rather than the feature branches it opens.
+    const policyRules = await this.approvalRules(
+      context,
+      names.value,
+      baseBranch.value,
+      repository.value.defaultBranch,
+      submittedReviews,
+      reviewShapes,
+      // Freshness is measured against the head the pull request currently holds. With no pull
+      // request there is nothing to approve, so no head is passed and nothing can count.
+      pullRequest.value?.headSha ?? null,
+    );
+    if (!policyRules.ok) return policyRules;
 
     return ok({
       repository: {
@@ -946,7 +1273,7 @@ export class GitHubGitAdapter implements GitAdapter {
       head: head.value,
       base: base.value,
       pullRequest: pullRequest.value === null ? null : pullRequestRefOf(pullRequest.value),
-      reviews: await this.approvalRules(context, names.value, branch.value, submittedReviews),
+      reviews: policyRules.value,
       observedAt: context.clock.now(),
     });
   }
@@ -1875,7 +2202,7 @@ export class GitHubGitAdapter implements GitAdapter {
     context: AdapterContext,
     names: RepositoryNames,
     pull: PullRequestShape,
-  ): Promise<Result<readonly GitReviewState[]>> {
+  ): Promise<Result<{ readonly states: readonly GitReviewState[]; readonly shapes: readonly ReviewShape[] }>> {
     const read = await this.client.execute(context, {
       operationName: 'GitHubPullRequestReviewsRead',
       method: 'GET',
@@ -1883,44 +2210,246 @@ export class GitHubGitAdapter implements GitAdapter {
       query: { per_page: MAX_REVIEWS },
     });
     if (!read.ok) return read;
-    return ok(arrayOf(read.value.data).map(readReview).filter((review): review is ReviewShape => review !== null).map(mapReview));
+    const shapes = arrayOf(read.value.data)
+      .map(readReview)
+      .filter((review): review is ReviewShape => review !== null);
+    // Both views are returned: the states are the contract, the shapes carry the `commit_id` the
+    // approval tally needs, which the contract has nowhere to put.
+    return ok({ states: shapes.map(mapReview), shapes });
   }
 
   /**
-   * Adds an approval rule the provider is still withholding.
+   * The provider's requirements on the branch a merge would land on.
    *
-   * A review that has not been submitted yet is not an approval, and saying so is the whole
-   * point: GitHub reports a pending review in the same list as a submitted one. Branch
-   * protection is optional and frequently absent, so its absence is not an error; a 403 is
-   * equally unremarkable, because reading protection needs administration this credential may
-   * not hold, and a repository without protection has no rule to report either way.
+   * `sources` is kept so a report can say *where* each requirement came from: a count read off
+   * branch protection and a count read off a ruleset are different obligations, and folding them
+   * into one number without saying so would let an owner lower one and believe the other moved.
+   */
+  private async mergePolicy(
+    context: AdapterContext,
+    names: RepositoryNames,
+    target: string,
+    defaultBranch: string,
+  ): Promise<Result<MergePolicy>> {
+    const protection = await this.branchProtection(context, names, target);
+    if (!protection.ok) return protection;
+
+    const rulesets = await this.applicableRulesets(context, names, target, defaultBranch);
+    if (!rulesets.ok) return rulesets;
+
+    const approvalSources: string[] = [];
+    const requiredChecks: string[] = [];
+    const bypassActors: string[] = [];
+    const dismissalRestrictions: string[] = [];
+    const dismissesStaleReviews: string[] = [];
+    const requireCodeOwnerReviews: string[] = [];
+    const requireLastPushApproval: string[] = [];
+    let requiredApprovals = 0;
+    const raiseApprovals = (count: number, source: string): void => {
+      if (count <= 0) return;
+      approvalSources.push(`${source} requires ${count}`);
+      requiredApprovals = Math.max(requiredApprovals, count);
+    };
+
+    if (protection.value.present) {
+      const reviews = protection.value.reviews;
+      raiseApprovals(reviews.requiredApprovals, `branch protection on ${target}`);
+      requiredChecks.push(...reviews.statusChecks);
+      dismissalRestrictions.push(...reviews.dismissalRestrictions);
+      if (reviews.dismissStaleReviews) dismissesStaleReviews.push(`branch protection on ${target}`);
+      if (reviews.requireCodeOwnerReviews) requireCodeOwnerReviews.push(`branch protection on ${target}`);
+      if (reviews.requireLastPushApproval) requireLastPushApproval.push(`branch protection on ${target}`);
+    }
+    for (const ruleset of rulesets.value.applicable) {
+      raiseApprovals(ruleset.requiredApprovals, `ruleset "${ruleset.name}"`);
+      requiredChecks.push(...ruleset.statusChecks);
+      bypassActors.push(...ruleset.bypassActors);
+      if (ruleset.dismissStaleReviews) dismissesStaleReviews.push(`ruleset "${ruleset.name}"`);
+      if (ruleset.requireCodeOwnerReviews) requireCodeOwnerReviews.push(`ruleset "${ruleset.name}"`);
+      if (ruleset.requireLastPushApproval) requireLastPushApproval.push(`ruleset "${ruleset.name}"`);
+    }
+    return ok({
+      requiredApprovals,
+      approvalSources,
+      requiredChecks: [...new Set(requiredChecks)].sort(),
+      bypassActors,
+      dismissalRestrictions,
+      dismissesStaleReviews,
+      requireCodeOwnerReviews,
+      requireLastPushApproval,
+      sources: [...protection.value.sources, ...rulesets.value.sources],
+    });
+  }
+
+  /**
+   * The full protection object for one branch.
+   *
+   * `required_pull_request_reviews` alone is not enough: F26-AC5 asks for the provider's *actual*
+   * approval requirement, and the count is only half of it — `dismiss_stale_reviews`,
+   * `require_code_owner_reviews`, `require_last_push_approval`, the dismissal restrictions and
+   * the required status-check contexts all change what "approved" means. A `404` is the provider
+   * stating the branch is unprotected, which is the one answer that may be read as absence;
+   * anything else is the policy being unreadable, and it is returned rather than swallowed.
+   */
+  private async branchProtection(
+    context: AdapterContext,
+    names: RepositoryNames,
+    target: string,
+  ): Promise<Result<{ readonly present: boolean; readonly reviews: BranchProtectionReviewRules; readonly sources: readonly string[] }>> {
+    const read = await this.client.execute(context, {
+      operationName: 'GitHubBranchProtectionRead',
+      method: 'GET',
+      path: `/repos/${names.owner}/${names.repo}/branches/${encodeRef(target)}/protection`,
+    });
+    if (!read.ok) {
+      if (read.error.code === 'NotFound') {
+        return ok({ present: false, reviews: emptyReviewRules(), sources: [] });
+      }
+      return err(unreadablePolicy(context, read.error, target, 'branch protection'));
+    }
+    const reviews = field(read.value.data, 'required_pull_request_reviews');
+    return ok({
+      present: true,
+      reviews: {
+        requiredApprovals: intOrNull(field(reviews, 'required_approving_review_count')) ?? 0,
+        dismissStaleReviews: boolOrNull(field(reviews, 'dismiss_stale_reviews')) ?? false,
+        requireCodeOwnerReviews: boolOrNull(field(reviews, 'require_code_owner_reviews')) ?? false,
+        requireLastPushApproval: boolOrNull(field(reviews, 'require_last_push_approval')) ?? false,
+        dismissalRestrictions: actorNames(field(reviews, 'dismissal_restrictions')),
+        statusChecks: requiredCheckContexts(field(read.value.data, 'required_status_checks')),
+      },
+      sources: [`branch protection on ${target}`],
+    });
+  }
+
+  /**
+   * The repository's rulesets that are enforced on this branch right now.
+   *
+   * `includes_parents=true` is asked for explicitly: an organisation-level ruleset is a real
+   * requirement on a merge and it is invisible to the repository-scoped listing. A ruleset that is
+   * `disabled` or `evaluate`, or whose `target` is a tag rather than a branch, or whose
+   * `ref_name` does not include the target, is not folded in — a ruleset that does not apply is
+   * not a requirement.
+   */
+  private async applicableRulesets(
+    context: AdapterContext,
+    names: RepositoryNames,
+    target: string,
+    defaultBranch: string,
+  ): Promise<Result<{ readonly applicable: readonly ApplicableRuleset[]; readonly sources: readonly string[] }>> {
+    const read = await this.client.execute(context, {
+      operationName: 'GitHubRulesetRead',
+      method: 'GET',
+      path: `/repos/${names.owner}/${names.repo}/rulesets`,
+      query: { includes_parents: 'true', per_page: MAX_RULESETS },
+    });
+    if (!read.ok) {
+      // A repository with no rulesets answers 200 `[]`. Anything else means the listing could not
+      // be read, and an unread listing is not an empty one.
+      if (read.error.code === 'NotFound') return ok({ applicable: [], sources: [] });
+      return err(unreadablePolicy(context, read.error, target, 'repository rulesets'));
+    }
+
+    const applicable: ApplicableRuleset[] = [];
+    const sources: string[] = [];
+    for (const entry of arrayOf(read.value.data)) {
+      if (str(field(entry, 'target')) !== 'branch') continue;
+      if (str(field(entry, 'enforcement')) !== 'active') continue;
+      const name = str(field(entry, 'name')) ?? 'unnamed ruleset';
+      if (!rulesetCoversRef(entry, target, defaultBranch)) continue;
+
+      let requiredApprovals = 0;
+      const statusChecks: string[] = [];
+      let dismissStaleReviews = false;
+      let requireCodeOwnerReviews = false;
+      let requireLastPushApproval = false;
+      for (const rule of arrayOf(field(entry, 'rules'))) {
+        const parameters = field(rule, 'parameters');
+        switch (str(field(rule, 'type'))) {
+          case 'pull_request':
+            requiredApprovals = Math.max(requiredApprovals, intOrNull(field(parameters, 'required_approving_review_count')) ?? 0);
+            dismissStaleReviews = dismissStaleReviews || (boolOrNull(field(parameters, 'dismiss_stale_reviews_on_push')) ?? false);
+            requireCodeOwnerReviews = requireCodeOwnerReviews || (boolOrNull(field(parameters, 'require_code_owner_review')) ?? false);
+            requireLastPushApproval = requireLastPushApproval || (boolOrNull(field(parameters, 'require_last_push_approval')) ?? false);
+            break;
+          case 'required_status_checks':
+            for (const required of arrayOf(field(parameters, 'required_status_checks'))) {
+              const context = str(field(required, 'context'));
+              if (context !== null) statusChecks.push(context);
+            }
+            break;
+          default:
+            break;
+        }
+      }
+
+      applicable.push({
+        name,
+        requiredApprovals,
+        statusChecks,
+        dismissStaleReviews,
+        requireCodeOwnerReviews,
+        requireLastPushApproval,
+        bypassActors: bypassActorNames(field(entry, 'bypass_actors')),
+      });
+      sources.push(`ruleset "${name}"`);
+    }
+    return ok({ applicable, sources });
+  }
+
+  /**
+   * Folds the provider's policy on the merge target into the review state.
+   *
+   * A review that has not been submitted is not an approval, and saying so is the whole point:
+   * GitHub reports a pending review in the same list as a submitted one. What this no longer does
+   * is treat an unreadable policy as an absent one — a 403 on protection needs administration this
+   * credential may not hold, and it is `Blocked` rather than a branch reported as unprotected
+   * (F26-AC5).
    */
   private async approvalRules(
     context: AdapterContext,
     names: RepositoryNames,
-    branch: string,
+    target: string,
+    defaultBranch: string,
     reviews: readonly GitReviewState[],
-  ): Promise<readonly GitReviewState[]> {
-    const read = await this.client.execute(context, {
-      operationName: 'GitHubBranchProtectionRead',
-      method: 'GET',
-      path: `/repos/${names.owner}/${names.repo}/branches/${encodeRef(branch)}/protection/required_pull_request_reviews`,
-    });
-    if (!read.ok) return reviews;
-    const required = intOrNull(field(read.value.data, 'required_approving_review_count'));
-    if (required === null || required === 0) return reviews;
-    const approvals = reviews.filter(
-      (review) => review.kind === 'Review' && review.decision === 'Approved',
-    ).length;
-    if (approvals >= required) return reviews;
-    return [
-      ...reviews,
-      {
-        kind: 'ApprovalRulePending',
-        rule: 'required_approving_review_count',
-        detail: `GitHub branch protection requires ${required} approving review(s) for ${branch} and ${approvals} have been submitted. The provider, not ShipLoop, is the authority on whether this is satisfied.`,
-      },
-    ];
+    shapes: readonly ReviewShape[],
+    headSha: string | null,
+  ): Promise<Result<readonly GitReviewState[]>> {
+    const policy = await this.mergePolicy(context, names, target, defaultBranch);
+    if (!policy.ok) return policy;
+    const effective = policy.value;
+    const rules: GitReviewState[] = [];
+
+    if (effective.requiredApprovals > 0) {
+      const tally = countCurrentApprovals(shapes, headSha);
+      if (tally.counted.length < effective.requiredApprovals) {
+        rules.push({
+          kind: 'ApprovalRulePending',
+          rule: 'required_approving_review_count',
+          detail: approvalRuleDetail(target, effective, tally),
+        });
+      }
+    }
+
+    // The provider's required status-check contexts are reported rather than enforced here: this
+    // read does not evaluate checks, and a rule the adapter cannot evaluate must not be invented
+    // into a pending one that would block every merge.
+    if (effective.requiredChecks.length > 0) {
+      rules.push({
+        kind: 'Unknown',
+        detail: `The provider requires status check(s) ${effective.requiredChecks.join(', ')} on ${target} (from ${effective.sources.join('; ')}). This read reports live refs, reviews and policy only; readChecks is what evaluates those contexts, so their state here is not known (F26-AC5).`,
+      });
+    }
+
+    // A ruleset can name who merges without satisfying its rules at all. That is a bypass, so it
+    // is stated wherever the rules are reported rather than left for an owner to discover.
+    if (effective.bypassActors.length > 0 && rules.length > 0) {
+      rules.push({
+        kind: 'Unknown',
+        detail: `${effective.bypassActors.join('; ')} may merge to ${target} without satisfying these rules. A bypass is the provider's own escape hatch, so any authorization ShipLoop issues is worthless against it (F26-AC5).`,
+      });
+    }
+    return ok([...reviews, ...rules]);
   }
 
   /**

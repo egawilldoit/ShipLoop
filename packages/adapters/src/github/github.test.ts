@@ -44,8 +44,8 @@ import {
   operationId,
   providerId,
 } from '../testing/fixtures.ts';
-import type { AdapterContext, DraftBody, GitRepositoryRef } from '../contracts/index.ts';
-import { GitHubGitAdapter, draftBody, linkKeyOf, markerLineOf, parseManagedMarker } from './adapter.ts';
+import type { AdapterContext, DraftBody, GitRepositoryRef, GitReviewState } from '../contracts/index.ts';
+import { GitHubGitAdapter, draftBody, linkKeyOf, markerLineOf, parseManagedMarker, rulesetCoversRef } from './adapter.ts';
 import type { GitTransport } from './client.ts';
 import {
   githubRetryAfterMs,
@@ -600,8 +600,11 @@ test('F20-AC1, F24-AC4 readState reports identity, head, base, draft and reviews
         { id: 3, state: 'COMMENTED', user: { login: 'maintainer-c' }, submitted_at: '2026-09-30T11:40:00Z' },
       ],
     }),
-    'GET /repos/:owner/:repo/branches/task/gitad-a/protection/required_pull_request_reviews': () =>
+    'GET /repos/:owner/:repo/branches/main/protection': () =>
+      // Live on 2026-10-01: `egawilldoit/ShipLoop` answers this 404 on every branch. The read is
+      // for the merge TARGET, which is what made the difference from the feature-branch read.
       notFound('Branch not protected'),
+    'GET /repos/:owner/:repo/rulesets': () => ({ body: [] }),
   });
   const state = await okOf(
     adapter.readState(adapterContext('op_read_state'), { repository: REPOSITORY, branch: BRANCH, baseBranch: 'main' }),
@@ -615,12 +618,404 @@ test('F20-AC1, F24-AC4 readState reports identity, head, base, draft and reviews
   assert.equal(state.pullRequest?.draft, true);
   assert.equal(state.pullRequest?.state, 'Open');
   assert.equal(state.observedAt, FIXED_INSTANT);
+  assert.equal(
+    state.reviews.some((review) => review.kind === 'ApprovalRulePending'),
+    false,
+    'an unprotected target with no ruleset has no rule to report',
+  );
   const decisions = state.reviews.filter((review) => review.kind === 'Review');
   assert.deepEqual(decisions.map((review) => (review.kind === 'Review' ? review.decision : 'none')), [
     'Approved',
     'ChangesRequested',
     'Commented',
   ]);
+});
+/* -------------------------------------------------------------------------- */
+/* F26-AC5: the policy is read for the merge target, and an unread policy is    */
+/* not an unprotected one                                                       */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * A full branch protection body, captured live on 2026-10-01 from
+ * `egawilldoit/Ega-House-Platform/branches/main/protection`.
+ *
+ * The field set and the shape of `required_status_checks` — `strict`, `contexts` and the same
+ * names again in `checks[].context` — are GitHub's own, which is why the reader accepts both.
+ */
+const PROTECTION_CAPTURE = {
+  url: 'https://api.github.com/repos/egawilldoit/Ega-House-Platform/branches/main/protection',
+  required_status_checks: {
+    strict: true,
+    contexts: ['workspace', 'contracts', 'domain'],
+    checks: [
+      { context: 'workspace', app_id: 15368 },
+      { context: 'contracts', app_id: 15368 },
+      { context: 'domain', app_id: 15368 },
+    ],
+  },
+  required_pull_request_reviews: {
+    dismiss_stale_reviews: true,
+    require_code_owner_reviews: false,
+    require_last_push_approval: false,
+    required_approving_review_count: 0,
+  },
+  enforce_admins: { enabled: false },
+  required_linear_history: { enabled: false },
+  allow_force_pushes: { enabled: false },
+  allow_deletions: { enabled: false },
+  required_conversation_resolution: { enabled: true },
+  lock_branch: { enabled: false },
+  allow_fork_syncing: { enabled: false },
+} as const;
+
+/**
+ * A ruleset body, captured live on 2026-10-01 from
+ * `egawilldoit/Ega-House-Platform/rulesets/19481313`.
+ *
+ * The captured ruleset is `disabled` with a `copilot_code_review` rule, which is why the fields
+ * that matter here — `conditions.ref_name.include: ["~DEFAULT_BRANCH"]`, `enforcement` and
+ * `bypass_actors: []` — are the ones taken from it and the rule bodies are marked constructed:
+ * no active ruleset exists in this workspace to capture a `pull_request` rule from.
+ */
+const RULESET_CONDITION_CAPTURE = {
+  id: 19481313,
+  name: 'Code Quality Copilot review for default branch',
+  target: 'branch',
+  source_type: 'Repository',
+  enforcement: 'disabled',
+  conditions: { ref_name: { exclude: [], include: ['~DEFAULT_BRANCH'] } },
+  rules: [{ type: 'copilot_code_review', parameters: { review_on_push: true, review_draft_pull_requests: true } }],
+  bypass_actors: [],
+  current_user_can_bypass: 'never',
+} as const;
+
+interface ReadStateOptions {
+  readonly reviews?: readonly Record<string, unknown>[];
+  readonly protection?: StubReply;
+  readonly rulesets?: StubReply;
+  readonly headSha?: string;
+}
+
+/** A scripted repository with a real pull request, and a scripted policy on `main`. */
+function repositoryWith(options: ReadStateOptions = {}): {
+  readonly adapter: GitHubGitAdapter;
+  readonly stub: StubGitHub;
+} {
+  return adapterWith({
+    'GET /repos/:owner/:repo': () => ({ body: REPOSITORY_CAPTURE }),
+    'GET /repos/:owner/:repo/git/ref/heads/task/gitad-a': () => ({ body: refCapture(BRANCH, options.headSha ?? FIXTURE_HEAD_SHA) }),
+    'GET /repos/:owner/:repo/git/ref/heads/main': () => ({ body: refCapture('main', FIXTURE_BASE_SHA) }),
+    'GET /repos/:owner/:repo/pulls': () => ({ body: [pullRequest({ body: null, headSha: options.headSha ?? FIXTURE_HEAD_SHA })] }),
+    'GET /repos/:owner/:repo/pulls/7/reviews': () => ({ body: options.reviews ?? [] }),
+    'GET /repos/:owner/:repo/branches/main/protection': () => options.protection ?? notFound('Branch not protected'),
+    'GET /repos/:owner/:repo/rulesets': () => options.rulesets ?? { body: [] },
+  });
+}
+
+function approvalRule(state: { readonly reviews: readonly GitReviewState[] }): string | null {
+  const rule = state.reviews.find((review) => review.kind === 'ApprovalRulePending');
+  return rule !== undefined && rule.kind === 'ApprovalRulePending' ? rule.detail : null;
+}
+
+test('F26-AC5 an unprotected target with no ruleset reports no rule, and the policy is read for the TARGET', async () => {
+  const { adapter, stub } = repositoryWith();
+  const state = await okOf(
+    adapter.readState(adapterContext('op_policy_unprotected'), { repository: REPOSITORY, branch: BRANCH, baseBranch: 'main' }),
+  );
+  assert.equal(approvalRule(state), null, 'a genuinely unprotected branch has no approval rule to withhold');
+  assert.equal(state.reviews.some((review) => review.kind === 'Unknown'), false);
+
+  // The paths are the assertion: the feature branch is the branch a repository is least likely to
+  // protect, so reading it instead of the merge target reported "unprotected" always.
+  assert.equal(stub.countOf('GET', '/repos/egawilldoit/ShipLoop/branches/main/protection'), 1, 'the merge target\'s protection must be read');
+  assert.equal(stub.countOf('GET', '/repos/egawilldoit/ShipLoop/branches/task/gitad-a/protection'), 0, 'the feature branch is not the merge target');
+  assert.equal(stub.countOf('GET', '/repos/egawilldoit/ShipLoop/rulesets'), 1, 'rulesets can require reviews with no branch protection at all');
+  assert.deepEqual(
+    stub.requests.find((request) => request.path === '/repos/egawilldoit/ShipLoop/rulesets')?.query,
+    { includes_parents: 'true', per_page: '100' },
+    'an organisation ruleset is invisible without includes_parents',
+  );
+});
+
+test('F26-AC5 a protected target requiring N reviews is a pending rule naming the target, the count and the source', async () => {
+  const { adapter } = repositoryWith({
+    protection: {
+      body: {
+        ...PROTECTION_CAPTURE,
+        required_pull_request_reviews: {
+          dismiss_stale_reviews: true,
+          require_code_owner_reviews: false,
+          require_last_push_approval: false,
+          required_approving_review_count: 2,
+        },
+      },
+    },
+    reviews: [{ id: 1, state: 'APPROVED', user: { login: 'maintainer-a' }, submitted_at: '2026-09-30T11:00:00Z', commit_id: FIXTURE_HEAD_SHA }],
+  });
+  const state = await okOf(
+    adapter.readState(adapterContext('op_policy_protected'), { repository: REPOSITORY, branch: BRANCH, baseBranch: 'main' }),
+  );
+  const detail = approvalRule(state);
+  assert.ok(detail !== null, `a two-review rule with one approval must be reported: ${JSON.stringify(state.reviews)}`);
+  assert.match(detail, /requires 2 approving review\(s\) on main/);
+  assert.match(detail, /1 current approval\(s\)/);
+  assert.match(detail, /branch protection on main requires 2/);
+  assert.match(detail, /dismisses reviews when the head moves/, 'the provider\'s own stale-review rule must be reported with it');
+});
+
+test('F26-AC5 the provider\'s required status-check contexts are reported rather than invented into a pending rule', async () => {
+  const { adapter } = repositoryWith({
+    protection: {
+      body: {
+        ...PROTECTION_CAPTURE,
+        required_pull_request_reviews: { ...PROTECTION_CAPTURE.required_pull_request_reviews, required_approving_review_count: 1 },
+      },
+    },
+    reviews: [{ id: 1, state: 'APPROVED', user: { login: 'maintainer-a' }, submitted_at: '2026-09-30T11:00:00Z', commit_id: FIXTURE_HEAD_SHA }],
+  });
+  const state = await okOf(
+    adapter.readState(adapterContext('op_policy_checks'), { repository: REPOSITORY, branch: BRANCH, baseBranch: 'main' }),
+  );
+  const unknown = state.reviews.find((review) => review.kind === 'Unknown');
+  assert.ok(unknown !== undefined, 'the provider\'s required contexts must reach the caller');
+  assert.match(unknown.kind === 'Unknown' ? unknown.detail : '', /requires status check\(s\) contracts, domain, workspace on main/);
+  assert.match(unknown.kind === 'Unknown' ? unknown.detail : '', /readChecks is what evaluates those contexts/);
+});
+
+test('F26-AC5 a ruleset-only requirement is enforced, with no branch protection in existence', async () => {
+  const { adapter } = repositoryWith({
+    protection: notFound('Branch not protected'),
+    rulesets: {
+      body: [
+        {
+          ...RULESET_CONDITION_CAPTURE,
+          name: 'Release gate',
+          enforcement: 'active',
+          rules: [
+            {
+              type: 'pull_request',
+              // constructed: no active ruleset exists in this workspace to capture this body from.
+              parameters: {
+                required_approving_review_count: 1,
+                dismiss_stale_reviews_on_push: true,
+                require_code_owner_review: true,
+                require_last_push_approval: false,
+              },
+            },
+          ],
+          bypass_actors: [{ actor_id: 115146963, actor_type: 'Integration', bypass_mode: 'always' }],
+        },
+      ],
+    },
+    reviews: [{ id: 1, state: 'COMMENTED', user: { login: 'maintainer-c' }, submitted_at: '2026-09-30T11:40:00Z', commit_id: FIXTURE_HEAD_SHA }],
+  });
+  const state = await okOf(
+    adapter.readState(adapterContext('op_policy_ruleset'), { repository: REPOSITORY, branch: BRANCH, baseBranch: 'main' }),
+  );
+  const detail = approvalRule(state);
+  assert.ok(detail !== null, 'a ruleset requirement must be enforced with no branch protection at all');
+  assert.match(detail, /requires 1 approving review\(s\) on main/);
+  assert.match(detail, /ruleset "Release gate" requires 1/);
+  assert.match(detail, /requires an approving review from a code owner/);
+  const bypass = state.reviews.find((review) => review.kind === 'Unknown');
+  assert.ok(bypass !== undefined && /may merge to main without satisfying these rules/.test(bypass.kind === 'Unknown' ? bypass.detail : ''), 'a bypass actor must be stated with the rule it bypasses');
+});
+
+test('F26-AC5 a ruleset that does not apply to the branch is not folded in, and a disabled one is not enforced', async () => {
+  const { adapter } = repositoryWith({
+    rulesets: {
+      body: [
+        // The captured ruleset's own shape, active instead of disabled: it covers `~DEFAULT_BRANCH`,
+        // which is `main`, so it does apply.
+        { ...RULESET_CONDITION_CAPTURE, name: 'Default branch gate', enforcement: 'active', rules: [{ type: 'pull_request', parameters: { required_approving_review_count: 2 } }] },
+        { ...RULESET_CONDITION_CAPTURE, name: 'Disabled gate', enforcement: 'disabled', rules: [{ type: 'pull_request', parameters: { required_approving_review_count: 2 } }] },
+        { ...RULESET_CONDITION_CAPTURE, name: 'Other branch', enforcement: 'active', conditions: { ref_name: { include: ['refs/heads/release/*'], exclude: [] } }, rules: [{ type: 'pull_request', parameters: { required_approving_review_count: 2 } }] },
+        { ...RULESET_CONDITION_CAPTURE, name: 'Tag target', enforcement: 'active', target: 'tag', rules: [{ type: 'pull_request', parameters: { required_approving_review_count: 2 } }] },
+        { ...RULESET_CONDITION_CAPTURE, name: 'Excluded default', enforcement: 'active', conditions: { ref_name: { include: ['~ALL'], exclude: ['refs/heads/main'] } }, rules: [{ type: 'pull_request', parameters: { required_approving_review_count: 2 } }] },
+        { ...RULESET_CONDITION_CAPTURE, name: 'Only push reviews', enforcement: 'active', rules: [{ type: 'pull_request', parameters: { allowed_merge_methods: ['squash'] } }] },
+      ],
+    },
+  });
+  const state = await okOf(
+    adapter.readState(adapterContext('op_policy_ruleset_scope'), { repository: REPOSITORY, branch: BRANCH, baseBranch: 'main' }),
+  );
+  // Exactly one of the six applies: the active one whose `~DEFAULT_BRANCH` covers `main`. The
+  // disabled, wrongly-targeted, excluded and wrongly-scoped ones contribute nothing, so the
+  // requirement is 2 and not 10.
+  const detail = approvalRule(state);
+  assert.ok(detail !== null, 'the one applicable ruleset is a requirement');
+  assert.match(detail, /ruleset "Default branch gate" requires 2/);
+  assert.ok(!detail.includes('Disabled gate') && !detail.includes('Other branch') && !detail.includes('Tag target') && !detail.includes('Excluded default'), `only an applicable ruleset may contribute: ${detail}`);
+});
+
+test('F26-AC5 a permission-denied policy read is Blocked, never reported as an unprotected branch', async () => {
+  const { adapter, stub } = repositoryWith({
+    protection: {
+      status: 403,
+      body: { message: 'Resource not accessible by integration', documentation_url: 'https://docs.github.com/rest', status: '403' },
+    },
+  });
+  const error = await errorOf(
+    adapter.readState(adapterContext('op_policy_denied'), { repository: REPOSITORY, branch: BRANCH, baseBranch: 'main' }),
+  );
+  assert.equal(error.code, 'Blocked', 'a 403 on the policy read is an unread policy, not an absent one');
+  assert.equal(error.code === 'Blocked' ? error.prerequisites[0]?.name : null, 'MergePolicyUnreadable');
+  assert.match(error.reason, /unknown rather than absent/);
+  assert.match(error.code === 'Blocked' ? (error.prerequisites[0]?.detail ?? '') : '', /never evidence of absence/);
+  // The ruleset listing is not read at all once the target's own policy could not be read: the
+  // refusal is about the whole policy, and a partial read presented as a whole is the failure.
+  assert.equal(stub.countOf('GET', '/repos/egawilldoit/ShipLoop/rulesets'), 0);
+});
+
+test('F26-AC5 a ruleset listing this credential may not read is Blocked rather than read as "no rulesets"', async () => {
+  const { adapter } = repositoryWith({
+    rulesets: {
+      status: 403,
+      body: { message: 'Resource not accessible by integration', documentation_url: 'https://docs.github.com/rest', status: '403' },
+    },
+  });
+  const error = await errorOf(
+    adapter.readState(adapterContext('op_policy_ruleset_denied'), { repository: REPOSITORY, branch: BRANCH, baseBranch: 'main' }),
+  );
+  assert.equal(error.code, 'Blocked');
+  assert.match(error.reason, /repository rulesets of main could not be read/);
+});
+
+test('F26-AC5 a policy read that times out is Blocked, not reported as an unprotected branch', async () => {
+  const { adapter } = repositoryWith({
+    protection: { body: {}, transportFailure: 'The operation was aborted due to timeout' },
+  });
+  const error = await errorOf(
+    adapter.readState(adapterContext('op_policy_timeout'), { repository: REPOSITORY, branch: BRANCH, baseBranch: 'main' }),
+  );
+  assert.equal(error.code, 'Blocked');
+  assert.match(error.reason, /could not be read/);
+  assert.match(error.reason, /unknown rather than absent/);
+  assert.match(error.reason, /aborted due to timeout/, 'the provider\'s own reason must survive into the blocker');
+  assert.match(error.code === 'Blocked' ? (error.prerequisites[0]?.detail ?? '') : '', /never evidence of absence/);
+});
+
+test('F26-AC5 a provider 5xx on the policy read is Blocked too', async () => {
+  const { adapter } = repositoryWith({
+    protection: { status: 502, body: { message: 'Bad gateway', documentation_url: '', status: '502' } },
+  });
+  const error = await errorOf(
+    adapter.readState(adapterContext('op_policy_5xx'), { repository: REPOSITORY, branch: BRANCH, baseBranch: 'main' }),
+  );
+  assert.equal(error.code, 'Blocked');
+});
+
+test('F26-AC5 a stale review is not a current approval', async () => {
+  // The provider reports the commit each review was submitted against. The `#19` capture on
+  // `egawilldoit/token-observatory` holds records against two different `commit_id`s, which is
+  // exactly the case: an approval given before the head moved is not an approval of this head.
+  const { adapter } = repositoryWith({
+    protection: {
+      body: {
+        ...PROTECTION_CAPTURE,
+        required_pull_request_reviews: { ...PROTECTION_CAPTURE.required_pull_request_reviews, required_approving_review_count: 1 },
+      },
+    },
+    reviews: [
+      { id: 1, state: 'APPROVED', user: { login: 'maintainer-a' }, submitted_at: '2026-09-06T09:01:06Z', commit_id: FIXTURE_SUPERSEDED_HEAD_SHA },
+      { id: 2, state: 'COMMENTED', user: { login: 'maintainer-b' }, submitted_at: '2026-09-06T09:06:50Z', commit_id: FIXTURE_HEAD_SHA },
+    ],
+  });
+  const state = await okOf(
+    adapter.readState(adapterContext('op_policy_stale'), { repository: REPOSITORY, branch: BRANCH, baseBranch: 'main' }),
+  );
+  const detail = approvalRule(state);
+  assert.ok(detail !== null, 'an approval of an older commit must not satisfy the rule');
+  assert.match(detail, /0 current approval\(s\)/);
+  assert.match(detail, /Not counted as current: maintainer-a \(approved/);
+  assert.match(detail, /Latest decision is not an approval: maintainer-b \(commented\)/);
+});
+
+test('F26-AC5 a duplicate review record counts once, so one reviewer cannot satisfy a two-review rule', async () => {
+  // Captured live: `egawilldoit/token-observatory#20` carries six `COMMENTED` records from one
+  // reviewer for one `commit_id`. Counting records would let that reviewer satisfy a two-review
+  // rule on their own.
+  const { adapter } = repositoryWith({
+    protection: {
+      body: {
+        ...PROTECTION_CAPTURE,
+        required_pull_request_reviews: { ...PROTECTION_CAPTURE.required_pull_request_reviews, required_approving_review_count: 2 },
+      },
+    },
+    reviews: [
+      { id: 5125168972, state: 'APPROVED', user: { login: 'maintainer-a' }, submitted_at: '2026-09-06T11:21:45Z', commit_id: FIXTURE_HEAD_SHA },
+      { id: 5125169011, state: 'APPROVED', user: { login: 'maintainer-a' }, submitted_at: '2026-09-06T11:26:49Z', commit_id: FIXTURE_HEAD_SHA },
+      { id: 5125169045, state: 'APPROVED', user: { login: 'maintainer-a' }, submitted_at: '2026-09-06T11:26:52Z', commit_id: FIXTURE_HEAD_SHA },
+      { id: 5125169084, state: 'APPROVED', user: { login: 'maintainer-a' }, submitted_at: '2026-09-06T11:26:53Z', commit_id: FIXTURE_HEAD_SHA },
+      { id: 5125177116, state: 'APPROVED', user: { login: 'maintainer-b' }, submitted_at: '2026-09-06T11:30:55Z', commit_id: FIXTURE_HEAD_SHA },
+    ],
+  });
+  const state = await okOf(
+    adapter.readState(adapterContext('op_policy_duplicate'), { repository: REPOSITORY, branch: BRANCH, baseBranch: 'main' }),
+  );
+  // Two distinct reviewers satisfy a two-review rule, so there is nothing to withhold — five
+  // approval records from two people is two approvals, not five.
+  assert.equal(approvalRule(state), null, 'two distinct current approvals satisfy a two-review rule');
+
+  // The same records with the second reviewer's approval removed: four approval records from one
+  // reviewer is one approval, and one never satisfies two.
+  const { adapter: single } = repositoryWith({
+    protection: {
+      body: {
+        ...PROTECTION_CAPTURE,
+        required_pull_request_reviews: { ...PROTECTION_CAPTURE.required_pull_request_reviews, required_approving_review_count: 2 },
+      },
+    },
+    reviews: [
+      { id: 5125168972, state: 'APPROVED', user: { login: 'maintainer-a' }, submitted_at: '2026-09-06T11:21:45Z', commit_id: FIXTURE_HEAD_SHA },
+      { id: 5125169011, state: 'APPROVED', user: { login: 'maintainer-a' }, submitted_at: '2026-09-06T11:26:49Z', commit_id: FIXTURE_HEAD_SHA },
+      { id: 5125169045, state: 'APPROVED', user: { login: 'maintainer-a' }, submitted_at: '2026-09-06T11:26:52Z', commit_id: FIXTURE_HEAD_SHA },
+      { id: 5125169084, state: 'APPROVED', user: { login: 'maintainer-a' }, submitted_at: '2026-09-06T11:26:53Z', commit_id: FIXTURE_HEAD_SHA },
+    ],
+  });
+  const short = await okOf(
+    single.readState(adapterContext('op_policy_duplicate_one'), { repository: REPOSITORY, branch: BRANCH, baseBranch: 'main' }),
+  );
+  const shortDetail = approvalRule(short);
+  assert.ok(shortDetail !== null, 'four approval records from one reviewer is one approval, not four');
+  assert.match(shortDetail, /1 current approval\(s\) count towards it/);
+  assert.match(shortDetail, /Repeated review records from maintainer-a were reduced to their latest decision/);
+});
+
+test('F26-AC5 a dismissed review is not an approval, and one with no reported commit cannot be counted', async () => {
+  const { adapter } = repositoryWith({
+    protection: {
+      body: {
+        ...PROTECTION_CAPTURE,
+        required_pull_request_reviews: { ...PROTECTION_CAPTURE.required_pull_request_reviews, required_approving_review_count: 2 },
+      },
+    },
+    reviews: [
+      { id: 3, state: 'DISMISSED', user: { login: 'maintainer-a' }, submitted_at: '2026-09-30T11:00:00Z', commit_id: FIXTURE_HEAD_SHA },
+      { id: 4, state: 'APPROVED', user: { login: 'maintainer-b' }, submitted_at: '2026-09-30T11:00:00Z' },
+    ],
+  });
+  const state = await okOf(
+    adapter.readState(adapterContext('op_policy_dismissed'), { repository: REPOSITORY, branch: BRANCH, baseBranch: 'main' }),
+  );
+  const detail = approvalRule(state);
+  assert.ok(detail !== null);
+  assert.match(detail, /Latest decision is not an approval: maintainer-a \(dismissed\)/);
+  assert.match(detail, /Not counted because GitHub reported no commit for them: maintainer-b/);
+});
+
+test('F26-AC5 the branch name is the one the request names as the merge target', () => {
+  // The pure half, so the ref matching GitHub uses is checkable without a repository: the
+  // captured ruleset condition is `~DEFAULT_BRANCH`, and a repository-wide ruleset is an empty
+  // include list.
+  assert.equal(rulesetCoversRef(RULESET_CONDITION_CAPTURE, 'main', 'main'), true);
+  assert.equal(rulesetCoversRef(RULESET_CONDITION_CAPTURE, 'task/gitad-a', 'main'), false);
+  assert.equal(rulesetCoversRef({ conditions: { ref_name: { include: ['~ALL'] } } }, 'anything', 'main'), true);
+  assert.equal(rulesetCoversRef({ conditions: { ref_name: { include: [] } } }, 'anything', 'main'), true);
+  assert.equal(rulesetCoversRef({ conditions: { ref_name: { include: ['refs/heads/release/*'] } } }, 'release/1', 'main'), true);
+  assert.equal(rulesetCoversRef({ conditions: { ref_name: { include: ['refs/heads/release/*'] } } }, 'main', 'main'), false);
+  assert.equal(rulesetCoversRef({ conditions: { ref_name: { include: ['refs/heads/main'], exclude: ['refs/heads/main'] } } }, 'main', 'main'), false);
+  assert.equal(rulesetCoversRef({}, 'main', 'main'), true, 'a ruleset with no ref condition covers every branch');
 });
 
 test('F24-AC4 a branch GitHub does not have is Missing with a reason, not a failure', async () => {
@@ -629,6 +1024,8 @@ test('F24-AC4 a branch GitHub does not have is Missing with a reason, not a fail
     'GET /repos/:owner/:repo/git/ref/heads/task/gitad-a': () => notFound(),
     'GET /repos/:owner/:repo/git/ref/heads/main': () => ({ body: refCapture('main', FIXTURE_BASE_SHA) }),
     'GET /repos/:owner/:repo/pulls': () => ({ body: [] }),
+    'GET /repos/:owner/:repo/branches/main/protection': () => notFound('Branch not protected'),
+    'GET /repos/:owner/:repo/rulesets': () => ({ body: [] }),
   });
   const state = await okOf(
     adapter.readState(adapterContext('op_missing_branch'), { repository: REPOSITORY, branch: BRANCH, baseBranch: 'main' }),
