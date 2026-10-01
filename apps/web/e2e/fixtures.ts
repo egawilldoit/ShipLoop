@@ -421,6 +421,11 @@ async function startRealEntrypoint(dataDirectory: string, artifactDirectory: str
         SHIPLOOP_STATIC_ROOT: DIST_DIRECTORY,
         SHIPLOOP_ARTIFACT_ROOT: artifactDirectory,
         SHIPLOOP_DATA_DIRECTORY: dataDirectory,
+        // The controller names the SQLite file this process serves and refuses to
+        // invent one: a server that quietly opened a database somewhere else would
+        // pass every assertion while writing state the owner cannot find. The file
+        // lives inside this run's temp data directory, so it is removed with it.
+        SHIPLOOP_DATABASE_PATH: join(dataDirectory, 'shiploop.db'),
         SHIPLOOP_CSRF_SECRET: randomBytes(32).toString('base64url'),
         SHIPLOOP_NODE_ENV: 'test',
         SHIPLOOP_CONTROLLER_MODULE: CONTROLLER_MODULE,
