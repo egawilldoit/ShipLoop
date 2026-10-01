@@ -1430,6 +1430,144 @@ CREATE TABLE candidates_aligned (
 `;
 
 /**
+ * One column per concept in a project procedure or fact version (F05-AC1).
+ *
+ * This arrives as version 8 rather than as an edit to the migration that created
+ * `procedure_versions`. An applied migration is recorded and never re-run, so
+ * rewriting one would leave every database that already applied it on the old
+ * shape while a freshly created one got the new shape - the two-vocabularies
+ * defect the project keeps eliminating, produced by the migration process itself
+ * (N08-AC3, ADR 0003).
+ *
+ * Versions 1 to 7 left this table carrying two names for one idea and one name
+ * for two ideas, which is what made the repository and the schema disagree:
+ *
+ *   - `approval_state` ('Draft' | 'Approved' | 'Superseded') versus `status`
+ *     ('Proposed' | 'Accepted' | 'Superseded' | 'Retired'). `Draft` cannot
+ *     express "the agent proposed this and the owner has not saved it", and
+ *     F05-AC4 requires exactly that distinction: a proposed improvement must be
+ *     visible to the owner while remaining invisible to the next run. Only
+ *     `status` separates "awaiting an owner save action" from "accepted", so
+ *     `approval_state` goes and its vocabulary is mapped below.
+ *   - `provider_revision` versus `source_revision`, one column written twice.
+ *     F05-AC1 records the source revision of a fact, so the name the repository
+ *     uses stays and the older column is folded into it.
+ *   - `content` versus `content_json`, the same document stored twice. One
+ *     column remains, named `content_json`, because that is the name every
+ *     other versioned document in this schema uses.
+ *   - `version_number`, which nothing read once the repository settled on
+ *     `version`.
+ *
+ * Every constraint from version 1 is carried across unchanged: the positive
+ * `version` CHECK, the `kind` and `source` vocabularies, `UNIQUE (project_id,
+ * version)`, `UNIQUE (project_id, kind, content_fingerprint)`, and the approval
+ * invariant in its new spelling, `status <> 'Accepted' OR approved_at IS NOT
+ * NULL`. Nothing is relaxed here. `content_fingerprint` gains the same
+ * fingerprint CHECK as a candidate identity, so a truncated value is refused by
+ * the column rather than recorded and never checked.
+ *
+ * `subject_key`, `scope` and `created_by` are NOT NULL because the repository
+ * binds all three on every write. Each carries an empty default so a direct
+ * INSERT that omits one - a fixture or an operator statement - is still refused
+ * a NULL rather than failing on the NOT NULL alone; the repository never omits
+ * them. `source_revision`, `note` and the two `last_verified_*` columns stay
+ * nullable because a fact may have no source revision and a version is
+ * unverified until something verifies it.
+ */
+const MIGRATION_8_PROCEDURE_VERSION_ALIGNMENT = `
+CREATE TABLE procedure_versions_aligned (
+  procedure_version_id   TEXT PRIMARY KEY,
+  project_id             TEXT NOT NULL REFERENCES projects(project_id) ON DELETE RESTRICT,
+  subject_key            TEXT NOT NULL DEFAULT '',
+  version                INTEGER NOT NULL CHECK (version > 0),
+  kind                   TEXT NOT NULL CHECK (kind IN ('Procedure', 'Fact')),
+  scope                  TEXT NOT NULL DEFAULT '',
+  source                 TEXT NOT NULL CHECK (source IN ('Owner', 'Repository', 'Provider')),
+  source_revision        TEXT,
+  content_json           TEXT NOT NULL,
+  content_fingerprint    TEXT NOT NULL ${fingerprintCheck('content_fingerprint')},
+  status                 TEXT NOT NULL DEFAULT 'Proposed'
+                           CHECK (status IN ('Proposed', 'Accepted', 'Superseded', 'Retired')),
+  last_verified_revision TEXT,
+  last_verified_at       TEXT,
+  approved_at            TEXT,
+  created_at             TEXT NOT NULL DEFAULT ${NOW},
+  created_by             TEXT NOT NULL DEFAULT '',
+  note                   TEXT,
+  UNIQUE (project_id, version),
+  UNIQUE (project_id, kind, content_fingerprint),
+  CHECK (status <> 'Accepted' OR approved_at IS NOT NULL)
+);
+`;
+
+/**
+ * The copy that replaces a rebuild's column-for-column restore.
+ *
+ * Written out rather than derived from `PRAGMA table_info` because the shapes
+ * differ on purpose: four columns are dropped, two are renamed and every column
+ * the repository always binds becomes NOT NULL. The three mappings that carry
+ * meaning are:
+ *
+ *   - `status` wins when a row already has one, because a row written after
+ *     version 5 already states its approval state; before that the only signal
+ *     was `approval_state`, whose 'Draft' and 'Approved' become 'Proposed' and
+ *     'Accepted'. A 'Superseded' row keeps its meaning either way. Nothing is
+ *     invented here: a 'Draft' row becomes a proposal, which is what a draft
+ *     was - content nobody accepted, so `currentVersion` cannot return it
+ *     (F05-AC4).
+ *   - `source_revision` falls back to the older `provider_revision`, so the
+ *     revision of a fact recorded before the rename is not lost.
+ *   - `content_json` prefers a populated, valid `content`, because a row the
+ *     repository wrote before this alignment stored the document there and a
+ *     JSON-encoded string of it in `content_json`. Keeping the encoded string
+ *     would hand a reader a quoted document that no longer parses into one.
+ */
+const COPY_PROCEDURE_VERSIONS = `
+INSERT INTO procedure_versions (
+  procedure_version_id,
+  project_id,
+  subject_key,
+  version,
+  kind,
+  scope,
+  source,
+  source_revision,
+  content_json,
+  content_fingerprint,
+  status,
+  last_verified_revision,
+  last_verified_at,
+  approved_at,
+  created_at,
+  created_by,
+  note
+)
+SELECT
+  procedure_version_id,
+  project_id,
+  coalesce(subject_key, ''),
+  version,
+  kind,
+  coalesce(scope, ''),
+  source,
+  coalesce(source_revision, provider_revision),
+  CASE WHEN content IS NOT NULL AND json_valid(content) THEN content ELSE content_json END,
+  content_fingerprint,
+  CASE
+    WHEN status IS NOT NULL THEN status
+    WHEN approval_state = 'Approved' THEN 'Accepted'
+    WHEN approval_state = 'Superseded' THEN 'Superseded'
+    ELSE 'Proposed'
+  END,
+  last_verified_revision,
+  last_verified_at,
+  approved_at,
+  created_at,
+  coalesce(created_by, ''),
+  note
+FROM stash_procedure_versions`;
+
+/**
  * Child tables that reference `table`, read from the live schema.
  *
  * Discovered rather than hard-coded so a future table cannot be missed: a
@@ -1473,6 +1611,63 @@ function columnNames(db: Database, table: string): string {
 }
 
 /**
+ * One table rebuilt in place, keeping the rows it already had.
+ *
+ * `copy` is the full INSERT that restores the stashed rows. It defaults to a
+ * column-for-column restore, which is only correct when the replacement has the
+ * same shape as the table it replaces; a rebuild that reshapes the table supplies
+ * its own projection so no column is dropped silently and no column is invented.
+ */
+interface TableRebuild {
+  readonly table: string;
+  readonly replacement: string;
+  readonly copy?: string;
+  /**
+   * Triggers dropped for the duration of the swap and recreated before the
+   * transaction ends.
+   *
+   * A referencing table has to be emptied while the parent is replaced, and a
+   * table whose rows are append-only refuses a DELETE. The trigger is therefore
+   * suspended for exactly the swap and restored immediately afterwards, inside
+   * the same transaction: the rows are copied back unchanged, so the immutability
+   * the trigger exists to provide (F12-AC1) is never actually exercised - it is
+   * only unavailable for the few statements this migration makes.
+   */
+  readonly suspended?: readonly SuspendedTrigger[];
+}
+
+interface SuspendedTrigger {
+  readonly name: string;
+  readonly create: string;
+}
+
+/**
+ * The append-only guards on `scope_snapshots` (F12-AC1).
+ *
+ * Written once here and reused rather than restated per call site: two copies of
+ * a trigger definition is exactly how a rebuilt table ends up with one guard and
+ * not the other.
+ */
+const SCOPE_SNAPSHOT_IMMUTABILITY_TRIGGERS: readonly SuspendedTrigger[] = [
+  {
+    name: 'scope_snapshots_immutable_update',
+    create: `CREATE TRIGGER IF NOT EXISTS scope_snapshots_immutable_update
+     BEFORE UPDATE ON scope_snapshots
+     BEGIN
+       SELECT RAISE(ABORT, 'scope_snapshots are immutable: record a new snapshot instead');
+     END`,
+  },
+  {
+    name: 'scope_snapshots_immutable_delete',
+    create: `CREATE TRIGGER IF NOT EXISTS scope_snapshots_immutable_delete
+     BEFORE DELETE ON scope_snapshots
+     BEGIN
+       SELECT RAISE(ABORT, 'scope_snapshots are immutable and retained for history');
+     END`,
+  },
+];
+
+/**
  * Rebuilds `ideas` and `work_items` with the nullable identity columns.
  *
  * Each table is rebuilt in dependency order and its referencing tables are
@@ -1481,7 +1676,7 @@ function columnNames(db: Database, table: string): string {
  * throws, the rollback restores the original schema and rows together.
  */
 function alignContracts(db: Database): void {
-  const rebuilds: readonly { readonly table: string; readonly replacement: string }[] = [
+  rebuildTables(db, [
     { table: 'ideas', replacement: 'ideas_nullable' },
     { table: 'owners', replacement: 'owners_aligned' },
     { table: 'work_items', replacement: 'work_items_aligned' },
@@ -1490,34 +1685,7 @@ function alignContracts(db: Database): void {
     { table: 'owner_decisions', replacement: 'owner_decisions_aligned' },
     { table: 'jobs', replacement: 'jobs_aligned' },
     { table: 'candidates', replacement: 'candidates_aligned' },
-  ];
-
-  for (const { table, replacement } of rebuilds) {
-    const children = referencingTables(db, table);
-    const columns = columnNames(db, table);
-
-    db.exec('PRAGMA defer_foreign_keys = ON');
-    for (const child of children) {
-      db.exec(`CREATE TEMP TABLE stash_${child} AS SELECT * FROM ${quoteIdentifier(child)}`);
-    }
-    db.exec(`CREATE TEMP TABLE stash_${table} AS SELECT * FROM ${quoteIdentifier(table)}`);
-    for (const child of children) {
-      db.exec(`DELETE FROM ${quoteIdentifier(child)}`);
-    }
-    db.exec(`DROP TABLE ${quoteIdentifier(table)}`);
-    db.exec(`ALTER TABLE ${quoteIdentifier(replacement)} RENAME TO ${quoteIdentifier(table)}`);
-    db.exec(`INSERT INTO ${quoteIdentifier(table)} (${columns}) SELECT ${columns} FROM stash_${table}`);
-    for (const child of children) {
-      const childColumns = columnNames(db, child);
-      db.exec(
-        `INSERT INTO ${quoteIdentifier(child)} (${childColumns}) SELECT ${childColumns} FROM stash_${child}`,
-      );
-    }
-    db.exec(`DROP TABLE stash_${table}`);
-    for (const child of children) {
-      db.exec(`DROP TABLE stash_${child}`);
-    }
-  }
+  ]);
 
   // SQLite drops an index and a trigger with the table it belongs to, so every
   // one defined in versions 1 to 6 that lives on a rebuilt table is recreated
@@ -1541,21 +1709,109 @@ function alignContracts(db: Database): void {
     'CREATE INDEX IF NOT EXISTS candidates_by_fingerprint ON candidates(fingerprint)',
     'CREATE INDEX IF NOT EXISTS owner_decisions_by_candidate ON owner_decisions(candidate_id, decided_at DESC)',
     'CREATE INDEX IF NOT EXISTS owner_decisions_by_work_item ON owner_decisions(work_item_id, decided_at DESC)',
-    'CREATE INDEX IF NOT EXISTS owner_decisions_unconsumed ON owner_decisions(candidate_id) WHERE state = \'Recorded\'',
-    `CREATE TRIGGER IF NOT EXISTS scope_snapshots_immutable_update
-     BEFORE UPDATE ON scope_snapshots
-     BEGIN
-       SELECT RAISE(ABORT, 'scope_snapshots are immutable: record a new snapshot instead');
-     END`,
-    `CREATE TRIGGER IF NOT EXISTS scope_snapshots_immutable_delete
-     BEFORE DELETE ON scope_snapshots
-     BEGIN
-       SELECT RAISE(ABORT, 'scope_snapshots are immutable and retained for history');
-     END`,
+'CREATE INDEX IF NOT EXISTS owner_decisions_unconsumed ON owner_decisions(candidate_id) WHERE state = \'Recorded\'',
+    // The append-only guards come from the single definition above, so this list
+    // cannot end up restoring one trigger and not the other.
+    ...SCOPE_SNAPSHOT_IMMUTABILITY_TRIGGERS.map((trigger) => trigger.create),
   ];
   for (const statement of restores) {
     db.exec(statement);
   }
+}
+
+/**
+ * Replaces each named table with its prepared replacement, keeping every row.
+ *
+ * The sequence is the one migrations 5 to 7 established, and the only one proven
+ * to work inside this runner: SQLite re-validates referencing rows against a
+ * dropped table, so a naive `CREATE`/`INSERT`/`DROP`/`RENAME` fails the moment a
+ * child row exists. Stashing the referencing tables, emptying them, swapping the
+ * parent and restoring in order keeps `PRAGMA foreign_key_check` empty and loses
+ * no row. A rebuild that throws leaves the caller's transaction to roll the
+ * original schema back with the data intact.
+ *
+ * `PRAGMA defer_foreign_keys` moves the child checks to the end of the
+ * transaction, which is what lets the parent be dropped and recreated under the
+ * children instead of after them.
+ */
+function rebuildTables(db: Database, rebuilds: readonly TableRebuild[]): void {
+  for (const { table, replacement, copy, suspended } of rebuilds) {
+    const children = referencingTables(db, table);
+    const restore = copy ?? identityCopy(db, table);
+
+    db.exec('PRAGMA defer_foreign_keys = ON');
+    for (const trigger of suspended ?? []) {
+      db.exec(`DROP TRIGGER IF EXISTS ${quoteIdentifier(trigger.name)}`);
+    }
+    for (const child of children) {
+      db.exec(`CREATE TEMP TABLE stash_${child} AS SELECT * FROM ${quoteIdentifier(child)}`);
+    }
+    db.exec(`CREATE TEMP TABLE stash_${table} AS SELECT * FROM ${quoteIdentifier(table)}`);
+    for (const child of children) {
+      db.exec(`DELETE FROM ${quoteIdentifier(child)}`);
+    }
+    db.exec(`DROP TABLE ${quoteIdentifier(table)}`);
+    db.exec(`ALTER TABLE ${quoteIdentifier(replacement)} RENAME TO ${quoteIdentifier(table)}`);
+    db.exec(restore);
+    for (const child of children) {
+      const childColumns = columnNames(db, child);
+      db.exec(
+        `INSERT INTO ${quoteIdentifier(child)} (${childColumns}) SELECT ${childColumns} FROM stash_${child}`,
+      );
+    }
+    db.exec(`DROP TABLE stash_${table}`);
+    for (const child of children) {
+      db.exec(`DROP TABLE stash_${child}`);
+    }
+    for (const trigger of suspended ?? []) {
+      db.exec(trigger.create);
+    }
+  }
+}
+
+/** The column-for-column restore used when a replacement has the same shape. */
+function identityCopy(db: Database, table: string): string {
+  const columns = columnNames(db, table);
+  return `INSERT INTO ${quoteIdentifier(table)} (${columns}) SELECT ${columns} FROM stash_${table}`;
+}
+
+/**
+ * Rebuilds `procedure_versions` so the schema carries one column per concept.
+ *
+ * The referencing tables (`evidence`, `scope_snapshots`, `jobs` and
+ * `candidates`, discovered rather than named) are stashed around the swap, so the
+ * rows that point at a run's procedure version survive the rebuild with their
+ * foreign keys intact.
+ *
+ * The indexes are recreated afterwards rather than carried across, because SQLite
+ * drops an index with the table that owns it. The subject-key index exists for a
+ * reason the version-1 index cannot serve: `currentVersion` and `appendVersion`
+ * both address one subject key, and the partial index over proposed versions is
+ * what makes `listProposed` read only the owner's outstanding proposals rather
+ * than the project's whole history.
+ */
+function alignProcedureVersions(db: Database): void {
+  rebuildTables(db, [
+    {
+      table: 'procedure_versions',
+      replacement: 'procedure_versions_aligned',
+      copy: COPY_PROCEDURE_VERSIONS,
+      // `scope_snapshots` references a procedure version and refuses to be
+      // emptied, so its append-only guards are suspended for the swap only.
+      suspended: SCOPE_SNAPSHOT_IMMUTABILITY_TRIGGERS,
+    },
+  ]);
+
+  db.exec(
+    'CREATE INDEX procedure_versions_by_project ON procedure_versions(project_id, kind, version DESC)',
+  );
+  db.exec(
+    'CREATE INDEX procedure_versions_by_subject ON procedure_versions(project_id, subject_key, status, version DESC)',
+  );
+  db.exec(
+    `CREATE INDEX procedure_versions_proposed ON procedure_versions(project_id, created_at, version)
+     WHERE status = 'Proposed'`,
+  );
 }
 
 const MIGRATIONS: readonly Migration[] = [
@@ -1607,6 +1863,14 @@ const MIGRATIONS: readonly Migration[] = [
     up: (db) => {
       db.exec(MIGRATION_7_CONTRACT_ALIGNMENT);
       alignContracts(db);
+    },
+  },
+  {
+    version: 8,
+    name: 'procedure_version_alignment',
+    up: (db) => {
+      db.exec(MIGRATION_8_PROCEDURE_VERSION_ALIGNMENT);
+      alignProcedureVersions(db);
     },
   },
 ];
