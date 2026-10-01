@@ -7,7 +7,10 @@ owns feature/acceptance IDs; it describes planned behavior, not implemented feat
 
 ## Current stage and commands
 
-This repository has a development foundation, not a runnable application.
+The web server and owner UI exist and are typechecked, tested and built by the commands below,
+but the shipped entrypoint still refuses to start: `SHIPLOOP_CONTROLLER_MODULE` must export the
+`ControllerSurface` from `apps/web/src/server/contracts.ts`, and `packages/controller` does not
+yet. Treat this as a foundation with a partially assembled application, not a running product.
 Node 24, pnpm **11.15.0** (package.json), Linux VM. Preserve the pnpm lockfile.
 Run commands from this checkout; never paste `set -e` into the parent SSH shell.
 
@@ -16,9 +19,17 @@ Run commands from this checkout; never paste `set -e` into the parent SSH shell.
 | `node scripts/doctor.mjs` | Bounded bootstrap diagnostics, usable even if pnpm is broken |
 | `pnpm doctor` | Node, pinned pnpm, Git, host resources |
 | `pnpm check` | Foundation configuration, documentation links, JavaScript syntax |
-| `pnpm test` | Verification tooling behavior |
+| `pnpm test` | Domain, storage, adapters, verification, controller and web unit/integration tests |
 | `pnpm verify` | Foundation checks/tests, with a local evidence report |
-| `pnpm verify:app` | **Blocked** until real application checks are configured |
+| `pnpm verify:app` | Foundation + lint + all package typechecks + `pnpm test` + web build + browser E2E |
+| `pnpm e2e` | Browser E2E alone; needs `pnpm build` first (the harness serves `dist/client`) |
+
+The application profile is configured, not blocked, and it stops at its first failure. Its
+current honest state is that everything through `web-build` passes and `browser-e2e` is **red**:
+the harness's assertion that the run drove `apps/web/src/server/main.ts` fails, because
+`@shiploop/controller` does not yet export the `ControllerSurface` that
+`src/server/contracts.ts` requires. Until that wiring lands, no browser run may be reported as
+application proof, and the browser E2E command must stay failing rather than be waived.
 
 [TESTING.md](TESTING.md) owns verification selection and the report format.
 [VM development](docs/runbooks/vm-development.md) owns setup, processes, ports,

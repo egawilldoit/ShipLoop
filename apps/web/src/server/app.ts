@@ -15,6 +15,10 @@
  *   - Nothing is served from a public prefix except the owner shell and its client
  *     code. Artifacts live under `/artifacts/` and are always behind the session
  *     guard, because an artifact is private run detail (F01-AC1).
+ *   - `/api/health` is the one unauthenticated API route, and it says only that the
+ *     server is up. A harness cannot use a private route to tell "ready" from "refused",
+ *     so the answer has to be a route whose 2xx is the signal, and it has to answer an
+ *     anonymous caller without disclosing anything (F01-AC1).
  */
 
 import fastifyCookie from '@fastify/cookie';
@@ -35,6 +39,7 @@ import {
 } from './http-error.ts';
 import type { ControllerSurface } from './contracts.ts';
 import { registerConnectorRoutes } from './routes/connectors.ts';
+import { registerHealthRoutes } from './routes/health.ts';
 import { registerOwnerRoutes } from './routes/owner.ts';
 import { registerProfileRoutes } from './routes/profiles.ts';
 
@@ -94,6 +99,7 @@ export async function buildApp(deps: AppDependencies): Promise<FastifyInstance> 
   app.setErrorHandler((error, request, reply) => sendFailure(reply, error, request));
   app.setNotFoundHandler((request, reply) => sendNotFound(reply, request, guard, config));
 
+  registerHealthRoutes(app);
   registerOwnerRoutes(app, { config, controller, guard, now });
   registerProfileRoutes(app, { controller, guard, now });
   registerConnectorRoutes(app, { controller, guard, now });

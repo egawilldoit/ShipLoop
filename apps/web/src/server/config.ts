@@ -17,6 +17,12 @@ export type NodeEnvironment = 'production' | 'development' | 'test';
 
 export interface ServerConfig {
   readonly host: string;
+  /**
+   * `0` asks the operating system to choose the port, which is what the browser E2E runbook
+   * requires so parallel runs cannot collide on a fixed number. The caller must then read the
+   * bound address back from the server rather than assume a port (TESTING.md: prefer port 0 and
+   * read the actual bound port). A non-zero value is this server's own listener.
+   */
   readonly port: number;
   readonly nodeEnv: NodeEnvironment;
   readonly csrfSecret: string;
@@ -58,6 +64,15 @@ const ALLOWED_ENVIRONMENTS: readonly NodeEnvironment[] = ['production', 'develop
 const INTEGER = /^\d+$/;
 
 /**
+ * The lowest value each setting accepts.
+ *
+ * Only the port may be zero, and only because zero has a defined meaning there rather than
+ * being an absent value; every other setting treats zero as the unusable input it is.
+ */
+const MINIMUM_PORT = 0;
+const MINIMUM_POSITIVE = 1;
+
+/**
  * Builds the configuration.
  *
  * Returns every problem at once so a misconfigured deployment is fixed in one pass
@@ -82,7 +97,7 @@ export function readServerConfig(env: NodeJS.ProcessEnv): ConfigResult {
     errors,
   );
   const cookiePath = env['SHIPLOOP_COOKIE_PATH'] ?? '/';
-  const port = readInteger(env['SHIPLOOP_PORT'], 'SHIPLOOP_PORT', DEFAULT_PORT, errors);
+  const port = readInteger(env['SHIPLOOP_PORT'], 'SHIPLOOP_PORT', DEFAULT_PORT, errors, MINIMUM_PORT);
   const cookieSecure = readBoolean(env['SHIPLOOP_COOKIE_SECURE'], 'SHIPLOOP_COOKIE_SECURE', true, errors);
   const trustProxy = readBoolean(env['SHIPLOOP_TRUST_PROXY'], 'SHIPLOOP_TRUST_PROXY', false, errors);
   const absoluteTtlSeconds = readInteger(
@@ -160,6 +175,7 @@ function readInteger(
   path: string,
   fallback: number,
   errors: ConfigProblem[],
+  minimum = MINIMUM_POSITIVE,
 ): number {
   if (raw === undefined || raw === '') return fallback;
   if (!INTEGER.test(raw)) {
@@ -167,11 +183,17 @@ function readInteger(
     return fallback;
   }
   const value = Number(raw);
-  if (value <= 0) {
-    errors.push({ path, message: 'Expected a positive number.' });
+  if (value < minimum) {
+    errors.push({ path, message: minimumMessage(minimum) });
     return fallback;
   }
   return value;
+}
+
+function minimumMessage(minimum: number): string {
+  return minimum === MINIMUM_PORT
+    ? 'Expected zero, meaning "let the operating system choose", or a positive number.'
+    : 'Expected a positive number.';
 }
 
 function readBoolean(

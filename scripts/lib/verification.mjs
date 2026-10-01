@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { existsSync } from 'node:fs';
 import { mkdir, mkdtemp, readFile, lstat, readlink, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -70,6 +71,8 @@ export async function verify({ cwd, profileName, signal }) {
   const env = offlineEnv({ PATH: process.env.PATH, HOME: home, TMPDIR: home,
     XDG_CONFIG_HOME: join(home, 'config'), XDG_CACHE_HOME: join(home, 'cache'),
     XDG_DATA_HOME: join(home, 'data') });
+  const browsersPath = hostBrowsersPath();
+  if (browsersPath !== null) env['PLAYWRIGHT_BROWSERS_PATH'] = browsersPath;
   const report = { version: 1, runId, profile: profileName, stage: 'unknown',
     startedAt: new Date().toISOString(), host: { platform: process.platform, arch: process.arch,
       node: process.version }, status: 'Blocked', commands: [] };
@@ -107,4 +110,34 @@ export async function verify({ cwd, profileName, signal }) {
   await writeFile(reportPath, JSON.stringify(report, null, 2) + '\n', { mode: 0o600 });
   const exitCode = { Passed: 0, Failed: 1, Blocked: 2, Stale: 3 }[report.status];
   return { report, reportPath, exitCode };
+}
+
+/**
+ * Where this host's Playwright browsers are installed, or null when it has none.
+ *
+ * The private temporary HOME below deliberately hides the developer's own configuration and
+ * caches from every command, so Playwright would resolve its browser directory inside a
+ * directory that is empty, fail to find the Chromium it was pinned to, and respond by
+ * downloading one. That download is exactly what this offline profile must never cause, and a
+ * check that silently provisions its own toolchain is no longer proving the repository.
+ *
+ * So the cache location is resolved from the real environment before HOME is replaced and
+ * handed to the browser command explicitly. It is a path, not a secret, and it names installed
+ * tooling rather than test state: nothing a command writes there is read back as evidence, and
+ * the temporary HOME still isolates every cache, data and config directory a command could
+ * otherwise inherit. The value is read at run time rather than written into verification.json
+ * because the JSON is shared by every host and a pinned absolute path would be wrong on all
+ * but one of them.
+ *
+ * Returning null on a host with no cached browser is intentional: the browser command then
+ * fails and says the executable is missing, which is a named, honest failure. Inventing a
+ * directory would only move the download somewhere less visible.
+ */
+function hostBrowsersPath() {
+  const declared = process.env.PLAYWRIGHT_BROWSERS_PATH;
+  if (typeof declared === 'string' && declared !== '') return declared;
+  const hostHome = process.env.HOME;
+  if (typeof hostHome !== 'string' || hostHome === '') return null;
+  const cached = join(hostHome, '.cache', 'ms-playwright');
+  return existsSync(cached) ? cached : null;
 }

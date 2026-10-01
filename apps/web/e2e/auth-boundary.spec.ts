@@ -61,6 +61,26 @@ function jsonBody(value: unknown): string {
 }
 
 test.describe('authentication boundary', () => {
+  // F01-AC1: `/api/health` is the one unauthenticated API route, because the browser harness
+  // cannot otherwise tell "ready" from "refused" before it drives a flow. Being reachable without
+  // a session is exactly what makes it a disclosure risk, so the fact that it answers at all and
+  // the fact that it answers nothing are both asserted here.
+  test('the health route answers an anonymous caller and discloses nothing', async ({ request, serverUrl }) => {
+    const response = await request.get(`${serverUrl}/api/health`);
+    expect(response.status()).toBe(200);
+
+    const body = await response.text();
+    const parsed: unknown = JSON.parse(body);
+    expect(parsed).toEqual({ status: 'ok' });
+    for (const marker of PRIVATE_MARKERS) {
+      expect(body).not.toContain(marker);
+    }
+    // Nothing that would help someone fingerprint the deployment either: `toEqual` above already
+    // pins the value, and pinning the key set makes an added field a failure rather than a
+    // silent widening of what an unauthenticated caller can read.
+    expect(Object.keys(parsed as Record<string, unknown>)).toEqual(['status']);
+  });
+
   test('an unauthenticated private route returns 401 and no private data', async ({ request, serverUrl }) => {
     const response = await request.get(`${serverUrl}/api/owner`);
     expect(response.status()).toBe(401);

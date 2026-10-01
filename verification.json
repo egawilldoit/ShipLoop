@@ -108,18 +108,6 @@
           "maxOutputBytes": 65536
         },
         {
-          "id": "typecheck-worker",
-          "argv": [
-            "node",
-            "node_modules/typescript/bin/tsc",
-            "--noEmit",
-            "-p",
-            "apps/worker/tsconfig.json"
-          ],
-          "timeoutMs": 180000,
-          "maxOutputBytes": 65536
-        },
-        {
           "id": "typecheck-web",
           "argv": [
             "node",
@@ -155,9 +143,11 @@
         {
           "id": "browser-e2e",
           "argv": [
-            "node",
-            "node_modules/@playwright/test/cli.js",
-            "test"
+            "pnpm",
+            "--filter",
+            "@shiploop/web",
+            "run",
+            "e2e"
           ],
           "timeoutMs": 900000,
           "maxOutputBytes": 262144

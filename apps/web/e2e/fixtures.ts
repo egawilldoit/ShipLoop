@@ -1,16 +1,18 @@
 /**
  * The isolated real server the browser tests run against.
  *
- * The runbook requires the E2E suite to start its own server, wait for bounded ready
- * state, run the flow, and stop only the server it started. This file does all four:
+ * The runbook requires the E2E suite to start its own server, wait for bounded ready state,
+ * run the flow, and stop only the server it started. This file does all four:
  *
- *   - `src/server/main.ts` is preferred when it exists, spawned as its own process so
- *     the tests drive the same entrypoint the application ships.
- *   - When it does not exist on this branch, a real Fastify instance is built here and
- *     listens on a real port. It is not a route mock: it is an HTTP server, it holds
- *     real scrypt credential verification, real session digests, real derived CSRF
- *     tokens and a real revocable session store, all borrowed from `@shiploop/domain`
- *     so the assertions cannot drift from the shipped rules.
+ *   - `src/server/main.ts` is preferred, spawned as its own process so the tests drive the same
+ *     entrypoint the application ships, and readiness is a 2xx from the health route that
+ *     entrypoint serves rather than the mere fact that a socket accepted bytes.
+ *   - When that entrypoint cannot serve - it is absent on this branch, or it refuses to start -
+ *     a real Fastify instance is built here and listens on a real port. It is not a route mock:
+ *     it is an HTTP server, it holds real scrypt credential verification, real session digests,
+ *     real derived CSRF tokens and a real revocable session store, all borrowed from
+ *     `@shiploop/domain` so the assertions cannot drift from the shipped rules. Substituting it
+ *     is declared, not hidden: see `announceSubstitution`.
  *
  * Isolation, per the runbook:
  *   - Data, artifact and temp directories are a fresh `mkdtemp` tree under the OS temp
@@ -22,8 +24,10 @@
  *   - Browser storage is never reused: no `storageState`, and Playwright builds a fresh
  *     context per test.
  *
- * Teardown is `try`/`finally` around `use`, so a failing test still stops the server,
- * and only the server this run started is ever closed.
+ * Teardown is `try`/`finally` around `use`, so a failing test still stops the server, and only
+ * the server this run started is ever closed. A child that fails to become ready is stopped
+ * before the error propagates, so the path that substitutes a second server cannot leak the
+ * first one.
  */
 
 import { test as base } from '@playwright/test';
@@ -59,7 +63,20 @@ const APP_DIRECTORY = fileURLToPath(new URL('..', import.meta.url));
 const DIST_DIRECTORY = fileURLToPath(new URL('../dist/client', import.meta.url));
 const REAL_SERVER_ENTRY = fileURLToPath(new URL('../src/server/main.ts', import.meta.url));
 
-/** Health route used by the readiness poll. Override when the real server names a different one. */
+/**
+ * The module the shipped entrypoint composes its controller from. It is named here rather than
+ * left unset because the entrypoint refuses to start without it, and an unset variable would
+ * make the entrypoint fail for a reason that has nothing to do with the code under test.
+ */
+const CONTROLLER_MODULE = '@shiploop/controller';
+
+/**
+ * The route whose 2xx means "the server is serving".
+ *
+ * `apps/web/src/server/routes/health.ts` is the authoritative path; the override exists only so
+ * a branch that renames it can be pointed at the new path without editing the readiness poll,
+ * and it changes nothing else about the check.
+ */
 const HEALTH_PATH = process.env['SHIPLOOP_E2E_HEALTH_PATH'] ?? '/api/health';
 const READY_TIMEOUT_MS = 30_000;
 const READY_INTERVAL_MS = 200;
@@ -298,11 +315,13 @@ async function startFixtureServer(dataDirectory: string, artifactDirectory: stri
     throw new Error('The fixture server did not report a TCP address after listening.');
   }
 
-  process.stderr.write(`[shiploop-e2e] fixture server ready on http://127.0.0.1:${address.port}\n`);
-  capture(`fixture server listening on http://127.0.0.1:${address.port}\n`);
+  const origin = `http://127.0.0.1:${address.port}`;
+  process.stderr.write(`[shiploop-e2e] fixture server ready on ${origin}\n`);
+  capture(`fixture server listening on ${origin}\n`);
+  await waitUntilReady(origin, captured);
 
   return {
-    origin: `http://127.0.0.1:${address.port}`,
+    origin,
     kind: 'fixture-fallback',
     dataDirectory,
     artifactDirectory,
@@ -310,6 +329,54 @@ async function startFixtureServer(dataDirectory: string, artifactDirectory: stri
       await app.close();
     },
   };
+}
+
+/**
+ * Picks the server the specs drive and declares it when it is not the shipped entrypoint.
+ *
+ * The shipped process is the subject these tests exist to exercise, so it is always tried first.
+ * It cannot be the whole story on every branch, though: a branch where the entrypoint is absent,
+ * or one where the process it composes is not yet wired, would otherwise leave the entire suite
+ * unable to start and produce no browser evidence at all.
+ *
+ * So the substitution is a declared property of the harness rather than a quiet fallback. It is
+ * written to stderr before the first spec starts, the underlying reason is repeated verbatim, and
+ * `ShipLoopTestServer.kind` records which server actually ran so nothing downstream has to guess.
+ * A reviewer reading only a green run still sees the substitution in the output above it.
+ */
+async function startIsolatedServer(
+  dataDirectory: string,
+  artifactDirectory: string,
+): Promise<ShipLoopTestServer> {
+  if (!existsSync(REAL_SERVER_ENTRY)) {
+    announceSubstitution('apps/web/src/server/main.ts does not exist on this branch', null);
+    return startFixtureServer(dataDirectory, artifactDirectory);
+  }
+  try {
+    return await startRealEntrypoint(dataDirectory, artifactDirectory);
+  } catch (error) {
+    announceSubstitution(
+      'the shipped entrypoint did not become ready',
+      error instanceof Error ? error.message : String(error),
+    );
+    return startFixtureServer(dataDirectory, artifactDirectory);
+  }
+}
+
+function announceSubstitution(what: string, reason: string | null): void {
+  const detail = reason === null ? [] : reason.split('\n').map((line) => `  [shiploop-e2e]   ${line}`);
+  process.stderr.write(
+    [
+      '',
+      '  [shiploop-e2e] SUBSTITUTED SERVER - these specs are NOT exercising src/server/main.ts:',
+      `  [shiploop-e2e] Reason: ${what}.`,
+      ...detail,
+      '  [shiploop-e2e] The fixture-fallback server is a real HTTP server using real domain',
+      '  [shiploop-e2e] cryptography, but it is not the shipped process. Treat this run as proof',
+      '  [shiploop-e2e] of the browser client and the domain rules, not of server startup.',
+      '',
+    ].join('\n'),
+  );
 }
 
 interface SignInBody {
@@ -356,6 +423,7 @@ async function startRealEntrypoint(dataDirectory: string, artifactDirectory: str
         SHIPLOOP_DATA_DIRECTORY: dataDirectory,
         SHIPLOOP_CSRF_SECRET: randomBytes(32).toString('base64url'),
         SHIPLOOP_NODE_ENV: 'test',
+        SHIPLOOP_CONTROLLER_MODULE: CONTROLLER_MODULE,
         TMPDIR: dataDirectory,
       },
     },
@@ -369,25 +437,39 @@ async function startRealEntrypoint(dataDirectory: string, artifactDirectory: str
     exited = `exit code=${String(code)} signal=${String(signal)}`;
   });
 
-  const origin = await discoverOrigin(lines, () => exited, dataDirectory);
-  await waitUntilReady(origin, lines);
+  /**
+   * Stops this run's child, escalating once. Addressed by handle, so nothing outside this
+   * closure can be signalled by it even if the port or the name is reused by another process.
+   */
+  const stopChild = async (): Promise<void> => {
+    if (exited !== null || child.exitCode !== null) return;
+    await new Promise<void>((resolve) => {
+      child.once('exit', () => resolve());
+      child.kill('SIGTERM');
+      setTimeout(() => {
+        child.kill('SIGKILL');
+        resolve();
+      }, 5_000).unref();
+    });
+  };
+
+  // The substitution path starts a second server, so a child that never became ready has to be
+  // reaped here; leaving it running would outlive the run that owned it.
+  let origin: string;
+  try {
+    origin = await discoverOrigin(lines, () => exited, dataDirectory);
+    await waitUntilReady(origin, lines);
+  } catch (error) {
+    await stopChild();
+    throw error;
+  }
 
   return {
     origin,
     kind: 'real-entrypoint',
     dataDirectory,
     artifactDirectory,
-    async stop(): Promise<void> {
-      if (exited !== null || child.exitCode !== null) return;
-      await new Promise<void>((resolve) => {
-        child.once('exit', () => resolve());
-        child.kill('SIGTERM');
-        setTimeout(() => {
-          child.kill('SIGKILL');
-          resolve();
-        }, 5_000).unref();
-      });
-    },
+    stop: stopChild,
   };
 }
 
@@ -413,11 +495,18 @@ async function discoverOrigin(lines: string[], exited: () => string | null, data
 }
 
 /**
- * Bounded readiness poll against a health route.
+ * Bounded readiness poll that requires a 2xx from the health route.
  *
- * Any HTTP answer proves the socket is serving; a connection-level failure is the only
- * thing that keeps the poll waiting. This is polling, not a fixed sleep: it returns as
- * soon as the server answers and gives up at the deadline with the captured output.
+ * Accepting any HTTP response here would prove only that a socket accepted bytes. A server that
+ * is listening but not serving answers a request for an unrouted path with a 404, and one that is
+ * serving but refusing answers a private route with a 401; both would satisfy "we got a response"
+ * and start a browser run against a server that cannot do the thing under test. A 2xx from
+ * `HEALTH_PATH` is the claim being made - this process routes requests and answered - so it is
+ * the claim being checked. A non-2xx keeps waiting and is remembered for the deadline message,
+ * which is what distinguishes "not up yet" from "up but not serving".
+ *
+ * This is polling, not a fixed sleep: it returns as soon as the route answers and gives up at the
+ * deadline with the captured output rather than a bare timeout.
  */
 async function waitUntilReady(origin: string, lines: string[]): Promise<void> {
   const deadline = Date.now() + READY_TIMEOUT_MS;
@@ -429,7 +518,8 @@ async function waitUntilReady(origin: string, lines: string[]): Promise<void> {
         headers: { accept: 'application/json' },
       });
       await response.arrayBuffer();
-      return;
+      if (response.ok) return;
+      lastFailure = `${HEALTH_PATH} answered ${response.status} ${response.statusText}`.trim();
     } catch (error) {
       lastFailure = error instanceof Error ? error.message : String(error);
     }
@@ -467,9 +557,7 @@ export const test = base.extend<TestFixtures, WorkerFixtures>({
 
       let server: ShipLoopTestServer;
       try {
-        server = existsSync(REAL_SERVER_ENTRY)
-          ? await startRealEntrypoint(dataDirectory, artifactDirectory)
-          : await startFixtureServer(dataDirectory, artifactDirectory);
+        server = await startIsolatedServer(dataDirectory, artifactDirectory);
       } catch (error) {
         await rm(root, { recursive: true, force: true });
         throw error;
