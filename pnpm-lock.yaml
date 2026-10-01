@@ -72,6 +72,9 @@ importers:
       '@shiploop/adapters':
         specifier: workspace:*
         version: link:../../packages/adapters
+      '@shiploop/controller':
+        specifier: workspace:*
+        version: link:../../packages/controller
       '@shiploop/domain':
         specifier: workspace:*
         version: link:../../packages/domain

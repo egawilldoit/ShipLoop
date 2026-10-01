@@ -13,6 +13,7 @@
   },
   "dependencies": {
     "@shiploop/adapters": "workspace:*",
+    "@shiploop/controller": "workspace:*",
     "@shiploop/domain": "workspace:*",
     "@shiploop/storage": "workspace:*",
     "@shiploop/verification": "workspace:*"
