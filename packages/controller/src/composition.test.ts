@@ -37,6 +37,7 @@ const PASSWORD = 'correct horse battery staple';
 const clock: ControllerClock = { now: () => NOW };
 
 const FAST_PASSWORD_COST = { N: 1024, r: 8, p: 1, keyLength: 32, saltLength: 16 };
+const SESSION_IDLE_TIMEOUT_SECONDS = 900;
 
 /**
  * The tables the bound repositories read and write.
@@ -69,7 +70,13 @@ const adapters: AdapterRegistry = {
 };
 
 function config(databasePath: string) {
-  return { databasePath, clock, adapters, passwordParameters: FAST_PASSWORD_COST };
+  return {
+    databasePath,
+    clock,
+    adapters,
+    passwordParameters: FAST_PASSWORD_COST,
+    sessionIdleTimeoutSeconds: SESSION_IDLE_TIMEOUT_SECONDS,
+  };
 }
 
 async function withDirectory(body: (path: string) => Promise<void> | void): Promise<void> {

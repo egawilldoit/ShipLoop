@@ -53,6 +53,8 @@ import type { AdapterRegistry, ConnectorUseCases } from './connectors.ts';
 import { createConnectorUseCases } from './connectors.ts';
 import type { ControllerClock, OwnerCredentialRecord, OwnerCredentialStore, ProfileUseCases } from './profiles.ts';
 import { createProfileUseCases } from './profiles.ts';
+import type { SessionUseCases } from './sessions.ts';
+import { createSessionUseCases } from './sessions.ts';
 
 export interface CompositionRootConfig {
   readonly databasePath: string;
@@ -60,6 +62,14 @@ export interface CompositionRootConfig {
   readonly adapters: AdapterRegistry;
   /** Cost override so a test can exercise real hashing without production cost. */
   readonly passwordParameters?: Partial<ScryptParameters>;
+  /**
+   * The idle session limit this deployment runs with (F01-AC2).
+   *
+   * Required rather than defaulted: an authorization gate that reads a constant
+   * instead of the configured value is a limit the owner believes they set and
+   * cannot change, which is the same failure as having no idle timeout at all.
+   */
+  readonly sessionIdleTimeoutSeconds: number;
   /** Injected probe runner; absent means preflight cannot be attempted (F04-AC2). */
   readonly preflight?: PreflightDeps;
   readonly openDatabaseOptions?: OpenDatabaseOptions;
@@ -78,6 +88,7 @@ export interface CompositionRoot {
   readonly procedures: ProcedureRepository;
   readonly credentials: OwnerCredentialStore;
   readonly useCases: ProfileUseCases & ConnectorUseCases;
+  readonly sessionUseCases: SessionUseCases;
   /** Closes only the database handle this root opened. */
   close(): Result<true, DomainError>;
 }
@@ -121,26 +132,8 @@ export class SqliteOwnerCredentialStore implements OwnerCredentialStore {
     this.connection = connection;
   }
 
-  put(record: OwnerCredentialRecord): Result<OwnerCredentialRecord> {
-    try {
-      this.connection
-        .prepare(
-          `UPDATE owners SET email = ?, password_digest = ? WHERE owner_id = ?`,
-        )
-        .run(record.email, record.passwordHash, record.ownerId);
-    } catch (error) {
-      return err({
-        code: 'Conflict',
-        reason: `The owner credential could not be stored; it was not overwritten (${describe(error)}).`,
-        expected: 'a writable owners row',
-        actual: describe(error),
-      });
-    }
-    return ok(record);
-  }
-
   findByEmail(email: string): Result<OwnerCredentialRecord | null> {
-    return this.find('email', email);
+    return this.find('email', email.trim().toLowerCase());
   }
 
   findByOwnerId(ownerId: OwnerId): Result<OwnerCredentialRecord | null> {
@@ -153,22 +146,33 @@ export class SqliteOwnerCredentialStore implements OwnerCredentialStore {
         .prepare(`SELECT ${OWNER_CREDENTIAL_COLUMNS} FROM owners WHERE ${column} = ?`)
         .get(value);
       if (row === undefined) return ok(null);
-      const email = requiredText(row, 'email');
-      const passwordHash = requiredText(row, 'password_digest');
       // A row with no credential is an owner provisioned by another path, not a
       // failed sign-in: returning null keeps unknown-address and wrong-password
       // indistinguishable to the caller (N02-AC1).
-      if (email === '' || passwordHash === '') return ok(null);
+      //
+      // Read as text-or-absent rather than required text, because both columns are
+      // nullable in the migrated schema and an owner that has no password digest
+      // yet is a legitimate row. Treating that as a missing column turned an
+      // ordinary unknown-owner sign-in attempt into a storage failure.
+      const email = nullableText(row, 'email');
+      const passwordHash = nullableText(row, 'password_digest');
+      if (email === null || email === '' || passwordHash === null || passwordHash === '') return ok(null);
       return ok({
         ownerId: requiredText(row, 'owner_id') as OwnerId,
         email,
         passwordHash: passwordHash as PasswordHash,
-        updatedAt: requiredText(row, 'created_at'),
+        updatedAt: nullableText(row, 'created_at') ?? '',
       });
     } catch (error) {
       return err({ code: 'Unavailable', reason: `owner credential lookup failed: ${describe(error)}` });
     }
   }
+}
+
+/** A nullable column read as text, with a null column reported as absent. */
+function nullableText(row: SqlRow, column: string): string | null {
+  const value = row[column];
+  return typeof value === 'string' ? value : null;
 }
 
 function describe(error: unknown): string {
@@ -270,10 +274,12 @@ export function createCompositionRoot(config: CompositionRootConfig): Result<Com
     procedures,
     credentials,
     adapters: config.adapters,
+    sessionIdleTimeoutSeconds: config.sessionIdleTimeoutSeconds,
     ...(config.passwordParameters === undefined ? {} : { passwordParameters: config.passwordParameters }),
     ...(config.preflight === undefined ? {} : { preflight: config.preflight }),
   });
   const connectorUseCases = createConnectorUseCases({ clock: config.clock, connectors, adapters: config.adapters });
+  const sessionUseCases = createSessionUseCases({ clock: config.clock, owners });
 
   let closed = false;
 
@@ -285,6 +291,7 @@ export function createCompositionRoot(config: CompositionRootConfig): Result<Com
     procedures,
     credentials,
     useCases: { ...profileUseCases, ...connectorUseCases },
+    sessionUseCases,
     close(): Result<true, DomainError> {
       if (closed) return ok(true);
       closed = true;

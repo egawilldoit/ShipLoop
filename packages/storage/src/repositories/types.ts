@@ -124,9 +124,14 @@ export interface OwnerCredentialRecord {
  * A signed-in session.
  *
  * Only the hash of the session token is persisted, so a database copy cannot
- * be replayed as a live session (F01-AC2). `rotatedFromSessionId` preserves the
- * chain so a rotation can be audited rather than looking like two unrelated
- * sessions (F32-AC1).
+ * be replayed as a live session (F01-AC2). `tokenHash` is the domain's
+ * domain-separated digest, which is the only digest any layer is permitted to
+ * write or compare against: two formats in one column made a legitimately
+ * stored session unreachable. `rotatedFromSessionId` preserves the chain so a
+ * rotation can be audited rather than looking like two unrelated sessions
+ * (F32-AC1). `lastSeenAt` is the instant the idle deadline measures from, and
+ * is written when the session is created and on every authorized request; a
+ * null on an established session is a corrupt row rather than an absent limit.
  */
 export interface OwnerSession {
   readonly sessionId: string;
@@ -136,11 +141,29 @@ export interface OwnerSession {
   readonly expiresAt: string;
   readonly revokedAt: string | null;
   readonly rotatedFromSessionId: string | null;
+  readonly lastSeenAt: string | null;
 }
 
 export interface CreateSessionInput {
   readonly ownerId: OwnerId;
   readonly token: string;
+  readonly issuedAt: string;
+  readonly expiresAt: string;
+}
+
+/**
+ * Opening a session from a digest the caller has already computed.
+ *
+ * A caller that only ever holds the plaintext long enough to hash it — because
+ * the token is on its way to a cookie and must not be stored, logged or handed
+ * to another component — cannot hand the plaintext back later, since a digest
+ * is not reversible. Storing the caller's digest is therefore the only way such
+ * a caller can open a session, and it is the same column and the same digest
+ * function as `createSession`: there is one format, not two (F01-AC2).
+ */
+export interface CreateSessionByDigestInput {
+  readonly ownerId: OwnerId;
+  readonly tokenDigest: string;
   readonly issuedAt: string;
   readonly expiresAt: string;
 }
@@ -740,13 +763,24 @@ export interface OwnerStore {
     credential?: OwnerCredentialInput,
   ): Result<OwnerRecord>;
   current(): Result<OwnerRecord | null>;
-  setCredential(input: OwnerCredentialInput): Result<OwnerCredentialRecord>;
-  findCredentialByEmail(email: string): Result<OwnerCredentialRecord | null>;
-  findCredentialByOwnerId(ownerId: OwnerId): Result<OwnerCredentialRecord | null>;
+  /**
+   * Resolves a sign-in identifier to its owner.
+   *
+   * Both the display name and the stored address match, in one statement, so an
+   * unknown identifier costs exactly what a known one costs and the two cannot be
+   * told apart by timing or by error (N02-AC1).
+   */
+  findBySignInIdentifier(identifier: string): Result<OwnerRecord | null>;
   createSession(input: CreateSessionInput): Result<OwnerSession>;
+  createSessionByDigest(input: CreateSessionByDigestInput): Result<OwnerSession>;
+  /** Raw token lookup. Refuses nothing: the domain judges liveness (F01-AC2). */
+  findSessionByToken(token: string): Result<OwnerSession | null>;
   authenticate(token: string, now: string): Result<OwnerSession>;
   rotateSession(input: RotateSessionInput): Result<OwnerSession>;
   revokeSession(token: string, revokedAt: string): Result<OwnerSession>;
+  revokeSessionById(sessionId: string, revokedAt: string): Result<OwnerSession>;
+  /** Records activity so the idle deadline stays meaningful (F01-AC2). */
+  touchSession(sessionId: string, lastSeenAt: string): Result<OwnerSession>;
   revokeAllSessions(ownerId: OwnerId, revokedAt: string): Result<number>;
 }
 

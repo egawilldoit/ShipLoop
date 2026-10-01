@@ -135,6 +135,22 @@ export interface ConnectorUseCases {
     connectorId: ConnectorId,
     actor: OwnerActor,
   ) => Result<ConnectorView, DomainError>;
+  /**
+   * The same records with the owner's own credential reference included.
+   *
+   * `listConnectors` withholds the reference because its callers are runs, exports
+   * and issue text, where reproducing a pointer is how it ends up somewhere it
+   * should not be (F03-AC3, F32-AC2). The owner's own settings screen is the one
+   * place that has to show which reference is configured, otherwise revoking the
+   * wrong one is easy. A reference is a pointer into the credential store rather
+   * than a value, so showing it back to the person who entered it adds no
+   * exposure, and the secret it points at is still never returned.
+   */
+  readonly ownerConnector: (
+    connectorId: ConnectorId,
+    actor: OwnerActor,
+  ) => Result<ConnectorRecord, DomainError>;
+  readonly ownerConnectors: (request: ConnectorReadRequest) => Result<readonly ConnectorRecord[], DomainError>;
   readonly revokeConnector: (
     input: RevokeConnectorInput,
     actor: OwnerActor,
@@ -297,6 +313,19 @@ export function createConnectorUseCases(deps: ConnectorUseCaseDeps): ConnectorUs
     return ok(toView(record.value));
   };
 
+  /** The owner's own record, reference included. See `ownerConnector`. */
+  const ownerConnector = (connectorId: ConnectorId, actor: OwnerActor): Result<ConnectorRecord, DomainError> => {
+    const permitted = requireOwner(actor);
+    if (!permitted.ok) return err(permitted.error);
+    return deps.connectors.get(connectorId);
+  };
+
+  const ownerConnectors = (request: ConnectorReadRequest): Result<readonly ConnectorRecord[], DomainError> => {
+    const permitted = requireOwner(request.actor);
+    if (!permitted.ok) return err(permitted.error);
+    return deps.connectors.listForProject(request.projectId);
+  };
+
   /**
    * Withdraws a connector (F03-AC4).
    *
@@ -441,6 +470,8 @@ export function createConnectorUseCases(deps: ConnectorUseCaseDeps): ConnectorUs
     registerConnector,
     listConnectors,
     describeConnector,
+    ownerConnector,
+    ownerConnectors,
     revokeConnector,
     resolveConnectorHealth,
     testConnections,

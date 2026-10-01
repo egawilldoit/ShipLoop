@@ -74,6 +74,7 @@ const SECRET_SHAPED_VALUE = ['AIza', 'FixtureKeyMaterialNotARealSecret01'].join(
  */
 
 const FAST_PASSWORD_COST = { N: 1024, r: 8, p: 1, keyLength: 32, saltLength: 16 };
+const SESSION_IDLE_TIMEOUT_SECONDS = 900;
 
 /** Injected time, so every recorded instant in these cases is reproducible. */
 const clock: ControllerClock = { now: () => NOW };
@@ -217,6 +218,7 @@ async function withHarness(body: (harness: Harness) => Promise<void> | void): Pr
         credentials: new SqliteOwnerCredentialStore(opened.value),
         adapters,
         passwordParameters: FAST_PASSWORD_COST,
+        sessionIdleTimeoutSeconds: SESSION_IDLE_TIMEOUT_SECONDS,
         ...(options.preflight === undefined ? {} : { preflight: options.preflight }),
       });
       const connectorUseCases = createConnectorUseCases({
