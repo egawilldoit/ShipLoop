@@ -64,7 +64,11 @@ test('owned descendants retaining stdio are stopped after leader exit', async ()
     // A reparented zombie has exited; PID 1 owns reaping it, not the test.
     assert.match(state, /^State:\s+Z/m);
   } catch (error) {
-    if (error.code !== 'ENOENT') throw error;
+    // ESRCH and ENOENT are the same fact about the descendant: it is gone, whether
+    // PID 1 has not adopted it yet or has already reaped it. Both mean the runner
+    // stopped it. Only a live process is a failure, and a live one reads a status
+    // rather than raising.
+    if (error.code !== 'ENOENT' && error.code !== 'ESRCH') throw error;
   }
 });
 
