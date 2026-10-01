@@ -1814,6 +1814,272 @@ function alignProcedureVersions(db: Database): void {
   );
 }
 
+/**
+ * The replacement for `scope_snapshots` (F12-AC1).
+ *
+ * Versions 2 and 5 left the table and its reader disagreeing about which columns
+ * a snapshot has. `WorkItemRepository.appendScopeSnapshot` reads `issue_identifier`,
+ * `title`, `dependency_issue_ids` and `acceptance_criteria` with `requiredText`, and
+ * `packages/domain` types all four as present, but version 5 added every one of them
+ * with `ALTER TABLE ADD COLUMN`, which cannot express NOT NULL. A row inserted by
+ * anything other than that repository could therefore make the whole work item
+ * unreadable: the reader throws, and the throw becomes an `Unavailable` for every
+ * caller, not for the bad row. The columns are NOT NULL here, each with the empty
+ * default its reader already treats as absent, so a row that omits one is a row that
+ * says "no title" rather than a row that cannot be read.
+ *
+ * `scope_fingerprint` gains the same CHECK `candidates.scope_fingerprint` has always
+ * had. Before this, a snapshot accepted any non-blank string, so a truncated or
+ * hand-written fingerprint could be recorded and then compared against live content
+ * forever without ever being refused. The original `length(trim(...)) > 0` CHECK is
+ * kept alongside the stronger one rather than replaced, so this migration provably
+ * removes no constraint: it adds two.
+ *
+ * The two JSON columns gain `json_valid` and `json_type = 'array'` CHECKs, which is
+ * the shape `parseStringList` and `parseJson` assume when they read them back. The
+ * stored form is `canonicalize` output, which is JSON, so the constraints hold for
+ * every row the repository writes.
+ *
+ * `sequence_number`, `profile_version_id`, `procedure_version_id` and `captured_at`
+ * stay nullable, and that is deliberate: tightening the two version columns would
+ * refuse the direct-INSERT fixtures in `core.test.ts` and `queue.test.ts`, which
+ * exist only to pin a different invariant. `ScopeRepository.capture` binds all four
+ * on every write, and `packages/storage/src/repositories/scope.test.ts` asserts that
+ * it does. The gap is recorded rather than hidden.
+ */
+const MIGRATION_9_SCOPE_SNAPSHOT_ALIGNMENT = `
+CREATE TABLE scope_snapshots_aligned (
+  scope_snapshot_id     TEXT PRIMARY KEY,
+  work_item_id          TEXT NOT NULL REFERENCES work_items(work_item_id) ON DELETE RESTRICT,
+  project_id            TEXT NOT NULL REFERENCES projects(project_id) ON DELETE RESTRICT,
+  issue_id              TEXT NOT NULL,
+  issue_identifier      TEXT NOT NULL DEFAULT '',
+  title                 TEXT NOT NULL DEFAULT '',
+  description           TEXT NOT NULL,
+  provider_revision     TEXT,
+  priority              TEXT,
+  scope_fingerprint     TEXT NOT NULL
+                          CHECK (length(trim(scope_fingerprint)) > 0)
+                          ${fingerprintCheck('scope_fingerprint')},
+  retrieved_at          TEXT NOT NULL,
+  created_at            TEXT NOT NULL DEFAULT ${NOW},
+  sequence_number       INTEGER,
+  attempt_id            TEXT REFERENCES attempts(attempt_id) ON DELETE RESTRICT,
+  dependency_issue_ids  TEXT NOT NULL DEFAULT '[]'
+                          CHECK (json_valid(dependency_issue_ids) AND json_type(dependency_issue_ids) = 'array'),
+  acceptance_criteria   TEXT NOT NULL DEFAULT '[]'
+                          CHECK (json_valid(acceptance_criteria) AND json_type(acceptance_criteria) = 'array'),
+  profile_version_id    TEXT REFERENCES project_profile_versions(profile_version_id) ON DELETE RESTRICT,
+  procedure_version_id  TEXT REFERENCES procedure_versions(procedure_version_id) ON DELETE RESTRICT,
+  captured_at           TEXT,
+  correlation_id        TEXT
+);
+`;
+
+/**
+ * The copy that carries existing snapshots across the alignment.
+ *
+ * `issue_identifier`, `title` and `captured_at` fall back to their empty value, and
+ * the two JSON columns fall back to an empty array when the stored text is not
+ * valid JSON. Those are the only translations, and each is the absence the reader
+ * already models rather than a guess: a snapshot row written before those columns
+ * existed has no title, no identifier and no criteria, and saying so is the truth.
+ *
+ * `scope_fingerprint` is deliberately NOT translated. A row whose fingerprint is not
+ * `fp_` plus 32 hex characters is corrupt, and quietly rewriting it to satisfy the
+ * new CHECK would make the migration report success over a snapshot that can no
+ * longer be compared honestly. The migration refuses instead, inside its own
+ * transaction, with a typed error.
+ */
+const COPY_SCOPE_SNAPSHOTS = `
+INSERT INTO scope_snapshots (
+  scope_snapshot_id, work_item_id, project_id, issue_id, issue_identifier, title, description,
+  provider_revision, priority, scope_fingerprint, retrieved_at, created_at, sequence_number,
+  attempt_id, dependency_issue_ids, acceptance_criteria, profile_version_id, procedure_version_id,
+  captured_at, correlation_id
+)
+SELECT
+  scope_snapshot_id, work_item_id, project_id, issue_id,
+  coalesce(issue_identifier, ''),
+  coalesce(title, ''),
+  description,
+  provider_revision,
+  priority,
+  scope_fingerprint,
+  retrieved_at,
+  created_at,
+  sequence_number,
+  attempt_id,
+  CASE WHEN json_valid(dependency_issue_ids) THEN dependency_issue_ids ELSE '[]' END,
+  CASE WHEN json_valid(acceptance_criteria) THEN acceptance_criteria ELSE '[]' END,
+  profile_version_id,
+  procedure_version_id,
+  coalesce(captured_at, created_at),
+  correlation_id
+FROM stash_scope_snapshots`;
+
+/**
+ * Rebuilds `scope_snapshots` with the constraints its reader already assumed.
+ *
+ * The rebuild runs before the new tables below are created, so the only referencing
+ * tables it has to stash are the five that already exist: `scope_snapshot_criteria`,
+ * `scope_snapshot_dependencies`, `jobs`, `candidates` and `owner_decisions`. The
+ * append-only triggers are suspended for the swap and restored from the single
+ * definition above, so a rebuild can never leave a snapshot editable (F12-AC1).
+ */
+function alignScopeSnapshots(db: Database): void {
+  rebuildTables(db, [
+    {
+      table: 'scope_snapshots',
+      replacement: 'scope_snapshots_aligned',
+      copy: COPY_SCOPE_SNAPSHOTS,
+      suspended: SCOPE_SNAPSHOT_IMMUTABILITY_TRIGGERS,
+    },
+  ]);
+
+  // SQLite drops an index with the table it belongs to, so both are restored here
+  // rather than being left to chance.
+  db.exec('CREATE INDEX IF NOT EXISTS scope_snapshots_by_work_item ON scope_snapshots(work_item_id, retrieved_at DESC)');
+  db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS scope_snapshots_by_work_item_sequence
+             ON scope_snapshots(work_item_id, sequence_number) WHERE sequence_number IS NOT NULL`);
+  // Comparing live content against what was recorded, and finding the work items
+  // whose recorded belief is still the one being compared against.
+  db.exec('CREATE INDEX IF NOT EXISTS scope_snapshots_by_fingerprint ON scope_snapshots(work_item_id, scope_fingerprint)');
+}
+
+/**
+ * Scope comparison, owner reconciliation, side-effect resolution and refused
+ * synchronisation (F12-AC2, F12-AC4, F12-AC5, F10-AC2, F10-AC5, F16-AC4, F28-AC4,
+ * F29-AC4, F30-AC5).
+ *
+ * Every one of these is a fact with a time and, where a person decided, an actor, so
+ * all four tables are append-only: the owner does not get to edit what ShipLoop
+ * believed, and a later resolution is a new row rather than a rewrite (F12-AC1,
+ * N01-AC2). `sync_discrepancies` is the single exception in spirit only - each
+ * refused attempt is its own row, so the table only ever grows.
+ *
+ * `scope_change_detections` and `scope_reconciliations` are separate tables because
+ * they are separate facts with different times and different authors: a difference
+ * was detected at 10:00, the owner chose at 14:00. Collapsing them would either lose
+ * the detection time or lose the ability to say a material change is still
+ * unreconciled, which is exactly what blocks acceptance (F12-AC2).
+ *
+ * `reconciliation_resolutions` is a separate table from `external_operations` because
+ * the ledger's own row is a single mutable status, and overwriting it would erase
+ * the record that an operation was ever in doubt. The CHECK is the anti-duplication
+ * rule in the schema: an operation may only be declared applied when a provider
+ * identity for it is recorded, so "it worked" is never an unevidenced claim
+ * (F28-AC4, F10-AC3).
+ */
+const MIGRATION_9_RECONCILIATION_LEDGER = `
+CREATE TABLE scope_change_detections (
+  scope_change_detection_id TEXT PRIMARY KEY,
+  work_item_id              TEXT NOT NULL REFERENCES work_items(work_item_id) ON DELETE RESTRICT,
+  project_id                TEXT NOT NULL REFERENCES projects(project_id) ON DELETE RESTRICT,
+  recorded_snapshot_id      TEXT NOT NULL REFERENCES scope_snapshots(scope_snapshot_id) ON DELETE RESTRICT,
+  change_kind               TEXT NOT NULL CHECK (change_kind IN ('Material', 'Cosmetic', 'Unchanged')),
+  material_differences      TEXT NOT NULL DEFAULT '[]'
+                              CHECK (json_valid(material_differences) AND json_type(material_differences) = 'array'),
+  cosmetic_differences      TEXT NOT NULL DEFAULT '[]'
+                              CHECK (json_valid(cosmetic_differences) AND json_type(cosmetic_differences) = 'array'),
+  recorded_fingerprint      TEXT NOT NULL ${fingerprintCheck('recorded_fingerprint')},
+  current_fingerprint       TEXT NOT NULL ${fingerprintCheck('current_fingerprint')},
+  observed_provider_revision TEXT,
+  observed_at               TEXT NOT NULL,
+  correlation_id            TEXT,
+  created_at                TEXT NOT NULL DEFAULT ${NOW},
+  -- Re-reading the same live content against the same recorded snapshot is the
+  -- same difference, so a repeated check is one row rather than a growing list.
+  UNIQUE (recorded_snapshot_id, current_fingerprint)
+);
+CREATE INDEX scope_change_detections_by_work_item ON scope_change_detections(work_item_id, observed_at DESC);
+
+CREATE TABLE scope_reconciliations (
+  scope_reconciliation_id   TEXT PRIMARY KEY,
+  work_item_id              TEXT NOT NULL REFERENCES work_items(work_item_id) ON DELETE RESTRICT,
+  project_id                TEXT NOT NULL REFERENCES projects(project_id) ON DELETE RESTRICT,
+  scope_change_detection_id TEXT NOT NULL REFERENCES scope_change_detections(scope_change_detection_id) ON DELETE RESTRICT,
+  recorded_snapshot_id      TEXT NOT NULL REFERENCES scope_snapshots(scope_snapshot_id) ON DELETE RESTRICT,
+  choice                    TEXT NOT NULL CHECK (choice IN ('AdoptRevisedScope', 'KeepPendingClarification', 'ProposeFollowUpIssue')),
+  follow_up_note            TEXT,
+  decided_by                TEXT NOT NULL CHECK (length(trim(decided_by)) > 0),
+  decided_at                TEXT NOT NULL,
+  correlation_id            TEXT,
+  created_at                TEXT NOT NULL DEFAULT ${NOW}
+);
+CREATE INDEX scope_reconciliations_by_work_item ON scope_reconciliations(work_item_id, decided_at DESC);
+
+CREATE TABLE reconciliation_resolutions (
+  reconciliation_resolution_id TEXT PRIMARY KEY,
+  operation_id                 TEXT NOT NULL REFERENCES external_operations(operation_id) ON DELETE RESTRICT,
+  work_item_id                 TEXT REFERENCES work_items(work_item_id) ON DELETE RESTRICT,
+  resolution                   TEXT NOT NULL CHECK (resolution IN ('Applied', 'NotApplied', 'StillUnknown')),
+  provider_identity            TEXT,
+  detail                       TEXT,
+  resolved_by                  TEXT NOT NULL CHECK (length(trim(resolved_by)) > 0),
+  resolved_at                  TEXT NOT NULL,
+  correlation_id               TEXT,
+  created_at                   TEXT NOT NULL DEFAULT ${NOW},
+  -- An operation may only be called applied when the provider identity that proves
+  -- it is recorded with the claim. Without this, "it worked" and "I assume it
+  -- worked" are the same row, and a retry on the second reading creates a duplicate
+  -- issue, PR, deployment or receipt (F10-AC3, F28-AC4, F29-AC4).
+  CHECK (resolution <> 'Applied' OR provider_identity IS NOT NULL)
+);
+CREATE INDEX reconciliation_resolutions_by_operation ON reconciliation_resolutions(operation_id, resolved_at DESC);
+
+CREATE TABLE sync_discrepancies (
+  discrepancy_id   TEXT PRIMARY KEY,
+  work_item_id     TEXT NOT NULL REFERENCES work_items(work_item_id) ON DELETE RESTRICT,
+  project_id       TEXT NOT NULL REFERENCES projects(project_id) ON DELETE RESTRICT,
+  outbox_event_id  TEXT REFERENCES outbox_events(outbox_event_id) ON DELETE RESTRICT,
+  operation_id     TEXT REFERENCES external_operations(operation_id) ON DELETE RESTRICT,
+  kind             TEXT NOT NULL
+                     CHECK (kind IN ('StaleContentRefused', 'ExternalStatusWithoutReleaseEvidence', 'PartialPublication')),
+  observed_status  TEXT,
+  refused_action   TEXT NOT NULL CHECK (length(trim(refused_action)) > 0),
+  detail           TEXT NOT NULL CHECK (length(trim(detail)) > 0),
+  -- Both ref lists are kept side by side: a partial publication must name what is
+  -- still unpublished without discarding the mappings that did succeed, or a retry
+  -- would republish work that already exists (F10-AC2, F10-AC5).
+  unpublished_refs TEXT NOT NULL DEFAULT '[]'
+                      CHECK (json_valid(unpublished_refs) AND json_type(unpublished_refs) = 'array'),
+  succeeded_refs   TEXT NOT NULL DEFAULT '[]'
+                      CHECK (json_valid(succeeded_refs) AND json_type(succeeded_refs) = 'array'),
+  recorded_at      TEXT NOT NULL,
+  correlation_id   TEXT,
+  created_at       TEXT NOT NULL DEFAULT ${NOW}
+);
+CREATE INDEX sync_discrepancies_by_work_item ON sync_discrepancies(work_item_id, recorded_at DESC);
+CREATE INDEX sync_discrepancies_by_operation ON sync_discrepancies(operation_id, recorded_at DESC);
+`;
+
+/**
+ * The append-only guards on the reconciliation ledger.
+ *
+ * `scope_snapshots` had its two triggers written out twice in this file before the
+ * single definition above, and the risk of a rebuilt table keeping one and losing the
+ * other is why they are now defined once and reused. These three tables get the same
+ * treatment: the trigger SQL is generated from the table name, which
+ * `quoteIdentifier` refuses unless it is a plain identifier.
+ */
+function appendOnlyTriggers(table: string, reason: string): readonly string[] {
+  const quoted = quoteIdentifier(table);
+  const guard = `${table}_append_only`;
+  return [
+    `CREATE TRIGGER ${guard}_update
+     BEFORE UPDATE ON ${quoted}
+     BEGIN
+       SELECT RAISE(ABORT, '${table} is append-only: record a new ${table.replace(/_s$/, '')} instead');
+     END`,
+    `CREATE TRIGGER ${guard}_delete
+     BEFORE DELETE ON ${quoted}
+     BEGIN
+       SELECT RAISE(ABORT, '${reason}');
+     END`,
+  ];
+}
+
 const MIGRATIONS: readonly Migration[] = [
   {
     version: 1,
@@ -1871,6 +2137,31 @@ const MIGRATIONS: readonly Migration[] = [
     up: (db) => {
       db.exec(MIGRATION_8_PROCEDURE_VERSION_ALIGNMENT);
       alignProcedureVersions(db);
+    },
+  },
+  {
+    version: 9,
+    name: 'scope_capture_and_reconciliation',
+    up: (db) => {
+      db.exec(MIGRATION_9_SCOPE_SNAPSHOT_ALIGNMENT);
+      alignScopeSnapshots(db);
+      db.exec(MIGRATION_9_RECONCILIATION_LEDGER);
+      for (const trigger of [
+        ...appendOnlyTriggers(
+          'scope_change_detections',
+          'scope_change_detections are retained: a difference that was detected is a fact about the past',
+        ),
+        ...appendOnlyTriggers(
+          'scope_reconciliations',
+          "scope_reconciliations are retained: a decision cannot be edited, only superseded by a new comparison",
+        ),
+        ...appendOnlyTriggers(
+          'reconciliation_resolutions',
+          'reconciliation_resolutions are retained: what was established about a lost response is a fact',
+        ),
+      ]) {
+        db.exec(trigger);
+      }
     },
   },
 ];

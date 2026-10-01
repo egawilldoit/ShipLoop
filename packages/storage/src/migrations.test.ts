@@ -322,8 +322,23 @@ async function withDatabaseAtVersion(
   }
 }
 
-test('a database already at the previous version is upgraded without losing a row (N08-AC3)', async () => {
-  await withDatabaseAtVersion(LATEST_SCHEMA_VERSION - 1, (db) => {
+/**
+ * The version pair this fixture is written for.
+ *
+ * The rows below are in the shape version 7 produced - `provider_revision` still
+ * on `procedure_versions`, `approval_state` rather than `status` - because they
+ * exist to prove the version 8 rebuild translates them instead of dropping them.
+ * Writing the pair down rather than deriving it from `LATEST_SCHEMA_VERSION` keeps
+ * that proof intact when a later migration is added: a fixture pinned to "one
+ * version back" silently changes shape when the tail moves, and then fails on a
+ * column that has nothing to do with what it is testing. The upgrade path of the
+ * newest migration is covered against a populated database in the file that owns
+ * that migration.
+ */
+const PROCEDURE_ALIGNMENT_FROM = 7;
+
+test('a database at version 7 upgrades to 8 without losing a row (N08-AC3)', async () => {
+  await withDatabaseAtVersion(PROCEDURE_ALIGNMENT_FROM, (db) => {
     db.prepare('INSERT INTO projects (project_id, name) VALUES (?, ?)').run(PROJECT, 'Migration project');
     db
       .prepare(
@@ -442,11 +457,18 @@ test('a database already at the previous version is upgraded without losing a ro
       .run(WORK_ITEM, PROJECT, SCOPE_SNAPSHOT, PROFILE_VERSION, T0);
 
     const report = expectOk(migrate(db));
-    assert.equal(report.fromVersion, LATEST_SCHEMA_VERSION - 1);
-    assert.equal(report.toVersion, LATEST_SCHEMA_VERSION);
-    assert.deepEqual(report.applied, [
-      { version: LATEST_SCHEMA_VERSION, name: 'procedure_version_alignment' },
-    ]);
+    assert.equal(report.fromVersion, PROCEDURE_ALIGNMENT_FROM);
+    // The runner applies every unrecorded version, so this asserts that the
+    // procedure-version rebuild was one of the steps that ran rather than that it
+    // was the last one. Which rows survived it is the rest of this test.
+    assert.ok(
+      report.toVersion > PROCEDURE_ALIGNMENT_FROM,
+      `the database moved past version ${PROCEDURE_ALIGNMENT_FROM}`,
+    );
+    assert.ok(
+      report.applied.some((step) => step.name === 'procedure_version_alignment'),
+      'the procedure-version alignment ran against these rows',
+    );
 
     // Every row survived, and the approval state was translated rather than
     // invented. A draft becomes a proposal: content nobody accepted still cannot
