@@ -1,9 +1,10 @@
 /**
  * Owner authentication routes (F01-AC1, F01-AC2, F01-AC4).
  *
- * Provision and sign-in are the only unauthenticated routes this server exposes, and
- * neither returns anything but the identity that was just proven. The session
- * cookie is built from the domain `sessionCookieAttributes`, so the flags cannot
+ * Provision, sign-in and the liveness route in `health.ts` are the only unauthenticated
+ * routes this server exposes, and none of them returns anything but the identity that
+ * was just proven. The session cookie is built from the domain
+ * `sessionCookieAttributes`, so the flags cannot
  * drift from the policy `identity/csrf.ts` documents: HttpOnly keeps the cookie away
  * from client-side scripts, Secure keeps it off a plaintext connection, and SameSite
  * keeps it off a cross-site request.

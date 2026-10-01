@@ -1260,3 +1260,86 @@ test('F01-AC4: a development server may drop Secure deliberately and says so in 
   if (!result.ok) return;
   assert.equal(result.value.cookieSecure, false);
 });
+
+test('F01-AC1: the health route answers an anonymous caller and discloses nothing', async (t) => {
+  const h = await harness();
+  t.after(() => h.close());
+
+  const response = await h.app.inject({ method: 'GET', url: '/api/health' });
+  assert.equal(response.statusCode, 200, 'liveness is what the browser harness polls before it drives a flow');
+  assert.deepEqual(JSON.parse(response.body), { status: 'ok' });
+
+  // The body is the whole disclosure surface, so the key set is pinned as well as the value: a
+  // field added here later is a new unauthenticated disclosure, and this fails when that happens
+  // rather than after someone reads a release note.
+  assert.deepEqual(Object.keys(JSON.parse(response.body) as object), ['status']);
+
+  // Nothing that would fingerprint the deployment. The version, the clock, the host and the store
+  // are all facts a caller with no session must not learn, and each is a plausible thing to add
+  // while making a liveness route more useful.
+  for (const disclosure of ['version', 'commit', 'uptime', 'hostname', 'host', 'database', 'startedAt', START]) {
+    assert.ok(!response.body.includes(disclosure), `the health body must not mention ${disclosure}`);
+  }
+
+  // No owner detail, and no cookie: the route is unauthenticated by design, so anything it returned
+  // would be returned to anyone who asked.
+  assert.ok(!response.body.includes(OWNER_NAME));
+  assert.ok(!response.body.includes(OWNER_ID));
+  assert.equal(response.headers['set-cookie'], undefined);
+  assert.equal(response.headers['cache-control'], 'no-store', 'a cached liveness answer outlives the process that gave it');
+});
+
+test('F01-AC1: the health route stays a 200 with a session cookie it did not need', async (t) => {
+  const h = await harness();
+  t.after(() => h.close());
+
+  // A caller presenting a cookie gets the same answer as one that does not, so the route is not
+  // quietly branching on the session and the response is not decorated for a signed-in reader.
+  const session = await signIn(h.app);
+  const withCookie = await h.app.inject({
+    method: 'GET',
+    url: '/api/health',
+    headers: { cookie: session.cookie },
+  });
+  assert.equal(withCookie.statusCode, 200);
+  assert.equal(withCookie.body, (await h.app.inject({ method: 'GET', url: '/api/health' })).body);
+});
+
+test('F01-AC1: SHIPLOOP_PORT 0 is the OS-assigned port, and only the port may be zero', () => {
+  // Zero has one defined meaning for the port and it is a useful one: the harness cannot know which
+  // port is free, so it asks for any and reads the bound address back. Rejecting it would make the
+  // browser suite unable to start a server at all.
+  const osChosen = readServerConfig({ SHIPLOOP_CSRF_SECRET: CSRF_SECRET, SHIPLOOP_PORT: '0' });
+  assert.equal(osChosen.ok, true, 'port 0 must be accepted');
+  if (!osChosen.ok) return;
+  assert.equal(osChosen.value.port, 0, 'zero must be passed through, not replaced by the default');
+
+  const explicit = readServerConfig({ SHIPLOOP_CSRF_SECRET: CSRF_SECRET, SHIPLOOP_PORT: '8080' });
+  assert.equal(explicit.ok, true);
+  if (!explicit.ok) return;
+  assert.equal(explicit.value.port, 8080);
+
+  // A negative port is not a request for an arbitrary one, and a non-number is not a number.
+  // The upper end of the range is deliberately absent from this list: nothing above 65535 is
+  // refused by `readServerConfig` today, so asserting it would be asserting a rule that does not
+  // exist. `listen` rejects such a port later, with a Node error rather than a named one.
+  for (const bad of ['-1', 'eighty', '80.5', ' ']) {
+    const refused = readServerConfig({ SHIPLOOP_CSRF_SECRET: CSRF_SECRET, SHIPLOOP_PORT: bad });
+    assert.equal(refused.ok, false, `port ${JSON.stringify(bad)} must be refused`);
+  }
+
+  // Zero stays refused everywhere else. It means "unset" for every other integer here, and a
+  // session lifetime or a byte limit of zero is a broken setting rather than a request.
+  for (const [path, value] of [
+    ['SHIPLOOP_SESSION_TTL_SECONDS', '0'],
+    ['SHIPLOOP_SESSION_IDLE_SECONDS', '0'],
+    ['SHIPLOOP_BODY_LIMIT_BYTES', '0'],
+  ] as const) {
+    const refused = readServerConfig({ SHIPLOOP_CSRF_SECRET: CSRF_SECRET, [path]: value });
+    assert.equal(refused.ok, false, `${path}=0 must be refused`);
+    if (refused.ok) continue;
+    const problem = refused.errors.find((candidate) => candidate.path === path);
+    assert.ok(problem !== undefined, `the refusal must name ${path}`);
+    assert.equal(problem.message, 'Expected a positive number.');
+  }
+});
