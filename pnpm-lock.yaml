@@ -67,6 +67,21 @@ importers:
         specifier: 8.3.1
         version: 8.3.1(@types/node@24.19.0)(esbuild@0.28.2)
 
+  apps/worker:
+    dependencies:
+      '@shiploop/adapters':
+        specifier: workspace:*
+        version: link:../../packages/adapters
+      '@shiploop/domain':
+        specifier: workspace:*
+        version: link:../../packages/domain
+      '@shiploop/storage':
+        specifier: workspace:*
+        version: link:../../packages/storage
+      '@shiploop/verification':
+        specifier: workspace:*
+        version: link:../../packages/verification
+
   packages/adapters:
     dependencies:
       '@shiploop/domain':
