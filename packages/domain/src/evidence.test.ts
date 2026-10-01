@@ -180,14 +180,37 @@ describe('F20-AC2 check result classification', () => {
     assert.equal(isBlocking('NotApplicable', false), !deliverFor([unapproved]).eligible);
   });
 
-  test('F20-AC2 a Waiting required check is not treated as a terminal success by deliveryEligible', () => {
-    // isBlocking does not cover Waiting; deliveryEligible requires Passed outright,
-    // so a required check that is still waiting still blocks delivery.
+  test('F20-AC2 a Waiting required check blocks delivery and readiness', () => {
+    // Waiting used to be reported as ready while its required check was still
+    // running, which let unreviewed work reach the delivery gate. It now blocks,
+    // and the reason is named rather than left implicit.
     const waiting = checkRecord({ result: 'Waiting', endedAt: null, exitCode: null });
 
     assert.equal(isTerminalSuccess(waiting.result), false);
-    assert.equal(isBlocking(waiting.result), false);
-    assert.equal(deliverFor([waiting]).eligible, false);
+    assert.equal(isBlocking(waiting.result), true);
+    const delivery = deliverFor([waiting]);
+    assert.equal(delivery.eligible, false);
+    assert.match(delivery.reasons.join(' '), /is Waiting, not Passed/);
+  });
+
+  test('F20-AC2 isBlocking and deliveryEligible are exact opposites for every result', () => {
+    // The two functions answer "blocks" and "may deliver" about the same record, so
+    // a disagreement between them is how a non-passed check became deliverable once.
+    for (const result of CHECK_RESULTS) {
+      for (const approved of [false, true]) {
+        const record = checkRecord({
+          result,
+          notApplicableApprovedByPolicy: approved,
+          endedAt: null,
+          exitCode: null,
+        });
+        assert.equal(
+          isBlocking(result, approved),
+          !deliverFor([record]).eligible,
+          `isBlocking(${result}, ${approved}) must be the inverse of deliveryEligible for the same record`,
+        );
+      }
+    }
   });
 });
 

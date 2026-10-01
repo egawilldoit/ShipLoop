@@ -32,15 +32,23 @@ export function isTerminalSuccess(result: CheckResult): boolean {
 }
 
 /**
- * Whether a result blocks delivery.
+ * Whether a result blocks readiness for delivery.
  *
- * NotApplicable blocks unless a policy decision approved it. The approval is a
- * separate argument rather than a property of the result string, because only a
- * policy decision can grant it and a bare result cannot prove that (F20-AC5).
+ * Every result other than `Passed` blocks, with one exception: `NotApplicable`
+ * stops blocking once a policy decision approved it. The approval is a separate
+ * argument rather than a property of the result string, because only a policy
+ * decision can grant it and a bare result cannot prove that (F20-AC5).
+ *
+ * `Waiting` is deliberately blocking. A required check that is still running has
+ * produced no observation, and reporting it as ready would let unreviewed work
+ * reach the delivery gate on the strength of a check that has not finished
+ * (F20-AC2). This is the exact inverse of `isSatisfied`, so the two cannot drift
+ * apart and disagree about the same record.
  */
 export function isBlocking(result: CheckResult, approvedByPolicy = false): boolean {
+  if (result === 'Passed') return false;
   if (result === 'NotApplicable') return !approvedByPolicy;
-  return result === 'Failed' || result === 'Missing' || result === 'Stale';
+  return true;
 }
 
 /** Whether a recorded check counts as satisfied for delivery purposes. */

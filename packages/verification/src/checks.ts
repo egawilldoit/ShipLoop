@@ -397,7 +397,7 @@ export function evaluateCandidateReadiness(input: ReadinessInput): Result<Readin
     const result: CheckResult = record === undefined
       ? 'Missing'
       : effectiveCheckResult(record, input.currentCandidateFingerprint, resolved.value.policyFingerprint);
-    const blocking = isBlocking(result);
+    const blocking = isBlocking(result, record?.notApplicableApprovedByPolicy ?? false);
     required.push({ checkId, name: record?.name ?? checkId, result, blocking });
     if (blocking) {
       blockingReasons.push(
