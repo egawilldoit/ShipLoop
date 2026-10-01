@@ -22,30 +22,38 @@ import {
   MINIMUM_PASSWORD_LENGTH,
   SESSION_COOKIE_NAME,
   blocked,
+  canTransition,
   capabilitiesFor,
   conflict,
   fingerprint,
   hashPassword,
   hashSessionToken,
+  invalid,
   ok,
   outcomeUnknown,
   sessionDeadlines,
   verifyPassword,
+  type AttentionItemId,
   type CapabilityDeclaration,
   type CapabilityKind,
   type ConnectorId,
   type DomainError,
   type IdeaId,
+  type JobId,
+  type JobMode,
   type OwnerId,
   type ProfileVersionId,
   type ProjectId,
   type Result,
 } from '@shiploop/domain';
+import type { JobOperation } from '@shiploop/storage';
 import type { FastifyInstance } from 'fastify';
 import { buildApp } from './app.ts';
 import { describeConfigErrors, readServerConfig, type ServerConfig } from './config.ts';
 import {
   isControllerSurface,
+  type AttentionBoardView,
+  type AttentionItemView,
   type BriefVersionView,
   type ClarificationRoundView,
   type ClarifyingQuestionView,
@@ -53,26 +61,111 @@ import {
   type ControllerSurface,
   type CorrectionView,
   type CreateSessionCommand,
+  type DecideExtensionCommand,
   type DispositionCommand,
   type IdeaExportView,
   type IntakeDetailView,
   type IntakeIdeaView,
   type CaptureIdeaCommand,
   type OwnerView,
+  type CancelledRunView,
+  type DeclinedExtensionView,
+  type GrantedExtensionView,
+  type PausedRunView,
+  type ResumedRunView,
   type ProfileContent,
   type ProfileVersionView,
   type ProvisionOwnerCommand,
   type RegisterConnectorCommand,
   type RelatednessReportView,
   type RelatedWorkChoiceView,
+  type ReviewCardView,
   type RevokeConnectorCommand,
   type RevokeSessionCommand,
+  type AttentionBucket,
+  type AcceptanceGateView,
+  type AcceptanceReportView,
+  type AcceptanceView,
+  type ChangeRequestReportView,
+  type RunCheckpointView,
+  type RunJobView,
+  type RunStartView,
+  type RunView,
+  type RunWriterView,
   type SaveProfileVersionCommand,
   type SignInCommand,
   type SignInGrant,
+  type StartRunCommand,
   type StoredSessionRecord,
   type TouchSessionCommand,
 } from './contracts.ts';
+
+/**
+ * The permissions each mode holds, as the storage vocabulary names them.
+ *
+ * The same table the queue enforces, so a route test that starts a Build run and reads the
+ * grant back is reading the shape a real Build run carries (F13-AC3).
+ */
+const MODE_OPERATIONS: Readonly<Record<JobMode, readonly JobOperation[]>> = {
+  Plan: ['ReadScope', 'ReadRepository', 'PublishIssue', 'UpdateManagedProgress', 'CreateDraft', 'UpdateDraft'],
+  Investigate: ['ReadScope', 'ReadRepository', 'ReadChecks'],
+  Build: ['ReadScope', 'ReadRepository', 'ReadChecks', 'PushBranch', 'CreateDraft', 'UpdateDraft', 'RunChecks', 'CollectEvidence'],
+  Test: ['ReadScope', 'ReadRepository', 'ReadChecks', 'RunChecks', 'CollectEvidence'],
+  Review: ['ReadScope', 'ReadRepository', 'ReadChecks', 'CollectEvidence'],
+};
+
+const READINESS_AREAS = ['scope', 'criteria', 'repository', 'target', 'verification', 'access'] as const;
+
+/** The domain's own area names, because a refusal quotes them and a synonym would disagree. */
+const READINESS_AREA_NAMES: Readonly<Record<(typeof READINESS_AREAS)[number], string>> = {
+  scope: 'Scope',
+  criteria: 'Criteria',
+  repository: 'Repository',
+  target: 'Target',
+  verification: 'Verification',
+  access: 'Access',
+};
+
+/**
+ * The states each attempt state can reach, restated from the domain's own table.
+ *
+ * Named only so a refusal can say what was reachable, and checked against
+ * `canTransition` on every use rather than trusted: a table that drifted from the domain
+ * would make an illegal move look legal in a message and nothing else (F17-AC1).
+ */
+const REACHABLE_FROM: Readonly<Record<string, readonly string[]>> = {
+  Queued: ['Preparing', 'Cancelled', 'Blocked'],
+  Preparing: ['Running', 'Blocked', 'Paused', 'Cancelled', 'Queued'],
+  Running: ['Verifying', 'WaitingForOwner', 'Paused', 'Blocked', 'Completed', 'Cancelled'],
+  Verifying: ['WaitingForOwner', 'Completed', 'Blocked', 'Paused', 'Cancelled'],
+  WaitingForOwner: ['Running', 'Verifying', 'Completed', 'Paused', 'Cancelled', 'Blocked'],
+  Paused: ['Running', 'Preparing', 'Cancelled', 'Blocked'],
+  Blocked: ['Preparing', 'Queued', 'Cancelled'],
+  Completed: ['Verifying', 'WaitingForOwner'],
+  Cancelled: [],
+};
+
+function unreachableFrom(state: string, to: string): string {
+  const reachable = (REACHABLE_FROM[state] ?? []).filter((candidate) => canTransition('attempt', state, candidate));
+  const legal = canTransition('attempt', state, to);
+  assert.equal(legal, reachable.includes(to), `the transcribed table for ${state} must agree with the domain's own`);
+  return reachable.length === 0 ? `From ${state} nothing is reachable; it is terminal.` : `From ${state} the reachable states are: ${reachable.join(', ')}.`;
+}
+
+const ATTENTION_BUCKETS: readonly AttentionBucket[] = [
+  'Working',
+  'NeedsYourInput',
+  'ReadyForYourTest',
+  'ReadyForRelease',
+];
+
+const ATTENTION_BUCKET_OF: Readonly<Record<string, AttentionBucket>> = {
+  RunProgress: 'Working',
+  ClarificationRequested: 'NeedsYourInput',
+  Blocker: 'NeedsYourInput',
+  ReadyForYourTest: 'ReadyForYourTest',
+  DeliveryDecision: 'ReadyForRelease',
+};
 
 const CSRF_SECRET = ['server', 'secret', 'material', '0123456789abcdef'].join('-');
 const START = '2026-03-01T12:00:00.000Z';
@@ -197,6 +290,14 @@ class InMemoryController implements ControllerSurface {
   private readonly capabilities: CapabilityDeclarationsByProvider;
   private passwordHash = '';
   private readonly scripted = new Map<string, DomainError>();
+  private readonly recordedRuns = new Map<string, RunJobView>();
+  private readonly checkpoints = new Map<string, RunCheckpointView>();
+  private readonly writers = new Map<string, RunWriterView>();
+  private readonly attentionItems = new Map<string, AttentionItemView>();
+  private readonly cards = new Map<string, ReviewCardView>();
+  private readonly gates = new Map<string, { readonly candidateId: string; readonly gate: AcceptanceGateView }>();
+  private readonly acceptanceStates = new Map<string, AcceptanceView>();
+  private readonly feedback: { readonly decisionId: string; readonly feedback: string }[] = [];
 
   constructor(
     _now: () => Date,
@@ -486,6 +587,443 @@ class InMemoryController implements ControllerSurface {
       return ok(revoked);
     },
   };
+
+  /**
+   * Runs, in maps rather than SQLite.
+   *
+   * The decisions this double makes are the ones a transport test needs to be able to
+   * exercise, and each one is the decision the real use case makes, so a route that reports
+   * the wrong status is caught here rather than at the first owner request: deduplication
+   * by operation identity (F13-AC2), the lifecycle transitions validated against the
+   * domain's own attempt table (F17-AC1), a pause that reports whether the writer stopped
+   * (F17-AC1), and a resume that is refused without a recorded resume point (F17-AC2).
+   *
+   * `script` still arms the refusals a route has to map: an extension granted to a run that
+   * is not waiting is a `Conflict`, and a review card for a run with no candidate is a
+   * `NotFound`.
+   */
+  readonly runs = {
+    startRun: async (command: StartRunCommand): Promise<Result<RunStartView, DomainError>> => {
+      const scripted = this.takeScripted('startRun');
+      if (scripted !== null) return { ok: false, error: scripted };
+      const existing = [...this.recordedRuns.values()].find((job) => job.operationId === command.operationId);
+      if (existing !== undefined) {
+        const checkpoint = this.checkpoints.get(existing.jobId) ?? null;
+        void checkpoint;
+        return ok(this.startView(existing, true, command.at));
+      }
+      if (command.workItemId.trim().length === 0) {
+        return {
+          ok: false,
+          error: invalid('The run could not be started as given.', [
+            { path: 'workItemId', message: 'Name the work item this run works on.' },
+          ]),
+        };
+      }
+      const unconfirmed = READINESS_AREAS.filter((area) => !command.readiness[area].confirmed).map(
+        (area) => READINESS_AREA_NAMES[area],
+      );
+      if (unconfirmed.length > 0) {
+        return {
+          ok: false,
+          error: blocked(
+            `Work ${command.workItemId} is NeedsInformation: ${unconfirmed.join(', ')} are not confirmed (F09-AC2).`,
+            unconfirmed.map((area) => ({
+              name: `readiness-${area.toLowerCase()}`,
+              detail: `${area} is not confirmed.`,
+              remedy: `Confirm the ${area} prerequisite on the start form, or record what is open about it.`,
+            })),
+          ),
+        };
+      }
+      const jobId = `job_${String(this.recordedRuns.size + 1)}`;
+      const job: RunJobView = {
+        jobId,
+        operationId: command.operationId,
+        mode: command.mode,
+        workItemId: command.workItemId,
+        scopeSnapshotId: `scope_${String(this.recordedRuns.size + 1)}`,
+        projectId: PROJECT_ID,
+        profileVersionId: 'prv_1',
+        procedureVersionId: 'prc_1',
+        state: 'Queued',
+        correlationId: command.operationId,
+        limits: { activeExecutionMs: 3_600_000, maxAutomatedFixPasses: 2, maxToolRetries: 3, maxAttempts: 2 },
+        permittedOperations: MODE_OPERATIONS[command.mode],
+        holder: null,
+        attemptCount: 0,
+        createdAt: command.at,
+        updatedAt: command.at,
+      };
+      this.recordedRuns.set(jobId, job);
+      return ok(this.startView(job, false, command.at));
+    },
+
+    listRuns: async (): Promise<Result<readonly RunJobView[], DomainError>> => ok([...this.recordedRuns.values()]),
+
+    getRun: async (jobId: JobId): Promise<Result<RunView, DomainError>> => this.viewOf(jobId),
+
+    pauseRun: async (jobId: JobId): Promise<Result<PausedRunView, DomainError>> => {
+      const scripted = this.takeScripted('pauseRun');
+      if (scripted !== null) return { ok: false, error: scripted };
+      const job = this.jobOf(jobId);
+      if (job === null) return { ok: false, error: { code: 'NotFound', reason: `No run ${jobId} exists.` } };
+      if (!canTransition('attempt', job.state, 'Paused')) {
+        return {
+          ok: false,
+          error: invalid(`Illegal attempt transition ${job.state} -> Paused`, [
+            { path: 'state', message: unreachableFrom(job.state, 'Paused') },
+          ]),
+        };
+      }
+      const writer = this.writers.get(jobId) ?? { holder: null, disposition: 'Unleased' as const, expiresAt: null, reconciliationReason: null };
+      const paused: RunJobView = { ...job, state: 'Paused', updatedAt: START };
+      this.recordedRuns.set(jobId, paused);
+      return ok({
+        job: paused,
+        checkpoint: this.checkpoints.get(jobId) ?? null,
+        writer,
+        writerStopped: writer.disposition === 'Vacant' || writer.disposition === 'Unleased',
+      });
+    },
+
+    resumeRun: async (jobId: JobId): Promise<Result<ResumedRunView, DomainError>> => {
+      const scripted = this.takeScripted('resumeRun');
+      if (scripted !== null) return { ok: false, error: scripted };
+      const job = this.jobOf(jobId);
+      if (job === null) return { ok: false, error: { code: 'NotFound', reason: `No run ${jobId} exists.` } };
+      const checkpoint = this.checkpoints.get(jobId);
+      if (checkpoint === undefined) {
+        return {
+          ok: false,
+          error: blocked(`Job ${jobId} has no recorded resume point, so there is nothing to resume from (F17-AC2).`, [
+            { name: 'resume-point', detail: `Job ${jobId} is ${job.state} and no checkpoint has been written for it.`, remedy: 'Write the resume point while the writer still holds the job, then resume it.' },
+          ]),
+        };
+      }
+      const resumed: RunJobView = { ...job, state: 'Running', updatedAt: START };
+      this.recordedRuns.set(jobId, resumed);
+      return ok({ job: resumed, checkpoint });
+    },
+
+    cancelRun: async (jobId: JobId): Promise<Result<CancelledRunView, DomainError>> => {
+      const scripted = this.takeScripted('cancelRun');
+      if (scripted !== null) return { ok: false, error: scripted };
+      const job = this.jobOf(jobId);
+      if (job === null) return { ok: false, error: { code: 'NotFound', reason: `No run ${jobId} exists.` } };
+      if (!canTransition('attempt', job.state, 'Cancelled')) {
+        return {
+          ok: false,
+          error: invalid(`Illegal attempt transition ${job.state} -> Cancelled`, [
+            { path: 'state', message: `From ${job.state} the reachable states are: ${REACHABLE_FROM[job.state]?.join(', ') ?? 'none; it is terminal'}.` },
+          ]),
+        };
+      }
+      const cancelled: RunJobView = { ...job, state: 'Cancelled', updatedAt: START };
+      this.recordedRuns.set(jobId, cancelled);
+      return ok({
+        job: cancelled,
+        preservedCheckpoint: this.checkpoints.get(jobId) ?? null,
+        writer: this.writers.get(jobId) ?? { holder: null, disposition: 'Unleased', expiresAt: null, reconciliationReason: null },
+        externalDelivery: 'UnchangedByCancellation',
+      });
+    },
+
+    grantExtension: async (command: DecideExtensionCommand): Promise<Result<GrantedExtensionView, DomainError>> => {
+      const job = this.jobOf(command.jobId);
+      if (job === null) return { ok: false, error: { code: 'NotFound', reason: `No run ${command.jobId} exists.` } };
+      if (job.state !== 'WaitingForOwner') {
+        return {
+          ok: false,
+          error: conflict(`Job ${command.jobId} is ${job.state}, so there is no reached limit to extend.`, 'WaitingForOwner', job.state),
+        };
+      }
+      const resumed: RunJobView = { ...job, state: 'Running', updatedAt: START };
+      this.recordedRuns.set(command.jobId, resumed);
+      return ok({
+        job: resumed,
+        previousLimits: { activeExecutionMs: 3_600_000, automatedFixPasses: 2 },
+        extendedLimits: { activeExecutionMs: 7_200_000, automatedFixPasses: 4 },
+        extendedBoundRecorded: false,
+        decidedBy: command.actor,
+        decidedAt: START,
+      });
+    },
+
+    declineExtension: async (command: DecideExtensionCommand): Promise<Result<DeclinedExtensionView, DomainError>> => {
+      const job = this.jobOf(command.jobId);
+      if (job === null) return { ok: false, error: { code: 'NotFound', reason: `No run ${command.jobId} exists.` } };
+      if (job.state !== 'WaitingForOwner') {
+        return {
+          ok: false,
+          error: conflict(`Job ${command.jobId} is ${job.state}, so there is no pending extension request to decline.`, 'WaitingForOwner', job.state),
+        };
+      }
+      return ok({
+        job,
+        limitsInForce: { activeExecutionMs: 3_600_000, automatedFixPasses: 2 },
+        decidedBy: command.actor,
+        decidedAt: START,
+      });
+    },
+  };
+
+  readonly attention = {
+    collectAttention: async (command: { projectId: string | null; at: string }): Promise<Result<AttentionBoardView, DomainError>> => {
+      const scripted = this.takeScripted('collectAttention');
+      if (scripted !== null) return { ok: false, error: scripted };
+      const projectId = command.projectId ?? PROJECT_ID;
+      const items: AttentionItemView[] = [...this.attentionItems.values()].filter((item) => item.projectId === projectId);
+      return ok({
+        projectId,
+        collectedAt: command.at,
+        items,
+        groups: ATTENTION_BUCKETS.map((bucket: AttentionBucket) => ({
+          bucket,
+          items: items.filter((item) => ATTENTION_BUCKET_OF[item.kind] === bucket && item.state !== 'Resolved'),
+        })).filter((group) => group.items.length > 0),
+        persistedItemIds: [...this.attentionItems.keys()],
+      });
+    },
+
+    acknowledge: async (command: { attentionItemId: AttentionItemId; actor: OwnerId }): Promise<Result<AttentionItemView, DomainError>> => {
+      const existing = this.attentionItems.get(command.attentionItemId);
+      if (existing === undefined) return { ok: false, error: { code: 'NotFound', reason: 'No such attention item.' } };
+      const acknowledged: AttentionItemView = {
+        ...existing,
+        state: 'Acknowledged',
+        acknowledgedAt: START,
+        acknowledgedBy: command.actor,
+      };
+      this.attentionItems.set(command.attentionItemId, acknowledged);
+      return ok(acknowledged);
+    },
+  };
+
+  readonly reviewCards = {
+    buildReviewCard: async (jobId: JobId): Promise<Result<ReviewCardView, DomainError>> => {
+      const scripted = this.takeScripted('buildReviewCard');
+      if (scripted !== null) return { ok: false, error: scripted };
+      const job = this.jobOf(jobId);
+      if (job === null) return { ok: false, error: { code: 'NotFound', reason: `No run ${jobId} exists.` } };
+      const card = this.cards.get(job.workItemId);
+      if (card === undefined) {
+        return {
+          ok: false,
+          error: {
+            code: 'NotFound',
+            reason: `Work item ${job.workItemId} has recorded no candidate yet, so there is nothing for a review card to describe (F24-AC2).`,
+          },
+        };
+      }
+      return ok(card);
+    },
+  };
+
+  /**
+   * The acceptance group of this double.
+   *
+   * Backed by real stored state rather than canned answers, because the two properties
+   * worth proving here are relational: feedback is retained across decisions, and
+   * acceptance is refused while a criterion is outstanding. A double that answered both
+   * from a fixed map would pass without either (F25-AC1, F25-AC2).
+   */
+  readonly acceptance = {
+    requestChanges: async (command: {
+      readonly jobId: JobId;
+      readonly reason: string;
+      readonly actor: string;
+      readonly at: string;
+    }): Promise<Result<ChangeRequestReportView, DomainError>> => {
+      const scripted = this.takeScripted('requestChanges');
+      if (scripted !== null) return { ok: false, error: scripted };
+      const gate = this.gateOf(command.jobId);
+      if (!gate.ok) return gate;
+      const decisionId = `decision-change-${this.feedback.length + 1}`;
+      this.feedback.push({ decisionId, feedback: command.reason });
+      this.acceptanceStates.set(gate.value.candidateId, {
+        candidateId: gate.value.candidateId,
+        candidateFingerprint: gate.value.gate.candidateFingerprint,
+        state: 'ChangesRequested',
+        decisionId,
+        ownerId: command.actor,
+        decidedAt: command.at,
+        note: null,
+        staleReasons: [],
+        retainedFeedback: [...this.feedback],
+      });
+      return ok({
+        candidateId: gate.value.candidateId,
+        workItemId: this.jobOf(command.jobId)?.workItemId ?? 'work-item-unknown',
+        decisionId,
+        state: 'ChangesRequested',
+        ownerId: command.actor,
+        decidedAt: command.at,
+        feedback: command.reason,
+        outstandingCriterionIds: [...gate.value.gate.outstandingCriterionIds],
+      });
+    },
+
+    recordAcceptance: async (command: {
+      readonly jobId: JobId;
+      readonly note: string | null;
+      readonly actor: string;
+      readonly at: string;
+    }): Promise<Result<AcceptanceReportView, DomainError>> => {
+      const scripted = this.takeScripted('recordAcceptance');
+      if (scripted !== null) return { ok: false, error: scripted };
+      const gate = this.gateOf(command.jobId);
+      if (!gate.ok) return gate;
+      if (gate.value.gate.outstandingCriterionIds.length > 0) {
+        const outstandingIds = new Set(gate.value.gate.outstandingCriterionIds);
+        return {
+          ok: false,
+          error: {
+            code: 'Blocked',
+            reason: `This candidate cannot be accepted yet: ${outstandingIds.size} of ${gate.value.gate.criteria.length} criteria are not verified (F25-AC1).`,
+            prerequisites: gate.value.gate.criteria
+              .filter((entry) => outstandingIds.has(entry.criterionId))
+              .map((entry) => ({
+                name: `Criterion ${entry.criterionId}`,
+                detail: entry.observed
+                  ? `It is ${entry.status} under the ${entry.methodKind} method.`
+                  : 'No observation of it is recorded for this candidate.',
+                remedy: 'Record the owner test for this criterion, or request changes with what is wrong.',
+              })),
+          },
+        };
+      }
+      const decisionId = `decision-accept-${this.acceptanceStates.size + 1}`;
+      this.acceptanceStates.set(gate.value.candidateId, {
+        candidateId: gate.value.candidateId,
+        candidateFingerprint: gate.value.gate.candidateFingerprint,
+        state: 'Accepted',
+        decisionId,
+        ownerId: command.actor,
+        decidedAt: command.at,
+        note: command.note,
+        staleReasons: [],
+        retainedFeedback: [...this.feedback],
+      });
+      return ok({
+        candidateId: gate.value.candidateId,
+        workItemId: this.jobOf(command.jobId)?.workItemId ?? 'work-item-unknown',
+        decisionId,
+        state: 'Accepted',
+        ownerId: command.actor,
+        decidedAt: command.at,
+        candidateFingerprint: gate.value.gate.candidateFingerprint,
+        headSha: gate.value.gate.headSha,
+        scopeFingerprint: gate.value.gate.scopeFingerprint,
+        observedDeployments: [],
+        feedbackHonoured: [...this.feedback],
+      });
+    },
+
+    currentAcceptance: async (jobId: JobId): Promise<Result<AcceptanceView, DomainError>> => {
+      const gate = this.gateOf(jobId);
+      if (!gate.ok) return gate;
+      const existing = this.acceptanceStates.get(gate.value.candidateId);
+      return ok(
+        existing ?? {
+          candidateId: gate.value.candidateId,
+          candidateFingerprint: gate.value.gate.candidateFingerprint,
+          state: 'Undecided',
+          decisionId: null,
+          ownerId: null,
+          decidedAt: null,
+          note: null,
+          staleReasons: [],
+          retainedFeedback: [],
+        },
+      );
+    },
+
+    acceptanceGate: async (jobId: JobId): Promise<Result<AcceptanceGateView, DomainError>> => {
+      const gate = this.gateOf(jobId);
+      return gate.ok ? ok(gate.value.gate) : gate;
+    },
+  };
+
+  /** The gate a decision is judged against, resolved from the run's own candidate. */
+  private gateOf(jobId: JobId): Result<{ readonly candidateId: string; readonly gate: AcceptanceGateView }, DomainError> {
+    const job = this.jobOf(jobId);
+    if (job === null) return { ok: false, error: { code: 'NotFound', reason: `No run ${jobId} exists.` } };
+    const gate = this.gates.get(job.workItemId);
+    if (gate === undefined) {
+      return {
+        ok: false,
+        error: {
+          code: 'NotFound',
+          reason: `Work item ${job.workItemId} has recorded no candidate yet, so there is nothing to accept or reject (F25-AC1).`,
+        },
+      };
+    }
+    return ok(gate);
+  }
+
+  /** Seeds the run-side state the lifecycle routes act on, so a test can drive a real move. */
+  seedRun(state: RunJobView, checkpoint?: RunCheckpointView, writer?: RunWriterView): void {
+    this.recordedRuns.set(state.jobId, state);
+    if (checkpoint !== undefined) this.checkpoints.set(state.jobId, checkpoint);
+    if (writer !== undefined) this.writers.set(state.jobId, writer);
+  }
+
+  seedAttentionItem(item: AttentionItemView): void {
+    this.attentionItems.set(item.attentionItemId, item);
+  }
+
+  seedReviewCard(workItemId: string, card: ReviewCardView): void {
+    this.cards.set(workItemId, card);
+  }
+
+  seedAcceptanceGate(workItemId: string, gate: AcceptanceGateView, candidateId: string): void {
+    this.gates.set(workItemId, { candidateId, gate });
+  }
+
+  private jobOf(jobId: JobId): RunJobView | null {
+    return this.recordedRuns.get(jobId) ?? null;
+  }
+
+  private viewOf(jobId: JobId): Result<RunView, DomainError> {
+    const job = this.jobOf(jobId);
+    if (job === null) return { ok: false, error: { code: 'NotFound', reason: `No run ${jobId} exists.` } };
+    return ok({
+      job,
+      checkpoint: this.checkpoints.get(jobId) ?? null,
+      writer: this.writers.get(jobId) ?? { holder: null, disposition: 'Unleased', expiresAt: null, reconciliationReason: null },
+    });
+  }
+
+  private startView(job: RunJobView, deduplicated: boolean, at: string): RunStartView {
+    const held = [...this.recordedRuns.values()].filter((other) => other.holder !== null && other.jobId !== job.jobId).map((other) => other.jobId);
+    return {
+      job,
+      deduplicated,
+      capturedScope: {
+        scopeSnapshotId: job.scopeSnapshotId,
+        workItemId: job.workItemId,
+        sequenceNumber: 1,
+        scopeFingerprint: fingerprint({ scope: job.scopeSnapshotId }),
+        capturedAt: at,
+      },
+      dispatch: {
+        state: 'Queued',
+        heldByWriter: held,
+        reason:
+          held.length === 0
+            ? 'No other job holds the single global coding writer, so the coding worker can claim this job (F13-AC2).'
+            : `The single global coding writer is held for ${held.join(', ')}, so this job stays Queued until that writer finishes (F13-AC2).`,
+      },
+      grant: {
+        mode: job.mode,
+        permittedOperations: job.permittedOperations,
+        refusedDeliveryOperations: ['Merge', 'Release', 'RecoveryRedeploy'],
+        refusalReason: 'Merge: a coding actor may never hold delivery authority (F03-AC5).',
+      },
+      requestedByOwner: OWNER_ID,
+    };
+  }
 }
 
 let decoyHashCache: string | null = null;
@@ -1267,6 +1805,19 @@ test('the loaded controller module is validated before it can serve a request', 
       applyOwnerCorrection() {},
       exportIdea() {},
     },
+    runs: {
+      startRun() {},
+      listRuns() {},
+      getRun() {},
+      pauseRun() {},
+      resumeRun() {},
+      cancelRun() {},
+      grantExtension() {},
+      declineExtension() {},
+    },
+    attention: { collectAttention() {}, acknowledge() {} },
+    reviewCards: { buildReviewCard() {} },
+    acceptance: { requestChanges() {}, recordAcceptance() {}, currentAcceptance() {}, acceptanceGate() {} },
   };
   assert.equal(isControllerSurface(complete), true);
 });
@@ -1463,4 +2014,906 @@ test('F01-AC1: SHIPLOOP_PORT 0 is the OS-assigned port, and only the port may be
     assert.ok(problem !== undefined, `the refusal must name ${path}`);
     assert.equal(problem.message, 'Expected a positive number.');
   }
+});
+
+/* -------------------------------------------------------------------------- */
+/* Runs, attention and the review card                                         */
+/* -------------------------------------------------------------------------- */
+
+const WORK_ITEM = 'wrk_octopus_1';
+const HEAD_SHA = 'a1b2c3d4e5f60718293a4b5c6d7e8f9012345678';
+const BASE_SHA = '0f1e2d3c4b5a69788796a5b4c3d2e1f001122334';
+const SCOPE_FINGERPRINT = 'fp_1a2b3c4d5e6f7081';
+
+/** A start body the route's own schema accepts, so a 400 here can only be about a named field. */
+function startPayload(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  const readiness: Record<string, { confirmed: boolean; note: string | null }> = {};
+  for (const area of READINESS_AREAS) readiness[area] = { confirmed: true, note: `Confirmed ${area} for this run.` };
+  return {
+    workItemId: WORK_ITEM,
+    mode: 'Build',
+    operationId: 'op_octopus_1',
+    scope: {
+      issueId: 'issue_octopus_1',
+      issueIdentifier: 'OCT-1',
+      title: 'Record that the run happened',
+      description: 'The run must leave a durable record a worker can claim.',
+      acceptanceCriteria: [{ id: 'AC1', text: 'A durable job row exists for the run.' }],
+    },
+    readiness,
+    ...overrides,
+  };
+}
+
+async function startRun(h: Harness, session: Session, overrides: Record<string, unknown> = {}): Promise<InjectedResponse> {
+  return h.app.inject({
+    method: 'POST',
+    url: '/api/runs',
+    headers: { cookie: session.cookie, 'x-shiploop-csrf': session.csrfToken },
+    payload: startPayload(overrides),
+  });
+}
+
+interface RunStartPayload {
+  readonly run: RunStartView;
+  readonly disposition: string;
+  readonly message: string;
+}
+
+function runCheckpoint(overrides: Partial<RunCheckpointView> = {}): RunCheckpointView {
+  return {
+    checkpointId: 'ckpt_1',
+    scopeSnapshotId: 'scope_1',
+    scopeFingerprint: SCOPE_FINGERPRINT,
+    profileVersionId: 'prv_1',
+    procedureVersionId: 'prc_1',
+    engineVersion: 'codex-1',
+    workspace: { workspaceId: 'ws_1', branchName: 'ship/octopus-1', worktreePath: '/tmp/wt/octopus-1' },
+    headSha: HEAD_SHA,
+    baseSha: BASE_SHA,
+    dirtyFiles: ['src/server/routes/runs.ts'],
+    untrackedFiles: ['apps/web/e2e/runs.spec.ts'],
+    results: [{ name: 'typecheck', result: 'Passed', detail: null }],
+    feedback: [{ author: OWNER_ID, at: START, body: 'Keep the refusal verbatim.' }],
+    blocker: 'The engine binary is not installed.',
+    nextAction: 'Install the engine, then resume this run.',
+    recordedAt: START,
+    ...overrides,
+  };
+}
+
+function queuedRun(overrides: Partial<RunJobView> = {}): RunJobView {
+  return {
+    jobId: 'job_seeded_1',
+    operationId: 'op_seeded_1',
+    mode: 'Build',
+    workItemId: WORK_ITEM,
+    scopeSnapshotId: 'scope_seeded_1',
+    projectId: PROJECT_ID,
+    profileVersionId: 'prv_1',
+    procedureVersionId: 'prc_1',
+    state: 'Queued',
+    correlationId: 'op_seeded_1',
+    limits: { activeExecutionMs: 3_600_000, maxAutomatedFixPasses: 2, maxToolRetries: 3, maxAttempts: 2 },
+    permittedOperations: MODE_OPERATIONS.Build,
+    holder: null,
+    attemptCount: 0,
+    createdAt: START,
+    updatedAt: START,
+    ...overrides,
+  };
+}
+
+// F13-AC1, F13-AC2, F13-AC3: a start answers 201 with the durable job, the scope it captured and the
+// grant it holds, and the grant names the delivery operations it refused. A 201 here is the claim
+// that a run exists, so the response has to carry the run rather than a bare acknowledgement.
+test('F13-AC1: a start answers 201 with the job, the captured scope and the refused delivery operations', async (t) => {
+  const h = await harness();
+  t.after(() => h.close());
+  const session = await signIn(h.app);
+
+  const response = await startRun(h, session);
+  assert.equal(response.statusCode, 201, `start failed: ${response.body}`);
+  const body = parse<RunStartPayload>(response);
+
+  assert.equal(body.run.job.state, 'Queued', 'a started run is Queued until a worker claims it');
+  assert.equal(body.run.job.workItemId, WORK_ITEM);
+  assert.equal(body.run.job.mode, 'Build');
+  assert.equal(body.run.deduplicated, false);
+  assert.equal(body.run.capturedScope.workItemId, WORK_ITEM);
+  assert.equal(body.run.capturedScope.sequenceNumber, 1);
+
+  // The grant is the mode's own set, read back rather than restated, and delivery is named as
+  // refused rather than omitted: a grant that silently lacked Merge reads as an oversight.
+  assert.deepEqual(body.run.grant.permittedOperations, MODE_OPERATIONS.Build);
+  assert.deepEqual(body.run.grant.refusedDeliveryOperations, ['Merge', 'Release', 'RecoveryRedeploy']);
+  assert.match(body.run.grant.refusalReason, /Merge/);
+  assert.equal(body.run.requestedByOwner, OWNER_ID);
+  assert.equal(response.headers['cache-control'], 'no-store');
+});
+
+// F13-AC2: the same operation identity twice is one run. This is the property the whole identity
+// exists for, and the second answer has to say it was a repeat rather than a second creation.
+test('F13-AC2: the same operation identity answers 200 and starts no second run', async (t) => {
+  const h = await harness();
+  t.after(() => h.close());
+  const session = await signIn(h.app);
+
+  const first = await startRun(h, session);
+  assert.equal(first.statusCode, 201, `first start failed: ${first.body}`);
+  const firstJobId = parse<RunStartPayload>(first).run.job.jobId;
+
+  const second = await startRun(h, session);
+  assert.equal(second.statusCode, 200, `the repeat must not answer 201: ${second.body}`);
+  const body = parse<RunStartPayload>(second);
+  assert.equal(body.disposition, 'AlreadyStarted');
+  assert.equal(body.run.deduplicated, true);
+  assert.equal(body.run.job.jobId, firstJobId, 'the repeat returns the run the identity already started');
+  assert.match(body.message, /already started run/);
+
+  // One run exists, which is the claim the status code makes and the store has to agree with.
+  const listed = await h.app.inject({ method: 'GET', url: '/api/runs', headers: { cookie: session.cookie } });
+  assert.equal(listed.statusCode, 200);
+  assert.equal(parse<{ runs: readonly RunJobView[] }>(listed).runs.length, 1);
+});
+
+// F13-AC2, F13-AC3: a run queued behind the single global coding writer answers 202 and names the
+// holder, because a 201 there would report a writer claim no worker has made.
+test('F13-AC2: a start behind the single coding writer answers 202 and names the holder', async (t) => {
+  const h = await harness();
+  t.after(() => h.close());
+  const session = await signIn(h.app);
+  h.controller.seedRun(queuedRun({ jobId: 'job_holder', operationId: 'op_holder', holder: 'worker-a' }), undefined, {
+    holder: 'worker-a',
+    disposition: 'Held',
+    expiresAt: '2026-03-01T13:00:00.000Z',
+    reconciliationReason: null,
+  });
+
+  const response = await startRun(h, session);
+  assert.equal(response.statusCode, 202, `a queued-behind-writer start must not answer 201: ${response.body}`);
+  const body = parse<RunStartPayload>(response);
+  assert.equal(body.disposition, 'QueuedBehindWriter');
+  assert.deepEqual(body.run.dispatch.heldByWriter, ['job_holder']);
+  assert.match(body.message, /job_holder/);
+  assert.equal(body.run.job.state, 'Queued');
+});
+
+// F09-AC2, N03-AC3: an unconfirmed prerequisite refuses the start and names every open area with
+// its remedy, and the refusal is per field so a form can mark the input that caused it.
+test('F09-AC2: an unconfirmed prerequisite refuses the start by name and starts nothing', async (t) => {
+  const h = await harness();
+  t.after(() => h.close());
+  const session = await signIn(h.app);
+
+  const response = await startRun(h, session, {
+    readiness: {
+      scope: { confirmed: true, note: null },
+      criteria: { confirmed: false, note: null },
+      repository: { confirmed: false, note: null },
+      target: { confirmed: true, note: null },
+      verification: { confirmed: true, note: null },
+      access: { confirmed: true, note: null },
+    },
+  });
+  assert.equal(response.statusCode, 422, `an unconfirmed prerequisite must be a Blocked 422: ${response.body}`);
+  const problem = parse<ErrorPayload>(response);
+  assert.equal(problem.error.code, 'Blocked');
+  const names = (problem.error.prerequisites ?? []).map((entry) => entry.name);
+  assert.deepEqual(names, ['readiness-criteria', 'readiness-repository']);
+  for (const prerequisite of problem.error.prerequisites ?? []) {
+    assert.ok(prerequisite.remedy.length > 0, 'every open area must carry a remedy (F09-AC2)');
+  }
+  assert.match(problem.error.message, /NeedsInformation/);
+
+  const listed = await h.app.inject({ method: 'GET', url: '/api/runs', headers: { cookie: session.cookie } });
+  assert.equal(parse<{ runs: readonly RunJobView[] }>(listed).runs.length, 0, 'a refused start leaves no run behind');
+});
+
+// F02-AC4, N03-AC3: every rejected field is reported, and an unrecognised key is refused rather
+// than dropped. A form can only mark the inputs it knows about, so one combined message would leave
+// the owner guessing which input to fix.
+test('F02-AC4: a start body is validated per field and refuses keys it does not accept', async (t) => {
+  const h = await harness();
+  t.after(() => h.close());
+  const session = await signIn(h.app);
+
+  const response = await startRun(h, session, {
+    mode: 'Deploy',
+    workItemId: '   ',
+    operationId: '',
+    surprise: 'accepted by nobody',
+    scope: {
+      issueId: 'issue_octopus_1',
+      issueIdentifier: 'OCT-1',
+      title: 'A title',
+      description: 'A description',
+      acceptanceCriteria: [],
+    },
+  });
+  assert.equal(response.statusCode, 400, response.body);
+  const problem = parse<ErrorPayload>(response);
+  assert.equal(problem.error.code, 'Invalid');
+  const paths = (problem.error.fields ?? []).map((field) => field.path);
+  assert.ok(paths.includes('mode'), `the mode must be reported: ${paths.join(', ')}`);
+  assert.ok(paths.includes('workItemId'), `the work item must be reported: ${paths.join(', ')}`);
+  assert.ok(paths.includes('operationId'), `the operation identity must be reported: ${paths.join(', ')}`);
+  assert.ok(paths.includes('surprise'), `an unrecognised key must be reported: ${paths.join(', ')}`);
+  assert.ok(paths.includes('scope.acceptanceCriteria'), `the criteria list must be reported: ${paths.join(', ')}`);
+});
+
+// F17-AC2: the resume point is readable on its own, in full. An abbreviated SHA or a dropped
+// untracked inventory would make the comparison a resume performs meaningless.
+test('F17-AC2: the checkpoint route returns the whole resume point, SHAs unabbreviated', async (t) => {
+  const h = await harness();
+  t.after(() => h.close());
+  const session = await signIn(h.app);
+  const job = queuedRun({ state: 'Running' });
+  h.controller.seedRun(job, runCheckpoint());
+
+  const response = await h.app.inject({
+    method: 'GET',
+    url: `/api/runs/${job.jobId}/checkpoint`,
+    headers: { cookie: session.cookie },
+  });
+  assert.equal(response.statusCode, 200, response.body);
+  const checkpoint = parse<{ checkpoint: RunCheckpointView }>(response).checkpoint;
+
+  assert.equal(checkpoint.headSha, HEAD_SHA);
+  assert.equal(checkpoint.baseSha, BASE_SHA);
+  assert.equal(checkpoint.headSha.length, 40, 'a head SHA must be full, because a resume compares it to a checkout');
+  assert.equal(checkpoint.baseSha.length, 40);
+  assert.equal(checkpoint.scopeFingerprint, SCOPE_FINGERPRINT);
+  assert.equal(checkpoint.profileVersionId, 'prv_1');
+  assert.equal(checkpoint.procedureVersionId, 'prc_1');
+  assert.equal(checkpoint.engineVersion, 'codex-1');
+  assert.equal(checkpoint.workspace.branchName, 'ship/octopus-1');
+  assert.deepEqual(checkpoint.dirtyFiles, ['src/server/routes/runs.ts']);
+  assert.deepEqual(checkpoint.untrackedFiles, ['apps/web/e2e/runs.spec.ts']);
+  assert.deepEqual(checkpoint.results, [{ name: 'typecheck', result: 'Passed', detail: null }]);
+  assert.equal(checkpoint.feedback.length, 1);
+  assert.equal(checkpoint.blocker, 'The engine binary is not installed.');
+  assert.equal(checkpoint.nextAction, 'Install the engine, then resume this run.');
+});
+
+// F17-AC2: a run with no resume point is a 404 by name, not a null body. A null would be
+// indistinguishable from a recorded point that happens to be empty.
+test('F17-AC2: a run with no recorded resume point answers 404 rather than an empty one', async (t) => {
+  const h = await harness();
+  t.after(() => h.close());
+  const session = await signIn(h.app);
+  const job = queuedRun();
+  h.controller.seedRun(job);
+
+  const response = await h.app.inject({
+    method: 'GET',
+    url: `/api/runs/${job.jobId}/checkpoint`,
+    headers: { cookie: session.cookie },
+  });
+  assert.equal(response.statusCode, 404, response.body);
+  const problem = parse<ErrorPayload>(response);
+  assert.equal(problem.error.code, 'NotFound');
+  assert.match(problem.error.message, /recorded no resume point/);
+});
+
+// F17-AC1: a pause reports whether the writer stopped, and the two answers are different facts. A
+// pause that left a writer recorded is a pause that may still be writing code.
+test('F17-AC1: a pause reports the writer disposition, and a held writer is not a stopped writer', async (t) => {
+  const h = await harness();
+  t.after(() => h.close());
+  const session = await signIn(h.app);
+
+  const free = queuedRun({ jobId: 'job_free', state: 'Running' });
+  h.controller.seedRun(free, runCheckpoint(), { holder: null, disposition: 'Vacant', expiresAt: null, reconciliationReason: null });
+  const stopped = await h.app.inject({
+    method: 'POST',
+    url: `/api/runs/${free.jobId}/pause`,
+    headers: { cookie: session.cookie, 'x-shiploop-csrf': session.csrfToken },
+  });
+  assert.equal(stopped.statusCode, 200, stopped.body);
+  const stoppedRun = parse<{ run: PausedRunView }>(stopped).run;
+  assert.equal(stoppedRun.writerStopped, true);
+  assert.equal(stoppedRun.writer.disposition, 'Vacant');
+  assert.equal(stoppedRun.job.state, 'Paused');
+  assert.ok(stoppedRun.checkpoint !== null, 'a pause keeps the resume point (F17-AC2)');
+
+  const held = queuedRun({ jobId: 'job_held', state: 'Running', holder: 'worker-a' });
+  h.controller.seedRun(held, runCheckpoint(), {
+    holder: 'worker-a',
+    disposition: 'Held',
+    expiresAt: '2026-03-01T13:00:00.000Z',
+    reconciliationReason: null,
+  });
+  const stillHeld = await h.app.inject({
+    method: 'POST',
+    url: `/api/runs/${held.jobId}/pause`,
+    headers: { cookie: session.cookie, 'x-shiploop-csrf': session.csrfToken },
+  });
+  assert.equal(stillHeld.statusCode, 200, stillHeld.body);
+  const heldRun = parse<{ run: PausedRunView }>(stillHeld).run;
+  assert.equal(heldRun.writerStopped, false, 'a held writer has not stopped (F17-AC1)');
+  assert.equal(heldRun.writer.holder, 'worker-a');
+});
+
+// F17-AC5: a detached writer is reported as one that may still be writing, never as stopped. An
+// expired lease proves heartbeats stopped, not that the process did.
+test('F17-AC5: a detached writer reads as still running, not as stopped', async (t) => {
+  const h = await harness();
+  t.after(() => h.close());
+  const session = await signIn(h.app);
+  const job = queuedRun({ jobId: 'job_detached', state: 'Paused', holder: 'worker-b' });
+  h.controller.seedRun(job, runCheckpoint(), {
+    holder: 'worker-b',
+    disposition: 'ReconciliationRequired',
+    expiresAt: '2026-03-01T11:30:00.000Z',
+    reconciliationReason: 'No heartbeat from worker-b since 2026-03-01T11:29:00.000Z',
+  });
+
+  const response = await h.app.inject({
+    method: 'GET',
+    url: `/api/runs/${job.jobId}`,
+    headers: { cookie: session.cookie },
+  });
+  assert.equal(response.statusCode, 200, response.body);
+  const run = parse<{ run: RunView }>(response).run;
+  assert.equal(run.writer.disposition, 'ReconciliationRequired');
+  assert.equal(run.writer.holder, 'worker-b');
+  assert.match(String(run.writer.reconciliationReason), /heartbeat/);
+  assert.equal(run.job.state, 'Paused');
+});
+
+// F17-AC1: an illegal lifecycle move is refused by name with the reachable states, so the owner is
+// told what the run may do next rather than that the request failed.
+test('F17-AC1: pausing a Queued run is refused with the states it can reach', async (t) => {
+  const h = await harness();
+  t.after(() => h.close());
+  const session = await signIn(h.app);
+  const job = queuedRun();
+  h.controller.seedRun(job);
+
+  const paused = await h.app.inject({
+    method: 'POST',
+    url: `/api/runs/${job.jobId}/pause`,
+    headers: { cookie: session.cookie, 'x-shiploop-csrf': session.csrfToken },
+  });
+  assert.equal(paused.statusCode, 400, paused.body);
+  const problem = parse<ErrorPayload>(paused);
+  assert.equal(problem.error.code, 'Invalid');
+  assert.match(problem.error.message, /Queued -> Paused/);
+  assert.match(String(problem.error.fields?.[0]?.message), /Preparing, Cancelled, Blocked/);
+
+  const resumed = await h.app.inject({
+    method: 'POST',
+    url: `/api/runs/${job.jobId}/resume`,
+    headers: { cookie: session.cookie, 'x-shiploop-csrf': session.csrfToken },
+  });
+  assert.equal(resumed.statusCode, 422, `a resume with no resume point must be Blocked: ${resumed.body}`);
+  assert.match(parse<ErrorPayload>(resumed).error.message, /no recorded resume point/);
+});
+
+// F17-AC3: a resume continues from the recorded point and says which, and F17-AC4: a cancellation
+// preserves that point and reports that no external delivery was touched.
+test('F17-AC3, F17-AC4: resume continues from the resume point and cancel preserves it', async (t) => {
+  const h = await harness();
+  t.after(() => h.close());
+  const session = await signIn(h.app);
+  const job = queuedRun({ jobId: 'job_resume_1', state: 'Paused' });
+  h.controller.seedRun(job, runCheckpoint());
+
+  const resumed = await h.app.inject({
+    method: 'POST',
+    url: `/api/runs/${job.jobId}/resume`,
+    headers: { cookie: session.cookie, 'x-shiploop-csrf': session.csrfToken },
+  });
+  assert.equal(resumed.statusCode, 200, resumed.body);
+  const resumedRun = parse<{ run: { job: RunJobView; checkpoint: RunCheckpointView } }>(resumed).run;
+  assert.equal(resumedRun.job.state, 'Running', 'a resume returns to Running, not to the queue (F17-AC3)');
+  assert.equal(resumedRun.checkpoint.headSha, HEAD_SHA);
+
+  const cancelled = await h.app.inject({
+    method: 'POST',
+    url: `/api/runs/${job.jobId}/cancel`,
+    headers: { cookie: session.cookie, 'x-shiploop-csrf': session.csrfToken },
+  });
+  assert.equal(cancelled.statusCode, 200, cancelled.body);
+  const cancelledRun = parse<{ run: { job: RunJobView; preservedCheckpoint: RunCheckpointView | null; externalDelivery: string } }>(cancelled).run;
+  assert.equal(cancelledRun.job.state, 'Cancelled');
+  assert.equal(cancelledRun.preservedCheckpoint?.headSha, HEAD_SHA, 'a cancellation preserves the resume point (F17-AC4)');
+  assert.equal(cancelledRun.externalDelivery, 'UnchangedByCancellation', 'a cancellation cannot reverse a delivery (F17-AC4)');
+});
+
+// F18-AC2, N01-AC3: a grant states that the extended bound is not recorded, and a decline changes
+// no state. A client told the bound was persisted would promise the owner a budget a restart loses.
+test('F18-AC2: a granted extension reports the bounds and says the extended one is not recorded', async (t) => {
+  const h = await harness();
+  t.after(() => h.close());
+  const session = await signIn(h.app);
+  const job = queuedRun({ jobId: 'job_waiting', state: 'WaitingForOwner' });
+  h.controller.seedRun(job, runCheckpoint());
+
+  const granted = await h.app.inject({
+    method: 'POST',
+    url: `/api/runs/${job.jobId}/extension`,
+    headers: { cookie: session.cookie, 'x-shiploop-csrf': session.csrfToken },
+    payload: { decision: 'Grant' },
+  });
+  assert.equal(granted.statusCode, 200, granted.body);
+  const extension = parse<{ extension: GrantedExtensionView }>(granted).extension;
+  assert.equal(extension.previousLimits.activeExecutionMs, 3_600_000);
+  assert.equal(extension.extendedLimits.activeExecutionMs, 7_200_000);
+  assert.equal(extension.extendedBoundRecorded, false, 'nothing in storage writes the bound, so this must be false (F18-AC2)');
+  assert.equal(extension.job.state, 'Running', 'a grant lets the attempt continue (F18-AC2)');
+  assert.equal(extension.decidedBy, OWNER_ID);
+
+  const declined = await h.app.inject({
+    method: 'POST',
+    url: `/api/runs/${job.jobId}/extension`,
+    headers: { cookie: session.cookie, 'x-shiploop-csrf': session.csrfToken },
+    payload: { decision: 'Decline' },
+  });
+  assert.equal(declined.statusCode, 409, `a decline of a run that is no longer waiting is a Conflict: ${declined.body}`);
+  const problem = parse<ErrorPayload>(declined);
+  assert.equal(problem.error.code, 'Conflict');
+  assert.equal(problem.error.expected, 'WaitingForOwner');
+  assert.equal(problem.error.actual, 'Running');
+
+  const refused = await h.app.inject({
+    method: 'POST',
+    url: `/api/runs/${job.jobId}/extension`,
+    headers: { cookie: session.cookie, 'x-shiploop-csrf': session.csrfToken },
+    payload: { decision: 'Maybe' },
+  });
+  assert.equal(refused.statusCode, 400, refused.body);
+  assert.deepEqual((parse<ErrorPayload>(refused).error.fields ?? []).map((field) => field.path), ['decision']);
+});
+
+// F24-AC2, F24-AC3: the card carries both SHAs, the scope revision, every check with its result and
+// an explicit not-ready list, and a run with no candidate is a 404 rather than an empty card.
+test('F24-AC3: the review card names every check result and every reason it is not ready', async (t) => {
+  const h = await harness();
+  t.after(() => h.close());
+  const session = await signIn(h.app);
+  const job = queuedRun({ jobId: 'job_card', state: 'Completed' });
+  h.controller.seedRun(job);
+  h.controller.seedReviewCard(WORK_ITEM, {
+    candidateFingerprint: 'fp_candidate_1',
+    headSha: HEAD_SHA,
+    baseSha: BASE_SHA,
+    scopeFingerprint: SCOPE_FINGERPRINT,
+    scopeRevision: 3,
+    collectedAt: START,
+    checks: [
+      { checkId: 'chk_1', name: 'typecheck', origin: 'LocalCheck', required: true, result: 'Passed', blocking: false, exitCode: 0, artifactRef: null, detail: null },
+      { checkId: 'chk_2', name: 'test', origin: 'LocalCheck', required: true, result: 'Failed', blocking: true, exitCode: 1, artifactRef: 'run-1/test.log', detail: 'one assertion failed' },
+    ],
+    criteria: [
+      { criterionId: 'AC1', text: 'A durable job row exists for the run.', methodKind: 'AutomatedCheck', status: 'Verified', evidenceId: 'ev_1', observedAt: START, detail: null },
+      { criterionId: 'AC2', text: 'The owner can pause the run.', methodKind: 'OwnerTest', status: 'PendingOwnerTest', evidenceId: null, observedAt: null, detail: null },
+    ],
+    pendingOwnerTestCriterionIds: ['AC2'],
+    readyForOwnerTest: false,
+    notReady: ['Required check "test" is Failed, not Passed.', 'Criterion "AC2" is PendingOwnerTest, with no verified observation.'],
+  });
+
+  const response = await h.app.inject({
+    method: 'GET',
+    url: `/api/runs/${job.jobId}/review-card`,
+    headers: { cookie: session.cookie },
+  });
+  assert.equal(response.statusCode, 200, response.body);
+  const card = parse<{ card: ReviewCardView }>(response).card;
+
+  assert.equal(card.headSha, HEAD_SHA);
+  assert.equal(card.baseSha, BASE_SHA);
+  assert.equal(card.scopeFingerprint, SCOPE_FINGERPRINT);
+  assert.equal(card.scopeRevision, 3);
+  assert.equal(card.checks.length, 2);
+  assert.deepEqual(card.checks.map((check) => `${check.name}:${check.result}`), ['typecheck:Passed', 'test:Failed']);
+  assert.equal(card.checks[1]?.blocking, true, 'a failing required check blocks, and the card says so (F20-AC2)');
+  assert.equal(card.criteria.length, 2);
+  assert.deepEqual(card.criteria.map((criterion) => criterion.status), ['Verified', 'PendingOwnerTest']);
+  assert.deepEqual(card.pendingOwnerTestCriterionIds, ['AC2']);
+  assert.equal(card.readyForOwnerTest, false);
+  assert.deepEqual(card.notReady, [
+    'Required check "test" is Failed, not Passed.',
+    'Criterion "AC2" is PendingOwnerTest, with no verified observation.',
+  ]);
+
+  const empty = queuedRun({ jobId: 'job_no_candidate', workItemId: 'wrk_without_candidate', state: 'Queued' });
+  h.controller.seedRun(empty);
+  const refused = await h.app.inject({
+    method: 'GET',
+    url: `/api/runs/${empty.jobId}/review-card`,
+    headers: { cookie: session.cookie },
+  });
+  assert.equal(refused.statusCode, 404, refused.body);
+  assert.match(parse<ErrorPayload>(refused).error.message, /recorded no candidate/);
+});
+
+// F31-AC1, F31-AC2: the board groups into the four buckets and carries the instant it was collected,
+// because a view that has stopped moving looks exactly like one with nothing to report.
+test('F31-AC2: the board groups into the four buckets and names when it was collected', async (t) => {
+  const h = await harness();
+  t.after(() => h.close());
+  const session = await signIn(h.app);
+  h.controller.seedAttentionItem({
+    attentionItemId: 'attn_working',
+    kind: 'RunProgress',
+    state: 'Open',
+    projectId: PROJECT_ID,
+    workItemId: WORK_ITEM,
+    issueIdentifier: 'OCT-1',
+    title: 'Job job_1 is Running',
+    blocker: null,
+    nextAction: 'Wait for job job_1 to leave Running.',
+    createdAt: START,
+    updatedAt: START,
+    acknowledgedAt: null,
+    acknowledgedBy: null,
+    candidateFingerprint: null,
+  });
+  h.controller.seedAttentionItem({
+    attentionItemId: 'attn_blocked',
+    kind: 'Blocker',
+    state: 'Open',
+    projectId: PROJECT_ID,
+    workItemId: WORK_ITEM,
+    issueIdentifier: 'OCT-1',
+    title: 'Job job_1 is blocked',
+    blocker: 'the engine binary is not installed',
+    nextAction: 'Resolve what is blocking job job_1, then resume it.',
+    createdAt: START,
+    updatedAt: START,
+    acknowledgedAt: null,
+    acknowledgedBy: null,
+    candidateFingerprint: null,
+  });
+  h.controller.seedAttentionItem({
+    attentionItemId: 'attn_release',
+    kind: 'DeliveryDecision',
+    state: 'Open',
+    projectId: PROJECT_ID,
+    workItemId: WORK_ITEM,
+    issueIdentifier: 'OCT-1',
+    title: 'Candidate fp_1 is accepted and ready for release',
+    blocker: null,
+    nextAction: 'Authorize merge and release for candidate fp_1.',
+    createdAt: START,
+    updatedAt: START,
+    acknowledgedAt: null,
+    acknowledgedBy: null,
+    candidateFingerprint: 'fp_1',
+  });
+
+  const response = await h.app.inject({ method: 'GET', url: '/api/attention', headers: { cookie: session.cookie } });
+  assert.equal(response.statusCode, 200, response.body);
+  const board = parse<{ board: AttentionBoardView }>(response).board;
+  assert.equal(board.projectId, PROJECT_ID);
+  assert.equal(board.collectedAt, START, 'every read carries the instant it was collected (N04-AC2)');
+  assert.deepEqual(board.groups.map((group) => group.bucket), ['Working', 'NeedsYourInput', 'ReadyForRelease']);
+  assert.equal(board.groups.find((group) => group.bucket === 'Working')?.items[0]?.attentionItemId, 'attn_working');
+  assert.equal(
+    board.groups.find((group) => group.bucket === 'NeedsYourInput')?.items[0]?.blocker,
+    'the engine binary is not installed',
+    'an item carries the blocker it names (F31-AC2)',
+  );
+  assert.deepEqual(board.persistedItemIds, ['attn_working', 'attn_blocked', 'attn_release']);
+});
+
+// F31-AC4: acknowledgement records owner attention and nothing else. The run's own state is
+// unchanged, which is what makes an acknowledgement safe to click without thinking.
+test('F31-AC4: acknowledging an item changes the item and nothing else', async (t) => {
+  const h = await harness();
+  t.after(() => h.close());
+  const session = await signIn(h.app);
+  const job = queuedRun({ jobId: 'job_unchanged', state: 'Running' });
+  h.controller.seedRun(job);
+  h.controller.seedAttentionItem({
+    attentionItemId: 'attn_one',
+    kind: 'Blocker',
+    state: 'Open',
+    projectId: PROJECT_ID,
+    workItemId: WORK_ITEM,
+    issueIdentifier: 'OCT-1',
+    title: 'Job job_unchanged is blocked',
+    blocker: 'the engine binary is not installed',
+    nextAction: 'Resolve what is blocking the run, then resume it.',
+    createdAt: START,
+    updatedAt: START,
+    acknowledgedAt: null,
+    acknowledgedBy: null,
+    candidateFingerprint: null,
+  });
+
+  const acknowledged = await h.app.inject({
+    method: 'POST',
+    url: '/api/attention/attn_one/acknowledge',
+    headers: { cookie: session.cookie, 'x-shiploop-csrf': session.csrfToken },
+  });
+  assert.equal(acknowledged.statusCode, 200, acknowledged.body);
+  const item = parse<{ item: AttentionItemView }>(acknowledged).item;
+  assert.equal(item.state, 'Acknowledged');
+  assert.equal(item.acknowledgedBy, OWNER_ID);
+  assert.equal(item.acknowledgedAt, START);
+  assert.equal(item.blocker, 'the engine binary is not installed', 'the blocker is unchanged by looking at it');
+
+  // The run's own state is untouched: an acknowledgement is not a decision about the work.
+  const run = await h.app.inject({
+    method: 'GET',
+    url: `/api/runs/${job.jobId}`,
+    headers: { cookie: session.cookie },
+  });
+  assert.equal(parse<{ run: RunView }>(run).run.job.state, 'Running');
+
+  const board = await h.app.inject({ method: 'GET', url: '/api/attention', headers: { cookie: session.cookie } });
+  const reread = parse<{ board: AttentionBoardView }>(board).board;
+  assert.equal(reread.items.find((entry) => entry.attentionItemId === 'attn_one')?.state, 'Acknowledged');
+
+  const unknown = await h.app.inject({
+    method: 'POST',
+    url: '/api/attention/attn_absent/acknowledge',
+    headers: { cookie: session.cookie, 'x-shiploop-csrf': session.csrfToken },
+  });
+  assert.equal(unknown.statusCode, 404, unknown.body);
+});
+
+// F01-AC1, F01-AC4: every run and attention route is behind the session guard and the forgery check,
+// because a run start is the most consequential write this server has and a job identity is private
+// run detail. An anonymous caller learns that a sign-in is required and nothing else.
+test('F01-AC1, F01-AC4: the run and attention routes refuse an anonymous caller and a missing token', async (t) => {
+  const h = await harness();
+  t.after(() => h.close());
+  const session = await signIn(h.app);
+  await startRun(h, session);
+  const jobId = parse<RunStartPayload>(await startRun(h, session, { operationId: 'op_octopus_2' })).run.job.jobId;
+
+  const anonymousReads = [
+    '/api/runs',
+    `/api/runs/${jobId}`,
+    `/api/runs/${jobId}/checkpoint`,
+    `/api/runs/${jobId}/review-card`,
+    '/api/attention',
+  ];
+  for (const url of anonymousReads) {
+    const response = await h.app.inject({ method: 'GET', url });
+    assert.equal(response.statusCode, 401, `${url} must refuse an anonymous caller: ${response.body}`);
+    assert.equal(parse<ErrorPayload>(response).signInRequired, true);
+    assert.ok(!response.body.includes(OWNER_NAME), `${url} must not disclose the owner`);
+    assert.ok(!response.body.includes(OWNER_ID), `${url} must not disclose the owner id`);
+    assert.ok(!response.body.includes(jobId), `${url} must not disclose a run`);
+  }
+
+  const anonymousWrite = await h.app.inject({ method: 'POST', url: '/api/runs', payload: startPayload() });
+  assert.equal(anonymousWrite.statusCode, 401, anonymousWrite.body);
+
+  const sessionlessStart = await h.app.inject({
+    method: 'POST',
+    url: '/api/attention/attn_one/acknowledge',
+    headers: { cookie: session.cookie },
+  });
+  assert.equal(sessionlessStart.statusCode, 403, 'a write without the forgery token is refused (F01-AC4)');
+  assert.equal(parse<ErrorPayload>(sessionlessStart).error.code, 'Forbidden');
+
+  const sessionlessPause = await h.app.inject({
+    method: 'POST',
+    url: `/api/runs/${jobId}/pause`,
+    headers: { cookie: session.cookie },
+  });
+  assert.equal(sessionlessPause.statusCode, 403, sessionlessPause.body);
+  assert.equal(parse<ErrorPayload>(sessionlessPause).error.code, 'Forbidden');
+});
+
+/**
+ * Seeds a candidate gate for a work item.
+ *
+ * One helper rather than a literal per test, because a criterion id that drifts between
+ * the seed and the assertion would make a passing test prove nothing (F25-AC1).
+ */
+function acceptanceGate(outstanding: readonly string[]): AcceptanceGateView {
+  return {
+    candidateFingerprint: 'fp_candidate_1',
+    headSha: HEAD_SHA,
+    scopeFingerprint: SCOPE_FINGERPRINT,
+    criteria: [
+      {
+        criterionId: 'AC1',
+        text: 'A durable job row exists for the run.',
+        methodKind: 'AutomatedCheck',
+        status: outstanding.includes('AC1') ? 'Failed' : 'Verified',
+        observed: outstanding.includes('AC1'),
+      },
+      {
+        criterionId: 'AC2',
+        text: 'The owner can pause the run.',
+        methodKind: 'OwnerTest',
+        status: outstanding.includes('AC2') ? 'PendingOwnerTest' : 'Verified',
+        observed: outstanding.includes('AC2'),
+      },
+    ],
+    outstandingCriterionIds: [...outstanding],
+    ready: outstanding.length === 0,
+  };
+}
+
+// F25-AC2: requesting changes retains the reason against the tested candidate, and the read-back carries it.
+test('F25-AC2: requested changes are retained with the criteria they land on', async (t) => {
+  const h = await harness();
+  t.after(() => h.close());
+  const session = await signIn(h.app);
+  const job = queuedRun({ jobId: 'job_changes', state: 'Completed' });
+  h.controller.seedRun(job);
+  h.controller.seedAcceptanceGate(WORK_ITEM, acceptanceGate(['AC2']), 'cand_octopus_1');
+
+  const response = await h.app.inject({
+    method: 'POST',
+    url: `/api/runs/${job.jobId}/acceptance`,
+    headers: { cookie: session.cookie, 'x-shiploop-csrf': session.csrfToken },
+    payload: { decision: 'RequestChanges', reason: 'Pausing still reports the run as running.' },
+  });
+  assert.equal(response.statusCode, 200, response.body);
+  const requested = parse<{ changeRequest: ChangeRequestReportView }>(response).changeRequest;
+  assert.equal(requested.state, 'ChangesRequested');
+  assert.equal(requested.feedback, 'Pausing still reports the run as running.');
+  assert.deepEqual(requested.outstandingCriterionIds, ['AC2'], 'the reason lands on the criterion that failed (F25-AC2)');
+  assert.equal(requested.decisionId !== null, true);
+
+  const readBack = await h.app.inject({
+    method: 'GET',
+    url: `/api/runs/${job.jobId}/acceptance`,
+    headers: { cookie: session.cookie },
+  });
+  assert.equal(readBack.statusCode, 200, readBack.body);
+  const body = parse<{ gate: AcceptanceGateView; acceptance: AcceptanceView }>(readBack);
+  assert.equal(body.acceptance.state, 'ChangesRequested');
+  assert.deepEqual(
+    body.acceptance.retainedFeedback.map((entry) => entry.feedback),
+    ['Pausing still reports the run as running.'],
+    'the feedback survives the decision that recorded it (F25-AC2)',
+  );
+});
+
+// F25-AC1: acceptance is refused while a criterion is outstanding, and the refusal names it.
+test('F25-AC1: acceptance is refused with the outstanding criteria named, not summarised', async (t) => {
+  const h = await harness();
+  t.after(() => h.close());
+  const session = await signIn(h.app);
+  const job = queuedRun({ jobId: 'job_notready', state: 'Completed' });
+  h.controller.seedRun(job);
+  h.controller.seedAcceptanceGate(WORK_ITEM, acceptanceGate(['AC1', 'AC2']), 'cand_octopus_2');
+
+  const response = await h.app.inject({
+    method: 'POST',
+    url: `/api/runs/${job.jobId}/acceptance`,
+    headers: { cookie: session.cookie, 'x-shiploop-csrf': session.csrfToken },
+    payload: { decision: 'Accept' },
+  });
+  assert.equal(response.statusCode, 422, `a blocked acceptance is not a success: ${response.body}`);
+  const error = parse<ErrorPayload>(response).error;
+  assert.equal(error.code, 'Blocked');
+  assert.deepEqual(
+    (error.prerequisites ?? []).map((entry) => entry.name),
+    ['Criterion AC1', 'Criterion AC2'],
+    'each outstanding criterion is named, so the owner knows what to fix (F25-AC1)',
+  );
+});
+
+// F25-AC1: once every criterion is verified the same request records acceptance.
+test('F25-AC1: a fully verified candidate is accepted and records what it was accepted against', async (t) => {
+  const h = await harness();
+  t.after(() => h.close());
+  const session = await signIn(h.app);
+  const job = queuedRun({ jobId: 'job_accept', state: 'Completed' });
+  h.controller.seedRun(job);
+  h.controller.seedAcceptanceGate(WORK_ITEM, acceptanceGate([]), 'cand_octopus_3');
+
+  const response = await h.app.inject({
+    method: 'POST',
+    url: `/api/runs/${job.jobId}/acceptance`,
+    headers: { cookie: session.cookie, 'x-shiploop-csrf': session.csrfToken },
+    payload: { decision: 'Accept', note: 'Verified against the preview deployment.' },
+  });
+  assert.equal(response.statusCode, 200, response.body);
+  const accepted = parse<{ acceptance: AcceptanceReportView }>(response).acceptance;
+  assert.equal(accepted.state, 'Accepted');
+  assert.equal(accepted.headSha, HEAD_SHA, 'the accepted head is named, so a later change is detectable (F25-AC3)');
+  assert.equal(accepted.candidateFingerprint, 'fp_candidate_1');
+
+  const readBack = await h.app.inject({
+    method: 'GET',
+    url: `/api/runs/${job.jobId}/acceptance`,
+    headers: { cookie: session.cookie },
+  });
+  const state = parse<{ acceptance: AcceptanceView }>(readBack).acceptance;
+  assert.equal(state.state, 'Accepted');
+  assert.equal(state.note, 'Verified against the preview deployment.');
+});
+
+// F25-AC2, F02-AC4: the request boundary refuses a rejection with no reason, per field.
+test('F25-AC2: requesting changes without a reason is refused beside its field', async (t) => {
+  const h = await harness();
+  t.after(() => h.close());
+  const session = await signIn(h.app);
+  const job = queuedRun({ jobId: 'job_noreason', state: 'Completed' });
+  h.controller.seedRun(job);
+  h.controller.seedAcceptanceGate(WORK_ITEM, acceptanceGate(['AC2']), 'cand_octopus_4');
+
+  const response = await h.app.inject({
+    method: 'POST',
+    url: `/api/runs/${job.jobId}/acceptance`,
+    headers: { cookie: session.cookie, 'x-shiploop-csrf': session.csrfToken },
+    payload: { decision: 'RequestChanges' },
+  });
+  assert.equal(response.statusCode, 400, response.body);
+  assert.deepEqual(
+    (parse<ErrorPayload>(response).error.fields ?? []).map((field) => field.path),
+    ['reason'],
+    'the refusal names the field to fix (F02-AC4)',
+  );
+
+  const unknownDecision = await h.app.inject({
+    method: 'POST',
+    url: `/api/runs/${job.jobId}/acceptance`,
+    headers: { cookie: session.cookie, 'x-shiploop-csrf': session.csrfToken },
+    payload: { decision: 'AcceptLater' },
+  });
+  assert.equal(unknownDecision.statusCode, 400, unknownDecision.body);
+  assert.deepEqual(
+    (parse<ErrorPayload>(unknownDecision).error.fields ?? []).map((field) => field.path),
+    ['decision'],
+  );
+
+  const extraKey = await h.app.inject({
+    method: 'POST',
+    url: `/api/runs/${job.jobId}/acceptance`,
+    headers: { cookie: session.cookie, 'x-shiploop-csrf': session.csrfToken },
+    payload: { decision: 'Accept', candidateId: 'cand_somewhere_else' },
+  });
+  assert.equal(extraKey.statusCode, 400, `an unrecognised key is refused, not dropped (F02-AC4): ${extraKey.body}`);
+});
+
+// F25-AC1: a run whose work item has no candidate has nothing to decide about.
+test('F25-AC1: a run with no candidate yet cannot be accepted', async (t) => {
+  const h = await harness();
+  t.after(() => h.close());
+  const session = await signIn(h.app);
+  const job = queuedRun({ jobId: 'job_nocandidate', state: 'Queued' });
+  h.controller.seedRun(job);
+
+  const response = await h.app.inject({
+    method: 'POST',
+    url: `/api/runs/${job.jobId}/acceptance`,
+    headers: { cookie: session.cookie, 'x-shiploop-csrf': session.csrfToken },
+    payload: { decision: 'Accept' },
+  });
+  assert.equal(response.statusCode, 404, response.body);
+  assert.equal(parse<ErrorPayload>(response).error.code, 'NotFound');
+});
+
+// F01-AC1, F01-AC4: the decision is a write and sits behind the session and forgery gates.
+test('F01-AC1: an acceptance decision needs a session and a forgery token', async (t) => {
+  const h = await harness();
+  t.after(() => h.close());
+  const session = await signIn(h.app);
+  const job = queuedRun({ jobId: 'job_guard', state: 'Completed' });
+  h.controller.seedRun(job);
+  h.controller.seedAcceptanceGate(WORK_ITEM, acceptanceGate([]), 'cand_octopus_5');
+
+  const anonymous = await h.app.inject({
+    method: 'POST',
+    url: `/api/runs/${job.jobId}/acceptance`,
+    payload: { decision: 'Accept' },
+  });
+  assert.equal(anonymous.statusCode, 401, anonymous.body);
+
+  const sessionless = await h.app.inject({
+    method: 'POST',
+    url: `/api/runs/${job.jobId}/acceptance`,
+    headers: { cookie: session.cookie },
+    payload: { decision: 'Accept' },
+  });
+  assert.equal(sessionless.statusCode, 403, sessionless.body);
+  assert.equal(parse<ErrorPayload>(sessionless).error.code, 'Forbidden');
+
+  const anonymousRead = await h.app.inject({ method: 'GET', url: `/api/runs/${job.jobId}/acceptance` });
+  assert.equal(anonymousRead.statusCode, 401, anonymousRead.body);
 });

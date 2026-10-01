@@ -26,41 +26,69 @@
  */
 
 import {
+  DEFAULT_LIMITS,
   err,
   ok,
   type DomainError,
   type OwnerId,
   type PasswordHash,
+  type ProcedureVersionId,
   type Result,
   type ScryptParameters,
 } from '@shiploop/domain';
 import {
   closeDatabase,
+  createJobQueue,
+  createLeaseManager,
   migrate,
   openDatabase,
+  AttentionItemRepository,
+  CandidateRepository,
+  OwnerDecisionRepository,
   ConnectorRepository,
   IdeaRepository,
   IntakeRepository,
   OwnerRepository,
   ProcedureRepository,
   ProjectProfileRepository,
+  ScopeRepository,
+  WorkItemRepository,
 } from '@shiploop/storage';
 import type {
   Database,
+  JobLimits,
+  JobQueue,
+  LeaseManager,
   MigrateOptions,
   OpenDatabaseOptions,
+  ProcedureVersion,
   SqlRow,
   StorageConnection,
 } from '@shiploop/storage';
-import type { PreflightDeps } from '@shiploop/verification';
+import { validateRecipe, type PreflightDeps, type RecipeVersion, type RequiredCheckPolicy } from '@shiploop/verification';
 import type { AdapterRegistry, ConnectorUseCases } from './connectors.ts';
 import { createConnectorUseCases } from './connectors.ts';
+import type { AcceptanceUseCases } from './acceptance.ts';
+import { createAcceptanceUseCases } from './acceptance.ts';
+import type { AttentionUseCases } from './attention.ts';
+import { SqliteAttentionScope, createAttentionUseCases } from './attention.ts';
 import type { IntakeArtifactRoot, IntakeUseCases } from './intake.ts';
 import { createIntakeUseCases } from './intake.ts';
+import type { JobUseCases } from './jobs.ts';
+import { createJobUseCases } from './jobs.ts';
 import type { ControllerClock, OwnerCredentialRecord, OwnerCredentialStore, ProfileUseCases } from './profiles.ts';
-import { createProfileUseCases } from './profiles.ts';
+import { RECIPE_SUBJECT_KEY, createProfileUseCases } from './profiles.ts';
 import type { SessionUseCases } from './sessions.ts';
 import { createSessionUseCases } from './sessions.ts';
+import type {
+  ProjectCheckPolicy,
+  ProjectChecks,
+  ProjectEnvironment,
+  ProjectEnvironmentReader,
+  ProviderCheckReader,
+  VerificationUseCases,
+} from './verification.ts';
+import { SqliteObservationJournal, createVerificationUseCases } from './verification.ts';
 
 export interface CompositionRootConfig {
   readonly databasePath: string;
@@ -76,6 +104,17 @@ export interface CompositionRootConfig {
    * cannot change, which is the same failure as having no idle timeout at all.
    */
   readonly sessionIdleTimeoutSeconds: number;
+  /**
+   * The bounded limits every run this process starts is recorded with (F18-AC2).
+   *
+   * Defaults to the v0.1 bound rather than to nothing, because a start with no configured
+   * bound would record `DEFAULT_JOB_LIMITS` deeper in the queue where a reader of the
+   * configuration could not see it, and a deployment that wants a different bound says so
+   * here. The two published fields come from the domain's frozen `DEFAULT_LIMITS` so this
+   * file cannot drift from the allowance they state; the attempt count has no domain
+   * default and is stated once, here, where it is visible.
+   */
+  readonly jobLimits?: JobLimits;
   /** Injected probe runner; absent means preflight cannot be attempted (F04-AC2). */
   readonly preflight?: PreflightDeps;
   readonly openDatabaseOptions?: OpenDatabaseOptions;
@@ -104,13 +143,50 @@ export interface CompositionRoot {
   readonly procedures: ProcedureRepository;
   readonly intake: IntakeRepository;
   readonly ideas: IdeaRepository;
+  readonly workItems: WorkItemRepository;
+  readonly scope: ScopeRepository;
+  readonly candidates: CandidateRepository;
+  /**
+   * The durable job queue and its writer-lease manager (F13-AC2, F17-AC5).
+   *
+   * Published rather than kept private because a process that has to read which runs
+   * exist reads the same rows the worker claims from, and a second projection of the
+   * `jobs` table is how a run list and a worker end up disagreeing about what is
+   * queued.
+   */
+  readonly jobs: JobQueue;
+  readonly leases: LeaseManager;
   readonly credentials: OwnerCredentialStore;
   readonly useCases: ProfileUseCases & ConnectorUseCases;
   readonly intakeUseCases: IntakeUseCases;
   readonly sessionUseCases: SessionUseCases;
+  /** Run start, lifecycle transitions and owner limit decisions (F13, F17, F18). */
+  readonly jobUseCases: JobUseCases;
+  /** The attention dashboard and acknowledgement (F31). */
+  readonly attentionUseCases: AttentionUseCases;
+  /** Required checks, the review card and criterion evidence (F20, F23, F24). */
+  readonly verificationUseCases: VerificationUseCases;
+  /** Owner acceptance and retained change feedback (F25). */
+  readonly acceptanceUseCases: AcceptanceUseCases;
   /** Closes only the database handle this root opened. */
   close(): Result<true, DomainError>;
 }
+
+/**
+ * The v0.1 bound a run is recorded with when the configuration names none.
+ *
+ * The active-execution and fix-pass allowances are the domain's frozen `DEFAULT_LIMITS`
+ * rather than literals, so this cannot drift from the allowance the specification
+ * publishes. The tool-retry count is that allowance's own per-operation attempt count, and
+ * the attempt count is stated here because the domain declares no default for it: a
+ * deployment that wants a different bound says so through `jobLimits` (F18-AC2).
+ */
+const DEFAULT_JOB_LIMITS: JobLimits = {
+  activeExecutionMs: DEFAULT_LIMITS.activeExecutionMs,
+  maxAutomatedFixPasses: DEFAULT_LIMITS.automatedFixPasses,
+  maxToolRetries: DEFAULT_LIMITS.toolRetry.attemptsPerOperation,
+  maxAttempts: 2,
+};
 
 /** The tables the bound repositories read and write. */
 const REQUIRED_TABLES: readonly string[] = [
@@ -291,6 +367,12 @@ export function createCompositionRoot(config: CompositionRootConfig): Result<Com
   const procedures = new ProcedureRepository(database);
   const intake = new IntakeRepository(database);
   const ideas = new IdeaRepository(database);
+  const workItems = new WorkItemRepository(database);
+  const scope = new ScopeRepository(database);
+  const candidates = new CandidateRepository(database);
+  const attentionItems = new AttentionItemRepository(database);
+  const jobs = createJobQueue({ connection: database });
+  const leases = createLeaseManager({ connection: database });
   const credentials = new SqliteOwnerCredentialStore(database);
 
   const profileUseCases = createProfileUseCases({
@@ -313,6 +395,65 @@ export function createCompositionRoot(config: CompositionRootConfig): Result<Com
     artifactRoot: config.artifactRoot ?? null,
   });
 
+  /**
+   * One queue, one lease manager and one clock for every run-facing use case.
+   *
+   * The queue is passed to both the job use cases and the attention dashboard rather
+   * than the dashboard opening its own SQLite reader of the `jobs` table, because a
+   * second projection of that table is exactly how a dashboard and a worker could
+   * disagree about which jobs exist (F31-AC1, F13-AC2).
+   */
+  const jobUseCases = createJobUseCases({
+    clock: config.clock,
+    queue: jobs,
+    leases,
+    profiles,
+    procedures,
+    workItems,
+    scope,
+    limits: config.jobLimits ?? DEFAULT_JOB_LIMITS,
+  });
+  const attentionUseCases = createAttentionUseCases({
+    clock: config.clock,
+    queue: jobs,
+    scope: new SqliteAttentionScope(database),
+    attentionStore: attentionItems,
+  });
+  /**
+   * One observation journal, shared by verification and acceptance.
+   *
+   * Both read criterion status from the same rows, and a second reader over one store
+   * is how the review card and the acceptance gate could disagree about whether a
+   * criterion was ever verified (F24-AC3, F25-AC1).
+   */
+  const observationJournal = new SqliteObservationJournal(database);
+  const verificationUseCases = createVerificationUseCases({
+    clock: config.clock,
+    git: providerChecksFor(),
+    checks: projectChecksFor(profiles),
+    evidence: observationJournal,
+    candidates,
+    scope: workItems,
+    workItems,
+    procedureVersions: environmentReaderFor(procedures),
+  });
+
+  /**
+   * Owner acceptance, bound to the same evidence the review card reads (F25-AC1).
+   *
+   * The decision store is the durable `owner_decisions` table rather than anything
+   * in this process, because an unattributable acceptance is not representable there
+   * and a decision lost on restart would let the same candidate be accepted twice
+   * (F25-AC4).
+   */
+  const acceptanceUseCases = createAcceptanceUseCases({
+    clock: config.clock,
+    decisions: new OwnerDecisionRepository(database),
+    candidates,
+    evidence: observationJournal,
+    scope: workItems,
+  });
+
   let closed = false;
 
   return ok({
@@ -323,16 +464,143 @@ export function createCompositionRoot(config: CompositionRootConfig): Result<Com
     procedures,
     intake,
     ideas,
+    workItems,
+    scope,
+    candidates,
+    jobs,
+    leases,
     credentials,
     useCases: { ...profileUseCases, ...connectorUseCases },
     intakeUseCases,
     sessionUseCases,
+    jobUseCases,
+    attentionUseCases,
+    verificationUseCases,
+    acceptanceUseCases,
     close(): Result<true, DomainError> {
       if (closed) return ok(true);
       closed = true;
       return closeDatabase(database);
     },
   });
+}
+
+/**
+ * The environment a run's checks would execute in, read from the project's recipe (F20-AC3).
+ *
+ * The recipe document is parsed and re-validated rather than cast, because a row can be
+ * edited or restored from an older backup and an environment fingerprint taken from a
+ * malformed document is a fingerprint of nothing (F04-AC1). The check commands travel
+ * with it because that is what the port declares; nothing in this process runs them.
+ */
+function environmentReaderFor(procedures: ProcedureRepository): ProjectEnvironmentReader {
+  return {
+    currentEnvironment: (projectId): Result<ProjectEnvironment, DomainError> => {
+      const procedure = procedures.currentVersion(projectId, RECIPE_SUBJECT_KEY);
+      if (!procedure.ok) return err(procedure.error);
+      if (procedure.value === null) {
+        return err({
+          code: 'NotFound',
+          reason: `Project ${projectId} has no accepted environment recipe, so no recorded result can be compared against an environment (F05-AC1).`,
+        });
+      }
+      const recipe = readStoredRecipe(procedure.value);
+      if (!recipe.ok) return err(recipe.error);
+      return ok({
+        procedureVersionId: procedure.value.procedureVersionId as ProcedureVersionId,
+        environmentFingerprint: procedure.value.contentFingerprint,
+        checks: recipe.value.checks,
+      });
+    },
+  };
+}
+
+/**
+ * The stored recipe document, read through the verification package's own validation.
+ *
+ * Reported as a duplication of the parsing `profiles.ts` and `apps/worker` each perform:
+ * the reader is private there, so a process that has to state an environment identity
+ * would otherwise have to cast the row itself (F04-AC1, F20-AC3).
+ */
+function readStoredRecipe(procedure: ProcedureVersion): Result<RecipeVersion, DomainError> {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(procedure.content);
+  } catch {
+    return err({
+      code: 'Unavailable',
+      reason: `The stored environment recipe for ${procedure.subjectKey} is not valid JSON, so no environment identity can be stated for it (F04-AC1).`,
+    });
+  }
+  return validateRecipe(parsed as RecipeVersion);
+}
+
+/**
+ * The required-check policy the project's current profile version states (F20-AC5).
+ *
+ * `policyFor` reads a profile and decides nothing: the approved set is the profile's own
+ * list, and the proposal is the same set because only an owner policy revision can extend
+ * or retire a check, and no coding pass in this process proposes one (F20-AC5). Reading
+ * the newest version rather than the one a job recorded is what makes a moved policy
+ * revision read as `Stale` instead of silently matching the recorded result (F20-AC3).
+ *
+ * `run` refuses by name. Executing a check means owning an isolated workspace and spawning
+ * a process, which is the worker's act; a use case that quietly succeeded here would let a
+ * check read as run by a process that never ran it (F20-AC1).
+ */
+function projectChecksFor(profiles: ProjectProfileRepository): ProjectChecks {
+  return {
+    policyFor: (projectId): Result<ProjectCheckPolicy, DomainError> => {
+      const current = profiles.currentVersion(projectId);
+      if (!current.ok) return err(current.error);
+      if (current.value === null) {
+        return err({
+          code: 'NotFound',
+          reason: `Project ${projectId} has no saved profile version, so no required check is named for it (F20-AC2).`,
+        });
+      }
+      const version = current.value;
+      const policy: RequiredCheckPolicy = {
+        policyFingerprint: version.contentFingerprint,
+        requiredCheckIds: version.content.policy.requiredChecks,
+        approvals: [],
+        decidedBy: version.createdBy,
+        decidedAt: version.createdAt,
+      };
+      return ok({ profileVersionId: version.profileVersionId, approved: policy, proposed: policy });
+    },
+    run: (request) => Promise.resolve(err(noCheckExecution(`check "${request.check.name}"`))),
+  };
+}
+
+/** Names the missing capability rather than reporting a check nobody ran (F20-AC1). */
+function noCheckExecution(what: string): DomainError {
+  return {
+    code: 'Unavailable',
+    reason: `${what} is read from the durable record only: this process never runs a check, because a check runs in an isolated workspace the coding worker owns (F20-AC1).`,
+  };
+}
+
+/**
+ * The provider check reader a process with no adapter bound reports.
+ *
+ * Declared rather than omitted so a use case that reaches for a live provider read fails
+ * with a named cause instead of a missing method. This process configures no adapters, and a
+ * reader that invented observations would be the one thing that could turn an unrun check
+ * into a `Passed` (F20-AC2).
+ */
+function providerChecksFor(): ProviderCheckReader {
+  return {
+    readChecks: () => Promise.resolve(err(noProviderRead())),
+    failureOnBase: () => Promise.resolve(err(noProviderRead())),
+  };
+}
+
+function noProviderRead(): DomainError {
+  return {
+    code: 'Unavailable',
+    reason: 'This process configured no provider adapter that can report check runs, so it cannot observe one. A check result must come from a provider report or from a run this system recorded (F20-AC1).',
+  };
 }
 
 /** Closes what was opened and returns the refusal, so no handle survives. */

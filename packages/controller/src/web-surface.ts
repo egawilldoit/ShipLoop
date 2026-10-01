@@ -45,23 +45,62 @@
 
 import { DEFAULT_IDLE_TIMEOUT_SECONDS, capabilitiesFor, err, ok } from '@shiploop/domain';
 import type {
+  AttentionBucket,
+  AttentionItem,
+  AttentionItemId,
+  AttentionKind,
+  AttentionState,
+  AreaObservation,
+  AttemptLimits,
+  AttemptState,
   CapabilityDeclaration,
   CapabilityKind,
+  CandidateId,
   ConnectorId,
   DomainError,
   IdeaId,
+  JobId,
+  OperationId,
   OwnerId,
   ProfileVersionId,
   ProjectId,
+  ReadinessObservation,
   Result,
+  ScopeSnapshot,
+  WorkItemId,
 } from '@shiploop/domain';
-import type { ConnectorKind, ConnectorRecord, ConnectorState, IdeaExport } from '@shiploop/storage';
+import type {
+  AttentionItemRecord,
+  CandidateRecord,
+  ConnectorKind,
+  ConnectorRecord,
+  ConnectorState,
+  IdeaExport,
+  JobCheckpoint,
+  JobLimits,
+  JobMode,
+  JobOperation,
+  JobRecord,
+  JobQuery,
+} from '@shiploop/storage';
 import type { CompositionRoot } from './composition.ts';
 import { createCompositionRoot } from './composition.ts';
 import type { IdeaDraft } from '@shiploop/domain';
 import type { ControllerClock, OwnerActor } from './profiles.ts';
 import type { StoredSessionRecord } from './sessions.ts';
 import type { AdapterRegistry, ConnectorProbe } from './connectors.ts';
+import type { AttentionBoard } from './attention.ts';
+import type {
+  CancelledRun,
+  DeclinedExtension,
+  GrantedExtension,
+  JobUseCases,
+  PausedRun,
+  ResumedRun,
+  RunView,
+  RunWriter,
+} from './jobs.ts';
+import type { ReviewCard } from './verification.ts';
 import type {
   BriefSectionsInput,
   BriefView,
@@ -382,6 +421,431 @@ export interface SurfaceIntakeUseCases {
   exportIdea(ideaId: IdeaId): Promise<Result<IdeaExport, DomainError>>;
 }
 
+/* -------------------------------------------------------------------------- */
+/* Runs, the attention dashboard and the review card                            */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * One area of the recorded readiness assessment, as the transport collects it (F09-AC1).
+ *
+ * A confirmation rather than a free-form observation, because the only thing this process
+ * can know about a prerequisite is whether the owner said they had checked it: the
+ * judgement of what that means is the domain's, and it is made from the assembled
+ * observation rather than from anything this shape decides (F09-AC4).
+ */
+export interface SurfaceReadinessAreaInput {
+  readonly confirmed: boolean;
+  /** What the owner saw. Null means they confirmed it without writing why. */
+  readonly note: string | null;
+}
+
+/**
+ * The scope the run is started against, in the transport's vocabulary (F12-AC1).
+ *
+ * Linear owns the published scope, so the run records what the provider reported rather
+ * than a scope derived from the ticket's own fields. `providerRevision` is the provider's
+ * own revision when it supplies one and a content digest otherwise, which is the same
+ * distinction the domain's `ScopeSnapshot` draws (F12-AC3).
+ */
+export interface SurfaceRunScopeInput {
+  readonly issueId: string;
+  readonly issueIdentifier: string;
+  readonly title: string;
+  readonly description: string;
+  readonly providerRevision: string | null;
+  readonly priority: string | null;
+  readonly dependencyIssueIds: readonly string[];
+  readonly acceptanceCriteria: readonly { readonly id: string; readonly text: string }[];
+}
+
+/**
+ * One durable job row, flattened for the transport (F13-AC1).
+ *
+ * The limits and the granted operations travel with it because both are facts about this
+ * row: an owner reading "running" has no way to ask what the attempt is bounded by, or what
+ * it was permitted to do, without the row (F18-AC2, F13-AC3).
+ */
+export interface SurfaceRunJob {
+  readonly jobId: string;
+  readonly operationId: string;
+  readonly mode: JobMode;
+  readonly workItemId: string;
+  readonly scopeSnapshotId: string;
+  readonly projectId: string;
+  readonly profileVersionId: string;
+  readonly procedureVersionId: string;
+  readonly state: AttemptState;
+  readonly correlationId: string;
+  readonly limits: JobLimits;
+  readonly permittedOperations: readonly JobOperation[];
+  readonly holder: string | null;
+  readonly attemptCount: number;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+}
+
+/**
+ * The resume point a paused or interrupted run carries (F17-AC2).
+ *
+ * Head and base are full commit SHAs and are reported as stored: an abbreviated SHA cannot
+ * be compared against a real checkout, so shortening one here would make the comparison
+ * the worker performs on resume meaningless (F17-AC2).
+ */
+export interface SurfaceRunCheckpoint {
+  readonly checkpointId: string;
+  readonly scopeSnapshotId: string;
+  readonly scopeFingerprint: string;
+  readonly profileVersionId: string;
+  readonly procedureVersionId: string;
+  readonly engineVersion: string | null;
+  readonly workspace: { readonly workspaceId: string; readonly branchName: string; readonly worktreePath: string };
+  readonly headSha: string;
+  readonly baseSha: string;
+  readonly dirtyFiles: readonly string[];
+  readonly untrackedFiles: readonly string[];
+  readonly results: readonly { readonly name: string; readonly result: string; readonly detail: string | null }[];
+  readonly feedback: readonly { readonly author: string; readonly at: string; readonly body: string }[];
+  readonly blocker: string | null;
+  readonly nextAction: string;
+  readonly recordedAt: string;
+}
+
+/**
+ * Who holds the coding writer, and whether that ownership can be trusted yet (F17-AC5).
+ *
+ * `disposition` is the lease's own answer rather than a word this file chose, and
+ * `ReconciliationRequired` is deliberately not `Vacant`: an expired lease proves heartbeats
+ * stopped, not that the process stopped writing (F17-AC5).
+ */
+export interface SurfaceRunWriter {
+  readonly holder: string | null;
+  readonly disposition: 'Vacant' | 'Held' | 'ReconciliationRequired' | 'Unleased';
+  readonly expiresAt: string | null;
+  readonly reconciliationReason: string | null;
+}
+
+export interface SurfaceRunView {
+  readonly job: SurfaceRunJob;
+  readonly checkpoint: SurfaceRunCheckpoint | null;
+  readonly writer: SurfaceRunWriter;
+}
+
+/**
+ * Where a started run sits with respect to the single global coding writer (F13-AC2).
+ *
+ * `heldByWriter` names the jobs still holding it, so a client can tell "queued behind a
+ * writer" from "waiting for a worker to look" without reading the reason text.
+ */
+export interface SurfaceRunDispatch {
+  readonly state: 'Queued';
+  readonly heldByWriter: readonly string[];
+  readonly reason: string;
+}
+
+/** The capability grant a started run holds, with the delivery refusals named (F13-AC3). */
+export interface SurfaceRunGrant {
+  readonly mode: JobMode;
+  readonly permittedOperations: readonly JobOperation[];
+  readonly refusedDeliveryOperations: readonly JobOperation[];
+  readonly refusalReason: string;
+}
+
+export interface SurfaceCapturedScope {
+  readonly scopeSnapshotId: string;
+  readonly workItemId: string;
+  readonly sequenceNumber: number;
+  readonly scopeFingerprint: string;
+  readonly capturedAt: string;
+}
+
+export interface SurfaceRunStart {
+  readonly job: SurfaceRunJob;
+  /** True when this operation identity had already started that run (F13-AC2). */
+  readonly deduplicated: boolean;
+  readonly capturedScope: SurfaceCapturedScope;
+  readonly dispatch: SurfaceRunDispatch;
+  readonly grant: SurfaceRunGrant;
+  readonly requestedByOwner: string;
+}
+
+/**
+ * A paused run and the evidence its writer stopped (F17-AC1).
+ *
+ * `writerStopped` is a separate field because a pause is only reported complete once the
+ * writer is stopped or safely detached; a run shown as `Paused` while a writer still holds
+ * it is a run that may still be writing code.
+ */
+export interface SurfacePausedRun extends SurfaceRunView {
+  readonly writerStopped: boolean;
+}
+
+export interface SurfaceResumedRun {
+  readonly job: SurfaceRunJob;
+  readonly checkpoint: SurfaceRunCheckpoint;
+}
+
+export interface SurfaceCancelledRun {
+  readonly job: SurfaceRunJob;
+  readonly preservedCheckpoint: SurfaceRunCheckpoint | null;
+  readonly writer: SurfaceRunWriter;
+  /** A one-member value: cancellation cannot reverse a delivery (F17-AC4). */
+  readonly externalDelivery: 'UnchangedByCancellation';
+}
+
+export interface SurfaceGrantedExtension {
+  readonly job: SurfaceRunJob;
+  readonly previousLimits: AttemptLimits;
+  readonly extendedLimits: AttemptLimits;
+  /** False, and typed: no storage port writes an extension onto the job (F18-AC2). */
+  readonly extendedBoundRecorded: false;
+  readonly decidedBy: string;
+  readonly decidedAt: string;
+}
+
+export interface SurfaceDeclinedExtension {
+  readonly job: SurfaceRunJob;
+  readonly limitsInForce: AttemptLimits;
+  readonly decidedBy: string;
+  readonly decidedAt: string;
+}
+
+/**
+ * Run start, lifecycle and owner limit decisions (F13, F17, F18).
+ *
+ * Writes carry the owner the transport proved, reads carry no caller, following the same
+ * rule as every other group: a read cannot be authorized by a request body (F01-AC1).
+ * `listRuns` returns the job rows alone, because a listing has no judgement to add and a
+ * per-run checkpoint read would make the list cost grow with the number of runs the owner
+ * is least likely to open (F13-AC1, N04-AC2).
+ */
+export interface SurfaceReadinessInput {
+  readonly scope: SurfaceReadinessAreaInput;
+  readonly criteria: SurfaceReadinessAreaInput;
+  readonly repository: SurfaceReadinessAreaInput;
+  readonly target: SurfaceReadinessAreaInput;
+  readonly verification: SurfaceReadinessAreaInput;
+  readonly access: SurfaceReadinessAreaInput;
+}
+
+export interface SurfaceRunUseCases {
+  startRun(command: {
+    readonly workItemId: string;
+    readonly mode: JobMode;
+    readonly operationId: string;
+    readonly correlationId: string | null;
+    readonly scope: SurfaceRunScopeInput;
+    readonly readiness: SurfaceReadinessInput;
+    readonly at: string;
+    readonly actor: OwnerId;
+  }): Promise<Result<SurfaceRunStart, DomainError>>;
+  listRuns(): Promise<Result<readonly SurfaceRunJob[], DomainError>>;
+  getRun(jobId: JobId): Promise<Result<SurfaceRunView, DomainError>>;
+  pauseRun(jobId: JobId): Promise<Result<SurfacePausedRun, DomainError>>;
+  resumeRun(jobId: JobId): Promise<Result<SurfaceResumedRun, DomainError>>;
+  cancelRun(jobId: JobId): Promise<Result<SurfaceCancelledRun, DomainError>>;
+  grantExtension(command: {
+    readonly jobId: JobId;
+    readonly actor: OwnerId;
+  }): Promise<Result<SurfaceGrantedExtension, DomainError>>;
+  declineExtension(command: {
+    readonly jobId: JobId;
+    readonly actor: OwnerId;
+  }): Promise<Result<SurfaceDeclinedExtension, DomainError>>;
+}
+
+/** One attention item as the transport carries it (F31-AC1, F31-AC4). */
+export interface SurfaceAttentionItem {
+  readonly attentionItemId: string;
+  readonly kind: AttentionKind;
+  readonly state: AttentionState;
+  readonly projectId: string;
+  readonly workItemId: string | null;
+  readonly issueIdentifier: string | null;
+  readonly title: string;
+  readonly blocker: string | null;
+  readonly nextAction: string;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+  readonly acknowledgedAt: string | null;
+  readonly acknowledgedBy: string | null;
+  readonly candidateFingerprint: string | null;
+}
+
+/**
+ * The board, with every group the dashboard renders (F31-AC1, F31-AC2).
+ *
+ * `projectId` is null when this owner has no recorded work at all, which is a different
+ * fact from a project whose board is empty and is reported as such rather than as a
+ * refusal. `collectedAt` travels with every read so a client can show how stale the view
+ * is and notice that it has stopped moving (N04-AC2).
+ */
+export interface SurfaceAttentionBoard {
+  readonly projectId: string | null;
+  readonly collectedAt: string;
+  readonly items: readonly SurfaceAttentionItem[];
+  readonly groups: readonly {
+    readonly bucket: AttentionBucket;
+    readonly items: readonly SurfaceAttentionItem[];
+  }[];
+  /** The identities an acknowledgement can be recorded against (F31-AC3). */
+  readonly persistedItemIds: readonly string[];
+}
+
+export interface SurfaceAttentionUseCases {
+  /**
+   * Derives the open items and persists them.
+   *
+   * A null `projectId` means "the project this owner's recorded work belongs to", resolved
+   * from the queue's own ordering rather than from a constant, because the transport has no
+   * project selector in this slice and a hard-coded project would make the board's scope a
+   * guess that looks like a fact. A deployment running several projects names the project
+   * explicitly (F31-AC2).
+   */
+  collectAttention(command: {
+    readonly projectId: string | null;
+    /** The transport's instant, so an empty board can say when it was collected (N04-AC2). */
+    readonly at: string;
+  }): Promise<Result<SurfaceAttentionBoard, DomainError>>;
+  acknowledge(command: {
+    readonly attentionItemId: AttentionItemId;
+    readonly actor: OwnerId;
+  }): Promise<Result<SurfaceAttentionItem, DomainError>>;
+}
+
+/** The review card as the owner reads it (F24-AC2, F24-AC3). */
+export interface SurfaceReviewCard {
+  readonly candidateFingerprint: string;
+  readonly headSha: string;
+  readonly baseSha: string;
+  readonly scopeFingerprint: string;
+  readonly scopeRevision: number;
+  readonly collectedAt: string;
+  readonly checks: readonly {
+    readonly checkId: string;
+    readonly name: string;
+    readonly origin: string | null;
+    readonly required: boolean;
+    readonly result: string;
+    readonly blocking: boolean;
+    readonly exitCode: number | null;
+    readonly artifactRef: string | null;
+    readonly detail: string | null;
+  }[];
+  readonly criteria: readonly {
+    readonly criterionId: string;
+    readonly text: string;
+    readonly methodKind: string;
+    readonly status: string;
+    readonly evidenceId: string | null;
+    readonly observedAt: string | null;
+    readonly detail: string | null;
+  }[];
+  readonly pendingOwnerTestCriterionIds: readonly string[];
+  readonly readyForOwnerTest: boolean;
+  /** Why the work cannot be accepted yet, named rather than left to be inferred (F24-AC3). */
+  readonly notReady: readonly string[];
+}
+
+export interface SurfaceReviewCardUseCases {
+  /**
+   * The card for the candidate the run's work item currently offers.
+   *
+   * A run with no candidate yet is `NotFound` rather than an empty card: there is nothing
+   * to review, and an empty card would read as a candidate that passed nothing it was
+   * asked about (F24-AC3).
+   */
+  buildReviewCard(jobId: JobId): Promise<Result<SurfaceReviewCard, DomainError>>;
+}
+
+/** One criterion's standing as the owner sees it before deciding (F25-AC1). */
+export interface SurfaceCriterionStanding {
+  readonly criterionId: string;
+  readonly text: string;
+  readonly methodKind: string;
+  readonly status: string;
+  /** False when no evidence row exists at all, which differs from a row that failed. */
+  readonly observed: boolean;
+}
+
+/** The acceptance state the candidate currently holds (F25-AC3). */
+export interface SurfaceAcceptanceView {
+  readonly candidateId: CandidateId;
+  readonly candidateFingerprint: string;
+  readonly state: string;
+  readonly decisionId: string | null;
+  readonly ownerId: OwnerId | null;
+  readonly decidedAt: string | null;
+  readonly note: string | null;
+  /** The identity inputs that differ from the ones the decision was recorded against. */
+  readonly staleReasons: readonly string[];
+  /** Feedback retained for a fix pass rather than replaced (F25-AC2). */
+  readonly retainedFeedback: readonly { readonly decisionId: string; readonly feedback: string }[];
+}
+
+/** What an accepted candidate was accepted against (F25-AC1). */
+export interface SurfaceAcceptanceReport {
+  readonly candidateId: CandidateId;
+  readonly workItemId: string;
+  readonly decisionId: string;
+  readonly state: 'Accepted';
+  readonly ownerId: OwnerId;
+  readonly decidedAt: string;
+  readonly candidateFingerprint: string;
+  readonly headSha: string;
+  readonly scopeFingerprint: string;
+  readonly observedDeployments: readonly {
+    readonly component: string;
+    readonly deploymentId: string | null;
+    readonly deploymentUrl: string | null;
+    readonly environment: string;
+  }[];
+  readonly feedbackHonoured: readonly { readonly decisionId: string; readonly feedback: string }[];
+}
+
+/** What the owner's rejection landed on, so a fix pass can read it (F25-AC2). */
+export interface SurfaceChangeRequestReport {
+  readonly candidateId: CandidateId;
+  readonly workItemId: string;
+  readonly decisionId: string;
+  readonly state: 'ChangesRequested';
+  readonly ownerId: OwnerId;
+  readonly decidedAt: string;
+  readonly feedback: string;
+  readonly outstandingCriterionIds: readonly string[];
+}
+
+/** The gate the owner decides against, and what is still outstanding (F25-AC1). */
+export interface SurfaceAcceptanceGate {
+  readonly candidateFingerprint: string;
+  readonly headSha: string;
+  readonly scopeFingerprint: string;
+  readonly criteria: readonly SurfaceCriterionStanding[];
+  readonly outstandingCriterionIds: readonly string[];
+  readonly ready: boolean;
+}
+
+export interface SurfaceAcceptanceUseCases {
+  /** F25-AC2, F25-AC4: records the owner's reason against the tested candidate. */
+  requestChanges(command: {
+    readonly jobId: JobId;
+    readonly reason: string;
+    readonly actor: OwnerId;
+    /** The transport's instant, so a decision cannot be backdated (F25-AC4). */
+    readonly at: string;
+  }): Promise<Result<SurfaceChangeRequestReport, DomainError>>;
+  /** F25-AC1, F25-AC4: records acceptance, or names the outstanding criteria. */
+  recordAcceptance(command: {
+    readonly jobId: JobId;
+    readonly note: string | null;
+    readonly actor: OwnerId;
+    readonly at: string;
+  }): Promise<Result<SurfaceAcceptanceReport, DomainError>>;
+  /** F25-AC3: what the candidate's acceptance state currently is, plus retained feedback. */
+  currentAcceptance(jobId: JobId): Promise<Result<SurfaceAcceptanceView, DomainError>>;
+  /** F24-AC3, F25-AC1: the criteria and the outstanding ones, for the owner's decision. */
+  acceptanceGate(jobId: JobId): Promise<Result<SurfaceAcceptanceGate, DomainError>>;
+}
+
 /** The whole injected surface. One argument, so a missing use case is a type error. */
 export interface ControllerSurface {
   readonly owners: SurfaceOwnerUseCases;
@@ -389,6 +853,10 @@ export interface ControllerSurface {
   readonly profiles: SurfaceProfileUseCases;
   readonly connectors: SurfaceConnectorUseCases;
   readonly intake: SurfaceIntakeUseCases;
+  readonly runs: SurfaceRunUseCases;
+  readonly attention: SurfaceAttentionUseCases;
+  readonly reviewCards: SurfaceReviewCardUseCases;
+  readonly acceptance: SurfaceAcceptanceUseCases;
 }
 
 /**
@@ -408,6 +876,149 @@ function ownerActor(actorId: OwnerId): OwnerActor {
 
 function toSurfaceSession(record: StoredSessionRecord): SurfaceStoredSession {
   return { ...record };
+}
+
+/**
+ * One job row, renamed for the transport (F13-AC1).
+ *
+ * A projection rather than a translation: the row's own fields travel, with the branded
+ * identities widened to text. Nothing is dropped and nothing is added, so a run the owner
+ * reads here is the row the worker claims (F13-AC1, N01-AC3).
+ */
+function toSurfaceJob(job: JobRecord): SurfaceRunJob {
+  return { ...job };
+}
+
+/**
+ * One resume point, renamed for the transport (F17-AC2).
+ *
+ * Every field of the recorded point travels, including the dirty and untracked inventory
+ * and the retained feedback: the inventory is what a resume compares against, so a card
+ * that omitted it would leave the owner unable to see what the next attempt will preserve
+ * (F17-AC2).
+ */
+function toSurfaceCheckpoint(checkpoint: JobCheckpoint): SurfaceRunCheckpoint {
+  return { ...checkpoint };
+}
+
+function toSurfaceWriter(writer: RunWriter): SurfaceRunWriter {
+  return { ...writer };
+}
+
+function toSurfaceView(view: RunView): SurfaceRunView {
+  return {
+    job: toSurfaceJob(view.job),
+    checkpoint: view.checkpoint === null ? null : toSurfaceCheckpoint(view.checkpoint),
+    writer: toSurfaceWriter(view.writer),
+  };
+}
+
+/**
+ * One readiness area as the transport collected it, judged by nothing (F09-AC4).
+ *
+ * A confirmed area is `Satisfied` with the reason the owner gave, or with a reason that
+ * states exactly what was observed: their confirmation, for this work, at this instant. An
+ * unconfirmed area is `Unknown` rather than `Unmet`, because this process has not looked
+ * and cannot say the prerequisite is absent, and every one of them carries the remedy that
+ * turns it into a fact. The verdict is the domain's `assessReadiness`, so nothing here can
+ * turn an open area into a startable one (F09-AC1, F09-AC2).
+ */
+function toSurfaceArea(area: string, input: SurfaceReadinessAreaInput, subjectId: string, at: string): AreaObservation {
+  const note = input.note === null ? '' : input.note.trim();
+  if (input.confirmed) {
+    return {
+      status: 'Satisfied',
+      reason: note === '' ? `The owner confirmed the ${area} prerequisite for ${subjectId} at ${at}.` : note,
+      remedy: null,
+    };
+  }
+  return {
+    status: 'Unknown',
+    reason: note === '' ? `The owner has not confirmed the ${area} prerequisite for ${subjectId}.` : note,
+    remedy: `Confirm the ${area} prerequisite on the start form, or record what is open about it and start a read-only investigation instead.`,
+  };
+}
+
+/**
+ * The collected confirmations as the domain's observation (F09-AC1).
+ *
+ * `dependencies` is empty and `investigationSupported` names every area, because this
+ * process references no dependency and an owner-confirmed uncertainty is one a read-only
+ * investigation may resolve. Both are stated rather than left to a default so the recorded
+ * assessment says what it did and did not look at (F09-AC1, F09-AC2).
+ */
+function toSurfaceReadiness(command: {
+  readonly readiness: SurfaceReadinessInput;
+  readonly workItemId: string;
+  readonly at: string;
+}): ReadinessObservation {
+  const subject = command.workItemId;
+  const at = command.at;
+  return {
+    subjectId: subject,
+    assessedAt: at,
+    scope: toSurfaceArea('Scope', command.readiness.scope, subject, at),
+    criteria: toSurfaceArea('Criteria', command.readiness.criteria, subject, at),
+    repository: toSurfaceArea('Repository', command.readiness.repository, subject, at),
+    target: toSurfaceArea('Target', command.readiness.target, subject, at),
+    verification: toSurfaceArea('Verification', command.readiness.verification, subject, at),
+    access: toSurfaceArea('Access', command.readiness.access, subject, at),
+    dependencies: [],
+    investigationSupported: ['Scope', 'Criteria', 'Repository', 'Target', 'Dependencies', 'Verification', 'Access'],
+  };
+}
+
+/** The scope the run records, with the instants the transport is the authority for (F12-AC1). */
+function toSurfaceScope(command: {
+  readonly scope: SurfaceRunScopeInput;
+  readonly workItemId: string;
+  readonly at: string;
+}): ScopeSnapshot {
+  return {
+    workItemId: command.workItemId,
+    issueId: command.scope.issueId,
+    issueIdentifier: command.scope.issueIdentifier,
+    title: command.scope.title,
+    description: command.scope.description,
+    providerRevision: command.scope.providerRevision,
+    priority: command.scope.priority,
+    dependencyIssueIds: [...command.scope.dependencyIssueIds],
+    acceptanceCriteria: command.scope.acceptanceCriteria.map((criterion) => ({ ...criterion })),
+    retrievedAt: command.at,
+  };
+}
+
+/** One attention item, renamed for the transport (F31-AC1, N02-AC2). */
+function toSurfaceAttentionItem(item: AttentionItem): SurfaceAttentionItem {
+  return {
+    attentionItemId: item.attentionItemId,
+    kind: item.kind,
+    state: item.state,
+    projectId: item.projectId,
+    workItemId: item.workItemId,
+    issueIdentifier: item.issueIdentifier,
+    title: item.title,
+    blocker: item.blocker,
+    nextAction: item.nextAction,
+    createdAt: item.createdAt,
+    updatedAt: item.updatedAt,
+    acknowledgedAt: item.acknowledgedAt,
+    acknowledgedBy: item.acknowledgedBy,
+    candidateFingerprint: item.candidateFingerprint,
+  };
+}
+
+function toSurfaceBoard(board: AttentionBoard): SurfaceAttentionBoard {
+  return {
+    projectId: board.projectId,
+    collectedAt: board.collectedAt,
+    items: board.items.map(toSurfaceAttentionItem),
+    groups: board.groups.map((group) => ({
+      bucket: group.bucket,
+      items: group.items.map(toSurfaceAttentionItem),
+    })),
+    persistedItemIds: [...board.persistedItemIds],
+  };
 }
 
 /**
@@ -898,6 +1509,443 @@ export function createControllerSurface(resolve: SurfaceRootResolver): Controlle
           return root.intakeUseCases.exportIdea(ideaId, actor.value);
         }),
     },
+
+    /**
+     * Runs: start, read, and the three lifecycle moves (F13, F17, F18).
+     *
+     * Every method is a delegation with a projection, so a run's state, its resume point
+     * and its writer all come from the queue's own rows and a client cannot report a
+     * lifecycle move the store did not make (F17-AC1, N01-AC3).
+     */
+    runs: {
+      /**
+       * Starts work, or answers with the run this operation identity already started
+       * (F13-AC1, F13-AC2).
+       *
+       * The `deduplicated` flag travels rather than being decided here: it is the queue's
+       * record of whether this call inserted the row, and re-deriving it from a read would
+       * turn a race into an answer (F13-AC2).
+       */
+      startRun: async (command) =>
+        use((root) => {
+          const started = startRunWith(root.jobUseCases, command);
+          if (!started.ok) return err(started.error);
+          return ok({
+            job: toSurfaceJob(started.value.job),
+            deduplicated: started.value.deduplicated,
+            capturedScope: {
+              scopeSnapshotId: started.value.capturedScope.scopeSnapshotId,
+              workItemId: started.value.capturedScope.workItemId,
+              sequenceNumber: started.value.capturedScope.sequenceNumber,
+              scopeFingerprint: started.value.capturedScope.scopeFingerprint,
+              capturedAt: started.value.capturedScope.capturedAt,
+            },
+            dispatch: { ...started.value.dispatch },
+            grant: { ...started.value.grant },
+            requestedByOwner: started.value.requestedByOwner,
+          });
+        }),
+
+      /**
+       * The recorded runs, oldest first.
+       *
+       * Job rows only: the ordering is the queue's own, and a listing that also read every
+       * checkpoint would make the cost of the list grow with the number of runs the owner
+       * is least likely to open (N04-AC2).
+       */
+      listRuns: async () =>
+        use((root) => {
+          const listed = listRecordedRuns(root);
+          if (!listed.ok) return err(listed.error);
+          return ok(listed.value.map(toSurfaceJob));
+        }),
+
+      /** The run, its resume point and who holds the writer for it (F13-AC1, F17-AC2). */
+      getRun: async (jobId) =>
+        use((root) => {
+          const view = root.jobUseCases.getRun(jobId);
+          if (!view.ok) return err(view.error);
+          return ok(toSurfaceView(view.value));
+        }),
+
+      /**
+       * Pauses, and reports whether the writer stopped.
+       *
+       * The transition is the queue's and the writer's disposition is the lease's; this
+       * layer adds no judgement, so a run can only be shown as `Paused` when the store says
+       * its writer is gone (F17-AC1).
+       */
+      pauseRun: async (jobId) =>
+        use((root) => {
+          const paused: Result<PausedRun, DomainError> = root.jobUseCases.pauseRun(jobId);
+          if (!paused.ok) return err(paused.error);
+          return ok({ ...toSurfaceView(paused.value), writerStopped: paused.value.writerStopped });
+        }),
+
+      /** Resumes from the recorded resume point, which travels with the answer (F17-AC3). */
+      resumeRun: async (jobId) =>
+        use((root) => {
+          const resumed: Result<ResumedRun, DomainError> = root.jobUseCases.resumeRun(jobId);
+          if (!resumed.ok) return err(resumed.error);
+          return ok({ job: toSurfaceJob(resumed.value.job), checkpoint: toSurfaceCheckpoint(resumed.value.checkpoint) });
+        }),
+
+      /**
+       * Cancels, reporting the resume point that survived and that no delivery was touched
+       * (F17-AC4).
+       */
+      cancelRun: async (jobId) =>
+        use((root) => {
+          const cancelled: Result<CancelledRun, DomainError> = root.jobUseCases.cancelRun(jobId);
+          if (!cancelled.ok) return err(cancelled.error);
+          return ok({
+            job: toSurfaceJob(cancelled.value.job),
+            preservedCheckpoint:
+              cancelled.value.preservedCheckpoint === null ? null : toSurfaceCheckpoint(cancelled.value.preservedCheckpoint),
+            writer: toSurfaceWriter(cancelled.value.writer),
+            externalDelivery: cancelled.value.externalDelivery,
+          });
+        }),
+
+      /**
+       * Extends a reached limit (F18-AC2).
+       *
+       * `extendedBoundRecorded: false` travels because it is true: nothing in storage can
+       * write the extended bound onto the job, so a client that reported it as recorded
+       * would promise an owner a budget a restart would lose (F18-AC2, N01-AC3).
+       */
+      grantExtension: async (command) =>
+        use((root) => {
+          const granted: Result<GrantedExtension, DomainError> = root.jobUseCases.grantExtension(
+            command.jobId,
+            command.actor,
+          );
+          if (!granted.ok) return err(granted.error);
+          return ok({
+            job: toSurfaceJob(granted.value.job),
+            previousLimits: granted.value.previousLimits,
+            extendedLimits: granted.value.extendedLimits,
+            extendedBoundRecorded: granted.value.extendedBoundRecorded,
+            decidedBy: granted.value.decidedBy,
+            decidedAt: granted.value.decidedAt,
+          });
+        }),
+
+      /** Declines an extension, which leaves the attempt waiting (F18-AC2). */
+      declineExtension: async (command) =>
+        use((root) => {
+          const declined: Result<DeclinedExtension, DomainError> = root.jobUseCases.declineExtension(
+            command.jobId,
+            command.actor,
+          );
+          if (!declined.ok) return err(declined.error);
+          return ok({
+            job: toSurfaceJob(declined.value.job),
+            limitsInForce: declined.value.limitsInForce,
+            decidedBy: declined.value.decidedBy,
+            decidedAt: declined.value.decidedAt,
+          });
+        }),
+    },
+
+    attention: {
+      /**
+       * The board for one project, or for the project this owner's recorded work belongs
+       * to (F31-AC1, F31-AC2).
+       *
+       * An owner with no recorded work gets an empty board naming no project rather than a
+       * refusal: "you have nothing to look at" is the answer, and it is not an error.
+       */
+      collectAttention: async (command) =>
+        use((root) => {
+          const resolved = command.projectId === null ? recordedProjectOf(root) : ok(command.projectId);
+          if (!resolved.ok) return err(resolved.error);
+          if (resolved.value === null) {
+            return ok({ projectId: null, collectedAt: command.at, items: [], groups: [], persistedItemIds: [] });
+          }
+          const board: Result<AttentionBoard, DomainError> = root.attentionUseCases.collectAttention(
+            resolved.value as ProjectId,
+          );
+          if (!board.ok) return err(board.error);
+          return ok(toSurfaceBoard(board.value));
+        }),
+
+      /**
+       * Records that the owner has seen an item, and nothing else (F31-AC4).
+       *
+       * Only an item with a durable row can be acknowledged, and the returned item is the
+       * stored row, so a client cannot show an acknowledgement that was recorded nowhere
+       * (F31-AC3, F31-AC4).
+       */
+      acknowledge: async (command) =>
+        use((root) => {
+          const acknowledged: Result<AttentionItemRecord, DomainError> = root.attentionUseCases.acknowledge(
+            command.attentionItemId,
+            command.actor,
+          );
+          if (!acknowledged.ok) return err(acknowledged.error);
+          return ok(toSurfaceAttentionItem(acknowledged.value));
+        }),
+    },
+
+    reviewCards: {
+      /**
+       * The card for the candidate the run's work item currently offers (F24-AC2).
+       *
+       * The candidate is read from the store rather than taken from the request, and the
+       * card is built by the verification use case, so a candidate that is no longer the
+       * current one is refused by that use case with both identities named instead of being
+       * shown as this run's evidence (F24-AC4).
+       */
+      buildReviewCard: async (jobId) =>
+        use(async (root) => {
+          const run = await root.jobUseCases.getRun(jobId);
+          if (!run.ok) return err(run.error);
+          const current = await currentCandidateFor(root, run.value.job.workItemId);
+          if (!current.ok) return err(current.error);
+          const card: Result<ReviewCard, DomainError> = root.verificationUseCases.buildReviewCard(current.value);
+          if (!card.ok) return err(card.error);
+          return ok(toSurfaceReviewCard(card.value));
+        }),
+    },
+
+    acceptance: {
+      /**
+       * Records the owner's reason against the candidate this run currently offers (F25-AC2).
+       *
+       * The candidate is resolved from the run rather than taken from the request, and the
+       * owner actor is built from the identity the transport proved, so a caller cannot
+       * record feedback against a candidate it chose or under a role it was not granted
+       * (F25-AC4).
+       */
+      requestChanges: async (command) =>
+        use(async (root) => {
+          const candidate = await candidateForRun(root, command.jobId);
+          if (!candidate.ok) return err(candidate.error);
+          const requested = root.acceptanceUseCases.requestChanges({
+            candidateId: candidate.value.candidateId,
+            actor: ownerActor(command.actor),
+            reason: command.reason,
+            correlationId: correlationOf(command.jobId),
+          });
+          if (!requested.ok) return err(requested.error);
+          const report = requested.value;
+          return ok({
+            candidateId: report.candidateId,
+            workItemId: String(report.workItemId),
+            decisionId: report.decisionId,
+            state: report.state,
+            ownerId: report.ownerId,
+            decidedAt: report.decidedAt,
+            feedback: report.feedback,
+            outstandingCriterionIds: [...report.outstandingCriterionIds],
+          });
+        }),
+
+      /**
+       * Records acceptance of the candidate this run currently offers (F25-AC1).
+       *
+       * The refusal that names the outstanding criteria comes from the use case and is
+       * passed through rather than restated here, so what the owner is told cannot drift
+       * from what the domain decides is outstanding (F25-AC1).
+       */
+      recordAcceptance: async (command) =>
+        use(async (root) => {
+          const candidate = await candidateForRun(root, command.jobId);
+          if (!candidate.ok) return err(candidate.error);
+          const accepted = root.acceptanceUseCases.recordAcceptance({
+            candidateId: candidate.value.candidateId,
+            actor: ownerActor(command.actor),
+            note: command.note,
+            correlationId: correlationOf(command.jobId),
+          });
+          if (!accepted.ok) return err(accepted.error);
+          const report = accepted.value;
+          return ok({
+            candidateId: report.candidateId,
+            workItemId: String(report.workItemId),
+            decisionId: report.decisionId,
+            state: report.state,
+            ownerId: report.ownerId,
+            decidedAt: report.decidedAt,
+            candidateFingerprint: report.candidateFingerprint,
+            headSha: report.headSha,
+            scopeFingerprint: report.scopeFingerprint,
+            observedDeployments: report.observedDeployments.map((deployment) => ({ ...deployment })),
+            feedbackHonoured: report.feedbackHonoured.map((entry) => ({ ...entry })),
+          });
+        }),
+
+      /**
+       * The acceptance state the candidate currently holds (F25-AC3).
+       *
+       * Retained feedback travels with it because the read is what a fix pass loads, and a
+       * read that dropped the feedback would make the recorded reason unreachable from the
+       * only screen that shows it (F25-AC2).
+       */
+      currentAcceptance: async (jobId) =>
+        use(async (root) => {
+          const candidate = await candidateForRun(root, jobId);
+          if (!candidate.ok) return err(candidate.error);
+          const view = root.acceptanceUseCases.currentAcceptance(candidate.value.candidateId);
+          if (!view.ok) return err(view.error);
+          return ok({
+            candidateId: view.value.candidateId,
+            candidateFingerprint: view.value.candidateFingerprint,
+            state: view.value.state,
+            decisionId: view.value.decisionId,
+            ownerId: view.value.ownerId,
+            decidedAt: view.value.decidedAt,
+            note: view.value.note,
+            staleReasons: [...view.value.staleReasons],
+            retainedFeedback: view.value.retainedFeedback.map((entry) => ({ ...entry })),
+          });
+        }),
+
+      /**
+       * The criteria and what is outstanding, read from the same evidence the card reads (F25-AC1).
+       */
+      acceptanceGate: async (jobId) =>
+        use(async (root) => {
+          const candidate = await candidateForRun(root, jobId);
+          if (!candidate.ok) return err(candidate.error);
+          const gate = root.acceptanceUseCases.acceptanceGate(candidate.value.candidateId);
+          if (!gate.ok) return err(gate.error);
+          return ok({
+            candidateFingerprint: gate.value.candidateFingerprint,
+            headSha: gate.value.headSha,
+            scopeFingerprint: gate.value.scopeFingerprint,
+            criteria: gate.value.criteria.map((criterion) => ({
+              criterionId: criterion.criterionId,
+              text: criterion.text,
+              methodKind: String(criterion.methodKind),
+              status: String(criterion.status),
+              observed: criterion.observed,
+            })),
+            outstandingCriterionIds: [...gate.value.outstandingCriterionIds],
+            ready: gate.value.ready,
+          });
+        }),
+    },
+  };
+}
+
+/**
+ * The candidate the run's work item currently offers, for a decision keyed by run (F25-AC1).
+ *
+ * The transport names a run because that is what the owner clicked, and the acceptance use
+ * cases name a candidate because that is what an acceptance is bound to. Resolving the one
+ * from the other here is the single translation, so a decision cannot be recorded against a
+ * candidate the run does not offer (F25-AC3).
+ */
+async function candidateForRun(
+  root: CompositionRoot,
+  jobId: JobId,
+): Promise<Result<CandidateRecord, DomainError>> {
+  const run = await root.jobUseCases.getRun(jobId);
+  if (!run.ok) return err(run.error);
+  return currentCandidateFor(root, run.value.job.workItemId);
+}
+
+/**
+ * The correlation identity a decision is recorded under (F25-AC2).
+ *
+ * The run's own correlation identity rather than a value from the request body, so a
+ * decision can be traced back to the run it was made about and two runs cannot have their
+ * feedback attributed to each other.
+ */
+function correlationOf(jobId: JobId): string {
+  return `acceptance:${String(jobId)}`;
+}
+
+/**
+ * A start, with the transport's validated text narrowed to the identities the use case takes.
+ *
+ * Both brands record a boundary the store checks rather than one assumed here: the `jobs` row
+ * declares both columns, and the queue refuses a start whose work item does not exist
+ * (F13-AC1, F13-AC5).
+ */
+function startRunWith(
+  useCases: JobUseCases,
+  command: {
+    readonly workItemId: string;
+    readonly mode: JobMode;
+    readonly operationId: string;
+    readonly correlationId: string | null;
+    readonly scope: SurfaceRunScopeInput;
+    readonly readiness: SurfaceReadinessInput;
+    readonly at: string;
+    readonly actor: OwnerId;
+  },
+): ReturnType<JobUseCases['startRun']> {
+  return useCases.startRun({
+    workItemId: command.workItemId as WorkItemId,
+    mode: command.mode,
+    operationId: command.operationId as OperationId,
+    ownerId: command.actor,
+    readiness: toSurfaceReadiness({ readiness: command.readiness, workItemId: command.workItemId, at: command.at }),
+    scope: toSurfaceScope({ scope: command.scope, workItemId: command.workItemId, at: command.at }),
+    correlationId: command.correlationId,
+  });
+}
+
+/** The recorded runs, in the queue's own order, with the project each belongs to (F13-AC1). */
+function listRecordedRuns(root: CompositionRoot): Result<readonly JobRecord[], DomainError> {
+  const query: JobQuery = { states: null, projectId: null };
+  return root.jobs.listJobs(query);
+}
+
+/**
+ * The project the most recently recorded run belongs to (F31-AC2).
+ *
+ * Read from the queue's own ordering rather than from a sort written here, and null when
+ * nothing is recorded: a board scoped to a guessed project would show an empty list that
+ * reads as "nothing needs you" for a project that was never looked at.
+ */
+function recordedProjectOf(root: CompositionRoot): Result<string | null, DomainError> {
+  const listed = listRecordedRuns(root);
+  if (!listed.ok) return err(listed.error);
+  const newest = listed.value[listed.value.length - 1];
+  return ok(newest === undefined ? null : String(newest.projectId));
+}
+
+/**
+ * The candidate the work item currently offers (F24-AC4).
+ *
+ * The last recorded candidate, which is the same rule the verification use case applies
+ * internally. A candidate that turns out not to be current is refused by that use case, so
+ * choosing it here cannot widen what a card shows: the worst case is a refusal naming both
+ * identities, never a card for the wrong candidate.
+ */
+async function currentCandidateFor(
+  root: CompositionRoot,
+  workItemId: string,
+): Promise<Result<CandidateRecord, DomainError>> {
+  const listed = root.candidates.listForWorkItem(workItemId as WorkItemId);
+  if (!listed.ok) return err(listed.error);
+  const current = listed.value[listed.value.length - 1];
+  if (current === undefined) {
+    return err({
+      code: 'NotFound',
+      reason: `Work item ${workItemId} has recorded no candidate yet, so there is nothing for a review card to describe (F24-AC2).`,
+    });
+  }
+  return ok(current);
+}
+
+function toSurfaceReviewCard(card: ReviewCard): SurfaceReviewCard {
+  return {
+    candidateFingerprint: card.candidateFingerprint,
+    headSha: card.headSha,
+    baseSha: card.baseSha,
+    scopeFingerprint: card.scopeFingerprint,
+    scopeRevision: card.scopeRevision,
+    collectedAt: card.collectedAt,
+    checks: card.checks.map((check) => ({ ...check, origin: check.origin === null ? null : String(check.origin) })),
+    criteria: card.criteria.map((criterion) => ({ ...criterion })),
+    pendingOwnerTestCriterionIds: [...card.pendingOwnerTestCriterionIds],
+    readyForOwnerTest: card.readyForOwnerTest,
+    notReady: [...card.notReady],
   };
 }
 

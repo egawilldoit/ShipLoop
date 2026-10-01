@@ -38,11 +38,13 @@ import {
   signInRequiredProblem,
 } from './http-error.ts';
 import type { ControllerSurface } from './contracts.ts';
+import { registerAttentionRoutes } from './routes/attention.ts';
 import { registerConnectorRoutes } from './routes/connectors.ts';
 import { registerHealthRoutes } from './routes/health.ts';
 import { registerIntakeRoutes } from './routes/intake.ts';
 import { registerOwnerRoutes } from './routes/owner.ts';
 import { registerProfileRoutes } from './routes/profiles.ts';
+import { registerRunRoutes } from './routes/runs.ts';
 
 const CONTENT_SECURITY_POLICY = [
   "default-src 'self'",
@@ -105,6 +107,8 @@ export async function buildApp(deps: AppDependencies): Promise<FastifyInstance> 
   registerProfileRoutes(app, { controller, guard, now });
   registerConnectorRoutes(app, { controller, guard, now });
   registerIntakeRoutes(app, { controller, guard, now });
+  registerRunRoutes(app, { controller, guard, now });
+  registerAttentionRoutes(app, { controller, guard, now });
 
   const staticRoot = config.staticRoot;
   if (staticRoot !== null) {

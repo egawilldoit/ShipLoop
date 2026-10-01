@@ -2,18 +2,24 @@ import { useState, type ReactElement } from 'react';
 import { ConnectionBanner } from './components/ConnectionBanner.tsx';
 import { BriefPage } from './pages/BriefPage.tsx';
 import { ConnectorsPage } from './pages/ConnectorsPage.tsx';
+import { DashboardPage } from './pages/DashboardPage.tsx';
 import { IntakePage } from './pages/IntakePage.tsx';
 import { ProfilesPage } from './pages/ProfilesPage.tsx';
+import { ReviewCardPage } from './pages/ReviewCardPage.tsx';
+import { RunPage } from './pages/RunPage.tsx';
 import { SignInPage } from './pages/SignInPage.tsx';
 import { SessionProvider, useSession } from './session.tsx';
 
-type Section = 'profiles' | 'connectors' | 'intake' | 'brief';
+type Section = 'profiles' | 'connectors' | 'intake' | 'brief' | 'runs' | 'review' | 'dashboard';
 
 const SECTIONS: readonly { readonly id: Section; readonly label: string }[] = [
   { id: 'profiles', label: 'Profiles' },
   { id: 'connectors', label: 'Connectors' },
   { id: 'intake', label: 'Intake' },
   { id: 'brief', label: 'Brief' },
+  { id: 'runs', label: 'Runs' },
+  { id: 'review', label: 'Review card' },
+  { id: 'dashboard', label: 'Needs you' },
 ];
 
 function Shell(): ReactElement {
@@ -22,6 +28,7 @@ function Shell(): ReactElement {
   const [activeProfileId, setActiveProfileId] = useState('');
   const [activeProfileLabel, setActiveProfileLabel] = useState('');
   const [activeIdeaId, setActiveIdeaId] = useState('');
+  const [activeJobId, setActiveJobId] = useState('');
   const [signingOut, setSigningOut] = useState(false);
 
   const selectProfile = (profileId: string, label: string): void => {
@@ -92,7 +99,9 @@ function Shell(): ReactElement {
         Intake and the brief share one selected request rather than each holding their
         own copy of it: the two screens are two views of one captured request, and a
         per-page selection would let the brief describe a different request than the
-        intake screen is showing.
+        intake screen is showing. The run and its review card share one selected run for
+        the same reason: a card is evidence about a run, and a card for a different run than
+        the one on screen would be a card about nothing (F24-AC2).
       */}
       <main className="app__main" id="main">
         {section === 'profiles' ? (
@@ -119,6 +128,24 @@ function Shell(): ReactElement {
             }}
             epoch={connectionEpoch}
           />
+        ) : section === 'runs' ? (
+          <RunPage
+            selectedJobId={activeJobId}
+            onSelectJob={setActiveJobId}
+            onOpenReviewCard={(jobId) => {
+              setActiveJobId(jobId);
+              setSection('review');
+            }}
+            epoch={connectionEpoch}
+          />
+        ) : section === 'review' ? (
+          <ReviewCardPage
+            jobId={activeJobId}
+            onBackToRuns={() => setSection('runs')}
+            epoch={connectionEpoch}
+          />
+        ) : section === 'dashboard' ? (
+          <DashboardPage epoch={connectionEpoch} />
         ) : (
           <BriefPage
             ideaId={activeIdeaId}

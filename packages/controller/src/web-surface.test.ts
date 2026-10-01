@@ -93,6 +93,10 @@ const REQUIRED_METHODS = {
     'applyOwnerCorrection',
     'exportIdea',
   ],
+  runs: ['startRun', 'listRuns', 'getRun', 'pauseRun', 'resumeRun', 'cancelRun', 'grantExtension', 'declineExtension'],
+  attention: ['collectAttention', 'acknowledge'],
+  reviewCards: ['buildReviewCard'],
+  acceptance: ['requestChanges', 'recordAcceptance', 'currentAcceptance', 'acceptanceGate'],
 } as const satisfies Record<keyof ControllerSurface, readonly string[]>;
 
 /**

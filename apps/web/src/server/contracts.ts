@@ -15,11 +15,18 @@
  * connector view carries a credential *reference* and its digest (F03-AC3).
  */
 
+import type { JobOperation } from '@shiploop/storage';
 import type {
+  AttemptState,
+  AttentionItemId,
+  AttentionKind,
+  AttentionState,
   CapabilityKind,
   ConnectorId,
   DomainError,
   IdeaId,
+  JobId,
+  JobMode,
   OwnerId,
   ProfileVersionId,
   ProjectId,
@@ -45,6 +52,16 @@ export function asConnectorId(value: string): ConnectorId {
 /** Narrows validated HTTP text to an idea identifier. See `asProjectId`. */
 export function asIdeaId(value: string): IdeaId {
   return value as IdeaId;
+}
+
+/** Narrows validated HTTP text to a job identifier. See `asProjectId`. */
+export function asJobId(value: string): JobId {
+  return value as JobId;
+}
+
+/** Narrows validated HTTP text to an attention item identifier. See `asProjectId`. */
+export function asAttentionItemId(value: string): AttentionItemId {
+  return value as AttentionItemId;
 }
 
 /**
@@ -640,6 +657,417 @@ export interface IntakeUseCases {
   exportIdea(ideaId: IdeaId): Promise<Result<IdeaExportView, DomainError>>;
 }
 
+/* -------------------------------------------------------------------------- */
+/* Runs, attention and the review card                                         */
+/* -------------------------------------------------------------------------- */
+
+/** The buckets the dashboard groups into, as the domain's own grouping names them (F31-AC1). */
+export type AttentionBucket = 'Working' | 'NeedsYourInput' | 'ReadyForYourTest' | 'ReadyForRelease';
+
+/** The bounded limits a run is recorded with, as the transport reports them (F18-AC2). */
+export interface AttemptLimitView {
+  readonly activeExecutionMs: number;
+  readonly automatedFixPasses: number;
+}
+
+/**
+ * One area of the recorded readiness assessment (F09-AC1).
+ *
+ * A confirmation with an optional note, because the only thing this server can know about
+ * a prerequisite is what the owner said about it. The verdict is the domain's, and the
+ * reason travels either way so the assessment says what it looked at (F09-AC4).
+ */
+export interface ReadinessAreaInput {
+  readonly confirmed: boolean;
+  readonly note: string | null;
+}
+
+export interface ReadinessInput {
+  readonly scope: ReadinessAreaInput;
+  readonly criteria: ReadinessAreaInput;
+  readonly repository: ReadinessAreaInput;
+  readonly target: ReadinessAreaInput;
+  readonly verification: ReadinessAreaInput;
+  readonly access: ReadinessAreaInput;
+}
+
+/** The scope a run records, as the provider reported it (F12-AC1). */
+export interface RunScopeInput {
+  readonly issueId: string;
+  readonly issueIdentifier: string;
+  readonly title: string;
+  readonly description: string;
+  readonly providerRevision: string | null;
+  readonly priority: string | null;
+  readonly dependencyIssueIds: readonly string[];
+  readonly acceptanceCriteria: readonly { readonly id: string; readonly text: string }[];
+}
+
+/**
+ * One durable job row (F13-AC1).
+ *
+ * The limits and the granted operations travel with it because both are facts about the
+ * row: an owner reading "running" cannot otherwise ask what the attempt is bounded by or
+ * what it may do (F18-AC2, F13-AC3).
+ */
+export interface RunJobView {
+  readonly jobId: string;
+  readonly operationId: string;
+  readonly mode: JobMode;
+  readonly workItemId: string;
+  readonly scopeSnapshotId: string;
+  readonly projectId: string;
+  readonly profileVersionId: string;
+  readonly procedureVersionId: string;
+  readonly state: AttemptState;
+  readonly correlationId: string;
+  readonly limits: {
+    readonly activeExecutionMs: number;
+    readonly maxAutomatedFixPasses: number;
+    readonly maxToolRetries: number;
+    readonly maxAttempts: number;
+  };
+  readonly permittedOperations: readonly JobOperation[];
+  readonly holder: string | null;
+  readonly attemptCount: number;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+}
+
+/**
+ * The resume point a run carries (F17-AC2).
+ *
+ * Head and base are full commit SHAs and are never abbreviated here, because the comparison
+ * a resume performs is against a real checkout (F17-AC2). The dirty and untracked inventory
+ * travels with them: it is what a resume preserves, so an owner cannot otherwise see what
+ * the next attempt will keep.
+ */
+export interface RunCheckpointView {
+  readonly checkpointId: string;
+  readonly scopeSnapshotId: string;
+  readonly scopeFingerprint: string;
+  readonly profileVersionId: string;
+  readonly procedureVersionId: string;
+  readonly engineVersion: string | null;
+  readonly workspace: { readonly workspaceId: string; readonly branchName: string; readonly worktreePath: string };
+  readonly headSha: string;
+  readonly baseSha: string;
+  readonly dirtyFiles: readonly string[];
+  readonly untrackedFiles: readonly string[];
+  readonly results: readonly { readonly name: string; readonly result: string; readonly detail: string | null }[];
+  readonly feedback: readonly { readonly author: string; readonly at: string; readonly body: string }[];
+  readonly blocker: string | null;
+  readonly nextAction: string;
+  readonly recordedAt: string;
+}
+
+/**
+ * Who holds the coding writer, and whether that ownership can be trusted (F17-AC5).
+ *
+ * `ReconciliationRequired` is a distinct value from `Vacant` because an expired lease proves
+ * heartbeats stopped, not that the writer stopped: a reader that collapsed the two would
+ * report a run as safely paused while a process may still be writing code (F17-AC5).
+ */
+export interface RunWriterView {
+  readonly holder: string | null;
+  readonly disposition: 'Vacant' | 'Held' | 'ReconciliationRequired' | 'Unleased';
+  readonly expiresAt: string | null;
+  readonly reconciliationReason: string | null;
+}
+
+export interface RunView {
+  readonly job: RunJobView;
+  readonly checkpoint: RunCheckpointView | null;
+  readonly writer: RunWriterView;
+}
+
+/**
+ * A paused run and whether its writer actually stopped (F17-AC1).
+ *
+ * A separate field rather than an implication of the state, because a run may only be shown
+ * as `Paused` once the writer is stopped or safely detached.
+ */
+export interface PausedRunView extends RunView {
+  readonly writerStopped: boolean;
+}
+
+export interface ResumedRunView {
+  readonly job: RunJobView;
+  readonly checkpoint: RunCheckpointView;
+}
+
+export interface CancelledRunView {
+  readonly job: RunJobView;
+  readonly preservedCheckpoint: RunCheckpointView | null;
+  readonly writer: RunWriterView;
+  /** A single value: a cancellation cannot reverse an external delivery (F17-AC4). */
+  readonly externalDelivery: 'UnchangedByCancellation';
+}
+
+export interface GrantedExtensionView {
+  readonly job: RunJobView;
+  readonly previousLimits: AttemptLimitView;
+  readonly extendedLimits: AttemptLimitView;
+  /** Literal false: nothing in storage writes the extended bound onto the job (F18-AC2). */
+  readonly extendedBoundRecorded: false;
+  readonly decidedBy: string;
+  readonly decidedAt: string;
+}
+
+export interface DeclinedExtensionView {
+  readonly job: RunJobView;
+  readonly limitsInForce: AttemptLimitView;
+  readonly decidedBy: string;
+  readonly decidedAt: string;
+}
+
+/** Where a started run sits with respect to the single global coding writer (F13-AC2). */
+export interface RunDispatchView {
+  readonly state: 'Queued';
+  readonly heldByWriter: readonly string[];
+  readonly reason: string;
+}
+
+/** The capability grant a started run holds, with the delivery refusals named (F13-AC3). */
+export interface RunGrantView {
+  readonly mode: JobMode;
+  readonly permittedOperations: readonly JobOperation[];
+  readonly refusedDeliveryOperations: readonly JobOperation[];
+  readonly refusalReason: string;
+}
+
+export interface CapturedScopeView {
+  readonly scopeSnapshotId: string;
+  readonly workItemId: string;
+  readonly sequenceNumber: number;
+  readonly scopeFingerprint: string;
+  readonly capturedAt: string;
+}
+
+export interface RunStartView {
+  readonly job: RunJobView;
+  /** True when this operation identity had already started that run (F13-AC2). */
+  readonly deduplicated: boolean;
+  readonly capturedScope: CapturedScopeView;
+  readonly dispatch: RunDispatchView;
+  readonly grant: RunGrantView;
+  readonly requestedByOwner: string;
+}
+
+export interface StartRunCommand {
+  readonly workItemId: string;
+  readonly mode: JobMode;
+  readonly operationId: string;
+  readonly correlationId: string | null;
+  readonly scope: RunScopeInput;
+  readonly readiness: ReadinessInput;
+  readonly at: string;
+  readonly actor: OwnerId;
+}
+
+export interface DecideExtensionCommand {
+  readonly jobId: JobId;
+  readonly actor: OwnerId;
+}
+
+/**
+ * Run start, lifecycle moves and owner limit decisions (F13, F17, F18).
+ *
+ * Writes carry the owner the transport proved; reads carry no caller, so a read cannot be
+ * authorized by a request body (F01-AC1). `listRuns` answers with the job rows alone: a
+ * listing has no judgement to add, and reading every checkpoint here would make its cost
+ * grow with the number of runs an owner is least likely to open (N04-AC2).
+ */
+export interface RunUseCases {
+  startRun(command: StartRunCommand): Promise<Result<RunStartView, DomainError>>;
+  listRuns(): Promise<Result<readonly RunJobView[], DomainError>>;
+  getRun(jobId: JobId): Promise<Result<RunView, DomainError>>;
+  pauseRun(jobId: JobId): Promise<Result<PausedRunView, DomainError>>;
+  resumeRun(jobId: JobId): Promise<Result<ResumedRunView, DomainError>>;
+  cancelRun(jobId: JobId): Promise<Result<CancelledRunView, DomainError>>;
+  grantExtension(command: DecideExtensionCommand): Promise<Result<GrantedExtensionView, DomainError>>;
+  declineExtension(command: DecideExtensionCommand): Promise<Result<DeclinedExtensionView, DomainError>>;
+}
+
+/** One attention item, with the blocker and the one next action it names (F31-AC1, F31-AC2). */
+export interface AttentionItemView {
+  readonly attentionItemId: string;
+  readonly kind: AttentionKind;
+  readonly state: AttentionState;
+  readonly projectId: string;
+  readonly workItemId: string | null;
+  readonly issueIdentifier: string | null;
+  readonly title: string;
+  readonly blocker: string | null;
+  readonly nextAction: string;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+  readonly acknowledgedAt: string | null;
+  readonly acknowledgedBy: string | null;
+  readonly candidateFingerprint: string | null;
+}
+
+/**
+ * The board, with the instant it was collected (F31-AC1, N04-AC2).
+ *
+ * `projectId` is null when this owner has no recorded work at all, which is a different fact
+ * from a project with an empty board. Only the identities in `persistedItemIds` can be
+ * acknowledged: a derived run-progress item has a stable identity but no row, and
+ * acknowledging it would record attention nowhere (F31-AC3, F31-AC4).
+ */
+export interface AttentionBoardView {
+  readonly projectId: string | null;
+  readonly collectedAt: string;
+  readonly items: readonly AttentionItemView[];
+  readonly groups: readonly {
+    readonly bucket: AttentionBucket;
+    readonly items: readonly AttentionItemView[];
+  }[];
+  readonly persistedItemIds: readonly string[];
+}
+
+export interface AttentionUseCases {
+  collectAttention(command: {
+    readonly projectId: string | null;
+    readonly at: string;
+  }): Promise<Result<AttentionBoardView, DomainError>>;
+  acknowledge(command: {
+    readonly attentionItemId: AttentionItemId;
+    readonly actor: OwnerId;
+  }): Promise<Result<AttentionItemView, DomainError>>;
+}
+
+/** The review card as the owner reads it, including why it is not ready (F24-AC2, F24-AC3). */
+export interface ReviewCardView {
+  readonly candidateFingerprint: string;
+  readonly headSha: string;
+  readonly baseSha: string;
+  readonly scopeFingerprint: string;
+  readonly scopeRevision: number;
+  readonly collectedAt: string;
+  readonly checks: readonly {
+    readonly checkId: string;
+    readonly name: string;
+    readonly origin: string | null;
+    readonly required: boolean;
+    readonly result: string;
+    readonly blocking: boolean;
+    readonly exitCode: number | null;
+    readonly artifactRef: string | null;
+    readonly detail: string | null;
+  }[];
+  readonly criteria: readonly {
+    readonly criterionId: string;
+    readonly text: string;
+    readonly methodKind: string;
+    readonly status: string;
+    readonly evidenceId: string | null;
+    readonly observedAt: string | null;
+    readonly detail: string | null;
+  }[];
+  readonly pendingOwnerTestCriterionIds: readonly string[];
+  readonly readyForOwnerTest: boolean;
+  /** Named reasons the work cannot be accepted, never an omission (F24-AC3). */
+  readonly notReady: readonly string[];
+}
+
+export interface ReviewCardUseCases {
+  /**
+   * The card for the candidate the run's work item currently offers.
+   *
+   * A run with no candidate yet is `NotFound`: an empty card would read as a candidate that
+   * passed nothing it was asked about (F24-AC3).
+   */
+  buildReviewCard(jobId: JobId): Promise<Result<ReviewCardView, DomainError>>;
+}
+
+/** One criterion's standing as the owner sees it before deciding (F25-AC1). */
+export interface CriterionStandingView {
+  readonly criterionId: string;
+  readonly text: string;
+  readonly methodKind: string;
+  readonly status: string;
+  /** False when no evidence row exists at all, which differs from one that failed. */
+  readonly observed: boolean;
+}
+
+/** The acceptance state the candidate currently holds, plus retained feedback (F25-AC2). */
+export interface AcceptanceView {
+  readonly candidateId: string;
+  readonly candidateFingerprint: string;
+  readonly state: string;
+  readonly decisionId: string | null;
+  readonly ownerId: string | null;
+  readonly decidedAt: string | null;
+  readonly note: string | null;
+  readonly staleReasons: readonly string[];
+  readonly retainedFeedback: readonly { readonly decisionId: string; readonly feedback: string }[];
+}
+
+export interface AcceptanceReportView {
+  readonly candidateId: string;
+  readonly workItemId: string;
+  readonly decisionId: string;
+  readonly state: 'Accepted';
+  readonly ownerId: string;
+  readonly decidedAt: string;
+  readonly candidateFingerprint: string;
+  readonly headSha: string;
+  readonly scopeFingerprint: string;
+  readonly observedDeployments: readonly {
+    readonly component: string;
+    readonly deploymentId: string | null;
+    readonly deploymentUrl: string | null;
+    readonly environment: string;
+  }[];
+  readonly feedbackHonoured: readonly { readonly decisionId: string; readonly feedback: string }[];
+}
+
+export interface ChangeRequestReportView {
+  readonly candidateId: string;
+  readonly workItemId: string;
+  readonly decisionId: string;
+  readonly state: 'ChangesRequested';
+  readonly ownerId: string;
+  readonly decidedAt: string;
+  readonly feedback: string;
+  /** The criteria the candidate had not satisfied, so the reason lands somewhere (F25-AC2). */
+  readonly outstandingCriterionIds: readonly string[];
+}
+
+export interface AcceptanceGateView {
+  readonly candidateFingerprint: string;
+  readonly headSha: string;
+  readonly scopeFingerprint: string;
+  readonly criteria: readonly CriterionStandingView[];
+  readonly outstandingCriterionIds: readonly string[];
+  readonly ready: boolean;
+}
+
+export interface AcceptanceUseCases {
+  /**
+   * Records the owner's reason against the candidate this run currently offers (F25-AC2).
+   *
+   * Keyed by run because that is what the owner acted on, and resolved to a candidate by
+   * the controller so a request cannot name a candidate the run does not offer (F25-AC3).
+   */
+  requestChanges(command: {
+    readonly jobId: JobId;
+    readonly reason: string;
+    readonly actor: string;
+    readonly at: string;
+  }): Promise<Result<ChangeRequestReportView, DomainError>>;
+  /** Records acceptance, or refuses with the outstanding criteria named (F25-AC1). */
+  recordAcceptance(command: {
+    readonly jobId: JobId;
+    readonly note: string | null;
+    readonly actor: string;
+    readonly at: string;
+  }): Promise<Result<AcceptanceReportView, DomainError>>;
+  currentAcceptance(jobId: JobId): Promise<Result<AcceptanceView, DomainError>>;
+  acceptanceGate(jobId: JobId): Promise<Result<AcceptanceGateView, DomainError>>;
+}
+
 /** The whole injected surface. One argument, so a missing use case is a type error. */
 export interface ControllerSurface {
   readonly owners: OwnerUseCases;
@@ -647,6 +1075,10 @@ export interface ControllerSurface {
   readonly profiles: ProfileUseCases;
   readonly connectors: ConnectorUseCases;
   readonly intake: IntakeUseCases;
+  readonly runs: RunUseCases;
+  readonly attention: AttentionUseCases;
+  readonly reviewCards: ReviewCardUseCases;
+  readonly acceptance: AcceptanceUseCases;
 }
 
 const REQUIRED_METHODS = {
@@ -671,6 +1103,19 @@ const REQUIRED_METHODS = {
     'applyOwnerCorrection',
     'exportIdea',
   ],
+  runs: [
+    'startRun',
+    'listRuns',
+    'getRun',
+    'pauseRun',
+    'resumeRun',
+    'cancelRun',
+    'grantExtension',
+    'declineExtension',
+  ],
+  attention: ['collectAttention', 'acknowledge'],
+  reviewCards: ['buildReviewCard'],
+  acceptance: ['requestChanges', 'recordAcceptance', 'currentAcceptance', 'acceptanceGate'],
 } as const satisfies Record<keyof ControllerSurface, readonly string[]>;
 
 export type ControllerGroup = keyof typeof REQUIRED_METHODS;
