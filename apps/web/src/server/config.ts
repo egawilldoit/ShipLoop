@@ -11,6 +11,7 @@
  * owner's workspace (F01-AC4, N02-AC1).
  */
 
+import { resolve } from 'node:path';
 import type { SessionCookieSameSite } from '@shiploop/domain';
 
 export type NodeEnvironment = 'production' | 'development' | 'test';
@@ -140,8 +141,8 @@ export function readServerConfig(env: NodeJS.ProcessEnv): ConfigResult {
       cookiePath,
       sessionAbsoluteTtlSeconds: absoluteTtlSeconds,
       sessionIdleTimeoutSeconds: idleTimeoutSeconds,
-      staticRoot: env['SHIPLOOP_STATIC_ROOT'] ?? null,
-      artifactRoot: env['SHIPLOOP_ARTIFACT_ROOT'] ?? null,
+      staticRoot: resolveConfiguredDirectory(env['SHIPLOOP_STATIC_ROOT']),
+      artifactRoot: resolveConfiguredDirectory(env['SHIPLOOP_ARTIFACT_ROOT']),
       trustProxy,
       bodyLimitBytes,
       logLevel: env['SHIPLOOP_LOG_LEVEL'] ?? 'info',
@@ -168,6 +169,20 @@ function readEnum<T extends string>(
     return fallback;
   }
   return match;
+}
+
+/**
+ * Resolves a configured directory to an absolute path, or records why it is unusable.
+ *
+ * `@fastify/static` requires an absolute root and refuses a relative one at plugin
+ * registration, which surfaces as a bare startup crash several frames deep instead
+ * of a configuration error naming the variable. Resolving here also makes the value
+ * independent of whatever directory the process happened to be started from, which
+ * matters because the worker and the server may be launched from different places.
+ */
+function resolveConfiguredDirectory(value: string | undefined): string | null {
+  if (value === undefined || value.trim() === '') return null;
+  return resolve(value.trim());
 }
 
 function readInteger(
