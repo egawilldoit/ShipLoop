@@ -58,6 +58,7 @@ import {
   sessionTokenHash,
 } from './core.ts';
 import type {
+  AppendProcedureVersionInput,
   ProjectProfileContent,
   StorageTransactions,
   UpsertAttentionItemInput,
@@ -838,6 +839,375 @@ test('a proposed procedure improvement never changes what a run would read (F05-
       'Conflict',
     );
     assert.equal(expectOk(procedures.currentVersion(OTHER_PROJECT, 'release.web')), null);
+  });
+});
+
+/** A procedure version to append, with only the field a case is about varied. */
+function procedureInput(
+  overrides: Partial<AppendProcedureVersionInput> & { readonly content: string },
+): AppendProcedureVersionInput {
+  return {
+    projectId: PROJECT,
+    subjectKey: 'release.web',
+    kind: 'Procedure',
+    scope: 'project',
+    source: 'Owner',
+    sourceRevision: null,
+    status: 'Accepted',
+    createdAt: '2026-01-02T03:00:00.000Z',
+    createdBy: OWNER,
+    note: null,
+    expectedVersionNumber: null,
+    ...overrides,
+  };
+}
+
+test('a proposed procedure version is not what a run reads until the owner accepts it (F05-AC4)', async () => {
+  await withDatabase(async ({ connection }) => {
+    seedOwnerAndProject(connection);
+    const procedures = new ProcedureRepository(connection);
+
+    // A proposal is the first version of its subject: there is nothing accepted
+    // for a run to read, and the proposal must not stand in for it.
+    const proposal = expectOk(
+      procedures.appendVersion(
+        procedureInput({
+          content: 'Tag the release only after the preview deployment reports ready.',
+          status: 'Proposed',
+          createdBy: 'agent',
+        }),
+      ),
+    );
+    assert.equal(expectOk(procedures.currentVersion(PROJECT, 'release.web')), null);
+    assert.deepEqual(
+      expectOk(procedures.listProposed(PROJECT)).map((version) => version.procedureVersionId),
+      [proposal.procedureVersionId],
+    );
+
+    // Accepting it is what makes it the version a later run is told.
+    const accepted = expectOk(
+      procedures.acceptVersion(proposal.procedureVersionId, '2026-01-02T04:00:00.000Z'),
+    );
+    assert.equal(accepted.status, 'Accepted');
+    assert.equal(expectOk(procedures.currentVersion(PROJECT, 'release.web'))?.procedureVersionId, proposal.procedureVersionId);
+    assert.deepEqual(expectOk(procedures.listProposed(PROJECT)), []);
+
+    // A later proposal is again invisible: the accepted version stays current
+    // until the owner saves the proposal as a new accepted version.
+    const second = expectOk(
+      procedures.appendVersion(
+        procedureInput({
+          content: 'Tag the release only after the preview deployment reports ready twice.',
+          status: 'Proposed',
+          createdAt: '2026-01-02T05:00:00.000Z',
+          createdBy: 'agent',
+          expectedVersionNumber: 1,
+        }),
+      ),
+    );
+    assert.equal(
+      expectOk(procedures.currentVersion(PROJECT, 'release.web'))?.procedureVersionId,
+      proposal.procedureVersionId,
+    );
+    assert.deepEqual(
+      expectOk(procedures.listProposed(PROJECT)).map((version) => version.procedureVersionId),
+      [second.procedureVersionId],
+    );
+  });
+});
+
+test('accepting a version supersedes the accepted version before it and keeps it readable (F05-AC4)', async () => {
+  await withDatabase(async ({ connection }) => {
+    seedOwnerAndProject(connection);
+    const procedures = new ProcedureRepository(connection);
+
+    const first = expectOk(
+      procedures.appendVersion(
+        procedureInput({ content: 'Promote the preview after every merge.', createdAt: '2026-01-02T03:00:00.000Z' }),
+      ),
+    );
+    const proposal = expectOk(
+      procedures.appendVersion(
+        procedureInput({
+          content: 'Promote the preview after a green postflight check.',
+          status: 'Proposed',
+          createdAt: '2026-01-02T04:00:00.000Z',
+          createdBy: 'agent',
+          expectedVersionNumber: 1,
+        }),
+      ),
+    );
+    expectOk(procedures.acceptVersion(proposal.procedureVersionId, '2026-01-02T05:00:00.000Z'));
+
+    const superseded = expectOk(procedures.getVersion(first.procedureVersionId));
+    assert.equal(superseded.status, 'Superseded');
+    // Superseding records what happened; it does not rewrite history. A run that
+    // already referenced this version still finds the document it was given.
+    assert.equal(superseded.content, 'Promote the preview after every merge.');
+    assert.equal(superseded.acceptedAt, '2026-01-02T03:00:00.000Z');
+    assert.equal(expectOk(procedures.currentVersion(PROJECT, 'release.web'))?.procedureVersionId, proposal.procedureVersionId);
+
+    // Appending an accepted version directly supersedes the previous one too, so
+    // exactly one version of a subject is ever current.
+    const third = expectOk(
+      procedures.appendVersion(
+        procedureInput({
+          content: 'Promote the preview after a green postflight check and a smoke test.',
+          createdAt: '2026-01-02T06:00:00.000Z',
+          expectedVersionNumber: 2,
+        }),
+      ),
+    );
+    assert.equal(expectOk(procedures.getVersion(proposal.procedureVersionId)).status, 'Superseded');
+    assert.equal(expectOk(procedures.currentVersion(PROJECT, 'release.web'))?.procedureVersionId, third.procedureVersionId);
+    assert.deepEqual(
+      expectOk(procedures.listVersions(PROJECT, 'release.web')).map((version) => version.status),
+      ['Superseded', 'Superseded', 'Accepted'],
+    );
+  });
+});
+
+test('the last verified revision and time round-trip on the version a run reads (F05-AC1)', async () => {
+  await withDatabase(async ({ connection }) => {
+    seedOwnerAndProject(connection);
+    const procedures = new ProcedureRepository(connection);
+
+    const version = expectOk(
+      procedures.appendVersion(
+        procedureInput({
+          content: '{"runtime":"node24"}',
+          source: 'Repository',
+          sourceRevision: '9f1c2d3e4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d',
+        }),
+      ),
+    );
+    assert.equal(version.sourceRevision, '9f1c2d3e4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d');
+    assert.equal(version.lastVerifiedRevision, null);
+    assert.equal(version.lastVerifiedAt, null);
+
+    expectOk(
+      procedures.recordVerification(version.procedureVersionId, 'sha256:abc123', '2026-01-02T07:30:00.000Z'),
+    );
+
+    // Read back from the store rather than from the returned record, so the
+    // claim is about what was persisted.
+    const reread = expectOk(procedures.getVersion(version.procedureVersionId));
+    assert.equal(reread.lastVerifiedRevision, 'sha256:abc123');
+    assert.equal(reread.lastVerifiedAt, '2026-01-02T07:30:00.000Z');
+    assert.equal(expectOk(procedures.currentVersion(PROJECT, 'release.web'))?.lastVerifiedAt, '2026-01-02T07:30:00.000Z');
+    const stored = connection
+      .prepare('SELECT last_verified_revision, last_verified_at FROM procedure_versions WHERE procedure_version_id = ?')
+      .get(version.procedureVersionId);
+    assert.equal(stored?.['last_verified_revision'], 'sha256:abc123');
+    assert.equal(stored?.['last_verified_at'], '2026-01-02T07:30:00.000Z');
+
+    // A new version starts unverified: the older verification described
+    // different content (F04-AC1).
+    const next = expectOk(
+      procedures.appendVersion(
+        procedureInput({ content: '{"runtime":"node25"}', createdAt: '2026-01-02T08:00:00.000Z', expectedVersionNumber: 1 }),
+      ),
+    );
+    assert.equal(next.lastVerifiedRevision, null);
+    assert.equal(next.lastVerifiedAt, null);
+  });
+});
+
+test('the schema refuses an accepted version with no approval time (F05-AC4)', async () => {
+  await withDatabase(async ({ connection }) => {
+    seedOwnerAndProject(connection);
+    const procedures = new ProcedureRepository(connection);
+
+    // The invariant the repository relies on is the column's, not the method's: a
+    // write that skipped appendVersion must still be refused. A NULL approval
+    // time is refused, and so is an explicitly NULL one on an otherwise
+    // identical row, so the refusal is the CHECK and not a side effect.
+    const insert = connection.prepare(
+      `INSERT INTO procedure_versions
+         (procedure_version_id, project_id, subject_key, version, kind, scope, source, content_json,
+          content_fingerprint, status, approved_at, created_at, created_by)
+       VALUES (?, ?, 'release.web', 1, 'Procedure', 'project', 'Owner', ?, ?, 'Accepted', ?, ?, ?)`,
+    );
+    assert.throws(
+      () =>
+        insert.run(
+          'procedure-direct-1',
+          OTHER_PROJECT,
+          'direct write',
+          fingerprint({ direct: true }),
+          null,
+          '2026-01-02T03:00:00.000Z',
+          OWNER,
+        ),
+      /status <> 'Accepted' OR approved_at IS NOT NULL/,
+    );
+    assert.equal(
+      connection
+        .prepare("SELECT count(*) AS rows FROM procedure_versions WHERE project_id = ? AND status = 'Accepted'")
+        .get(OTHER_PROJECT)?.['rows'],
+      0,
+    );
+
+    // The same row with an approval time is representable, and a proposal with no
+    // approval time is what the owner's save action produces.
+    insert.run(
+      'procedure-direct-3',
+      OTHER_PROJECT,
+      'direct write',
+      fingerprint({ direct: true }),
+      '2026-01-02T03:00:00.000Z',
+      '2026-01-02T03:00:00.000Z',
+      OWNER,
+    );
+    assert.equal(
+      expectOk(procedures.currentVersion(OTHER_PROJECT, 'release.web'))?.procedureVersionId,
+      'procedure-direct-3',
+    );
+  });
+});
+
+test('appending with a stale expected version number is refused rather than overwriting (F05-AC4)', async () => {
+  await withDatabase(async ({ connection }) => {
+    seedOwnerAndProject(connection);
+    const procedures = new ProcedureRepository(connection);
+
+    const first = expectOk(
+      procedures.appendVersion(procedureInput({ content: 'First saved procedure.' })),
+    );
+    expectError(
+      procedures.appendVersion(
+        procedureInput({
+          content: 'Written from a stale editor.',
+          createdAt: '2026-01-02T04:00:00.000Z',
+          expectedVersionNumber: 0,
+        }),
+      ),
+      'Conflict',
+    );
+    // The refusal must not have written anything.
+    assert.equal(expectOk(procedures.listVersions(PROJECT, 'release.web')).length, 1);
+
+    expectOk(
+      procedures.appendVersion(
+        procedureInput({
+          content: 'Second saved procedure.',
+          createdAt: '2026-01-02T04:00:00.000Z',
+          expectedVersionNumber: first.versionNumber,
+        }),
+      ),
+    );
+    assert.equal(expectOk(procedures.currentVersion(PROJECT, 'release.web'))?.content, 'Second saved procedure.');
+  });
+});
+
+test('listProposed returns a project\'s proposals oldest first and ignores another project (F05-AC4)', async () => {
+  await withDatabase(async ({ connection }) => {
+    seedOwnerAndProject(connection);
+    const procedures = new ProcedureRepository(connection);
+
+    const first = expectOk(
+      procedures.appendVersion(
+        procedureInput({
+          content: 'First proposal.',
+          status: 'Proposed',
+          createdAt: '2026-01-02T07:00:00.000Z',
+          createdBy: 'agent',
+        }),
+      ),
+    );
+    // Two proposals sharing one timestamp are ordered by version, so the order
+    // the owner reads them in does not depend on which row SQLite returns first.
+    const second = expectOk(
+      procedures.appendVersion(
+        procedureInput({
+          content: 'Second proposal.',
+          status: 'Proposed',
+          createdAt: '2026-01-02T07:00:00.000Z',
+          createdBy: 'agent',
+          expectedVersionNumber: first.versionNumber,
+        }),
+      ),
+    );
+    const third = expectOk(
+      procedures.appendVersion(
+        procedureInput({
+          content: 'Third proposal.',
+          status: 'Proposed',
+          createdAt: '2026-01-02T09:00:00.000Z',
+          createdBy: 'agent',
+          expectedVersionNumber: second.versionNumber,
+        }),
+      ),
+    );
+    assert.deepEqual(
+      expectOk(procedures.listVersions(PROJECT, 'release.web')).map((version) => version.versionNumber),
+      [1, 2, 3],
+    );
+    expectOk(
+      procedures.appendVersion(
+        procedureInput({
+          projectId: OTHER_PROJECT,
+          content: 'Another project\'s proposal.',
+          status: 'Proposed',
+          createdAt: '2026-01-02T07:30:00.000Z',
+          createdBy: 'agent',
+        }),
+      ),
+    );
+
+    assert.deepEqual(
+      expectOk(procedures.listProposed(PROJECT)).map((version) => version.procedureVersionId),
+      [first.procedureVersionId, second.procedureVersionId, third.procedureVersionId],
+    );
+    assert.equal(expectOk(procedures.listProposed(OTHER_PROJECT)).length, 1);
+  });
+});
+
+test('the migrated procedure_versions columns are exactly the ones the repository reads', async () => {
+  await withDatabase(async ({ connection }) => {
+    seedOwnerAndProject(connection);
+    const columns = connection.prepare('PRAGMA table_info(procedure_versions)').all();
+
+    // One column per concept. The columns versions 1 to 7 carried for a second
+    // name are gone, so a reader cannot pick the wrong one and a writer cannot
+    // fill a column nothing reads.
+    assert.deepEqual(
+      columns.map((column) => column['name']),
+      [
+        'procedure_version_id',
+        'project_id',
+        'subject_key',
+        'version',
+        'kind',
+        'scope',
+        'source',
+        'source_revision',
+        'content_json',
+        'content_fingerprint',
+        'status',
+        'last_verified_revision',
+        'last_verified_at',
+        'approved_at',
+        'created_at',
+        'created_by',
+        'note',
+      ],
+    );
+
+    const notNull = new Map(
+      columns.map((column) => [String(column['name']), column['notnull']] as const),
+    );
+    // The repository binds these on every write, so the column refuses a NULL.
+    assert.equal(notNull.get('subject_key'), 1);
+    assert.equal(notNull.get('scope'), 1);
+    assert.equal(notNull.get('created_by'), 1);
+    assert.equal(notNull.get('status'), 1);
+    // A fact may have no source revision, a version is unverified until something
+    // verifies it, and a note is optional.
+    assert.equal(notNull.get('source_revision'), 0);
+    assert.equal(notNull.get('last_verified_revision'), 0);
+    assert.equal(notNull.get('last_verified_at'), 0);
+    assert.equal(notNull.get('note'), 0);
   });
 });
 

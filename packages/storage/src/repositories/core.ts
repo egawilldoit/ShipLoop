@@ -899,10 +899,18 @@ export class ConnectorRepository extends SqlRepository implements ConnectorStore
 }
 
 const PROCEDURE_COLUMNS =
-  'procedure_version_id, project_id, subject_key, version, kind, scope, source, source_revision, content, content_fingerprint, status, last_verified_revision, last_verified_at, approved_at, created_at, created_by, note';
+  'procedure_version_id, project_id, subject_key, version, kind, scope, source, source_revision, content_json, content_fingerprint, status, last_verified_revision, last_verified_at, approved_at, created_at, created_by, note';
 
 const PROCEDURE_STATUSES: readonly string[] = ['Proposed', 'Accepted', 'Superseded', 'Retired'];
 
+/**
+ * Reads a stored document back as the exact text the caller wrote.
+ *
+ * The column holds the canonical JSON document, and it is not re-encoded on the
+ * way out: a reader parses this string, so wrapping it in another JSON string
+ * here would hand back a quoted document that parses into text rather than into
+ * the stored recipe (F04-AC1).
+ */
 function toProcedureVersion(row: SqlRow): ProcedureVersion {
   return {
     procedureVersionId: requiredText(row, 'procedure_version_id') as ProcedureVersionId,
@@ -913,7 +921,7 @@ function toProcedureVersion(row: SqlRow): ProcedureVersion {
     scope: requiredText(row, 'scope'),
     source: requiredText(row, 'source') as ProcedureSource,
     sourceRevision: nullableText(row, 'source_revision'),
-    content: requiredText(row, 'content'),
+    content: requiredText(row, 'content_json'),
     contentFingerprint: requiredText(row, 'content_fingerprint') as Fingerprint,
     status: requiredText(row, 'status') as ProcedureStatus,
     lastVerifiedRevision: nullableText(row, 'last_verified_revision'),
@@ -943,6 +951,16 @@ export class ProcedureRepository extends SqlRepository implements ProcedureStore
             { path: 'status', message: `Must be one of ${PROCEDURE_STATUSES.join(', ')}.` },
           ]));
         }
+        // A procedure can be the first thing recorded for a project, and the schema
+        // makes its project_id a foreign key, so the parent row is created here
+        // rather than demanded as a separate provisioning step. The name comes from
+        // the scope so the row never carries a placeholder a later profile save
+        // would contradict. `ON CONFLICT DO NOTHING` leaves an existing project
+        // untouched, so appending a version never resets a project.
+        this.statement(
+          'INSERT INTO projects (project_id, name, created_at, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT (project_id) DO NOTHING',
+        ).run(input.projectId, input.scope.trim() === '' ? String(input.projectId) : input.scope.trim(), input.createdAt, input.createdAt);
+
         const newest = this.statement(
           'SELECT version FROM procedure_versions WHERE project_id = ? AND subject_key = ? ORDER BY version DESC LIMIT 1',
         ).get(input.projectId, input.subjectKey);
@@ -963,7 +981,7 @@ export class ProcedureRepository extends SqlRepository implements ProcedureStore
         }
         const versionId = newId<'ProcedureVersionId'>();
         this.statement(
-          `INSERT INTO procedure_versions (${PROCEDURE_COLUMNS}, content_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?)`,
+          `INSERT INTO procedure_versions (${PROCEDURE_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?)`,
         ).run(
           versionId,
           input.projectId,
@@ -980,7 +998,6 @@ export class ProcedureRepository extends SqlRepository implements ProcedureStore
           input.createdAt,
           input.createdBy,
           input.note,
-          canonicalize(input.content),
         );
         const created = this.statement(
           `SELECT ${PROCEDURE_COLUMNS} FROM procedure_versions WHERE procedure_version_id = ?`,
