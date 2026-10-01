@@ -22,5 +22,7 @@ export * from './connectors.ts';
 export * from './intake.ts';
 export * from './profiles.ts';
 export * from './publication.ts';
+export * from './jobs.ts';
+export * from './attention.ts';
 export * from './sessions.ts';
 export * from './web-surface.ts';
