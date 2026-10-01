@@ -1,6 +1,6 @@
 /**
- * The composition root (F01-AC1, F02-AC1, F03-AC1, ARCHITECTURE "Authority and
- * durable state").
+ * The composition root (F01-AC1, F02-AC1, F03-AC1, F06-AC1, F07-AC3, ARCHITECTURE
+ * "Authority and durable state").
  *
  * One place where the durable store, the clock and the adapters are bound, so the
  * web layer obtains dependencies rather than constructing them and every process
@@ -18,9 +18,11 @@
  * The root verifies that the tables and columns its repositories need actually
  * exist after migrating, and refuses to start with a named cause rather than
  * handing out a root whose every use case would throw "no such table" or "no such
- * column". Owner credentials are read from and written to the owner row itself,
- * because `@shiploop/storage` owns those columns and a second credential table
- * would put sign-in state outside the backup.
+ * column". Intake's tables are in that list because an idea that cannot be stored
+ * would fail at the first capture, which is the one request the owner cannot afford to
+ * lose (F06-AC2). Owner credentials are read from and written to the owner row itself,
+ * because `@shiploop/storage` owns those columns and a second credential table would
+ * put sign-in state outside the backup.
  */
 
 import {
@@ -37,6 +39,8 @@ import {
   migrate,
   openDatabase,
   ConnectorRepository,
+  IdeaRepository,
+  IntakeRepository,
   OwnerRepository,
   ProcedureRepository,
   ProjectProfileRepository,
@@ -51,6 +55,8 @@ import type {
 import type { PreflightDeps } from '@shiploop/verification';
 import type { AdapterRegistry, ConnectorUseCases } from './connectors.ts';
 import { createConnectorUseCases } from './connectors.ts';
+import type { IntakeArtifactRoot, IntakeUseCases } from './intake.ts';
+import { createIntakeUseCases } from './intake.ts';
 import type { ControllerClock, OwnerCredentialRecord, OwnerCredentialStore, ProfileUseCases } from './profiles.ts';
 import { createProfileUseCases } from './profiles.ts';
 import type { SessionUseCases } from './sessions.ts';
@@ -74,6 +80,16 @@ export interface CompositionRootConfig {
   readonly preflight?: PreflightDeps;
   readonly openDatabaseOptions?: OpenDatabaseOptions;
   readonly migrateOptions?: MigrateOptions;
+  /**
+   * Directory intake attachment bytes are written under (F06-AC1).
+   *
+   * Required rather than defaulted because the only honest default is none: writing
+   * an owner's attachment somewhere this configuration did not name would produce a
+   * file the owner cannot find and cannot delete through the product. A root of null
+   * means attachments are refused by name rather than written to a temporary
+   * directory nobody backs up (F01-AC3).
+   */
+  readonly artifactRoot?: IntakeArtifactRoot;
 }
 
 /**
@@ -86,8 +102,11 @@ export interface CompositionRoot {
   readonly profiles: ProjectProfileRepository;
   readonly connectors: ConnectorRepository;
   readonly procedures: ProcedureRepository;
+  readonly intake: IntakeRepository;
+  readonly ideas: IdeaRepository;
   readonly credentials: OwnerCredentialStore;
   readonly useCases: ProfileUseCases & ConnectorUseCases;
+  readonly intakeUseCases: IntakeUseCases;
   readonly sessionUseCases: SessionUseCases;
   /** Closes only the database handle this root opened. */
   close(): Result<true, DomainError>;
@@ -100,6 +119,11 @@ const REQUIRED_TABLES: readonly string[] = [
   'project_profile_versions',
   'connectors',
   'procedure_versions',
+  'ideas',
+  'idea_messages',
+  'idea_attachments',
+  'idea_questions',
+  'briefs',
 ];
 
 /**
@@ -265,6 +289,8 @@ export function createCompositionRoot(config: CompositionRootConfig): Result<Com
   const profiles = new ProjectProfileRepository(database);
   const connectors = new ConnectorRepository(database);
   const procedures = new ProcedureRepository(database);
+  const intake = new IntakeRepository(database);
+  const ideas = new IdeaRepository(database);
   const credentials = new SqliteOwnerCredentialStore(database);
 
   const profileUseCases = createProfileUseCases({
@@ -280,6 +306,12 @@ export function createCompositionRoot(config: CompositionRootConfig): Result<Com
   });
   const connectorUseCases = createConnectorUseCases({ clock: config.clock, connectors, adapters: config.adapters });
   const sessionUseCases = createSessionUseCases({ clock: config.clock, owners });
+  const intakeUseCases = createIntakeUseCases({
+    clock: config.clock,
+    intake,
+    ideas,
+    artifactRoot: config.artifactRoot ?? null,
+  });
 
   let closed = false;
 
@@ -289,8 +321,11 @@ export function createCompositionRoot(config: CompositionRootConfig): Result<Com
     profiles,
     connectors,
     procedures,
+    intake,
+    ideas,
     credentials,
     useCases: { ...profileUseCases, ...connectorUseCases },
+    intakeUseCases,
     sessionUseCases,
     close(): Result<true, DomainError> {
       if (closed) return ok(true);

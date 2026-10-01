@@ -17,10 +17,11 @@
  *     calls; the transport speaks of `tokenDigest`, `lastActivityAt` and one
  *     command object. Two vocabularies for one row are fine as long as exactly one
  *     translation exists, and this file is it.
- *   - promisification. The use cases are synchronous because their storage is a
+ *   - promisification. Most use cases are synchronous because their storage is a
  *     single local writer; the port is asynchronous because the port is not
- *     storage. Wrapping rather than rewriting keeps the use cases testable without
- *     a promise in sight.
+ *     storage, and one of them is asynchronous because it writes an attachment
+ *     file. Wrapping rather than rewriting keeps the use cases testable without a
+ *     promise in sight.
  *   - the owner actor. `saveProfile` and the connector use cases demand an actor
  *     and judge its role. Writes carry the owner the transport proved; reads carry
  *     no caller at all in the port, so the adapter resolves the single provisioned
@@ -48,17 +49,32 @@ import type {
   CapabilityKind,
   ConnectorId,
   DomainError,
+  IdeaId,
   OwnerId,
   ProfileVersionId,
   ProjectId,
   Result,
 } from '@shiploop/domain';
-import type { ConnectorKind, ConnectorRecord, ConnectorState } from '@shiploop/storage';
+import type { ConnectorKind, ConnectorRecord, ConnectorState, IdeaExport } from '@shiploop/storage';
 import type { CompositionRoot } from './composition.ts';
 import { createCompositionRoot } from './composition.ts';
+import type { IdeaDraft } from '@shiploop/domain';
 import type { ControllerClock, OwnerActor } from './profiles.ts';
 import type { StoredSessionRecord } from './sessions.ts';
 import type { AdapterRegistry, ConnectorProbe } from './connectors.ts';
+import type {
+  BriefSectionsInput,
+  BriefView,
+  BriefVersionView,
+  CapturedIdeaView,
+  ClarificationRoundView,
+  ClarifyingQuestionView,
+  CorrectionView,
+  IntakeDetailView,
+  RejectedCandidateView,
+  RelatedWorkChoiceView,
+  RelatedWorkView,
+} from './intake.ts';
 
 /** The connector kinds the transport names. Storage names the same four. */
 export type SurfaceConnectorKind = ConnectorKind;
@@ -219,12 +235,160 @@ export interface SurfaceConnectorUseCases {
   }): Promise<Result<SurfaceConnector, DomainError>>;
 }
 
+
+/**
+ * One captured request as the transport names it (F06-AC1, F06-AC3, F06-AC5).
+ *
+ * The controller's own view nests the request inside an `IdeaDraft` and keeps the bug
+ * detail inside a discriminated union. The transport names the same facts flat, with
+ * the kind and the three optional bug fields as siblings, so this file is where that
+ * one translation lives rather than in each of the fifteen intake routes.
+ */
+export interface SurfaceIntakeIdea {
+  readonly ideaId: IdeaId;
+  readonly rawRequest: string;
+  readonly projectId: string | null;
+  readonly notes: string | null;
+  readonly kind: 'FeatureRequest' | 'Bug';
+  readonly bugDetail: {
+    readonly expected: string | null;
+    readonly actual: string | null;
+    readonly reproduction: string | null;
+  };
+  readonly attachments: readonly { readonly name: string; readonly mediaType: string; readonly byteSize: number; readonly addedAt: string }[];
+  readonly summary: {
+    readonly text: string;
+    readonly generatedAt: string;
+    readonly generatedBy: string;
+    readonly rawRequestFingerprint: string;
+  } | null;
+  readonly disposition: 'Unpublished' | 'Published' | 'Deferred' | 'Archived';
+  readonly dispositionDetail: string | null;
+  readonly capturedAt: string;
+}
+
+export interface SurfaceRelatednessReport {
+  readonly candidateIdeaId: IdeaId;
+  readonly score: number;
+  readonly reasons: readonly string[];
+  readonly mergeable: false;
+  readonly discardable: false;
+  readonly disposition: 'OwnerChoiceRequired';
+  readonly ownerChoices: readonly ('LinkToExisting' | 'ExtendExisting' | 'CreateNewIssue')[];
+}
+
+export interface SurfaceIntakeDetail {
+  readonly idea: SurfaceIntakeIdea;
+  readonly brief: {
+    readonly briefId: string | null;
+    readonly currentVersion: number | null;
+    readonly current: BriefVersionView | null;
+    readonly versions: readonly BriefVersionView[];
+  };
+  readonly questions: readonly ClarifyingQuestionView[];
+  readonly rejected: readonly RejectedCandidateView[];
+  readonly turns: readonly {
+    readonly kind: 'RawRequest' | 'Question' | 'Answer' | 'Correction';
+    readonly at: string;
+    readonly text: string;
+    readonly reference: string | null;
+  }[];
+}
+
+/**
+ * The intake port the transport loads.
+ *
+ * Every command carries `actor` on a write and nothing on a read, following the same
+ * rule as the other groups: the transport has proven who is asking, and reads carry
+ * no caller so a read cannot be authorized by a request body (F01-AC1). The view
+ * types are the controller's own, because this file's job is translating vocabulary
+ * and not restating shapes.
+ */
+export interface SurfaceIntakeUseCases {
+  captureIdea(command: {
+    readonly rawRequest: string;
+    readonly kind: 'FeatureRequest' | 'Bug';
+    readonly projectId: string | null;
+    readonly notes: string | null;
+    readonly detail: { readonly expected: string | null; readonly actual: string | null; readonly reproduction: string | null } | null;
+    readonly actor: OwnerId;
+  }): Promise<Result<SurfaceIntakeIdea, DomainError>>;
+  listIdeas(): Promise<Result<readonly SurfaceIntakeIdea[], DomainError>>;
+  getIdea(ideaId: IdeaId): Promise<Result<SurfaceIntakeDetail, DomainError>>;
+  attachFile(command: {
+    readonly ideaId: IdeaId;
+    readonly name: string;
+    readonly mediaType: string;
+    readonly content: string;
+    readonly actor: OwnerId;
+  }): Promise<Result<SurfaceIntakeIdea, DomainError>>;
+  recordSummary(command: {
+    readonly ideaId: IdeaId;
+    readonly text: string;
+    readonly generatedBy: string;
+    readonly actor: OwnerId;
+  }): Promise<Result<SurfaceIntakeIdea, DomainError>>;
+  archiveIdea(command: {
+    readonly ideaId: IdeaId;
+    readonly reason: string | null;
+    readonly actor: OwnerId;
+  }): Promise<Result<SurfaceIntakeIdea, DomainError>>;
+  deferIdea(command: {
+    readonly ideaId: IdeaId;
+    readonly reason: string | null;
+    readonly actor: OwnerId;
+  }): Promise<Result<SurfaceIntakeIdea, DomainError>>;
+  findRelatedWork(ideaId: IdeaId): Promise<Result<readonly SurfaceRelatednessReport[], DomainError>>;
+  recordRelatedWorkChoice(command: {
+    readonly ideaId: IdeaId;
+    readonly candidateIdeaId: IdeaId;
+    readonly choice: string;
+    readonly actor: OwnerId;
+  }): Promise<Result<RelatedWorkChoiceView, DomainError>>;
+  draftBrief(command: {
+    readonly ideaId: IdeaId;
+    readonly authoredBy: 'Owner' | 'ClarificationModel' | 'OwnerEdit';
+    readonly sections: BriefSectionsInput;
+    readonly basedOnBriefVersion: number | null;
+    readonly actor: OwnerId;
+  }): Promise<Result<BriefVersionView, DomainError>>;
+  agreeBrief(command: { readonly ideaId: IdeaId; readonly actor: OwnerId }): Promise<Result<BriefVersionView, DomainError>>;
+  askClarifyingQuestions(command: {
+    readonly ideaId: IdeaId;
+    readonly sections: BriefSectionsInput;
+    readonly ambiguities: readonly {
+      readonly kind: 'UnspecifiedSubject' | 'ConflictingStatement' | 'MissingAcceptanceThreshold' | 'UnstatedScopeBoundary' | 'UnresolvedDependency';
+      readonly topic: string;
+      readonly readings: readonly string[];
+      readonly answeredBy: readonly string[];
+      readonly impact: 'ChangesBehaviour' | 'ChangesAcceptance' | 'Cosmetic';
+      readonly evidence: string;
+    }[];
+    readonly actor: OwnerId;
+  }): Promise<Result<ClarificationRoundView, DomainError>>;
+  answerClarifyingQuestion(command: {
+    readonly ideaId: IdeaId;
+    readonly questionId: string;
+    readonly answer: string;
+    readonly actor: OwnerId;
+  }): Promise<Result<ClarifyingQuestionView, DomainError>>;
+  applyOwnerCorrection(command: {
+    readonly ideaId: IdeaId;
+    readonly text: string;
+    readonly sections: BriefSectionsInput;
+    readonly basedOnBriefVersion: number;
+    readonly actor: OwnerId;
+  }): Promise<Result<CorrectionView, DomainError>>;
+  exportIdea(ideaId: IdeaId): Promise<Result<IdeaExport, DomainError>>;
+}
+
 /** The whole injected surface. One argument, so a missing use case is a type error. */
 export interface ControllerSurface {
   readonly owners: SurfaceOwnerUseCases;
   readonly sessions: SurfaceSessionUseCases;
   readonly profiles: SurfaceProfileUseCases;
   readonly connectors: SurfaceConnectorUseCases;
+  readonly intake: SurfaceIntakeUseCases;
 }
 
 /**
@@ -292,6 +456,95 @@ function toSurfaceProfile(version: {
 }
 
 /**
+ * One draft as the transport's flat view of it (F06-AC1, F06-AC3).
+ *
+ * The kind and the bug detail are read out of the domain's discriminated union here
+ * and nowhere else, so the routes never have to know that "a feature request with
+ * reproduction steps" is not a shape the product recognises.
+ */
+function toSurfaceIdea(view: CapturedIdeaView): SurfaceIntakeIdea {
+  const idea: IdeaDraft = view.idea;
+  const request = idea.request;
+  const disposition = idea.disposition;
+  return {
+    ideaId: idea.ideaId,
+    rawRequest: idea.rawRequest,
+    projectId: idea.projectId,
+    notes: idea.notes,
+    kind: request.kind,
+    bugDetail:
+      request.kind === 'Bug'
+        ? {
+            expected: request.detail.expected,
+            actual: request.detail.actual,
+            reproduction: request.detail.reproduction,
+          }
+        : { expected: null, actual: null, reproduction: null },
+    attachments: [...view.attachments],
+    summary:
+      view.summary === null
+        ? null
+        : {
+            text: view.summary.text,
+            generatedAt: view.summary.generatedAt,
+            generatedBy: view.summary.generatedBy,
+            rawRequestFingerprint: view.summary.rawRequestFingerprint,
+          },
+    disposition: disposition.state,
+    dispositionDetail:
+      disposition.state === 'Archived'
+        ? (disposition.reason ?? 'archived without a stated reason')
+        : disposition.state === 'Deferred'
+          ? (disposition.reason ?? 'deferred without a stated reason')
+          : disposition.state === 'Published'
+            ? `${disposition.workItemIds.length} work item(s), ${disposition.codingRunIds.length} coding run(s)`
+            : null,
+    capturedAt: idea.capturedAt,
+  };
+}
+
+/**
+ * One resemblance report, keyed by the candidate's identity (F06-AC4).
+ *
+ * The report is reported whole, including the literal `false` flags and the single
+ * `OwnerChoiceRequired` disposition, because dropping them here is exactly how a
+ * client would come to read a high score as permission to merge.
+ */
+function toSurfaceRelatedness(entries: readonly RelatedWorkView[]): SurfaceRelatednessReport[] {
+  return entries.map((entry) => ({
+    candidateIdeaId: entry.candidate.idea.ideaId,
+    score: entry.report.score,
+    reasons: [...entry.report.reasons],
+    mergeable: entry.report.mergeable,
+    discardable: entry.report.discardable,
+    disposition: entry.report.disposition,
+    ownerChoices: [...entry.report.ownerChoices],
+  }));
+}
+
+/**
+ * Everything one captured request consists of, in the transport's vocabulary.
+ *
+ * The brief and the questions are carried whole: this file renames vocabularies and
+ * flattens the one idea view, and it does not reshape facts the owner reads.
+ */
+function toSurfaceDetail(detail: IntakeDetailView): SurfaceIntakeDetail {
+  const brief: BriefView = detail.brief;
+  return {
+    idea: toSurfaceIdea({ idea: detail.idea, summary: detail.idea.summary, attachments: detail.idea.attachments, disposition: detail.idea.disposition.state }),
+    brief: {
+      briefId: brief.briefId,
+      currentVersion: brief.currentVersion,
+      current: brief.current,
+      versions: brief.versions,
+    },
+    questions: detail.questions,
+    rejected: detail.rejected,
+    turns: detail.turns,
+  };
+}
+
+/**
  * Builds the surface a transport can inject.
  *
  * Every method is a one-line delegation, so a use case whose shape changes breaks
@@ -299,12 +552,12 @@ function toSurfaceProfile(version: {
  */
 export function createControllerSurface(resolve: SurfaceRootResolver): ControllerSurface {
   const use = async <T>(
-    body: (root: CompositionRoot) => Result<T, DomainError>,
+    body: (root: CompositionRoot) => Result<T, DomainError> | Promise<Result<T, DomainError>>,
   ): Promise<Result<T, DomainError>> => {
     const root = resolve();
     if (!root.ok) return root;
     try {
-      return body(root.value);
+      return await body(root.value);
     } catch (error) {
       return err({
         code: 'Unavailable',
@@ -492,6 +745,159 @@ export function createControllerSurface(resolve: SurfaceRootResolver): Controlle
           return ok(toSurfaceConnector(stored.value));
         }),
     },
+
+    intake: {
+      captureIdea: async (command) =>
+        use((root) => {
+          const captured = root.intakeUseCases.captureIdea(
+            {
+              rawRequest: command.rawRequest,
+              kind: command.kind,
+              projectId: command.projectId,
+              notes: command.notes,
+              detail: command.detail,
+            },
+            ownerActor(command.actor),
+          );
+          if (!captured.ok) return err(captured.error);
+          return ok(toSurfaceIdea(captured.value));
+        }),
+
+      /**
+       * Reads carry no caller, so the owner is resolved rather than assumed, and the
+       * same `requireOwner` gate every write passes is what a read passes (F01-AC1).
+       */
+      listIdeas: async () =>
+        use((root) => {
+          const actor = root.useCases.resolveOwnerActor();
+          if (!actor.ok) return err(actor.error);
+          const listed = root.intakeUseCases.listIdeas(actor.value);
+          if (!listed.ok) return err(listed.error);
+          return ok(listed.value.map(toSurfaceIdea));
+        }),
+
+      getIdea: async (ideaId) =>
+        use((root) => {
+          const actor = root.useCases.resolveOwnerActor();
+          if (!actor.ok) return err(actor.error);
+          const detail = root.intakeUseCases.getIdea(ideaId, actor.value);
+          if (!detail.ok) return err(detail.error);
+          return ok(toSurfaceDetail(detail.value));
+        }),
+
+      attachFile: async (command) =>
+        use(async (root) => {
+          const attached = await root.intakeUseCases.attachFile(
+            {
+              ideaId: command.ideaId,
+              name: command.name,
+              mediaType: command.mediaType,
+              content: command.content,
+            },
+            ownerActor(command.actor),
+          );
+          if (!attached.ok) return err(attached.error);
+          return ok(toSurfaceIdea(attached.value));
+        }),
+
+      recordSummary: async (command) =>
+        use((root) => {
+          const summarized = root.intakeUseCases.recordSummary(
+            { ideaId: command.ideaId, text: command.text, generatedBy: command.generatedBy },
+            ownerActor(command.actor),
+          );
+          if (!summarized.ok) return err(summarized.error);
+          return ok(toSurfaceIdea(summarized.value));
+        }),
+
+      archiveIdea: async (command) =>
+        use((root) => {
+          const archived = root.intakeUseCases.archiveIdea(
+            { ideaId: command.ideaId, reason: command.reason },
+            ownerActor(command.actor),
+          );
+          if (!archived.ok) return err(archived.error);
+          return ok(toSurfaceIdea(archived.value));
+        }),
+
+      deferIdea: async (command) =>
+        use((root) => {
+          const deferred = root.intakeUseCases.deferIdea(
+            { ideaId: command.ideaId, reason: command.reason },
+            ownerActor(command.actor),
+          );
+          if (!deferred.ok) return err(deferred.error);
+          return ok(toSurfaceIdea(deferred.value));
+        }),
+
+      findRelatedWork: async (ideaId) =>
+        use((root) => {
+          const actor = root.useCases.resolveOwnerActor();
+          if (!actor.ok) return err(actor.error);
+          const related = root.intakeUseCases.findRelatedWork({ ideaId }, actor.value);
+          if (!related.ok) return err(related.error);
+          return ok(toSurfaceRelatedness(related.value));
+        }),
+
+      recordRelatedWorkChoice: async (command) =>
+        use((root) => root.intakeUseCases.recordRelatedWorkChoice({
+          ideaId: command.ideaId,
+          candidateIdeaId: command.candidateIdeaId,
+          choice: command.choice,
+        }, ownerActor(command.actor))),
+
+      draftBrief: async (command) =>
+        use((root) =>
+          root.intakeUseCases.draftBrief(
+            {
+              ideaId: command.ideaId,
+              authoredBy: command.authoredBy,
+              sections: command.sections,
+              basedOnBriefVersion: command.basedOnBriefVersion,
+            },
+            ownerActor(command.actor),
+          ),
+        ),
+
+      agreeBrief: async (command) =>
+        use((root) => root.intakeUseCases.agreeBrief(command.ideaId, ownerActor(command.actor))),
+
+      askClarifyingQuestions: async (command) =>
+        use((root) =>
+          root.intakeUseCases.askClarifyingQuestions(
+            { ideaId: command.ideaId, sections: command.sections, ambiguities: command.ambiguities },
+            ownerActor(command.actor),
+          ),
+        ),
+
+      answerClarifyingQuestion: async (command) =>
+        use((root) =>
+          root.intakeUseCases.answerClarifyingQuestion(
+            { ideaId: command.ideaId, questionId: command.questionId, answer: command.answer },
+            ownerActor(command.actor),
+          ),
+        ),
+
+      applyOwnerCorrection: async (command) =>
+        use((root) =>
+          root.intakeUseCases.applyOwnerCorrection(
+            {
+              ideaId: command.ideaId,
+              text: command.text,
+              sections: command.sections,
+              basedOnBriefVersion: command.basedOnBriefVersion,
+            },
+            ownerActor(command.actor),
+          ),
+        ),
+
+      exportIdea: async (ideaId) =>
+        use((root) => {
+          const actor = root.useCases.resolveOwnerActor();
+          if (!actor.ok) return err(actor.error);
+          return root.intakeUseCases.exportIdea(ideaId, actor.value);
+        }),
+    },
   };
 }
 
@@ -511,6 +917,15 @@ export const DATABASE_PATH_ENV = 'SHIPLOOP_DATABASE_PATH';
 
 /** The environment variable naming the idle session limit this process enforces. */
 export const SESSION_IDLE_TIMEOUT_ENV = 'SHIPLOOP_SESSION_IDLE_SECONDS';
+
+/**
+ * The environment variable naming the directory intake attachments are written under.
+ *
+ * The same variable `apps/web` reads for its static artifact mount, because the row
+ * an attachment records stores a path relative to that one root; two variables would
+ * mean two roots and a pointer that resolves to neither (F06-AC1).
+ */
+export const ARTIFACT_ROOT_ENV = 'SHIPLOOP_ARTIFACT_ROOT';
 
 /**
  * No provider adapter is configured in this slice.
@@ -553,6 +968,7 @@ export function resolveSurfaceRoot(env: NodeJS.ProcessEnv): Result<CompositionRo
     clock: SYSTEM_CLOCK,
     adapters: NO_ADAPTERS,
     sessionIdleTimeoutSeconds: readPositiveInteger(env[SESSION_IDLE_TIMEOUT_ENV]),
+    artifactRoot: env[ARTIFACT_ROOT_ENV] === undefined || env[ARTIFACT_ROOT_ENV] === '' ? null : env[ARTIFACT_ROOT_ENV],
   });
 }
 

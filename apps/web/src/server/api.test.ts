@@ -35,6 +35,7 @@ import {
   type CapabilityKind,
   type ConnectorId,
   type DomainError,
+  type IdeaId,
   type OwnerId,
   type ProfileVersionId,
   type ProjectId,
@@ -45,14 +46,25 @@ import { buildApp } from './app.ts';
 import { describeConfigErrors, readServerConfig, type ServerConfig } from './config.ts';
 import {
   isControllerSurface,
+  type BriefVersionView,
+  type ClarificationRoundView,
+  type ClarifyingQuestionView,
   type ConnectorView,
   type ControllerSurface,
+  type CorrectionView,
   type CreateSessionCommand,
+  type DispositionCommand,
+  type IdeaExportView,
+  type IntakeDetailView,
+  type IntakeIdeaView,
+  type CaptureIdeaCommand,
   type OwnerView,
   type ProfileContent,
   type ProfileVersionView,
   type ProvisionOwnerCommand,
   type RegisterConnectorCommand,
+  type RelatednessReportView,
+  type RelatedWorkChoiceView,
   type RevokeConnectorCommand,
   type RevokeSessionCommand,
   type SaveProfileVersionCommand,
@@ -163,11 +175,25 @@ function testConfig(overrides: Record<string, string> = {}): ServerConfig {
  * conflicts, a revoked connector blocks the operations that depend on it, and a
  * sign-in failure is answered without saying which half of the credential was wrong.
  */
+/**
+ * A refusal that names the use case this double does not implement.
+ *
+ * Typed rather than thrown, because the port's contract is a `Result` and a double
+ * that broke it would turn a coverage gap into a 500 instead of a stated fact.
+ */
+function notImplemented<T>(useCase: string): Promise<Result<T, DomainError>> {
+  return Promise.resolve({
+    ok: false,
+    error: { code: 'Unavailable', reason: `The HTTP boundary double does not implement ${useCase}.` },
+  });
+}
+
 class InMemoryController implements ControllerSurface {
   private readonly sessionsById = new Map<string, StoredSessionRecord>();
   private readonly sessionIdByDigest = new Map<string, string>();
   private readonly profileVersions = new Map<string, ProfileVersionView[]>();
   private readonly connectorRecords = new Map<string, ConnectorView>();
+  private readonly intakeIdeas = new Map<string, IntakeIdeaView>();
   private readonly capabilities: CapabilityDeclarationsByProvider;
   private passwordHash = '';
   private readonly scripted = new Map<string, DomainError>();
@@ -195,6 +221,76 @@ class InMemoryController implements ControllerSurface {
     if (error !== undefined) this.scripted.delete(useCase);
     return error ?? null;
   }
+
+  /**
+   * The intake group of this double.
+   *
+   * A capture and a read are real, because the file tests that no intake route is
+   * registered ahead of the transport's own error handling need a controller that
+   * answers the port. Every other member refuses by name: this file proves the
+   * authentication boundary, not intake behaviour, and a double that quietly
+   * succeeded at a use case nobody implemented would let a broken intake route read
+   * as covered here.
+   */
+  readonly intake = {
+    captureIdea: async (command: CaptureIdeaCommand): Promise<Result<IntakeIdeaView, DomainError>> => {
+      const rawRequest = command.rawRequest.trim();
+      if (rawRequest === '') {
+        return { ok: false, error: { code: 'Invalid', reason: 'A request is required.', fields: [{ path: 'rawRequest', message: 'Required.' }] } };
+      }
+      const view: IntakeIdeaView = {
+        ideaId: `idea_${this.intakeIdeas.size + 1}` as IdeaId,
+        rawRequest,
+        projectId: command.projectId,
+        notes: command.notes,
+        kind: command.kind,
+        bugDetail: command.detail ?? { expected: null, actual: null, reproduction: null },
+        attachments: [],
+        summary: null,
+        disposition: 'Unpublished',
+        dispositionDetail: null,
+        capturedAt: '2026-03-01T12:00:00.000Z',
+      };
+      this.intakeIdeas.set(view.ideaId, view);
+      return { ok: true, value: view };
+    },
+    listIdeas: async (): Promise<Result<readonly IntakeIdeaView[], DomainError>> => ({
+      ok: true,
+      value: [...this.intakeIdeas.values()],
+    }),
+    getIdea: async (ideaId: IdeaId): Promise<Result<IntakeDetailView, DomainError>> => {
+      const idea = this.intakeIdeas.get(ideaId);
+      if (idea === undefined) return { ok: false, error: { code: 'NotFound', reason: 'No such idea.' } };
+      return {
+        ok: true,
+        value: {
+          idea,
+          brief: { briefId: null, currentVersion: null, current: null, versions: [] },
+          questions: [],
+          rejected: [],
+          turns: [{ kind: 'RawRequest', at: idea.capturedAt, text: idea.rawRequest, reference: null }],
+        },
+      };
+    },
+    attachFile: async (): Promise<Result<IntakeIdeaView, DomainError>> => notImplemented('attachFile'),
+    recordSummary: async (): Promise<Result<IntakeIdeaView, DomainError>> => notImplemented('recordSummary'),
+    archiveIdea: async (command: DispositionCommand): Promise<Result<IntakeIdeaView, DomainError>> => {
+      const idea = this.intakeIdeas.get(command.ideaId);
+      if (idea === undefined) return { ok: false, error: { code: 'NotFound', reason: 'No such idea.' } };
+      const archived: IntakeIdeaView = { ...idea, disposition: 'Archived', dispositionDetail: command.reason };
+      this.intakeIdeas.set(archived.ideaId, archived);
+      return { ok: true, value: archived };
+    },
+    deferIdea: async (): Promise<Result<IntakeIdeaView, DomainError>> => notImplemented('deferIdea'),
+    findRelatedWork: async (): Promise<Result<readonly RelatednessReportView[], DomainError>> => ({ ok: true, value: [] }),
+    recordRelatedWorkChoice: async (): Promise<Result<RelatedWorkChoiceView, DomainError>> => notImplemented('recordRelatedWorkChoice'),
+    draftBrief: async (): Promise<Result<BriefVersionView, DomainError>> => notImplemented('draftBrief'),
+    agreeBrief: async (): Promise<Result<BriefVersionView, DomainError>> => notImplemented('agreeBrief'),
+    askClarifyingQuestions: async (): Promise<Result<ClarificationRoundView, DomainError>> => notImplemented('askClarifyingQuestions'),
+    answerClarifyingQuestion: async (): Promise<Result<ClarifyingQuestionView, DomainError>> => notImplemented('answerClarifyingQuestion'),
+    applyOwnerCorrection: async (): Promise<Result<CorrectionView, DomainError>> => notImplemented('applyOwnerCorrection'),
+    exportIdea: async (): Promise<Result<IdeaExportView, DomainError>> => notImplemented('exportIdea'),
+  };
 
   readonly owners = {
     provision: async (command: ProvisionOwnerCommand): Promise<Result<OwnerView, DomainError>> => {
@@ -1134,6 +1230,14 @@ test('F01-AC1, F03-AC3: provisioning an owner refuses a password below the domai
   assert.ok(session.cookie.length > 0);
 });
 
+/**
+ * The structural guard, over a literal that carries every group.
+ *
+ * The intake group is spelled out method by method rather than as one placeholder,
+ * because a guard that accepts a partial group is not a guard: naming all of them here
+ * is what makes an intake method disappearing from `contracts.ts` fail this test rather
+ * than being noticed by whoever next calls it (F01-AC1).
+ */
 test('the loaded controller module is validated before it can serve a request', () => {
   assert.equal(isControllerSurface(null), false);
   assert.equal(isControllerSurface({ owners: {} }), false);
@@ -1146,6 +1250,23 @@ test('the loaded controller module is validated before it can serve a request', 
     sessions: { loadByToken() {}, create() {}, revoke() {}, touch() {} },
     profiles: { saveVersion() {}, currentVersion() {}, listVersions() {} },
     connectors: { register() {}, listForProject() {}, revoke() {} },
+    intake: {
+      captureIdea() {},
+      listIdeas() {},
+      getIdea() {},
+      attachFile() {},
+      recordSummary() {},
+      archiveIdea() {},
+      deferIdea() {},
+      findRelatedWork() {},
+      recordRelatedWorkChoice() {},
+      draftBrief() {},
+      agreeBrief() {},
+      askClarifyingQuestions() {},
+      answerClarifyingQuestion() {},
+      applyOwnerCorrection() {},
+      exportIdea() {},
+    },
   };
   assert.equal(isControllerSurface(complete), true);
 });

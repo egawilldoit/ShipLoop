@@ -1,22 +1,27 @@
 import { useState, type ReactElement } from 'react';
 import { ConnectionBanner } from './components/ConnectionBanner.tsx';
+import { BriefPage } from './pages/BriefPage.tsx';
 import { ConnectorsPage } from './pages/ConnectorsPage.tsx';
+import { IntakePage } from './pages/IntakePage.tsx';
 import { ProfilesPage } from './pages/ProfilesPage.tsx';
 import { SignInPage } from './pages/SignInPage.tsx';
 import { SessionProvider, useSession } from './session.tsx';
 
-type Section = 'profiles' | 'connectors';
+type Section = 'profiles' | 'connectors' | 'intake' | 'brief';
 
 const SECTIONS: readonly { readonly id: Section; readonly label: string }[] = [
   { id: 'profiles', label: 'Profiles' },
   { id: 'connectors', label: 'Connectors' },
+  { id: 'intake', label: 'Intake' },
+  { id: 'brief', label: 'Brief' },
 ];
 
 function Shell(): ReactElement {
   const { status, owner, projectId, projectName, connection, connectionEpoch, signOut, retry } = useSession();
-  const [section, setSection] = useState<Section>('profiles');
+  const [section, setSection] = useState<Section>('intake');
   const [activeProfileId, setActiveProfileId] = useState('');
   const [activeProfileLabel, setActiveProfileLabel] = useState('');
+  const [activeIdeaId, setActiveIdeaId] = useState('');
   const [signingOut, setSigningOut] = useState(false);
 
   const selectProfile = (profileId: string, label: string): void => {
@@ -83,6 +88,12 @@ function Shell(): ReactElement {
         </ul>
       </nav>
 
+      {/*
+        Intake and the brief share one selected request rather than each holding their
+        own copy of it: the two screens are two views of one captured request, and a
+        per-page selection would let the brief describe a different request than the
+        intake screen is showing.
+      */}
       <main className="app__main" id="main">
         {section === 'profiles' ? (
           <ProfilesPage
@@ -91,11 +102,27 @@ function Shell(): ReactElement {
             onSelectProfile={selectProfile}
             epoch={connectionEpoch}
           />
-        ) : (
+        ) : section === 'connectors' ? (
           <ConnectorsPage
             projectId={projectId}
             profileId={activeProfileId}
             profileName={activeProfileLabel}
+            epoch={connectionEpoch}
+          />
+        ) : section === 'intake' ? (
+          <IntakePage
+            selectedIdeaId={activeIdeaId}
+            onSelectIdea={setActiveIdeaId}
+            onOpenBrief={(ideaId) => {
+              setActiveIdeaId(ideaId);
+              setSection('brief');
+            }}
+            epoch={connectionEpoch}
+          />
+        ) : (
+          <BriefPage
+            ideaId={activeIdeaId}
+            onBackToIntake={() => setSection('intake')}
             epoch={connectionEpoch}
           />
         )}
