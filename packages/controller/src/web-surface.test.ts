@@ -97,6 +97,18 @@ const REQUIRED_METHODS = {
   attention: ['collectAttention', 'acknowledge'],
   reviewCards: ['buildReviewCard'],
   acceptance: ['requestChanges', 'recordAcceptance', 'currentAcceptance', 'acceptanceGate'],
+  planning: [
+    'draftPlan',
+    'getPlan',
+    'editPlan',
+    'listPlansForIdea',
+    'assessPlan',
+    'publishPlan',
+    'reconcilePublication',
+    'adoptExistingIssue',
+    'linkExistingChange',
+    'requestAdoptedEvaluation',
+  ],
 } as const satisfies Record<keyof ControllerSurface, readonly string[]>;
 
 /**
@@ -664,3 +676,346 @@ function profileContent(): {
     environment: { runtime: 'node-24', ports: [4100], secretReferences: ['shiploop://credentials/linear-team-eng'] },
   };
 }
+
+/* -------------------------------------------------------------------------- */
+/* Planning, readiness, publication and adoption through the seam               */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * A plan proposal over two independently reviewable surfaces.
+ *
+ * Two surfaces, because a one-surface change is refused by the domain as an
+ * over-decomposed plan, and a test that seeded one task would be testing the refusal
+ * rather than the surface (F08-AC2).
+ */
+function planProposal(planId: string): Record<string, unknown> {
+  const task = (taskId: string, outcome: string, dependencies: readonly string[]): Record<string, unknown> => ({
+    taskId,
+    outcome,
+    scope: `Scope for ${taskId}.`,
+    acceptanceCriteria: [`${taskId} is observable.`],
+    verificationMethod: 'The seam test reads the stored plan.',
+    dependencies: [...dependencies],
+    relevantProjectContext: ['apps/web'],
+    implementationLocation: {
+      kind: 'ProposedLocation',
+      candidates: [`apps/web/src/${taskId}.ts`],
+      basis: 'The seam reads the plan.',
+    },
+    coversOutcomeIds: ['out_1'],
+  });
+  return {
+    kind: 'PlanProposal',
+    briefId: 'brief_1',
+    draftedAt: NOW,
+    basedOnRevision: null,
+    requestedOutcomes: [{ id: 'out_1', statement: 'The owner can see why a build may not start.' }],
+    tasks: [
+      task('task_1', 'Show the readiness assessment.', []),
+      task('task_2', 'Gate publication on acceptance.', ['task_1']),
+    ],
+    exclusions: [],
+    ...(planId === '' ? {} : {}),
+  };
+}
+
+const planChange: Record<string, unknown> = {
+  summary: 'Show readiness and refuse an unpublishable proposal.',
+  surfaces: [
+    {
+      surfaceId: 'readiness_panel',
+      description: 'The readiness panel.',
+      observableBehaviour: 'Every area and its reason are readable.',
+      independentlyReviewable: true,
+    },
+    {
+      surfaceId: 'publish_gate',
+      description: 'The publish control.',
+      observableBehaviour: 'Publication is offered only when a proposal is accepted.',
+      independentlyReviewable: true,
+    },
+  ],
+  dependencyEdges: [{ surface: 'publish_gate', dependsOn: 'readiness_panel' }],
+};
+
+/**
+ * The owner id this store already holds, or a refusal naming why there is none.
+ *
+ * A store is single-owner, so a second `provision` is refused as a conflict. The tests
+ * read the owner the store already has rather than provisioning per test: the read is
+ * the path a running process takes, and provisioning again would make every test's
+ * setup depend on whether an earlier test had already run (F01-AC1).
+ */
+async function ownerFor(surface: ControllerSurface, root: CompositionRoot): Promise<OwnerId> {
+  const provisioned = await surface.owners.provision({ displayName: DISPLAY_NAME, password: PASSWORD, at: NOW });
+  if (provisioned.ok) return provisioned.value.ownerId;
+  const stored = root.owners.current();
+  assert.ok(stored.ok && stored.value !== null, 'the test needs exactly one provisioned owner');
+  return (stored.value as { readonly ownerId: OwnerId }).ownerId;
+}
+
+/** An idea to plan, created through the same surface the transport uses (F06-AC1). */
+async function ideaFor(surface: ControllerSurface, root: CompositionRoot): Promise<string> {
+  const actor = await ownerFor(surface, root);
+  const captured = await surface.intake.captureIdea({
+    rawRequest: 'The owner wants to see why a build was refused.',
+    kind: 'FeatureRequest',
+    projectId: null,
+    notes: null,
+    detail: null,
+    actor,
+  });
+  assert.ok(captured.ok, `capturing the request must succeed: ${captured.ok ? '' : captured.error.reason}`);
+  return captured.value.ideaId;
+}
+
+test('a drafted plan reaches the durable store and every F08-AC1 field survives the round trip (F08-AC1, F02-AC3)', async () => {
+  await withSurface(async (surface, root) => {
+    const actor = await ownerFor(surface, root);
+    const ideaId = await ideaFor(surface, root);
+
+    const drafted = await surface.planning.draftPlan({
+      ideaId,
+      planId: 'plan_seam_1',
+      change: planChange,
+      proposal: planProposal('plan_seam_1'),
+      actor,
+    });
+    assert.ok(drafted.ok, `drafting must succeed: ${drafted.ok ? '' : drafted.error.reason}`);
+    const plan = drafted.value;
+
+    assert.equal(plan.revision, 1);
+    assert.equal(plan.split.split, true, 'two reviewable surfaces justify a split (F08-AC2)');
+    assert.match(plan.split.reason, /F08-AC2/);
+    assert.equal(plan.tasks.length, 2);
+
+    for (const task of plan.tasks) {
+      assert.notEqual(task.outcome, '');
+      assert.notEqual(task.scope, '');
+      assert.ok(task.acceptanceCriteria.length > 0);
+      assert.notEqual(task.verificationMethod, '');
+      assert.ok(Array.isArray(task.dependencies));
+      assert.ok(task.relevantProjectContext.length > 0);
+      assert.equal(task.implementationLocation.kind, 'ProposedLocation', 'F08-AC5: a location is a proposal');
+      assert.ok(task.implementationLocation.candidates.length > 0);
+      assert.notEqual(task.implementationLocation.basis, '');
+      assert.equal(task.publishable, false, 'F08-AC3: nothing is publishable before acceptance');
+    }
+
+    // F08-AC4: the order the dependencies permit puts the prerequisite first.
+    assert.deepEqual(plan.proposedOrder, ['task_1', 'task_2']);
+    assert.deepEqual(plan.agreedSequence, ['task_1', 'task_2']);
+    assert.equal(plan.taskReadiness.find((entry) => entry.taskId === 'task_2')?.readyAfter[0], 'task_1');
+
+    // F08-AC5: the recorded coverage accounts for the one requested outcome.
+    assert.equal(plan.coverage.length, 1);
+    assert.equal(plan.coverage[0]?.outcomeId, 'out_1');
+
+    // The row is durable: read through a second call and through the repository itself,
+    // so a plan that only existed in the response would fail here.
+    const readBack = await surface.planning.getPlan('plan_seam_1');
+    assert.ok(readBack.ok);
+    assert.equal(readBack.value.digest, plan.digest, 'the stored plan must rebuild to the same content');
+    assert.equal(root.plans.read('plan_seam_1').ok, true);
+  });
+});
+
+test('an owner edit is revision-checked, and an unaccepted proposal never becomes publishable (F08-AC3)', async () => {
+  await withSurface(async (surface, root) => {
+    const actor = await ownerFor(surface, root);
+    const ideaId = await ideaFor(surface, root);
+    const drafted = await surface.planning.draftPlan({
+      ideaId,
+      planId: 'plan_seam_2',
+      change: planChange,
+      proposal: planProposal('plan_seam_2'),
+      actor,
+    });
+    assert.ok(drafted.ok);
+
+    const accepted = await surface.planning.editPlan({
+      planId: 'plan_seam_2',
+      edit: { kind: 'Accept', taskId: 'task_1', expectedRevision: 1 },
+      actor,
+    });
+    assert.ok(accepted.ok, `accepting must succeed: ${accepted.ok ? '' : accepted.error.reason}`);
+    assert.equal(accepted.value.revision, 2, 'an edit appends the next revision (F08-AC3)');
+    assert.equal(accepted.value.lastEditedBy, actor, 'the edit records the owner the transport proved (F01-AC1)');
+    assert.equal(accepted.value.tasks.find((task) => task.taskId === 'task_1')?.publishable, true);
+    assert.equal(
+      accepted.value.tasks.find((task) => task.taskId === 'task_2')?.publishable,
+      false,
+      'accepting one task must not publish the other (F08-AC3)',
+    );
+
+    // F08-AC3: an edit made against the revision the owner no longer sees is refused
+    // rather than merged into the newer plan.
+    const stale = await surface.planning.editPlan({
+      planId: 'plan_seam_2',
+      edit: { kind: 'Accept', taskId: 'task_2', expectedRevision: 1 },
+      actor,
+    });
+    assert.equal(stale.ok, false);
+    if (!stale.ok) {
+      assert.equal(stale.error.code, 'Conflict');
+      assert.equal(stale.error.expected, 'revision 2');
+    }
+
+    // F08-AC5: a lifecycle field cannot reach the domain through this seam either.
+    const lifecycle = await surface.planning.editPlan({
+      planId: 'plan_seam_2',
+      edit: { kind: 'Edit', taskId: 'task_1', expectedRevision: 2, changes: { acceptance: 'Accepted' } },
+      actor,
+    });
+    assert.equal(lifecycle.ok, false, 'an edit carrying a lifecycle field must be refused (F05-AC5, F08-AC3)');
+    if (!lifecycle.ok) assert.equal(lifecycle.error.code, 'Invalid');
+  });
+});
+
+test('readiness is recorded over every area F09-AC1 names, and a dependency needing a receipt is not available (F09-AC1, F09-AC3)', async () => {
+  await withSurface(async (surface, root) => {
+    const actor = await ownerFor(surface, root);
+    const ideaId = await ideaFor(surface, root);
+    const drafted = await surface.planning.draftPlan({
+      ideaId,
+      planId: 'plan_seam_3',
+      change: planChange,
+      proposal: planProposal('plan_seam_3'),
+      actor,
+    });
+    assert.ok(drafted.ok);
+
+    const assessed = await surface.planning.assessPlan('plan_seam_3');
+    assert.ok(assessed.ok, `assessment must succeed: ${assessed.ok ? '' : assessed.error.reason}`);
+    const assessment = assessed.value;
+
+    assert.deepEqual(
+      assessment.areas.map((area) => area.area),
+      ['Scope', 'Criteria', 'Repository', 'Target', 'Dependencies', 'Verification', 'Access'],
+      'every area is present, in the order the specification lists them (F09-AC1)',
+    );
+    for (const area of assessment.areas) {
+      assert.notEqual(area.reason, '', `the ${area.area} area must carry a reason (F09-AC1)`);
+      if (area.status !== 'Satisfied') {
+        assert.notEqual(area.remedy, null, `an open ${area.area} area must name a remedy (F09-AC1)`);
+      }
+    }
+
+    // F09-AC3: the second task depends on the first, which is proposed rather than
+    // delivered, so the Dependencies area is unmet and says why.
+    const dependencies = assessment.areas.find((area) => area.area === 'Dependencies');
+    assert.equal(dependencies?.status, 'Unmet', 'a dependency that is not delivered is not available (F09-AC3)');
+
+    // F09-AC4: it is a recorded assessment with an instant, not a percentage.
+    assert.equal(assessment.assessedAt, NOW);
+    assert.ok(['Ready', 'NeedsInformation', 'Blocked'].includes(assessment.verdict));
+
+    // F09-AC2: `mayStartBuild` and `buildBlockingAreas` are two readings of one decision
+    // and cannot disagree. This plan has no project, so Repository and Target are unmet
+    // and the build is disabled.
+    assert.equal(assessment.mayStartBuild, false, 'an unmet required area disables the build (F09-AC2)');
+    assert.ok(assessment.buildBlockingAreas.includes('Repository'), 'the blocking areas are named (F09-AC2)');
+    assert.ok(!assessment.buildBlockingAreas.includes('Verification'), 'an undecided verification method does not block a build (F09-AC2)');
+  });
+});
+
+test('publication and adoption refuse by name when this deployment configured no provider (F03-AC2, F10-AC1, F11-AC1)', async () => {
+  await withSurface(async (surface, root) => {
+    const actor = await ownerFor(surface, root);
+    const ideaId = await ideaFor(surface, root);
+    const drafted = await surface.planning.draftPlan({
+      ideaId,
+      planId: 'plan_seam_4',
+      change: planChange,
+      proposal: planProposal('plan_seam_4'),
+      actor,
+    });
+    assert.ok(drafted.ok);
+    await surface.planning.editPlan({
+      planId: 'plan_seam_4',
+      edit: { kind: 'Accept', taskId: 'task_1', expectedRevision: 1 },
+      actor,
+    });
+
+    // F08-AC3, F10-AC1: a plan with no accepted proposal is refused by name rather than
+    // published as nothing, because those are different answers.
+    const nothing = await surface.planning.publishPlan({
+      planId: 'plan_seam_3',
+      requestId: 'req_seam_1',
+      correlationId: 'corr_seam_1',
+      actor,
+    });
+    assert.equal(nothing.ok, false);
+
+    // F03-AC2: the provider refusal names the missing capability rather than reporting a
+    // generic publication failure, because configuration and a fault need different fixes.
+    const published = await surface.planning.publishPlan({
+      planId: 'plan_seam_4',
+      requestId: 'req_seam_2',
+      correlationId: 'corr_seam_2',
+      actor,
+    });
+    assert.equal(published.ok, false);
+    if (!published.ok) {
+      assert.equal(published.error.code, 'Blocked');
+      assert.match(published.error.reason, /no ticket provider configured/);
+      assert.ok(published.error.prerequisites.some((entry) => entry.name === 'ticket provider'));
+    }
+
+    const adopted = await surface.planning.adoptExistingIssue({
+      projectId: PROJECT_ID,
+      profileVersionId: 'pv_1' as never,
+      procedureVersionId: 'proc_1',
+      issueId: 'issue_1',
+      expectedIdentifier: null,
+      title: '',
+      correlationId: 'corr_seam_3',
+      actor,
+    });
+    assert.equal(adopted.ok, false);
+    if (!adopted.ok) assert.equal(adopted.error.code, 'Blocked');
+
+    // F11-AC5: `Build` is refused by the use case with its own reason, because a build
+    // against adopted work is the reset F11-AC4 and F14-AC2 exist to prevent.
+    const build = await surface.planning.requestAdoptedEvaluation({
+      workItemId: 'wi_1',
+      candidateId: null,
+      candidateFingerprint: null,
+      mode: 'Build',
+      correlationId: 'corr_seam_4',
+      actor,
+    });
+    assert.equal(build.ok, false);
+  });
+});
+
+test('a plan address is a plan id or any work item it publishes as (F10-AC2)', async () => {
+  await withSurface(async (surface, root) => {
+    const actor = await ownerFor(surface, root);
+    const ideaId = await ideaFor(surface, root);
+    const drafted = await surface.planning.draftPlan({
+      ideaId,
+      planId: 'plan_seam_5',
+      change: planChange,
+      proposal: planProposal('plan_seam_5'),
+      actor,
+    });
+    assert.ok(drafted.ok);
+
+    // F10-AC3: the work item a task publishes as is fixed at draft time, so a
+    // publication retry addresses one operation rather than two.
+    const workItemId = drafted.value.workItemIdByTaskId['task_1'];
+    assert.equal(typeof workItemId, 'string');
+    assert.notEqual(workItemId, '');
+
+    // F10-AC2: a client handed a work item id by a publication report can come back to
+    // the plan without a second lookup.
+    const byWorkItem = await surface.planning.getPlan(workItemId ?? '');
+    assert.ok(byWorkItem.ok, `a work item address must resolve to its plan: ${byWorkItem.ok ? '' : byWorkItem.error.reason}`);
+    assert.equal(byWorkItem.value.planId, 'plan_seam_5');
+
+    const unknown = await surface.planning.getPlan('wi_nothing_publishes_this');
+    assert.equal(unknown.ok, false);
+    if (!unknown.ok) assert.equal(unknown.error.code, 'NotFound');
+  });
+});

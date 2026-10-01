@@ -27,12 +27,31 @@
 
 import {
   DEFAULT_LIMITS,
+  applyPlanProposal,
+  assessReadiness,
+  conflict,
+  draftPlan as domainDraftPlan,
+  editPlan as domainEditPlan,
   err,
   ok,
+  planReadiness,
+  publishableTickets,
+  redact,
+  type AreaObservation,
+  type ChangeShape,
+  type DependencyStatus,
   type DomainError,
+  type IdeaId,
   type OwnerId,
   type PasswordHash,
+  type Plan,
+  type PlanEdit,
+  type PlanProposal,
   type ProcedureVersionId,
+  type ProjectId,
+  type PublishableTicket,
+  type ReadinessDecision,
+  type ReadinessObservation,
   type Result,
   type ScryptParameters,
 } from '@shiploop/domain';
@@ -51,9 +70,11 @@ import {
   OwnerRepository,
   ProcedureRepository,
   ProjectProfileRepository,
+  PublicationRepository,
   ScopeRepository,
   WorkItemRepository,
 } from '@shiploop/storage';
+import { withTransaction } from '@shiploop/storage';
 import type {
   Database,
   JobLimits,
@@ -65,6 +86,7 @@ import type {
   SqlRow,
   StorageConnection,
 } from '@shiploop/storage';
+import type { GitAdapter, TicketAdapter } from '@shiploop/adapters';
 import { validateRecipe, type PreflightDeps, type RecipeVersion, type RequiredCheckPolicy } from '@shiploop/verification';
 import type { AdapterRegistry, ConnectorUseCases } from './connectors.ts';
 import { createConnectorUseCases } from './connectors.ts';
@@ -89,6 +111,10 @@ import type {
   VerificationUseCases,
 } from './verification.ts';
 import { SqliteObservationJournal, createVerificationUseCases } from './verification.ts';
+import type { AdoptionUseCases } from './adoption.ts';
+import { createAdoptionUseCases } from './adoption.ts';
+import type { PublicationUseCases } from './publication.ts';
+import { createPublicationUseCases } from './publication.ts';
 
 export interface CompositionRootConfig {
   readonly databasePath: string;
@@ -129,6 +155,21 @@ export interface CompositionRootConfig {
    * directory nobody backs up (F01-AC3).
    */
   readonly artifactRoot?: IntakeArtifactRoot;
+  /**
+   * The working providers, when the process has any.
+   *
+   * Absent rather than empty-by-default because publication and adoption both read or
+   * write a provider, and a use case built over a provider that refuses every call
+   * would present as a configured capability that cannot be used. A process with no
+   * `providers` gets `null` for both groups, and the transport says so by name
+   * (F03-AC2, F10-AC1, F11-AC1, N05-AC1).
+   */
+  readonly providers?: {
+    readonly ticket: TicketAdapter;
+    readonly git: GitAdapter;
+  };
+  /** Redaction applied to provider text before it reaches a stored row (N02-AC2). */
+  readonly redactProviderText?: (text: string) => string;
 }
 
 /**
@@ -143,6 +184,7 @@ export interface CompositionRoot {
   readonly procedures: ProcedureRepository;
   readonly intake: IntakeRepository;
   readonly ideas: IdeaRepository;
+  /** Over the same handle, so a compare-and-set is meaningful within a process (F02-AC2). */
   readonly workItems: WorkItemRepository;
   readonly scope: ScopeRepository;
   readonly candidates: CandidateRepository;
@@ -157,6 +199,8 @@ export interface CompositionRoot {
   readonly jobs: JobQueue;
   readonly leases: LeaseManager;
   readonly credentials: OwnerCredentialStore;
+  readonly plans: SqlitePlanStore;
+  readonly publications: PublicationRepository;
   readonly useCases: ProfileUseCases & ConnectorUseCases;
   readonly intakeUseCases: IntakeUseCases;
   readonly sessionUseCases: SessionUseCases;
@@ -168,6 +212,11 @@ export interface CompositionRoot {
   readonly verificationUseCases: VerificationUseCases;
   /** Owner acceptance and retained change feedback (F25). */
   readonly acceptanceUseCases: AcceptanceUseCases;
+  readonly planningUseCases: PlanningUseCases;
+  /** Null when the process was configured with no ticket provider (F03-AC2). */
+  readonly publicationUseCases: PublicationUseCases | null;
+  /** Null for the same reason: adoption reads providers, so it cannot exist without one. */
+  readonly adoptionUseCases: AdoptionUseCases | null;
   /** Closes only the database handle this root opened. */
   close(): Result<true, DomainError>;
 }
@@ -200,6 +249,7 @@ const REQUIRED_TABLES: readonly string[] = [
   'idea_attachments',
   'idea_questions',
   'briefs',
+  'plans',
 ];
 
 /**
@@ -302,6 +352,619 @@ export function ensureOwnerCredentialSchema(connection: StorageConnection): Resu
     });
   }
   return ok(true);
+}
+
+/* -------------------------------------------------------------------------- */
+/* Plans (F08, F09, F10)                                                        */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The decisions that produced a plan, in the order they were taken.
+ *
+ * The domain `Plan` is a frozen derived value: `draftPlan` and `editPlan` are pure
+ * functions over a proposal, a change shape and a list of edits. Storing the
+ * *decisions* rather than the derived value means a stored plan is reproduced by
+ * replaying them, so a row cannot disagree with the plan it claims to describe, and
+ * the durable record is exactly what the owner and the proposing model actually
+ * said (F08-AC1, F08-AC3).
+ *
+ * Every edit is revision-checked on replay, so a body that has been tampered with or
+ * truncated fails loudly at read time instead of producing a plan nobody reviewed.
+ */
+export interface PlanDecisionTrail {
+  readonly ideaId: string;
+  readonly planId: string;
+  /** Who asked for this draft, so a stored plan names the request it came from (F01-AC1). */
+  readonly draftedBy: string;
+  readonly change: ChangeShape;
+  readonly proposal: PlanProposal;
+  readonly edits: readonly PlanEdit[];
+  /**
+   * The work item each accepted task publishes as, fixed when the plan was drafted.
+   *
+   * Fixed at draft time rather than derived from the task's current position because
+   * publication derives its operation identity from the work item, and a reordering
+   * that changed it would let the same request address two different issues
+   * (F10-AC3).
+   */
+  readonly taskWorkItemIds: Readonly<Record<string, string>>;
+}
+
+const PLAN_BODY_COLUMNS = 'plan_id, revision, body_redacted, state';
+
+/** The lifecycle state a plan row carries alongside its decision trail. */
+type PlanRowState = 'Draft' | 'Proposed' | 'Superseded' | 'Withdrawn';
+
+const PLAN_ROW_STATES: readonly PlanRowState[] = ['Draft', 'Proposed', 'Superseded', 'Withdrawn'];
+
+/**
+ * The plan decision trail as a durable row.
+ *
+ * The same shape `SqliteOwnerCredentialStore` sets for `owners`: `@shiploop/storage`
+ * owns the `plans` table and its columns, and it exposes no repository for a plan, so
+ * the read and write live here rather than being reached around the controller from a
+ * route. A durable `PlanRepository` against the same columns belongs in
+ * `@shiploop/storage`; this is the narrowest thing that makes F08 reachable without
+ * that change.
+ */
+export class SqlitePlanStore {
+  private readonly connection: StorageConnection;
+
+  constructor(connection: StorageConnection) {
+    this.connection = connection;
+  }
+
+  /**
+   * Replaces the trail for one plan.
+   *
+   * One row per plan, updated in place rather than appended: F08 requires the current
+   * plan and its revision, not a history of plans, so a second row per plan would be
+   * a version of the brief (F07) rather than of the plan. The revision travels in the
+   * row so a stale read is caught by `UNIQUE (idea_id, revision)` rather than by a
+   * caller remembering to compare it.
+   */
+  record(trail: PlanDecisionTrail, revision: number, at: string): Result<true, DomainError> {
+    try {
+      const existing = this.connection
+        .prepare('SELECT revision FROM plans WHERE plan_id = ?')
+        .get(trail.planId);
+      if (existing === undefined) {
+        this.connection
+          .prepare(
+            `INSERT INTO plans (plan_id, idea_id, revision, body_redacted, state, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          )
+          .run(
+            trail.planId,
+            trail.ideaId,
+            revision,
+            redact(JSON.stringify(trail)).text,
+            'Proposed',
+            at,
+            at,
+          );
+        return ok(true);
+      }
+      const written = this.connection
+        .prepare(
+          `UPDATE plans SET revision = ?, body_redacted = ?, state = ?, updated_at = ? WHERE plan_id = ?`,
+        )
+        .run(revision, redact(JSON.stringify(trail)).text, 'Proposed', at, trail.planId);
+      if (Number(written.changes) !== 1) {
+        return err({ code: 'Unavailable', reason: `Plan ${trail.planId} could not be written.` });
+      }
+      return ok(true);
+    } catch (error) {
+      return err({
+        code: 'Unavailable',
+        reason: `The plan decision trail could not be stored: ${describe(error)}`,
+      });
+    }
+  }
+
+  /** The trail for one plan, or null when the plan has never been drafted. */
+  read(planId: string): Result<PlanDecisionTrail | null, DomainError> {
+    try {
+      const row = this.connection.prepare(`SELECT ${PLAN_BODY_COLUMNS} FROM plans WHERE plan_id = ?`).get(planId);
+      if (row === undefined) return ok(null);
+      const state = requiredText(row, 'state');
+      if (!PLAN_ROW_STATES.includes(state as PlanRowState)) {
+        return err({
+          code: 'Unavailable',
+          reason: `Plan ${planId} is stored in the unknown state "${state}".`,
+        });
+      }
+      return ok(readTrail(requiredText(row, 'body_redacted'), planId));
+    } catch (error) {
+      return err({
+        code: 'Unavailable',
+        reason: `The plan decision trail could not be read: ${describe(error)}`,
+      });
+    }
+  }
+
+  /** Every plan drafted for one idea, newest revision first. */
+  listForIdea(ideaId: string): Result<readonly PlanDecisionTrail[], DomainError> {
+    try {
+      const rows = this.connection
+        .prepare(`SELECT ${PLAN_BODY_COLUMNS} FROM plans WHERE idea_id = ? ORDER BY revision DESC`)
+        .all(ideaId);
+      return ok(rows.map((row) => readTrail(requiredText(row, 'body_redacted'), requiredText(row, 'plan_id'))));
+    } catch (error) {
+      return err({
+        code: 'Unavailable',
+        reason: `The plans for one idea could not be read: ${describe(error)}`,
+      });
+    }
+  }
+
+  /**
+   * The plan a work item address names.
+   *
+   * The address a publication or a readiness assessment is given is the plan's own
+   * identifier, and this is how that identifier is resolved back to the plan. Plans
+   * are per idea and a project holds a bounded number of them, so the scan is over
+   * `plans` rows only and never touches work items or provider state.
+   */
+  findByAnyWorkItemId(workItemId: string): Result<PlanDecisionTrail | null, DomainError> {
+    try {
+      const rows = this.connection.prepare(`SELECT ${PLAN_BODY_COLUMNS} FROM plans`).all();
+      for (const row of rows) {
+        const trail = readTrail(requiredText(row, 'body_redacted'), requiredText(row, 'plan_id'));
+        if (Object.values(trail.taskWorkItemIds).includes(workItemId)) return ok(trail);
+      }
+      return ok(null);
+    } catch (error) {
+      return err({
+        code: 'Unavailable',
+        reason: `The plan for one work item could not be read: ${describe(error)}`,
+      });
+    }
+  }
+}
+
+/** The stored body read back as a trail, refusing a body this version cannot replay. */
+function readTrail(body: string, planId: string): PlanDecisionTrail {
+  let decoded: unknown;
+  try {
+    decoded = JSON.parse(body);
+  } catch {
+    throw new Error(`Plan ${planId} has a decision trail that is not readable JSON`);
+  }
+  const record = decoded !== null && typeof decoded === 'object' ? (decoded as Record<string, unknown>) : null;
+  if (record === null) throw new Error(`Plan ${planId} has a decision trail that is not an object`);
+  const ideaId = record['ideaId'];
+  const change = record['change'];
+  const proposal = record['proposal'];
+  const edits = record['edits'];
+  const taskWorkItemIds = record['taskWorkItemIds'];
+  if (typeof ideaId !== 'string' || change === null || typeof change !== 'object') {
+    throw new Error(`Plan ${planId} has a decision trail without an idea or a change shape`);
+  }
+  if (proposal === null || typeof proposal !== 'object') {
+    throw new Error(`Plan ${planId} has a decision trail without a proposal`);
+  }
+  if (!Array.isArray(edits) || taskWorkItemIds === null || typeof taskWorkItemIds !== 'object') {
+    throw new Error(`Plan ${planId} has a decision trail without edits or task work items`);
+  }
+  const draftedBy = record['draftedBy'];
+  return {
+    ideaId,
+    planId,
+    draftedBy: typeof draftedBy === 'string' ? draftedBy : '',
+    change: change as ChangeShape,
+    proposal: proposal as PlanProposal,
+    edits: edits as PlanEdit[],
+    taskWorkItemIds: taskWorkItemIds as Readonly<Record<string, string>>,
+  };
+}
+
+/**
+ * The identity each proposed task publishes as.
+ *
+ * Derived from the plan and the task rather than minted, because a publication's
+ * operation identity is derived from the work item and F10-AC3 requires a repeat of
+ * the same request to address the same operation. A minted id would make a retry
+ * after a timeout address a second issue, which is the exact duplicate that criterion
+ * exists to prevent.
+ */
+export function taskWorkItemId(planId: string, taskId: string): string {
+  return `wi_${planId}_${taskId}`;
+}
+
+/** What `assessReadiness` was asked to judge, assembled from what this process can read. */
+export interface PlanReadinessReport {
+  readonly decision: ReadinessDecision;
+  /** F08-AC4: which tasks can be declared ready, and in which order. */
+  readonly order: readonly string[];
+  readonly blocked: readonly { readonly taskId: string; readonly reason: string }[];
+}
+
+/**
+ * Planning use cases: the plan's lifecycle, its readiness, and its publication.
+ *
+ * Every rule these enforce already exists in `@shiploop/domain`: `draftPlan` refuses
+ * an over-decomposed plan and an uncovered outcome, `editPlan` revision-checks every
+ * owner action, and `assessReadiness` turns named areas into a verdict. What is added
+ * here is the store and the clock, so a decision is recorded against durable state
+ * rather than recomputed per request.
+ */
+export interface PlanningUseCases {
+  readonly draftPlan: (
+    input: {
+      readonly ideaId: string;
+      readonly planId: string;
+      readonly change: ChangeShape;
+      readonly proposal: PlanProposal;
+      readonly actor: string;
+    },
+  ) => Result<Plan, DomainError>;
+  readonly getPlan: (planId: string) => Result<Plan, DomainError>;
+  readonly editPlan: (input: { readonly planId: string; readonly edit: PlanEdit }) => Result<Plan, DomainError>;
+  readonly listPlansForIdea: (ideaId: string) => Result<readonly Plan[], DomainError>;
+  readonly assessPlan: (planId: string) => Result<PlanReadinessReport, DomainError>;
+  /** The accepted proposals as the tickets publication may act on (F08-AC3, F10-AC1). */
+  readonly publishableFor: (planId: string) => Result<readonly PublishableTicket[], DomainError>;
+  readonly workItemForTask: (planId: string, taskId: string) => string;
+}
+
+export interface PlanningDeps {
+  readonly clock: ControllerClock;
+  readonly plans: SqlitePlanStore;
+  readonly ideas: IdeaRepository;
+  readonly profiles: ProjectProfileRepository;
+  readonly connectors: ConnectorRepository;
+}
+
+/**
+ * The `investigationSupported` set: every area whose uncertainty read-only
+ * investigation can actually resolve (F09-AC2).
+ *
+ * Access is the one exclusion. Reading code, a repository, an issue or a check is
+ * investigation; obtaining a credential is not, so an open Access area is the case
+ * where a build is disabled and investigation is not offered as the way past it.
+ */
+const INVESTIGATABLE_AREAS = Object.freeze([
+  'Scope',
+  'Criteria',
+  'Repository',
+  'Target',
+  'Dependencies',
+  'Verification',
+] as const);
+
+function satisfied(reason: string): AreaObservation {
+  return { status: 'Satisfied', reason, remedy: null };
+}
+
+function unmet(reason: string, remedy: string): AreaObservation {
+  return { status: 'Unmet', reason, remedy };
+}
+
+/**
+ * Assembles the readiness observation from what this process can genuinely read.
+ *
+ * Nothing here is invented. Scope and criteria come from the plan, repository and
+ * target from the project's saved profile, access from the connectors that profile's
+ * project actually has, and verification from the tasks' own stated methods. An area
+ * this slice cannot observe is reported `Unknown` with a reason naming the reader that
+ * is missing, which is what keeps an unassessed prerequisite from reading as a
+ * satisfied one (F09-AC1, F09-AC4).
+ */
+export function readinessObservationFor(
+  plan: Plan,
+  profile: { readonly repository: string; readonly targetBranch: string } | null,
+  ticketConnectorHealthy: boolean,
+  assessedAt: string,
+): ReadinessObservation {
+  const active = plan.tasks.filter((task) => task.acceptance.state !== 'Removed');
+  const withCriteria = active.filter((task) => task.acceptanceCriteria.length > 0);
+  const withVerification = active.filter((task) => task.verificationMethod.trim().length > 0);
+  const publishedTasks = active.filter((task) => task.acceptance.state === 'Accepted');
+
+  const dependencies = plan.tasks
+    .flatMap((task) => task.dependencies)
+    .map((dependsOn) => ({
+      id: dependsOn,
+      // A dependency that has been published exists at the provider; one that has not
+      // is still a proposal. Neither is Cancelled, because nothing in a plan can
+      // cancel work, and reporting a cancellation nobody recorded would be a blocker
+      // with no source (F09-AC3).
+      status: (publishedTasks.some((task) => task.taskId === dependsOn) ? 'Done' : 'Todo') as DependencyStatus,
+      // No release receipt is recorded against a plan task in this slice, and F09-AC3
+      // is precisely the rule that "done" is not a delivery: so a Done dependency that
+      // the work consumes is reported as awaiting its receipt rather than as available.
+      releaseReceiptRecorded: false,
+      requiresRelease: true,
+    }));
+
+  return {
+    subjectId: plan.planId,
+    assessedAt,
+    scope:
+      active.length === 0
+        ? unmet(
+            'Every proposed task has been removed, so there is nothing scoped to build.',
+            'Restore or re-propose a task before the work can start.',
+          )
+        : satisfied(`${active.length} active task(s) cover every requested outcome (F08-AC5).`),
+    criteria:
+      withCriteria.length === active.length
+        ? satisfied(`All ${active.length} active task(s) state at least one acceptance criterion (F08-AC1).`)
+        : unmet(
+            `${active.length - withCriteria.length} active task(s) state no acceptance criterion.`,
+            'Add an acceptance criterion to each task, or remove the task.',
+          ),
+    repository:
+      profile === null
+        ? unmet(
+            'This project has no saved profile, so no repository has been read.',
+            'Save a project profile naming the repository, then assess readiness again (F02-AC1, F09-AC1).',
+          )
+        : satisfied(`The project profile names ${profile.repository}.`),
+    target:
+      profile === null
+        ? unmet(
+            'This project has no saved profile, so no delivery target has been read.',
+            'Save a project profile naming the target branch, then assess readiness again (F02-AC1, F09-AC1).',
+          )
+        : satisfied(`Delivery targets ${profile.targetBranch}.`),
+    verification:
+      withVerification.length === active.length
+        ? satisfied(`All ${active.length} active task(s) state how they will be verified (F08-AC1).`)
+        : unmet(
+            `${active.length - withVerification.length} active task(s) state no verification method.`,
+            'Name how each task will be verified; an undecided method blocks completion, not implementation (F09-AC1).',
+          ),
+    access: ticketConnectorHealthy
+      ? satisfied('A ticket connector for this project reports itself healthy.')
+      : unmet(
+          'No ticket connector for this project is configured and healthy, so the provider cannot be reached.',
+          'Register a working ticket connector on the Connectors screen, then assess readiness again (F03-AC2, F09-AC1).',
+        ),
+    dependencies,
+    investigationSupported: INVESTIGATABLE_AREAS,
+  };
+}
+
+function createPlanningUseCases(deps: PlanningDeps): PlanningUseCases {
+  /**
+   * Replays a stored trail into the plan it describes.
+   *
+   * `draftPlan` runs first and each edit follows in order, so a body whose edits do
+   * not chain from its draft fails here rather than producing a plan the owner never
+   * reviewed (F08-AC3).
+   */
+  const replay = (trail: PlanDecisionTrail): Result<Plan, DomainError> => {
+    const validated = applyPlanProposal(trail.proposal);
+    if (!validated.ok) return err(validated.error);
+    const drafted = domainDraftPlan({
+      planId: trail.planId,
+      briefId: trail.proposal.briefId,
+      change: trail.change,
+      proposal: validated.value,
+    });
+    if (!drafted.ok) return err(drafted.error);
+    let current = drafted.value;
+    for (const edit of trail.edits) {
+      const next = domainEditPlan(current, edit);
+      if (!next.ok) return err(next.error);
+      current = next.value;
+    }
+    return ok(current);
+  };
+
+  const load = (planId: string): Result<{ trail: PlanDecisionTrail; plan: Plan }, DomainError> => {
+    const read = deps.plans.read(planId);
+    if (!read.ok) return err(read.error);
+    const trail = read.value;
+    if (trail === null) return err({ code: 'NotFound', reason: `Plan ${planId} has never been drafted.` });
+    try {
+      const plan = replay(trail);
+      if (!plan.ok) return err(plan.error);
+      return ok({ trail, plan: plan.value });
+    } catch (error) {
+      return err({
+        code: 'Unavailable',
+        reason: `Plan ${planId} could not be rebuilt from its stored decisions: ${describe(error)}`,
+      });
+    }
+  };
+
+  const draftPlan = (
+    input: {
+      readonly ideaId: string;
+      readonly planId: string;
+      readonly change: ChangeShape;
+      readonly proposal: PlanProposal;
+      readonly actor: string;
+    },
+  ): Result<Plan, DomainError> => {
+    const idea = deps.ideas.get(input.ideaId as IdeaId);
+    if (!idea.ok) return err(idea.error);
+    const validated = applyPlanProposal(input.proposal);
+    if (!validated.ok) return err(validated.error);
+    const drafted = domainDraftPlan({
+      planId: input.planId,
+      briefId: input.proposal.briefId,
+      change: input.change,
+      proposal: validated.value,
+    });
+    if (!drafted.ok) return err(drafted.error);
+
+    const existing = deps.plans.read(input.planId);
+    if (!existing.ok) return err(existing.error);
+    if (existing.value !== null) {
+      return err(
+        conflict(
+          `Plan ${input.planId} has already been drafted, so drafting it again would discard the owner's edits.`,
+          'a plan id that has never been drafted',
+          `plan ${input.planId}`,
+        ),
+      );
+    }
+
+    const taskWorkItemIds = workItemsFor(drafted.value);
+    const trail: PlanDecisionTrail = {
+      ideaId: input.ideaId,
+      planId: input.planId,
+      draftedBy: input.actor,
+      change: input.change,
+      proposal: input.proposal,
+      edits: [],
+      taskWorkItemIds,
+    };
+    const recorded = deps.plans.record(trail, drafted.value.revision, deps.clock.now());
+    if (!recorded.ok) return err(recorded.error);
+    return ok(drafted.value);
+  };
+
+  const resolve = (planId: string): Result<PlanDecisionTrail, DomainError> => {
+    const direct = deps.plans.read(planId);
+    if (!direct.ok) return err(direct.error);
+    if (direct.value !== null) return ok(direct.value);
+    // The address may be a work item the plan publishes as rather than the plan id
+    // itself, so a client handed one by a publication report can reach the plan without
+    // a second lookup (F10-AC2).
+    const byWorkItem = deps.plans.findByAnyWorkItemId(planId);
+    if (!byWorkItem.ok) return err(byWorkItem.error);
+    if (byWorkItem.value === null) {
+      return err({
+        code: 'NotFound',
+        reason: `No plan has id ${planId} and none publishes it as a work item. Open the plan from its own address (F10-AC2).`,
+      });
+    }
+    return ok(byWorkItem.value);
+  };
+
+  const getPlan = (planId: string): Result<Plan, DomainError> => {
+    const addressed = resolve(planId);
+    if (!addressed.ok) return err(addressed.error);
+    const found = load(addressed.value.planId);
+    return found.ok ? ok(found.value.plan) : err(found.error);
+  };
+
+  const listPlansForIdea = (ideaId: string): Result<readonly Plan[], DomainError> => {
+    const trails = deps.plans.listForIdea(ideaId);
+    if (!trails.ok) return err(trails.error);
+    const plans: Plan[] = [];
+    for (const trail of trails.value) {
+      try {
+        const replayed = replay(trail);
+        if (!replayed.ok) return err(replayed.error);
+        plans.push(replayed.value);
+      } catch (error) {
+        return err({
+          code: 'Unavailable',
+          reason: `Plan ${trail.planId} could not be rebuilt from its stored decisions: ${describe(error)}`,
+        });
+      }
+    }
+    return ok(plans);
+  };
+
+  const editPlan = (input: { readonly planId: string; readonly edit: PlanEdit }): Result<Plan, DomainError> => {
+    const addressed = resolve(input.planId);
+    if (!addressed.ok) return err(addressed.error);
+    const found = load(addressed.value.planId);
+    if (!found.ok) return err(found.error);
+    const edited = domainEditPlan(found.value.plan, input.edit);
+    if (!edited.ok) return err(edited.error);
+    const trail: PlanDecisionTrail = {
+      ...found.value.trail,
+      edits: [...found.value.trail.edits, input.edit],
+      taskWorkItemIds: workItemsFor(edited.value),
+    };
+    const recorded = deps.plans.record(trail, edited.value.revision, deps.clock.now());
+    if (!recorded.ok) return err(recorded.error);
+    return ok(edited.value);
+  };
+
+  const assessPlan = (planId: string): Result<PlanReadinessReport, DomainError> => {
+    const addressed = resolve(planId);
+    if (!addressed.ok) return err(addressed.error);
+    const found = load(addressed.value.planId);
+    if (!found.ok) return err(found.error);
+    const plan = found.value.plan;
+    const idea = deps.ideas.get(found.value.trail.ideaId as IdeaId);
+    const projectId = idea.ok ? idea.value.projectId : null;
+    const profile = projectId === null ? null : readProfileReferences(deps.profiles, projectId);
+    const connectors = projectId === null ? null : deps.connectors.listForProject(projectId);
+    const ticketConnectorHealthy =
+      connectors !== null &&
+      connectors.ok &&
+      connectors.value.some((connector) => connector.kind === 'Ticket' && connector.state === 'Healthy');
+
+    const decision = assessReadiness(
+      readinessObservationFor(plan, profile, ticketConnectorHealthy, deps.clock.now()),
+    );
+    if (!decision.ok) return err(decision.error);
+
+    const readiness = planReadiness(plan);
+    return ok({
+      decision: decision.value,
+      order: readiness.order,
+      blocked: readiness.tasks
+        .filter((entry) => !entry.ready)
+        .map((entry) => ({
+          taskId: entry.taskId,
+          reason:
+            entry.blockedBy
+              .map((blocker) =>
+                blocker.kind === 'Cycle'
+                  ? `it is part of the dependency cycle ${blocker.cycle.join(' -> ')}`
+                  : `it depends on "${blocker.dependsOn}", which the plan no longer has`,
+              )
+              .join('; ') + ' (F08-AC4)',
+        })),
+    });
+  };
+
+  const publishableFor = (planId: string): Result<readonly PublishableTicket[], DomainError> => {
+    const addressed = resolve(planId);
+    if (!addressed.ok) return err(addressed.error);
+    const found = load(addressed.value.planId);
+    if (!found.ok) return err(found.error);
+    return ok(publishableTickets(found.value.plan));
+  };
+
+  const workItemForTask = (planId: string, taskId: string): string => taskWorkItemId(planId, taskId);
+
+  return {
+    draftPlan,
+    getPlan,
+    editPlan,
+    listPlansForIdea,
+    assessPlan,
+    publishableFor,
+    workItemForTask,
+  };
+}
+
+/**
+ * Carries the work item of an absorbed task onto the task that absorbed it.
+ *
+ * A combine removes the absorbed tasks, so their identities would stop naming
+ * anything the plan holds. Each remaining task's identity is recomputed from the
+ * current task set, which keeps exactly one work item per live task and none for a
+ * task that no longer exists (F08-AC3, F10-AC3).
+ */
+function workItemsFor(plan: Plan): Readonly<Record<string, string>> {
+  const assigned: Record<string, string> = {};
+  for (const task of plan.tasks) assigned[task.taskId] = taskWorkItemId(plan.planId, task.taskId);
+  return assigned;
+}
+
+/** The repository and target a saved profile names, or null when it has none. */
+function readProfileReferences(
+  profiles: ProjectProfileRepository,
+  projectId: ProjectId,
+): { readonly repository: string; readonly targetBranch: string } | null {
+  const current = profiles.currentVersion(projectId);
+  if (!current.ok || current.value === null) return null;
+  const { repository, targetBranch } = current.value.content.references;
+  if (typeof repository !== 'string' || typeof targetBranch !== 'string') return null;
+  return { repository, targetBranch };
 }
 
 /**
@@ -454,6 +1117,43 @@ export function createCompositionRoot(config: CompositionRootConfig): Result<Com
     scope: workItems,
   });
 
+  const planStore = new SqlitePlanStore(database);
+  const planningUseCases = createPlanningUseCases({
+    clock: config.clock,
+    plans: planStore,
+    ideas,
+    profiles,
+    connectors,
+  });
+
+  // Publication and adoption need a ticket provider and a git provider. Neither is
+  // constructed here: `config.providers` carries whatever the process was configured
+  // with, and a process configured with none gets `null` for both groups rather than a
+  // use case that would refuse every call with a fabricated reason (F03-AC2, N05-AC1).
+  const providers = config.providers ?? null;
+  const publications = new PublicationRepository(database);
+  const publicationUseCases =
+    providers === null
+      ? null
+      : createPublicationUseCases({
+          clock: config.clock,
+          publications,
+          ticket: providers.ticket,
+          ...(config.redactProviderText === undefined ? {} : { redactProviderText: config.redactProviderText }),
+        });
+  const adoptionUseCases =
+    providers === null
+      ? null
+      : createAdoptionUseCases({
+          clock: config.clock,
+          publications,
+          scope,
+          profiles,
+          ticket: providers.ticket,
+          git: providers.git,
+          ...(config.redactProviderText === undefined ? {} : { redactProviderText: config.redactProviderText }),
+        });
+
   let closed = false;
 
   return ok({
@@ -464,12 +1164,15 @@ export function createCompositionRoot(config: CompositionRootConfig): Result<Com
     procedures,
     intake,
     ideas,
-    workItems,
-    scope,
     candidates,
     jobs,
     leases,
     credentials,
+    plans: planStore,
+    /** Over the same handle, so a compare-and-set is meaningful within a process (F02-AC2). */
+    workItems: new WorkItemRepository(database, { transaction: (body) => withTransaction(database, body) }),
+    publications,
+    scope,
     useCases: { ...profileUseCases, ...connectorUseCases },
     intakeUseCases,
     sessionUseCases,
@@ -477,6 +1180,9 @@ export function createCompositionRoot(config: CompositionRootConfig): Result<Com
     attentionUseCases,
     verificationUseCases,
     acceptanceUseCases,
+    planningUseCases,
+    publicationUseCases,
+    adoptionUseCases,
     close(): Result<true, DomainError> {
       if (closed) return ok(true);
       closed = true;

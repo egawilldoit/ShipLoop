@@ -382,6 +382,231 @@ export interface IntakeIdeaExport {
   }[];
 }
 
+/**
+ * One proposed task, with the acceptance that makes it publishable (F08-AC3).
+ *
+ * `publishable` is read from the server rather than derived here: it is false for
+ * anything the owner has not accepted, and a client that recomputed it from
+ * `acceptance` would be a second opinion about which tasks may become tickets
+ * (F08-AC3). `implementationLocation.kind` is always `ProposedLocation`, so a
+ * suggestion cannot be rendered as an inspected fact (F08-AC5).
+ */
+export interface PlanTask {
+  readonly taskId: string;
+  readonly outcome: string;
+  readonly scope: string;
+  readonly acceptanceCriteria: readonly string[];
+  readonly verificationMethod: string;
+  readonly dependencies: readonly string[];
+  readonly relevantProjectContext: readonly string[];
+  readonly implementationLocation: {
+    readonly kind: 'ProposedLocation';
+    readonly candidates: readonly string[];
+    readonly basis: string;
+  };
+  readonly acceptance: 'Proposed' | 'Accepted' | 'Removed';
+  readonly acceptedBy: string | null;
+  readonly acceptedAt: string | null;
+  readonly removedBy: string | null;
+  readonly removedAt: string | null;
+  readonly publishable: boolean;
+}
+
+/** Why one task cannot be declared ready, which is what F08-AC4 asks to be visible. */
+export type PlanTaskReadinessBlocker =
+  | { readonly kind: 'Cycle'; readonly cycle: readonly string[] }
+  | { readonly kind: 'UnresolvedDependency'; readonly dependsOn: string };
+
+/** A task's readiness within the plan: ready after its prerequisites, or blocked (F08-AC4). */
+export interface PlanTaskReadiness {
+  readonly taskId: string;
+  readonly ready: boolean;
+  readonly readyAfter: readonly string[];
+  readonly blockedBy: readonly PlanTaskReadinessBlocker[];
+}
+
+/** A plan as the owner reviews it, with the reason it has the tasks it has (F08-AC2). */
+export interface Plan {
+  readonly planId: string;
+  readonly ideaId: string;
+  readonly briefId: string;
+  readonly revision: number;
+  readonly draftedAt: string;
+  readonly lastEditedAt: string | null;
+  readonly lastEditedBy: string | null;
+  readonly requestedOutcomes: readonly { readonly id: string; readonly statement: string }[];
+  readonly exclusions: readonly { readonly outcomeId: string; readonly excluded: string; readonly reason: string }[];
+  readonly coverage: readonly {
+    readonly outcomeId: string;
+    readonly via: 'Task' | 'Exclusion';
+    readonly taskId?: string;
+    readonly reason?: string;
+  }[];
+  readonly split: {
+    readonly split: boolean;
+    readonly reason: string;
+    readonly justifications: readonly ('IndependentlyReviewable' | 'RealDependency')[];
+    readonly surfacesWithoutOwnBehaviour: readonly string[];
+  };
+  readonly tasks: readonly PlanTask[];
+  /** The sequence the owner agreed, which a reorder changes (F08-AC3). */
+  readonly agreedSequence: readonly string[];
+  /** Prerequisites first; what makes a dependency visible rather than implied (F08-AC4). */
+  readonly proposedOrder: readonly string[];
+  readonly taskReadiness: readonly PlanTaskReadiness[];
+  readonly digest: string;
+  readonly workItemIdByTaskId: Readonly<Record<string, string>>;
+}
+
+/** One readiness area with the reason it stands where it does (F09-AC1). */
+export interface ReadinessArea {
+  readonly area: string;
+  readonly status: 'Satisfied' | 'Unmet' | 'Unknown';
+  readonly reason: string;
+  readonly remedy: string | null;
+}
+
+/**
+ * The recorded readiness decision, over every area F09-AC1 names (F09-AC1, F09-AC2).
+ *
+ * `mayStartBuild` and `buildBlockingAreas` are both carried because they are two
+ * readings of one decision; `mayStartInvestigation` is separate because it is
+ * precisely when the build is disabled that read-only investigation is still allowed
+ * (F09-AC2).
+ */
+export interface ReadinessAssessment {
+  readonly subjectId: string;
+  readonly assessedAt: string;
+  readonly verdict: 'Ready' | 'NeedsInformation' | 'Blocked';
+  readonly mayStartBuild: boolean;
+  readonly mayStartInvestigation: boolean;
+  readonly buildBlockingAreas: readonly string[];
+  readonly areas: readonly ReadinessArea[];
+  readonly reasons: readonly { readonly area: string; readonly status: string; readonly reason: string }[];
+}
+
+/** One proposed ticket's outcome, as the owner must be shown it (F10-AC2). */
+export interface TicketPublication {
+  readonly workItemId: string;
+  readonly taskId: string | null;
+  readonly kind: 'Published' | 'Failed' | 'OutcomeUnknown';
+  readonly issueId: string | null;
+  readonly identifier: string | null;
+  readonly url: string | null;
+  readonly disposition: 'CreatedNew' | 'AlreadyPresent' | 'AdoptedExisting' | null;
+  readonly unlinked: readonly { readonly target: string; readonly reason: string }[];
+  readonly detail: string;
+}
+
+/**
+ * One publication request's outcome, per ticket (F10-AC2, F10-AC3).
+ *
+ * `unpublished` is read from the server rather than derived from `published`: a partial
+ * failure has to name what remains, and deriving the remainder on the client is exactly
+ * the step that goes wrong when it matters (F10-AC2).
+ */
+export interface PublicationReport {
+  readonly requestId: string;
+  readonly planId: string;
+  readonly tickets: readonly TicketPublication[];
+  readonly published: readonly string[];
+  readonly unpublished: readonly string[];
+  /** True when this request addressed existing external work rather than writing (F10-AC3). */
+  readonly reconciled: boolean;
+}
+
+/** An adopted issue's live content, read rather than re-created (F11-AC1). */
+export interface AdoptedIssue {
+  readonly workItemId: string;
+  readonly issueId: string;
+  readonly identifier: string;
+  readonly url: string;
+  readonly title: string;
+  readonly description: string;
+  readonly priority: string | null;
+  readonly acceptanceCriteria: readonly { readonly id: string; readonly text: string }[];
+  readonly dependencyIssueIds: readonly string[];
+  readonly state: string;
+  readonly capturedScopeSnapshotId: string;
+  /** Always false: adoption creates no replacement and offers no merge (F11-AC3). */
+  readonly mergeable: false;
+}
+
+/** An adopted branch or pull request, verified before adoption (F11-AC2). */
+export interface LinkedChange {
+  readonly workItemId: string;
+  readonly repository: string;
+  readonly headSha: string;
+  readonly baseBranch: string;
+  readonly pullRequestId: string | null;
+}
+
+/** A recorded Test or Review request for adopted work (F11-AC5). */
+export interface AdoptedEvaluation {
+  readonly workItemId: string;
+  readonly mode: 'Test' | 'Review';
+  readonly dedupKey: string;
+  readonly created: boolean;
+  /** Always false: no job was launched and no issue was rewritten (F11-AC5). */
+  readonly jobEnqueued: false;
+}
+
+/** The change a plan proposes, which is what justifies or refuses a split (F08-AC2). */
+export interface PlanChangeSurface {
+  readonly surfaceId: string;
+  readonly description: string;
+  readonly observableBehaviour: string;
+  readonly independentlyReviewable: boolean;
+}
+
+export interface PlanDraftRequest {
+  readonly ideaId: string;
+  readonly planId: string;
+  readonly change: {
+    readonly summary: string;
+    readonly surfaces: readonly PlanChangeSurface[];
+    readonly dependencyEdges: readonly { readonly surface: string; readonly dependsOn: string }[];
+  };
+  /** The structured proposal as it was produced; the domain validates it (F05-AC5). */
+  readonly proposal: unknown;
+}
+
+export type PlanEditRequest =
+  | { readonly kind: 'Accept'; readonly taskId: string; readonly expectedRevision: number }
+  | { readonly kind: 'Remove'; readonly taskId: string; readonly expectedRevision: number }
+  | {
+      readonly kind: 'Edit';
+      readonly taskId: string;
+      readonly expectedRevision: number;
+      readonly changes: {
+        readonly outcome?: string;
+        readonly scope?: string;
+        readonly acceptanceCriteria?: readonly string[];
+        readonly verificationMethod?: string;
+        readonly dependencies?: readonly string[];
+        readonly relevantProjectContext?: readonly string[];
+        readonly implementationLocation?: {
+          readonly kind: 'ProposedLocation';
+          readonly candidates: readonly string[];
+          readonly basis: string;
+        };
+      };
+    }
+  | { readonly kind: 'Reorder'; readonly order: readonly string[]; readonly expectedRevision: number }
+  | {
+      readonly kind: 'Combine';
+      readonly intoTaskId: string;
+      readonly fromTaskIds: readonly string[];
+      readonly expectedRevision: number;
+    }
+  | {
+      readonly kind: 'Exclusion';
+      readonly outcomeId: string;
+      readonly excluded: string;
+      readonly reason: string;
+      readonly expectedRevision: number;
+    };
+
 export interface SessionResponse {
   readonly owner: OwnerIdentity;
   readonly csrfToken: string;
@@ -1127,6 +1352,112 @@ export function applyIntakeCorrection(
     method: 'POST',
     csrf: true,
     body: correction,
+  });
+}
+
+/**
+ * Plans, readiness, publication and adoption (F08, F09, F10, F11).
+ *
+ * Every address is percent-encoded because a plan address may be a work item id rather
+ * than the plan's own, and both forms reach the same plan (F10-AC2). Publication and
+ * adoption carry the caller's own request or work item identity rather than one minted
+ * here, because a retry after a timeout must present the same request id (F10-AC3).
+ */
+export function draftPlan(draft: PlanDraftRequest): Promise<ApiResult<{ readonly plan: Plan }>> {
+  return request<{ readonly plan: Plan }>('/api/plans', { method: 'POST', csrf: true, body: draft });
+}
+
+export function fetchPlan(planId: string): Promise<ApiResult<{ readonly plan: Plan }>> {
+  return request<{ readonly plan: Plan }>(`/api/plans/${encodeURIComponent(planId)}`, { method: 'GET', csrf: false });
+}
+
+export function fetchPlansForIdea(ideaId: string): Promise<ApiResult<{ readonly plans: readonly Plan[] }>> {
+  return request<{ readonly plans: readonly Plan[] }>(`/api/ideas/${encodeURIComponent(ideaId)}/plans`, {
+    method: 'GET',
+    csrf: false,
+  });
+}
+
+export function editPlan(planId: string, edit: PlanEditRequest): Promise<ApiResult<{ readonly plan: Plan }>> {
+  return request<{ readonly plan: Plan }>(`/api/plans/${encodeURIComponent(planId)}/edit`, {
+    method: 'POST',
+    csrf: true,
+    body: edit,
+  });
+}
+
+export function fetchPlanReadiness(
+  planId: string,
+): Promise<ApiResult<{ readonly assessment: ReadinessAssessment }>> {
+  return request<{ readonly assessment: ReadinessAssessment }>(`/api/plans/${encodeURIComponent(planId)}/readiness`, {
+    method: 'GET',
+    csrf: false,
+  });
+}
+
+export function publishPlan(
+  planId: string,
+  requestId: string,
+): Promise<ApiResult<{ readonly report: PublicationReport }>> {
+  return request<{ readonly report: PublicationReport }>(`/api/plans/${encodeURIComponent(planId)}/publish`, {
+    method: 'POST',
+    csrf: true,
+    body: { requestId },
+  });
+}
+
+export function reconcilePlanPublication(
+  planId: string,
+  input: {
+    readonly operationId: string;
+    readonly resolution: unknown;
+    readonly observedAt: string;
+    readonly resolvedBy: string;
+  },
+): Promise<ApiResult<{ readonly reconciliation: { readonly resolution: string; readonly workItemId: string | null; readonly detail: string } }>> {
+  return request(`/api/plans/${encodeURIComponent(planId)}/reconcile-publication`, {
+    method: 'POST',
+    csrf: true,
+    body: input,
+  });
+}
+
+export function adoptExistingIssue(input: {
+  readonly projectId: string;
+  readonly profileVersionId: string;
+  readonly procedureVersionId: string;
+  readonly issueId: string;
+  readonly expectedIdentifier: string | null;
+  readonly title: string;
+}): Promise<ApiResult<{ readonly adopted: AdoptedIssue }>> {
+  return request<{ readonly adopted: AdoptedIssue }>('/api/adoption/issue', { method: 'POST', csrf: true, body: input });
+}
+
+export function linkExistingChange(input: {
+  readonly workItemId: string;
+  readonly repository: {
+    readonly provider: string;
+    readonly fullName: string;
+    readonly defaultBranch?: string;
+    readonly url?: string;
+  };
+  readonly branch: string;
+  readonly baseBranch: string;
+  readonly expectedHeadSha: string | null;
+  readonly pullRequestId: string | null;
+}): Promise<ApiResult<{ readonly change: LinkedChange }>> {
+  return request<{ readonly change: LinkedChange }>('/api/adoption/change', { method: 'POST', csrf: true, body: input });
+}
+
+export function requestAdoptedEvaluation(input: {
+  readonly workItemId: string;
+  readonly mode: 'Test' | 'Review' | 'Build';
+  readonly candidateId: string | null;
+}): Promise<ApiResult<{ readonly evaluation: AdoptedEvaluation }>> {
+  return request<{ readonly evaluation: AdoptedEvaluation }>('/api/adoption/evaluate', {
+    method: 'POST',
+    csrf: true,
+    body: input,
   });
 }
 

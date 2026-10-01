@@ -1068,6 +1068,263 @@ export interface AcceptanceUseCases {
   acceptanceGate(jobId: JobId): Promise<Result<AcceptanceGateView, DomainError>>;
 }
 
+/* -------------------------------------------------------------------------- */
+/* Plans, readiness, publication and adoption                                 */
+/* -------------------------------------------------------------------------- */
+
+/** One proposed task's plan content, with the acceptance that makes it publishable (F08-AC3). */
+export interface PlanTaskView {
+  readonly taskId: string;
+  readonly outcome: string;
+  readonly scope: string;
+  readonly acceptanceCriteria: readonly string[];
+  readonly verificationMethod: string;
+  readonly dependencies: readonly string[];
+  readonly relevantProjectContext: readonly string[];
+  /**
+   * Always tagged `ProposedLocation` (F08-AC5).
+   *
+   * The tag is carried rather than assumed by the client so a suggestion cannot be
+   * rendered as an inspected fact: the transport states what kind of thing this is
+   * instead of leaving the reader to infer it from the word "location".
+   */
+  readonly implementationLocation: {
+    readonly kind: 'ProposedLocation';
+    readonly candidates: readonly string[];
+    readonly basis: string;
+  };
+  readonly acceptance: 'Proposed' | 'Accepted' | 'Removed';
+  readonly acceptedBy: string | null;
+  readonly acceptedAt: string | null;
+  readonly removedBy: string | null;
+  readonly removedAt: string | null;
+  /** False for anything but an accepted proposal, so an unaccepted task offers no ticket (F08-AC3). */
+  readonly publishable: boolean;
+}
+
+/** Why the plan holds the number of tasks it holds (F08-AC2). */
+export interface PlanSplitView {
+  readonly split: boolean;
+  readonly reason: string;
+  readonly justifications: readonly ('IndependentlyReviewable' | 'RealDependency')[];
+  readonly surfacesWithoutOwnBehaviour: readonly string[];
+}
+
+/**
+ * A plan as the owner reviews it (F08-AC1, F08-AC2, F08-AC4, F08-AC5).
+ *
+ * `split.reason` is the justification for the task count and `coverage` records how
+ * every requested outcome is accounted for, so neither is a thing the client has to
+ * recompute and trust. `proposedOrder` is prerequisites first and `taskReadiness`
+ * names what blocks each task, which is what makes a cyclic or unresolved dependency
+ * visible rather than inferred from the dependency list (F08-AC4).
+ */
+export interface PlanView {
+  readonly planId: string;
+  readonly ideaId: string;
+  readonly briefId: string;
+  readonly revision: number;
+  readonly draftedAt: string;
+  readonly lastEditedAt: string | null;
+  readonly lastEditedBy: string | null;
+  readonly requestedOutcomes: readonly { readonly id: string; readonly statement: string }[];
+  readonly exclusions: readonly { readonly outcomeId: string; readonly excluded: string; readonly reason: string }[];
+  readonly coverage: readonly {
+    readonly outcomeId: string;
+    readonly via: 'Task' | 'Exclusion';
+    readonly taskId?: string;
+    readonly reason?: string;
+  }[];
+  readonly split: PlanSplitView;
+  readonly tasks: readonly PlanTaskView[];
+  /** The sequence the owner agreed, which a reorder changes (F08-AC3). */
+  readonly agreedSequence: readonly string[];
+  /** What the dependencies permit, which a reorder cannot change (F08-AC4). */
+  readonly proposedOrder: readonly string[];
+  readonly taskReadiness: readonly {
+    readonly taskId: string;
+    readonly ready: boolean;
+    readonly readyAfter: readonly string[];
+    readonly blockedBy: readonly (
+      | { readonly kind: 'Cycle'; readonly cycle: readonly string[] }
+      | { readonly kind: 'UnresolvedDependency'; readonly dependsOn: string }
+    )[];
+  }[];
+  readonly digest: string;
+  readonly workItemIdByTaskId: Readonly<Record<string, string>>;
+}
+
+/** One readiness area with the reason it stands where it does (F09-AC1). */
+export interface ReadinessAreaView {
+  readonly area: string;
+  readonly status: 'Satisfied' | 'Unmet' | 'Unknown';
+  readonly reason: string;
+  readonly remedy: string | null;
+}
+
+/**
+ * The recorded readiness decision over every area F09-AC1 names (F09-AC1, F09-AC2).
+ *
+ * Every area is present, whether satisfied or not, so an assessment that never looked
+ * at access cannot be presented as one that found access fine. `buildBlockingAreas`
+ * travels with `mayStartBuild` because they are two readings of one decision (F09-AC2),
+ * and `mayStartInvestigation` is separate because it is precisely when the build is
+ * disabled that read-only investigation is still permitted.
+ */
+export interface ReadinessAssessmentView {
+  readonly subjectId: string;
+  readonly assessedAt: string;
+  readonly verdict: 'Ready' | 'NeedsInformation' | 'Blocked';
+  readonly mayStartBuild: boolean;
+  readonly mayStartInvestigation: boolean;
+  readonly buildBlockingAreas: readonly string[];
+  readonly areas: readonly ReadinessAreaView[];
+  readonly reasons: readonly { readonly area: string; readonly status: string; readonly reason: string }[];
+}
+
+/** One proposed ticket's outcome, as the owner must be shown it (F10-AC2). */
+export interface TicketPublicationView {
+  readonly workItemId: string;
+  readonly taskId: string | null;
+  readonly kind: 'Published' | 'Failed' | 'OutcomeUnknown';
+  readonly issueId: string | null;
+  readonly identifier: string | null;
+  readonly url: string | null;
+  readonly disposition: 'CreatedNew' | 'AlreadyPresent' | 'AdoptedExisting' | null;
+  /** Links the provider refused, so a partial publication does not present as complete (F10-AC2). */
+  readonly unlinked: readonly { readonly target: string; readonly reason: string }[];
+  readonly detail: string;
+}
+
+/**
+ * One publication request's whole outcome (F10-AC2, F10-AC3).
+ *
+ * `unpublished` is carried explicitly rather than left to be derived from `published`:
+ * a partial failure has to name what remains, and a client that derived the remainder
+ * could get it wrong exactly when it matters most. `reconciled` distinguishes a repeat
+ * that addressed existing external work from one that wrote a new issue (F10-AC3).
+ */
+export interface PublicationReportView {
+  readonly requestId: string;
+  readonly planId: string;
+  readonly tickets: readonly TicketPublicationView[];
+  readonly published: readonly string[];
+  readonly unpublished: readonly string[];
+  readonly reconciled: boolean;
+}
+
+/** An adopted issue's live content, read rather than re-created (F11-AC1). */
+export interface AdoptedIssueView {
+  readonly workItemId: string;
+  readonly issueId: string;
+  readonly identifier: string;
+  readonly url: string;
+  readonly title: string;
+  readonly description: string;
+  readonly priority: string | null;
+  readonly acceptanceCriteria: readonly { readonly id: string; readonly text: string }[];
+  readonly dependencyIssueIds: readonly string[];
+  readonly state: string;
+  readonly capturedScopeSnapshotId: string;
+  /** Always false: adoption creates no replacement and offers no merge (F11-AC1, F11-AC3). */
+  readonly mergeable: false;
+}
+
+/** An adopted branch or pull request, verified before adoption (F11-AC2). */
+export interface LinkedChangeView {
+  readonly workItemId: string;
+  readonly repository: string;
+  readonly headSha: string;
+  readonly baseBranch: string;
+  readonly pullRequestId: string | null;
+}
+
+/** A recorded Test or Review request for an adopted candidate (F11-AC5). */
+export interface AdoptedEvaluationView {
+  readonly workItemId: string;
+  readonly mode: 'Test' | 'Review';
+  readonly dedupKey: string;
+  readonly created: boolean;
+  /** Always false: requesting a review launches no job and rewrites no issue (F11-AC5). */
+  readonly jobEnqueued: false;
+}
+
+export interface DraftPlanCommand {
+  readonly ideaId: string;
+  readonly planId: string;
+  /** Decoded structured output. Validated by the domain, never by the route (F05-AC5). */
+  readonly change: unknown;
+  readonly proposal: unknown;
+  readonly actor: OwnerId;
+}
+
+export interface EditPlanCommand {
+  readonly planId: string;
+  /** The edit, decoded by the controller into the domain's union (F08-AC3). */
+  readonly edit: unknown;
+  readonly actor: OwnerId;
+}
+
+/**
+ * Planning, readiness, publication and adoption (F08, F09, F10, F11).
+ *
+ * Writes carry the owner the transport proved and reads carry no caller, following the
+ * same rule as the other groups (F01-AC1). `publishPlan` and `adoptExistingIssue` are
+ * separate from the plan reads because both are explicit owner actions on an accepted
+ * revision, never a consequence of drafting or editing one (F10-AC1, F11-AC1).
+ */
+export interface PlanningUseCases {
+  draftPlan(command: DraftPlanCommand): Promise<Result<PlanView, DomainError>>;
+  getPlan(planId: string): Promise<Result<PlanView, DomainError>>;
+  listPlansForIdea(ideaId: string): Promise<Result<readonly PlanView[], DomainError>>;
+  editPlan(command: EditPlanCommand): Promise<Result<PlanView, DomainError>>;
+  assessPlan(planId: string): Promise<Result<ReadinessAssessmentView, DomainError>>;
+  publishPlan(command: {
+    readonly planId: string;
+    /** Stable across a retry, so a repeat reconciles rather than duplicating (F10-AC3). */
+    readonly requestId: string;
+    readonly correlationId: string;
+    readonly actor: OwnerId;
+  }): Promise<Result<PublicationReportView, DomainError>>;
+  reconcilePublication(command: {
+    readonly operationId: string;
+    readonly resolution: unknown;
+    readonly observedAt: string;
+    readonly resolvedBy: string;
+    readonly correlationId: string;
+    readonly actor: OwnerId;
+  }): Promise<Result<{ readonly resolution: string; readonly workItemId: string | null; readonly detail: string }, DomainError>>;
+  adoptExistingIssue(command: {
+    readonly projectId: ProjectId;
+    readonly profileVersionId: ProfileVersionId;
+    readonly procedureVersionId: string;
+    readonly issueId: string;
+    readonly expectedIdentifier: string | null;
+    readonly title: string;
+    readonly correlationId: string;
+    readonly actor: OwnerId;
+  }): Promise<Result<AdoptedIssueView, DomainError>>;
+  linkExistingChange(command: {
+    readonly workItemId: string;
+    readonly repository: unknown;
+    readonly branch: string;
+    readonly baseBranch: string;
+    readonly expectedHeadSha: string | null;
+    readonly pullRequestId: string | null;
+    readonly correlationId: string;
+    readonly actor: OwnerId;
+  }): Promise<Result<LinkedChangeView, DomainError>>;
+  requestAdoptedEvaluation(command: {
+    readonly workItemId: string;
+    readonly candidateId: string | null;
+    readonly candidateFingerprint: string | null;
+    /** `Build` is expressible so the use case's own refusal is what the owner reads (F11-AC5). */
+    readonly mode: 'Test' | 'Review' | 'Build';
+    readonly correlationId: string;
+    readonly actor: OwnerId;
+  }): Promise<Result<AdoptedEvaluationView, DomainError>>;
+}
+
 /** The whole injected surface. One argument, so a missing use case is a type error. */
 export interface ControllerSurface {
   readonly owners: OwnerUseCases;
@@ -1079,6 +1336,7 @@ export interface ControllerSurface {
   readonly attention: AttentionUseCases;
   readonly reviewCards: ReviewCardUseCases;
   readonly acceptance: AcceptanceUseCases;
+  readonly planning: PlanningUseCases;
 }
 
 const REQUIRED_METHODS = {
@@ -1116,6 +1374,18 @@ const REQUIRED_METHODS = {
   attention: ['collectAttention', 'acknowledge'],
   reviewCards: ['buildReviewCard'],
   acceptance: ['requestChanges', 'recordAcceptance', 'currentAcceptance', 'acceptanceGate'],
+  planning: [
+    'draftPlan',
+    'getPlan',
+    'listPlansForIdea',
+    'editPlan',
+    'assessPlan',
+    'publishPlan',
+    'reconcilePublication',
+    'adoptExistingIssue',
+    'linkExistingChange',
+    'requestAdoptedEvaluation',
+  ],
 } as const satisfies Record<keyof ControllerSurface, readonly string[]>;
 
 export type ControllerGroup = keyof typeof REQUIRED_METHODS;
