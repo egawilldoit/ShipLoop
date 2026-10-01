@@ -22,7 +22,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
-import { ok } from '@shiploop/domain';
+import { blocked, err, ok } from '@shiploop/domain';
 import type {
   AttemptState,
   CapabilityKind,
@@ -347,13 +347,28 @@ function prepared(
 
 class ScriptedWorkspacePort implements WorkspacePort {
   current: PreparedWorkspace;
+  /** What the workspace looks like once the attempt has written to it. */
+  afterAttempt: PreparedWorkspace['observation'];
+  observeCalls = 0;
 
-  constructor(current: PreparedWorkspace = prepared()) {
+  constructor(current: PreparedWorkspace = prepared(), afterAttempt?: PreparedWorkspace['observation']) {
     this.current = current;
+    this.afterAttempt = afterAttempt ?? current.observation;
   }
 
   async prepare(): Promise<Result<PreparedWorkspace, DomainError>> {
     return ok(this.current);
+  }
+
+  /**
+   * Answers with the post-attempt reading, which is what a checkpoint's inventory must be
+   * written from. A checkpoint taken from the pre-attempt reading describes a worktree the
+   * attempt had not yet written to, so the worker could never authorise resuming its own
+   * workspace (F14-AC4, F17-AC2).
+   */
+  async observe(): Promise<Result<PreparedWorkspace['observation'], DomainError>> {
+    this.observeCalls += 1;
+    return ok(this.afterAttempt);
   }
 }
 
@@ -568,6 +583,12 @@ function stateOf(queue: JobQueue, jobId: JobId): AttemptState {
 
 function checkpointOf(queue: JobQueue, jobId: JobId): JobCheckpoint | null {
   return expectOk(queue.readCheckpoint(jobId));
+}
+
+/** The holder recorded in the single coding slot row, read from the durable row itself. */
+function slotHolder(database: Database): string | null {
+  const holder = database.prepare('SELECT holder FROM coding_slots WHERE slot_id = 1').get()?.['holder'];
+  return typeof holder === 'string' ? holder : null;
 }
 
 /** Writes a checkpoint as a previous holder, for the recovery cases. */
@@ -1042,6 +1063,20 @@ test('F17-AC3: a resume checks the actual workspace and live external state befo
       lostUntracked.kind === 'Reconcile' ? lostUntracked.reason : '',
       /the set of untracked files changed/,
     );
+    const otherWorkspace = assessResume(
+      recoveredCheckpoint(),
+      prepared(
+        observation({
+          workspace: { workspaceId: 'ws-elsewhere', branchName: 'shiploop/elsewhere', worktreePath: '/tmp/shiploop-elsewhere' },
+        }),
+      ),
+    );
+    assert.equal(
+      otherWorkspace.kind,
+      'Reconcile',
+      'a resume must run in the workspace its checkpoint names, whatever else matches',
+    );
+    assert.match(otherWorkspace.kind === 'Reconcile' ? otherWorkspace.reason : '', /the workspace moved from/);
   });
 
   await withHarness(async (h) => {
@@ -1260,6 +1295,320 @@ test('F18-AC5: a deterministic authentication failure is not dispatched a second
 });
 
 /* -------------------------------------------------------------------------- */
+/* The five defects the first real coding run found                             */
+/* -------------------------------------------------------------------------- */
+
+/** The untracked file an attempt is taken to have written into the fixture worktree. */
+const ATTEMPT_FILE = 'src/worker/attempt-notes.ts';
+
+test('defect 1: the checkpoint lists the file the attempt created, read after the work settled', async () => {
+  await withHarness(async (h) => {
+    const port = new ScriptedWorkspacePort(prepared(), observation({ untrackedFiles: [ATTEMPT_FILE] }));
+    const engine = new ScriptedEngine({ events: [sessionStarted(T0)], hold: () => h.hold });
+    const worker = h.buildWorker(engine, { workspaces: port });
+    const jobId = h.enqueue();
+
+    const running = worker.tick();
+    await engine.firstSession;
+    worker.requestStop();
+    h.release();
+    expectOk(await running);
+
+    assert.equal(
+      port.observeCalls,
+      1,
+      'the checkpoint is written from a re-read of the workspace, not from the reading taken before the attempt',
+    );
+    const checkpoint = checkpointOf(h.queue, jobId);
+    assert.ok(checkpoint !== null, 'a stop leaves a durable resume point');
+    assert.deepEqual(
+      [...checkpoint.untrackedFiles],
+      [ATTEMPT_FILE],
+      'the resume point describes the worktree the engine actually left behind',
+    );
+    assert.deepEqual([...checkpoint.dirtyFiles], ['src/worker.ts']);
+    assert.equal(
+      prepared().observation.untrackedFiles.includes(ATTEMPT_FILE),
+      false,
+      'the pre-attempt reading is not what the checkpoint may be built from, or this assertion proves nothing',
+    );
+  });
+});
+
+test('defect 2: a deterministic reconciliation refusal reaches a terminal state instead of repeating every tick', async () => {
+  await withHarness(async (h) => {
+    const jobId = h.enqueue();
+    assert.equal(claimAsForeignWriter(h.queue, 'writer-that-vanished', h.clock.now()), jobId);
+    writeCheckpointAs(h.queue, jobId, 'writer-that-vanished', h.clock.now());
+    h.clock.advance(61_000);
+
+    // The workspace provider refuses the same thing on every tick, as a stale worktree lock does.
+    const refusing: WorkspacePort = {
+      prepare: async () =>
+        err(
+          blocked(`Workspace ws-worker cannot be reused by ${HOLDER}: the workspace lock names another owner.`, [
+            { name: 'WorkspaceLocked', detail: 'The workspace lock names a different owner.', remedy: 'Release it or reconcile it.' },
+          ]),
+        ),
+    };
+    const engine = new ScriptedEngine({ events: [sessionStarted(T0), succeeded(T0, 'must not run')] });
+    const worker = h.buildWorker(engine, {
+      workspaces: refusing,
+      liveness: livenessPort(() => ({ kind: 'Stopped', evidence: 'the previous group is gone' })),
+    });
+
+    const first = expectOk(await worker.tick());
+    assert.equal(first.kind, 'Claimed');
+    assert.equal(first.outcome.kind, 'Blocked', `the refusal must reach a terminal state, got ${JSON.stringify(first.outcome)}`);
+    const failure = first.outcome.kind === 'Blocked' ? first.outcome.failure : null;
+    assert.ok(failure !== null);
+    assert.equal(failure.stage, 'Reconciliation');
+    assert.equal(failure.category, 'DeterministicAuth', 'a scope or authentication refusal repeats identically');
+    assert.equal(failure.retryable, false);
+    assert.equal(engine.starts.length, 0, 'a refused reconciliation starts no coding session');
+    assert.equal(stateOf(h.queue, jobId), 'Blocked', 'Blocked is not a state the loop tries again');
+    const blocker = expectOk(h.attention.list('Open')).find((item) => item.dedupKey === `Blocker:${jobId}`);
+    assert.ok(blocker !== undefined, 'the owner is told the refusal rather than finding it in a log');
+    assert.match(blocker.blocker ?? '', /DeterministicAuth/);
+    assert.match(blocker.nextAction, /Supply valid credentials|workspace|credential/i);
+
+    const second = expectOk(await worker.tick());
+    assert.equal(second.kind, 'Idle', `a terminal refusal must not be claimed again, got ${JSON.stringify(second)}`);
+    assert.equal(engine.starts.length, 0);
+    assert.equal(stateOf(h.queue, jobId), 'Blocked');
+  });
+});
+
+test('defect 3: Blocked and WaitingForOwner both give up the coding slot, so the next job is claimable', async () => {
+  await withHarness(async (h) => {
+    const waiting = h.enqueue({ limits: limits({ activeExecutionMs: 60_000 }) });
+    const queued = h.enqueue();
+    const reaching = new ScriptedEngine({
+      events: [sessionStarted(T0), succeeded(T0, 'the engine kept going')],
+      advance: (): void => {
+        h.clock.advance(90_000);
+      },
+    });
+
+    const tick = expectOk(await h.buildWorker(reaching).tick());
+    assert.equal(tick.kind, 'Claimed');
+    assert.equal(tick.kind === 'Claimed' ? tick.outcome.kind : null, 'WaitingForOwner');
+    assert.equal(stateOf(h.queue, waiting), 'WaitingForOwner');
+    assert.equal(expectOk(h.leases.leaseStatus(waiting))?.state, 'Released', 'a waiting attempt is not writing');
+    assert.equal(slotHolder(h.database), null, 'the coding slot is given up while the owner decides');
+    assert.equal(
+      expectOk(h.queue.claimNext({ holder: 'next-writer', now: h.clock.now(), leaseTtlMs: LEASE_TTL_MS, projectId: null })).job
+        .jobId,
+      queued,
+      'the job queued behind it is claimable the moment the slot is released',
+    );
+  });
+
+  await withHarness(async (h) => {
+    const blocked = h.enqueue();
+    const queued = h.enqueue();
+    const engine = new ScriptedEngine({ events: [sessionStarted(T0), blockedByAuthentication(T0)] });
+
+    const tick = expectOk(await h.buildWorker(engine).tick());
+    assert.equal(tick.kind, 'Claimed');
+    assert.equal(tick.kind === 'Claimed' ? tick.outcome.kind : null, 'Blocked');
+    assert.equal(stateOf(h.queue, blocked), 'Blocked');
+    assert.equal(expectOk(h.leases.leaseStatus(blocked))?.state, 'Released', 'a blocked attempt is not writing');
+    assert.equal(slotHolder(h.database), null, 'one blocked job must not hold every later job in the project');
+    assert.equal(
+      expectOk(h.queue.claimNext({ holder: 'next-writer', now: h.clock.now(), leaseTtlMs: LEASE_TTL_MS, projectId: null })).job
+        .jobId,
+      queued,
+      'the next job is claimable while the blocked one waits for an owner',
+    );
+  });
+});
+
+test('defect 4: an expired lease whose holder is still writing authorises no takeover until it is confirmed stopped', async () => {
+  await withHarness(async (h) => {
+    const jobId = h.enqueue();
+    assert.equal(claimAsForeignWriter(h.queue, 'writer-that-vanished', h.clock.now()), jobId);
+    h.clock.advance(61_000);
+
+    let liveness: HolderLiveness = {
+      kind: 'StillWriting',
+      evidence: 'process group 4242 is still running and its worktree is still changing',
+    };
+    const engine = new ScriptedEngine({ events: [sessionStarted(T0), succeeded(T0, 'must not run')] });
+    const refusing = h.buildWorker(engine, { liveness: livenessPort(() => liveness) });
+
+    const refused = expectOk(await refusing.tick());
+    assert.equal(refused.kind, 'SlotOccupied', 'an expired lease is not evidence that the writer is gone');
+    assert.equal(engine.starts.length, 0, 'no second coding writer may start while the first may still be writing');
+    assert.equal(stateOf(h.queue, jobId), 'Running', 'the live writer keeps its job');
+    assert.equal(slotHolder(h.database), 'writer-that-vanished', 'the coding slot stays with the writer that may be alive');
+    const unconfirmed = expectOk(h.leases.leaseStatus(jobId));
+    assert.equal(unconfirmed?.state, 'Active');
+    assert.equal(unconfirmed?.confirmedStoppedBy, null);
+    const reconciled = expectOk(await refusing.reconcile());
+    assert.ok(
+      reconciled.findings.some((finding) => finding.status !== 'Vacant'),
+      'the silence is reported for reconciliation rather than resolved',
+    );
+
+    liveness = { kind: 'Stopped', evidence: 'process group 4242 was observed gone' };
+    const recovered = expectOk(await refusing.tick());
+    assert.equal(recovered.kind, 'Claimed', 'only a recorded stop hands the job over');
+    const confirmed = expectOk(h.leases.leaseStatus(jobId));
+    assert.equal(confirmed?.confirmedStoppedBy, HOLDER);
+    assert.equal(stateOf(h.queue, jobId), 'Completed');
+    assert.equal(slotHolder(h.database), null, 'the completed job gave the slot back');
+  });
+
+  await withHarness(async (h) => {
+    // The storage rule behind the fix: re-taking a lease is only ever the same holder taking back
+    // one it gave up. An `Active` term that merely lapsed is not reissued, because a fresh term
+    // would be a second writer on the strength of evidence that proved only silence (F17-AC5).
+    const jobId = h.enqueue();
+    assert.equal(claimAsForeignWriter(h.queue, 'writer-that-vanished', h.clock.now()), jobId);
+    const lapsed = expectOk(h.leases.leaseStatus(jobId));
+    const held = expectOk(h.queue.readJob(jobId));
+    assert.ok(lapsed !== null && held !== null);
+    h.clock.advance(61_000);
+
+    const sameHolder = expectOk(
+      h.leases.reclaimLease({
+        leaseId: `lease:${jobId}`,
+        jobId,
+        holder: 'writer-that-vanished',
+        operationId: held.operationId,
+        now: h.clock.now(),
+        leaseTtlMs: LEASE_TTL_MS,
+      }),
+    );
+    assert.equal(sameHolder.granted, true, 'a holder may continue its own job');
+    assert.equal(sameHolder.lease.leaseId, lapsed.leaseId, 'on the term it already held, not a second one');
+    assert.equal(sameHolder.lease.acquiredAt, lapsed.acquiredAt);
+
+    const otherHolder = expectOk(
+      h.leases.reclaimLease({
+        leaseId: `lease:${jobId}`,
+        jobId,
+        holder: 'second-writer',
+        operationId: ('op-second' as OperationId),
+        now: h.clock.now(),
+        leaseTtlMs: LEASE_TTL_MS,
+      }),
+    );
+    assert.equal(otherHolder.granted, false, 'an expired lease authorises no other holder');
+    assert.equal(otherHolder.reconciliationRequired, true);
+    assert.equal(slotHolder(h.database), 'writer-that-vanished', 'the coding slot is still the lapsed holder\u2019s to give up');
+  });
+});
+
+test('defect 5: a SIGTERM-ignoring engine child still produces a bounded stop and a written checkpoint', async () => {
+  await withHarness(async (h) => {
+    /*
+     * The stop poll has to hold the event loop while it decides, and the only way to see that is a
+     * process in which nothing else does: this probe holds nothing but the adapter's own timer. A
+     * group that never reports itself empty keeps the poll running to its deadline, so an
+     * unreferenced sleep ends the probe with `Detected unsettled top-level await` and exit 13
+     * instead of reporting what it observed (F17-AC1, F17-AC2).
+     */
+    const probe = join(h.directory, 'stop-probe.mjs');
+    await writeFile(
+      probe,
+      [
+        `import { stopCodexProcess } from ${JSON.stringify(
+          new URL('../../../packages/adapters/src/codex/index.ts', import.meta.url).pathname,
+        )};`,
+        'const target = {',
+        '  pid: process.pid,',
+        '  processGroupId: process.pid,',
+        '  argv: [],',
+        '  cwd: process.cwd(),',
+        '  async *lines() {},',
+        "  stderrTail: () => '',",
+        '  waited: () => new Promise(() => {}),',
+        '  requestGracefulStop: () => {},',
+        '  killProcessGroup: () => {},',
+        '  groupHasSurvivors: () => true,',
+        '  dispose: () => {},',
+        '};',
+        'const startedAt = Date.now();',
+        'const report = await stopCodexProcess(target, { gracefulStopMs: 50, killWaitMs: 400 });',
+        "process.stdout.write(JSON.stringify({ ...report, elapsedMs: Date.now() - startedAt }) + '\\n');",
+      ].join('\n'),
+    );
+    const probed = await new Promise<{ readonly code: number | null; readonly output: string }>((resolve) => {
+      const child = spawn(process.execPath, [probe], { cwd: h.directory, stdio: ['ignore', 'pipe', 'pipe'] });
+      let output = '';
+      child.stdout.on('data', (chunk: Buffer) => (output += chunk.toString()));
+      child.stderr.on('data', (chunk: Buffer) => (output += chunk.toString()));
+      child.on('close', (code) => resolve({ code, output }));
+    });
+    assert.equal(
+      probed.code,
+      0,
+      `the stop poll must hold the event loop rather than end the process (exit 13 is Node reporting an unsettled top-level await): ${probed.output}`,
+    );
+    assert.doesNotMatch(probed.output, /unsettled top-level await/);
+    const report: { stopped: boolean; survivors: boolean; elapsedMs: number } = JSON.parse(probed.output.trim()) as {
+      stopped: boolean;
+      survivors: boolean;
+      elapsedMs: number;
+    };
+    assert.equal(report.stopped, false, 'a group that never empties is not reported stopped');
+    assert.equal(report.survivors, true, 'and it is reported as surviving, which is what makes a second writer unsafe');
+    assert.ok(report.elapsedMs >= 400, `the poll must run to its deadline, took ${String(report.elapsedMs)}ms`);
+
+    // The same stop inside the worker: a real child that ignores SIGTERM, then a checkpoint.
+    const port = new ScriptedWorkspacePort(prepared(), observation({ untrackedFiles: [ATTEMPT_FILE] }));
+    const engine = new ScriptedEngine({
+      events: [sessionStarted(T0)],
+      hold: () => h.hold,
+      spawnGroup: () =>
+        spawn(process.execPath, ['-e', "process.on('SIGTERM', () => undefined); setInterval(() => undefined, 1000)"], {
+          cwd: h.directory,
+          detached: true,
+          stdio: 'ignore',
+        }),
+    });
+    const worker = h.buildWorker(engine, { workspaces: port });
+    const jobId = h.enqueue();
+
+    try {
+      const running = worker.tick();
+      await engine.firstSession;
+      assert.equal(
+        await waitFor(() => engine.tracked !== null, 10_000),
+        true,
+        'the session spawned a real tracked process group',
+      );
+      worker.requestStop();
+      h.release();
+      const tick = expectOk(await running);
+
+      assert.equal(tick.kind, 'Claimed');
+      assert.equal(tick.outcome.kind, 'Stopped', `the SIGTERM-ignoring child must still produce a stop: ${JSON.stringify(tick.outcome)}`);
+      const trackedGroup = engine.tracked?.pid;
+      assert.ok(trackedGroup !== undefined);
+      assert.throws(() => process.kill(-trackedGroup, 0), /ESRCH/, 'the bounded kill reached the tracked group');
+
+      const checkpoint = checkpointOf(h.queue, jobId);
+      assert.ok(checkpoint !== null, 'the checkpoint is written before the process may end: its absence is the exit-13 failure');
+      assert.deepEqual([...checkpoint.untrackedFiles], [ATTEMPT_FILE]);
+      assert.equal(stateOf(h.queue, jobId), 'Paused');
+      assert.equal(expectOk(h.leases.leaseStatus(jobId))?.state, 'Released');
+    } finally {
+      const trackedGroup = engine.tracked?.pid;
+      if (trackedGroup !== undefined) {
+        try {
+          process.kill(-trackedGroup, 'SIGKILL');
+        } catch {
+          /* the tracked group is already gone */
+        }
+      }
+    }
+  });
+});
+
+/* -------------------------------------------------------------------------- */
 /* Interruption safety                                                         */
 /* -------------------------------------------------------------------------- */
 
@@ -1270,6 +1619,24 @@ test('F18-AC5: a deterministic authentication failure is not dispatched a second
  * real `SIGTERM` leaves durable state consistent is to send one (N01-AC1).
  */
 const WORKER_ENTRYPOINT = new URL('./index.ts', import.meta.url).pathname;
+
+/**
+ * The workspace the interrupted child worker prepared, as it is left behind.
+ *
+ * The recovery port has to present this and not the fixture's default: a checkpoint written after
+ * the attempt settles records the workspace as it is then, so a recovery that read a different
+ * workspace identity, or one without the file the attempt had written, would be refused as
+ * unaccounted work. That refusal is the rule working (F14-AC4), not a defect to work around.
+ */
+function signalWorkspace(worktreePath: string, untrackedFiles: readonly string[]): PreparedWorkspace['observation'] {
+  return {
+    workspace: { workspaceId: 'ws-signal', branchName: 'shiploop/signal', worktreePath },
+    headSha: HEAD_SHA,
+    baseSha: BASE_SHA,
+    dirtyFiles: ['src/worker.ts'],
+    untrackedFiles,
+  };
+}
 
 test('N01-AC1: a SIGTERM mid-run leaves durable state consistent, and a restart recovers it without a second writer', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'shiploop-worker-signal-'));
@@ -1289,23 +1656,22 @@ test('N01-AC1: a SIGTERM mid-run leaves durable state consistent, and a restart 
     ].join('\n'),
   );
   await chmod(engineBinary, 0o755);
+  const beforeAttempt = signalWorkspace(worktree, ['src/worker.test.ts']);
+  const afterAttempt = signalWorkspace(worktree, ['src/worker.test.ts', 'in-progress.txt']);
   await writeFile(
     workspaceModule,
     [
       'export const createWorkspacePort = () => ({',
       '  async prepare() {',
-      `    const workspace = { workspaceId: 'ws-signal', branchName: 'shiploop/signal', worktreePath: ${JSON.stringify(worktree)} };`,
-      `    const head = ${JSON.stringify(HEAD_SHA)};`,
-      `    const base = ${JSON.stringify(BASE_SHA)};`,
-      `    const observation = { workspace, headSha: head, baseSha: base, dirtyFiles: ['src/worker.ts'], untrackedFiles: ['src/worker.test.ts'] };`,
+      `    const observation = ${JSON.stringify(beforeAttempt)};`,
       '    return {',
       '      ok: true,',
       '      value: {',
       '        execution: {',
-      '          workspaceId: workspace.workspaceId,',
-      '          absolutePath: workspace.worktreePath,',
-      '          headSha: head,',
-      '          baseSha: base,',
+      '          workspaceId: observation.workspace.workspaceId,',
+      '          absolutePath: observation.workspace.worktreePath,',
+      '          headSha: observation.headSha,',
+      '          baseSha: observation.baseSha,',
       `          environmentFingerprint: ${JSON.stringify(SCOPE_FINGERPRINT)},`,
       `          scopeFingerprint: ${JSON.stringify(SCOPE_FINGERPRINT)},`,
       '          isolatedPorts: {},',
@@ -1316,6 +1682,9 @@ test('N01-AC1: a SIGTERM mid-run leaves durable state consistent, and a restart 
       '        deliveryAlreadyObserved: false,',
       '      },',
       '    };',
+      '  },',
+      '  async observe() {',
+      `    return { ok: true, value: ${JSON.stringify(afterAttempt)} };`,
       '  },',
       '});',
     ].join('\n'),
@@ -1415,7 +1784,7 @@ test('N01-AC1: a SIGTERM mid-run leaves durable state consistent, and a restart 
         leases,
         workItems: new WorkItemRepository(afterSignal.value.database),
         attention: new AttentionItemRepository(afterSignal.value.database),
-        workspaces: new ScriptedWorkspacePort(prepared()),
+        workspaces: new ScriptedWorkspacePort(prepared(afterAttempt)),
         extensions: new ScriptedExtensions(),
         facts: FIXED_FACTS,
         liveness: livenessPort(() => ({ kind: 'Stopped', evidence: 'the interrupted worker process is gone' })),

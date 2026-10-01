@@ -575,6 +575,12 @@ export async function stopCodexProcess(
  * for a few milliseconds after the kill. Sampling once would report `Detached` for a group that
  * is in fact clean, which is the wrong answer in the direction that blocks an attempt. Polling to
  * a deadline is what makes `survivors: false` mean the group was **observed** empty.
+ *
+ * The sleep between samples is a referenced timer. This poll runs at the one moment nothing else
+ * holds the event loop: the leader has been reaped, so the only handle left is this timer, and an
+ * unreferenced one lets Node end the worker with `Detected unsettled top-level await` and exit 13
+ * before the checkpoint is written. The bound is the deadline, not the timer's reference
+ * (F17-AC1, F17-AC2).
  */
 async function waitForEmptyGroup(target: CodexProcess, timeoutMs: number): Promise<boolean> {
   const deadline = Date.now() + Math.max(0, timeoutMs);
@@ -582,12 +588,18 @@ async function waitForEmptyGroup(target: CodexProcess, timeoutMs: number): Promi
     if (!target.groupHasSurvivors()) return true;
     if (Date.now() >= deadline) return false;
     await new Promise((resolve) => {
-      const timer = setTimeout(resolve, 25);
-      timer.unref?.();
+      setTimeout(resolve, 25);
     });
   }
 }
 
+/**
+ * Waits, for a bounded window, until the child exits.
+ *
+ * The timeout is referenced for the same reason the group poll's sleep is: after the last process
+ * handle is released, an unreferenced timeout is the only thing left, and Node would end the worker
+ * before it could report whether the group actually stopped (F17-AC1, F17-AC2).
+ */
 async function waitForExit(
   waited: Promise<{ readonly exitCode: number | null; readonly signal: string | null }>,
   timeoutMs: number,
@@ -595,7 +607,6 @@ async function waitForExit(
   let timer: NodeJS.Timeout | undefined;
   const timeout = new Promise<'timeout'>((resolve) => {
     timer = setTimeout(() => resolve('timeout'), timeoutMs);
-    timer.unref?.();
   });
   const outcome = await Promise.race([waited.then(() => 'exited' as const), timeout]);
   if (timer !== undefined) clearTimeout(timer);

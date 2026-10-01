@@ -14,9 +14,13 @@
  *   - a resume re-reads the actual workspace and live external state before continuing, and a
  *     workspace that no longer matches the recorded checkpoint is reported rather than
  *     written over (F17-AC3, F14-AC4);
- *   - a reached limit checkpoints the work and waits for an owner extension instead of
- *     continuing, and time spent waiting for the owner is not charged to the execution
- *     budget (F18-AC2, F18-AC3);
+ *   - every checkpoint records the workspace re-read after the attempt's work has settled, so the
+ *     resume point it leaves describes the work that is actually there (F14-AC4, F17-AC2);
+ *   - a reached limit halts the engine before the attempt parks, then checkpoints the work and
+ *     waits for an owner extension instead of continuing, and time spent waiting for the owner is
+ *     not charged to the execution budget (F17-AC1, F18-AC2, F18-AC3);
+ *   - a refusal that cannot improve on a retry reaches a terminal state instead of being reported
+ *     once per tick forever (F18-AC1, F18-AC5);
  *   - usage is carried through only when the engine reported it, and is `Unknown` otherwise
  *     (F18-AC4);
  *   - a deterministic scope or authentication failure is never dispatched a second time
@@ -119,7 +123,44 @@ export interface WorkspacePort {
     readonly job: JobRecord;
     readonly checkpoint: JobCheckpoint | null;
   }): Promise<Result<PreparedWorkspace, DomainError>>;
+  /**
+   * Re-reads the repository state of a workspace this port already prepared.
+   *
+   * A checkpoint is written after the attempt's work has settled, so the inventory it stores has to
+   * be read at that moment rather than remembered from before the attempt. A checkpoint built from
+   * the pre-attempt workspace records a clean worktree that the worktree does not have, which makes
+   * the retained resume point refuse the very workspace it describes (F14-AC4, F17-AC2).
+   *
+   * Optional because a provider that only prepares is still usable: `createWorker` then re-reads
+   * with the same verified workspace module the provider itself uses to decide whether a workspace
+   * may be reused, so both sides of a resume comparison are read by one implementation. A provider
+   * that can re-read its own workspace should say so here, because its read is the authoritative
+   * one for anything the workspace module cannot see (F14-AC1).
+   */
+  observe?(request: WorkspaceObservationRequest): Promise<Result<WorkspaceObservation, DomainError>>;
 }
+
+/** What a re-observation is asked about: the workspace being written, and what the last read said. */
+export interface WorkspaceObservationRequest {
+  readonly job: JobRecord;
+  /** The writer this attempt is, which the read reports against when it refuses. */
+  readonly holder: string;
+  /** The workspace to re-read, as the last read reported its identity. */
+  readonly workspace: JobCheckpoint['workspace'];
+  /**
+   * The last read of that workspace.
+   *
+   * It is never written to a checkpoint and never treated as current: it names the workspace to
+   * re-read and the state a read is compared against, so a difference is reported rather than
+   * hidden (F14-AC4).
+   */
+  readonly lastRead: WorkspaceObservation;
+}
+
+/** Re-reads a prepared workspace, which is what a checkpoint's inventory is written from. */
+export type WorkspaceObserver = (
+  request: WorkspaceObservationRequest,
+) => Promise<Result<WorkspaceObservation, DomainError>>;
 
 /** An owner grant that lifts a limit this attempt already reached (F18-AC2). */
 export interface OwnerExtension {
@@ -167,6 +208,8 @@ export interface RunnerPorts {
   readonly redact: (text: string) => string;
   readonly engine: EngineAdapter;
   readonly workspaces: WorkspacePort;
+  /** Re-reads the workspace the attempt is writing, because a checkpoint records it after the work. */
+  readonly observeWorkspace: WorkspaceObserver;
   readonly extensions: OwnerExtensionPort;
   readonly facts: CheckpointFactsPort;
   readonly onMilestone: (job: JobRecord, milestone: Milestone) => void;
@@ -241,7 +284,7 @@ export async function runAttempt(
   request: AttemptRequest,
 ): Promise<Result<AttemptOutcome, DomainError>> {
   const prepared = await ports.workspaces.prepare({ job: request.job, checkpoint: request.checkpoint });
-  if (!prepared.ok) return prepared;
+  if (!prepared.ok) return refusalOutcome(request.job.jobId, prepared.error);
   const observation = prepared.value.observation;
 
   if (request.checkpoint !== null) {
@@ -392,10 +435,11 @@ export async function runAttempt(
 /**
  * What a resume is allowed to do, given what the workspace actually looks like now.
  *
- * A workspace whose head, base or dirty inventory differs from the recorded checkpoint is
- * reported rather than written over, because those differences are a person's uncommitted
- * work (F14-AC4). A delivery already visible in live external state means the attempt must not
- * repeat it, whatever a lost response suggested (F17-AC3).
+ * The checkpoint's recorded workspace identity, code identity and work inventory are compared
+ * against a fresh read, and any difference is reported rather than written over, because those
+ * differences are a person's uncommitted work (F14-AC4). A delivery already visible in live
+ * external state means the attempt must not repeat it, whatever a lost response suggested
+ * (F17-AC3).
  */
 export function assessResume(
   checkpoint: JobCheckpoint,
@@ -409,6 +453,15 @@ export function assessResume(
   }
   const observed = prepared.observation;
   const differences: string[] = [];
+  if (
+    observed.workspace.workspaceId !== checkpoint.workspace.workspaceId ||
+    observed.workspace.branchName !== checkpoint.workspace.branchName ||
+    observed.workspace.worktreePath !== checkpoint.workspace.worktreePath
+  ) {
+    differences.push(
+      `the workspace moved from ${checkpoint.workspace.workspaceId} at ${checkpoint.workspace.worktreePath} to ${observed.workspace.workspaceId} at ${observed.workspace.worktreePath}`,
+    );
+  }
   if (observed.headSha !== checkpoint.headSha) {
     differences.push(`head moved from ${checkpoint.headSha} to ${observed.headSha}`);
   }
@@ -672,6 +725,15 @@ async function consumeSession(
     }
     if (!withinBudget.value) {
       budgetExhausted = true;
+      /**
+       * The session is halted before the attempt parks, exactly as a stop is.
+       *
+       * A reached limit ends this attempt and releases the coding slot, so an engine process left
+       * running here would be writing into a workspace another job has been given. Treating the
+       * budget as a stop routes it through the same observed stop, so a group that survives the
+       * bounded kill is reported as detached and no job state moves (F17-AC1, F18-AC2, F17-AC5).
+       */
+      isStopped = true;
       break;
     }
 
@@ -865,12 +927,32 @@ function engineCheckpointOf(checkpoint: JobCheckpoint, instruction: string): Eng
   };
 }
 
+/**
+ * Writes one resume point from the workspace as it is at the moment of writing.
+ *
+ * The inventory is re-read through the observer rather than reused from `prepare`, because the whole
+ * point of a checkpoint is that it describes the work an attempt left behind: reusing the
+ * pre-attempt observation stored `untracked files: []` for a worktree the engine had just written
+ * into, and the retained checkpoint then refused to authorise resuming its own workspace
+ * (F14-AC4, F17-AC2).
+ *
+ * A re-read that is refused is returned as an error rather than papered over with the earlier
+ * observation, because the alternative is a resume point that states something about the workspace
+ * nobody read.
+ */
 async function persistCheckpoint(
   ports: RunnerPorts,
   request: AttemptRequest,
-  observation: WorkspaceObservation,
+  lastRead: WorkspaceObservation,
   content: CheckpointContent,
 ): Promise<Result<null, DomainError>> {
+  const observed = await ports.observeWorkspace({
+    job: request.job,
+    holder: request.holder,
+    workspace: lastRead.workspace,
+    lastRead,
+  });
+  if (!observed.ok) return observed;
   const written = ports.writeCheckpoint({
     jobId: request.job.jobId,
     holder: request.holder,
@@ -880,11 +962,11 @@ async function persistCheckpoint(
     profileVersionId: request.job.profileVersionId,
     procedureVersionId: request.job.procedureVersionId,
     engineVersion: content.engineVersion,
-    workspace: observation.workspace,
-    headSha: observation.headSha,
-    baseSha: observation.baseSha,
-    dirtyFiles: observation.dirtyFiles,
-    untrackedFiles: observation.untrackedFiles,
+    workspace: observed.value.workspace,
+    headSha: observed.value.headSha,
+    baseSha: observed.value.baseSha,
+    dirtyFiles: observed.value.dirtyFiles,
+    untrackedFiles: observed.value.untrackedFiles,
     results: ports.facts.resultsFor({ jobId: request.job.jobId }),
     feedback: ports.facts.feedbackFor({ jobId: request.job.jobId }),
     blocker: content.blocker,
@@ -892,6 +974,25 @@ async function persistCheckpoint(
     now: ports.clock.now(),
   });
   return written.ok ? ok(null) : written;
+}
+
+/**
+ * Turns a refusal to start the attempt into a terminal outcome or a reported error.
+ *
+ * Whether a refusal is retried is the domain's decision, taken from the failure category the same
+ * way every other failure in this file is classified, rather than a local rule about workspace
+ * errors. A deterministic scope or authentication refusal repeats identically on every tick, so it
+ * becomes a `Blocked` attempt: the job reaches a terminal state, the owner is given the blocker,
+ * and the run loop stops retrying it (F18-AC1, F18-AC5, N01-AC1).
+ */
+function refusalOutcome(jobId: JobId, error: DomainError): Result<AttemptOutcome, DomainError> {
+  const failure = classifyFailure({
+    stage: 'Reconciliation',
+    observed: { error: error.reason, references: [`job:${jobId}`] },
+    category: failureCategoryOfError(error.code),
+  });
+  if (failure.retryable) return err(error);
+  return ok({ kind: 'Blocked', failure, usage: usageReporting(null) });
 }
 
 /**

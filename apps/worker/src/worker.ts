@@ -41,6 +41,7 @@ import {
   type WriterLease,
   type WorkItemRepository,
 } from '@shiploop/storage';
+import { nodeProcessRunner, reuseWorkspace } from '@shiploop/verification';
 import {
   ownerWaitBetween,
   runAttempt,
@@ -50,6 +51,9 @@ import {
   type Milestone,
   type OwnerExtensionPort,
   type RunnerPorts,
+  type WorkspaceObservation,
+  type WorkspaceObservationRequest,
+  type WorkspaceObserver,
   type WorkspacePort,
 } from './runner.ts';
 
@@ -218,6 +222,7 @@ export function createWorker(
       ]),
     );
   }
+  const observeWorkspace = workspaceObserverOf(ports.workspaces);
   ports.leases.ensureCodingSlot();
 
   const clockAtStartup = readInstant(ports.clock.now());
@@ -251,6 +256,7 @@ export function createWorker(
     redact: ports.redact,
     engine: ports.engine,
     workspaces: ports.workspaces,
+    observeWorkspace,
     extensions: ports.extensions,
     facts: ports.facts,
     onMilestone: (job, milestone: Milestone) => {
@@ -408,12 +414,16 @@ export function createWorker(
         lease.holder === config.holder &&
         ports.extensions.extensionFor({ jobId: job.jobId }) !== null;
 
-      if (job.state === 'WaitingForOwner' && extendedByOwner) {
-        continuable.push(job.jobId);
-        continue;
-      }
-      if (!vacant && !confirmed) continue;
+      if (!extendedByOwner && !vacant && !confirmed) continue;
 
+      /**
+       * A continuation reclaims as well.
+       *
+       * `WaitingForOwner` gives the coding slot up, so continuing it means taking the single writer
+       * again. Reclaiming is what mints that term and puts this holder back on the job row, so a
+       * continued attempt owns the writer and can heartbeat and checkpoint like any other
+       * (F13-AC2, F18-AC2).
+       */
       const reclaimed = ports.leases.reclaimLease({
         leaseId: `lease:${job.jobId}`,
         jobId: job.jobId,
@@ -423,7 +433,12 @@ export function createWorker(
         leaseTtlMs: config.leaseTtlMs,
       });
       if (!reclaimed.ok) return reclaimed;
-      if (reclaimed.value.granted) recoverable.push({ jobId: job.jobId, updatedAt: job.updatedAt });
+      if (!reclaimed.value.granted) continue;
+      if (extendedByOwner) {
+        continuable.push(job.jobId);
+        continue;
+      }
+      recoverable.push({ jobId: job.jobId, updatedAt: job.updatedAt });
     }
 
     counters.findingsRequiringReconciliation += findings.filter((finding) => finding.status !== 'Vacant').length;
@@ -646,11 +661,16 @@ export function createWorker(
   }
 
   /**
-   * Moves a confirmed-stale job into a driven state.
+   * Moves a confirmed-stale job into a driven state and counts this as another attempt.
    *
    * The writer lease is already this process's, so this is a lifecycle move rather than a claim.
    * `WaitingForOwner` returns to `Running` because the owner has now had the decision the state
    * was waiting for (F17-AC3).
+   *
+   * The attempt counter advances because a recovery dispatches a second engine session, and the
+   * checkpoint it writes is named by that counter. Left alone it reused the first attempt's
+   * identifier, so two attempts of one job produced the same `ckpt:<jobId>:<attemptCount>` and the
+   * retained resume point could not say which attempt produced the workspace (F17-AC2, F18-AC1).
    */
   async function prepareResume(jobId: JobId): Promise<Result<JobRecord, DomainError>> {
     const job = ports.queue.readJob(jobId);
@@ -658,10 +678,12 @@ export function createWorker(
     if (job.value === null) {
       return err({ code: 'NotFound', reason: `Job ${jobId} disappeared between reconciliation and resume.` });
     }
-    if (job.value.state === 'Running' || job.value.state === 'Verifying') return ok(job.value);
-    const moved = ports.queue.markState({ jobId, state: 'Running', now: ports.clock.now() });
-    if (!moved.ok) return moved;
-    return ok(moved.value);
+    const now = ports.clock.now();
+    if (job.value.state !== 'Running' && job.value.state !== 'Verifying') {
+      const moved = ports.queue.markState({ jobId, state: 'Running', now });
+      if (!moved.ok) return moved;
+    }
+    return ports.queue.beginAttempt({ jobId, holder: config.holder, now });
   }
 
   async function run(signal: AbortSignal): Promise<WorkerRunReport> {
@@ -722,6 +744,79 @@ function instructionFor(
  */
 function asProjectId(value: string | null): ProjectId | null {
   return value === null ? null : (value as ProjectId);
+}
+
+/**
+ * Builds the read a checkpoint's inventory is written from.
+ *
+ * A checkpoint is written after the attempt's work has settled, so it has to describe the workspace
+ * as it is then rather than as it was before the attempt; the pre-attempt reading stored an empty
+ * untracked set for a worktree the engine had just written into, and the retained checkpoint then
+ * refused the very workspace it described (F14-AC4, F17-AC2).
+ *
+ * A provider that exposes `observe` reads its own workspace. One that does not is read with
+ * `@shiploop/verification`, the same module that provider uses to decide whether a workspace may be
+ * reused, applied to the identity the provider reported. Both sides of a resume comparison are then
+ * read by one implementation, so a difference means the workspace changed rather than that two
+ * readers disagree. Preparing the workspace still belongs to the provider alone: this reads a
+ * workspace the attempt already owns and creates nothing, takes no lock and reserves no port
+ * (F14-AC1).
+ */
+function workspaceObserverOf(port: WorkspacePort): WorkspaceObserver {
+  const observe = port.observe;
+  if (typeof observe === 'function') return (request) => observe.call(port, request);
+  return rereadWorkspaceWithVerification;
+}
+
+/**
+ * Re-reads one workspace with the verified workspace module.
+ *
+ * The read is the observation `reuseWorkspace` performs, and it is taken from the report rather than
+ * from the verdict: a workspace that has moved on since the last read is exactly the case a
+ * checkpoint has to describe, so refusing the read here would reinstate the defect. What is not
+ * negotiable is an unreadable workspace, which has no honest inventory and is reported as an error
+ * rather than written down (F14-AC4).
+ */
+async function rereadWorkspaceWithVerification(
+  request: WorkspaceObservationRequest,
+): Promise<Result<WorkspaceObservation, DomainError>> {
+  const observedAt = new Date().toISOString();
+  const read = await reuseWorkspace(
+    {
+      checkpoint: {
+        checkpointId: `reread:${request.job.jobId}`,
+        workspaceId: request.workspace.workspaceId,
+        branchName: request.workspace.branchName,
+        worktreePath: request.workspace.worktreePath,
+        headSha: request.lastRead.headSha,
+        baseSha: request.lastRead.baseSha,
+        dirtyFiles: request.lastRead.dirtyFiles,
+        untrackedFiles: request.lastRead.untrackedFiles,
+        recordedAt: observedAt,
+      },
+      holder: request.holder,
+      now: observedAt,
+    },
+    { runCommand: nodeProcessRunner },
+  );
+  // A refused reuse still carries the observation, which is the whole of what a checkpoint needs.
+  const report = read.ok ? read.value : read.error.report;
+  const headSha = report.actualHeadSha;
+  if (headSha === null) {
+    const unreadable = report.divergences.find((divergence) => divergence.kind === 'WorkspaceUnreadable');
+    return err({
+      code: 'Unavailable',
+      reason: `The workspace ${request.workspace.workspaceId} at ${request.workspace.worktreePath} could not be re-read, so no checkpoint can describe it: ${unreadable?.detail ?? 'its head could not be read as a commit.'}`,
+    });
+  }
+  return ok({
+    workspace: request.workspace,
+    headSha,
+    // The base is the fork point the provider recorded, not something a checkout can re-derive.
+    baseSha: request.lastRead.baseSha,
+    dirtyFiles: report.observedDirtyFiles,
+    untrackedFiles: report.observedUntrackedFiles,
+  });
 }
 
 /**

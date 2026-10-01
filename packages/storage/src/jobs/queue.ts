@@ -131,6 +131,19 @@ export interface HeartbeatRequest {
   readonly leaseTtlMs: number;
 }
 
+/**
+ * A writer that already holds a job and is beginning another attempt on it.
+ *
+ * A checkpoint is identified by `ckpt:<jobId>:<attemptCount>`, so an attempt that did not advance
+ * the count would write the identifier of the attempt it replaced and a resume could not say which
+ * attempt produced the workspace it is about to write over (F17-AC2, F18-AC1).
+ */
+export interface BeginAttemptRequest {
+  readonly jobId: JobId;
+  readonly holder: string;
+  readonly now: string;
+}
+
 /** The durable resume point written for a paused or interrupted job (F17-AC2). */
 export interface CheckpointRequest {
   readonly jobId: JobId;
@@ -177,6 +190,7 @@ export interface JobQueue {
   enqueue: (request: EnqueueRequest) => Result<EnqueueOutcome, DomainError>;
   claimNext: (candidate: ClaimCandidate) => Result<ClaimedJob, DomainError>;
   heartbeat: (request: HeartbeatRequest) => Result<WriterLease, DomainError>;
+  beginAttempt: (request: BeginAttemptRequest) => Result<JobRecord, DomainError>;
   checkpoint: (request: CheckpointRequest) => Result<JobCheckpoint, DomainError>;
   markState: (request: MarkStateRequest) => Result<JobRecord, DomainError>;
   permittedOperation: (job: JobRecord, operation: JobOperation) => Result<JobOperation, DomainError>;
@@ -526,6 +540,45 @@ export function createJobQueue(store: JobQueueStore): JobQueue {
   }
 
   /**
+   * Records that the holder which owns this job is beginning another attempt on it.
+   *
+   * `claimNext` advances the counter for a first claim; a recovery has no claim, so without this
+   * the second engine session of a job would be recorded under the first one's attempt count and
+   * `ckpt:<jobId>:<attemptCount>` could not tell the two apart (F17-AC2).
+   *
+   * The holder is checked because the counter is part of the ownership record: a process that lost
+   * the job must not be able to advance the count of an attempt it is not performing (F17-AC5).
+   */
+  function beginAttempt(request: BeginAttemptRequest): Result<JobRecord, DomainError> {
+    return guard(() =>
+      transaction(connection, (): Result<JobRecord, DomainError> => {
+        const row = readJobRow(connection, request.jobId);
+        if (row === undefined) {
+          return err({ code: 'NotFound', reason: `No job ${request.jobId} exists to attempt.` });
+        }
+        const job = jobFromRow(row);
+        if (job.holder !== request.holder) {
+          return err(
+            conflict(
+              `Job ${request.jobId} is held by ${job.holder ?? 'nobody'}, so ${request.holder} cannot begin an attempt on it (F17-AC5).`,
+              job.holder ?? 'nobody',
+              request.holder,
+            ),
+          );
+        }
+        connection
+          .prepare('UPDATE jobs SET attempt_count = attempt_count + 1, updated_at = ? WHERE job_id = ?')
+          .run(request.now, request.jobId);
+        const stored = readJobRow(connection, request.jobId);
+        if (stored === undefined) {
+          return err({ code: 'Unavailable', reason: 'The job row vanished inside its own transaction.' });
+        }
+        return ok(jobFromRow(stored));
+      }),
+    );
+  }
+
+  /**
    * Writes the durable resume point.
    *
    * Every field the specification lists is stored, including the dirty and
@@ -589,7 +642,9 @@ export function createJobQueue(store: JobQueueStore): JobQueue {
    * the coding slot. Clearing the job's holder while the slot still names it
    * would leave a queue whose only claimable job is invisible to the next
    * claimer, which reads as a permanently stuck writer rather than a finished
-   * one (F13-AC2, N01-AC1).
+   * one (F13-AC2, N01-AC1). A transition is a statement that the job is no longer
+   * writing, so a caller must not record one while a process may still be writing
+   * (F17-AC5).
    */
   function markState(request: MarkStateRequest): Result<JobRecord, DomainError> {
     return guard(() =>
@@ -695,6 +750,7 @@ export function createJobQueue(store: JobQueueStore): JobQueue {
     enqueue,
     claimNext,
     heartbeat,
+    beginAttempt,
     checkpoint,
     markState,
     permittedOperation: permittedOperationOf,
@@ -863,10 +919,25 @@ const ACTIVE_STATES: ReadonlySet<AttemptState> = new Set<AttemptState>([
 /** States in which a job is no longer in flight, so it has a finish time. */
 const FINISHED_STATES: ReadonlySet<AttemptState> = new Set<AttemptState>(['Completed', 'Cancelled']);
 
-/** States in which the job is no longer the active writer, so the holder is dropped. */
+/**
+ * States in which the job is no longer the active writer, so the holder is dropped.
+ *
+ * `Blocked` and `WaitingForOwner` belong here because both mean the attempt has stopped writing:
+ * a blocked attempt has nothing left it may do without an owner decision, and a job waiting for an
+ * owner extension has already checkpointed and stopped. Keeping the single global coding slot for
+ * either state made one job that needed an owner block every later job in the project until an
+ * owner intervened, which is the opposite of what `WaitingForOwner` exists to do (F13-AC2, F18-AC2).
+ *
+ * The states that could still have a writing process are deliberately absent. `Running` and
+ * `Verifying` are the states a live attempt holds, and a writer that may still be writing is
+ * reported as detached and moves no job state at all, so no transition in this set can hand the
+ * slot to a second writer while the first one is alive (F17-AC1, F17-AC5).
+ */
 const STATES_WITHOUT_WRITER: ReadonlySet<AttemptState> = new Set<AttemptState>([
   'Queued',
   'Paused',
+  'Blocked',
+  'WaitingForOwner',
   'Completed',
   'Cancelled',
 ]);

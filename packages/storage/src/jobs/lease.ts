@@ -640,6 +640,8 @@ export function createLeaseManager(store: LeaseStore): LeaseManager {
    * lives: "the lease expired, therefore the process is gone". It is refused
    * here. An expired lease records that reconciliation is required and returns
    * without granting; only a lease the operator confirmed stopped is vacant.
+   * The one grant made on the caller's own evidence is a holder re-taking a
+   * lease it released itself, which is not a takeover of anyone (F17-AC5).
    */
   function reclaimLease(request: ReclaimLeaseRequest): Result<ReclaimOutcome, DomainError> {
     return guard((): Result<ReclaimOutcome, DomainError> =>
@@ -659,6 +661,27 @@ export function createLeaseManager(store: LeaseStore): LeaseManager {
         }
 
         if (existing.holder === request.holder) {
+          /**
+           * A holder that gave the slot up and is taking it again is not a second writer.
+           *
+           * The lease is `Released` or `HolderStoppedConfirmed` here, which means this same holder
+           * stopped writing and released it, or a confirmation of that was recorded. Minting a fresh
+           * `Active` term is what lets a continued attempt heartbeat and write its checkpoint again:
+           * a released lease refuses renewal and the job row no longer names the holder, so without
+           * this a recovered or owner-extended attempt would run while owning nothing (F17-AC5).
+           *
+           * An `Active` lease is returned as it stands, including one this holder's own term has
+           * let lapse: a second term is not minted on evidence that proved only that heartbeats
+           * stopped.
+           */
+          if (existing.state === 'Released' || existing.state === 'HolderStoppedConfirmed') {
+            const reacquired = carryConfirmationOnward(mintWriterLease(request), existing);
+            writeLeaseOnConnection(connection, reacquired);
+            const claimed = claimSlotOnConnection(connection, request, reacquired);
+            if (!claimed.ok) return claimed;
+            transferJobHolderOnConnection(connection, request.jobId, request.holder, request.now);
+            return ok({ granted: true, lease: reacquired, slot: claimed.value, previousHolder: existing.holder });
+          }
           return ok({ granted: true, lease: existing, slot: readSlotOnConnection(connection), previousHolder: existing.holder });
         }
 
