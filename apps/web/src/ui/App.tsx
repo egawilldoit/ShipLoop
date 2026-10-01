@@ -3,17 +3,21 @@ import { ConnectionBanner } from './components/ConnectionBanner.tsx';
 import { BriefPage } from './pages/BriefPage.tsx';
 import { ConnectorsPage } from './pages/ConnectorsPage.tsx';
 import { IntakePage } from './pages/IntakePage.tsx';
+import { PlanPage } from './pages/PlanPage.tsx';
 import { ProfilesPage } from './pages/ProfilesPage.tsx';
+import { PublicationPage } from './pages/PublicationPage.tsx';
 import { SignInPage } from './pages/SignInPage.tsx';
 import { SessionProvider, useSession } from './session.tsx';
 
-type Section = 'profiles' | 'connectors' | 'intake' | 'brief';
+type Section = 'profiles' | 'connectors' | 'intake' | 'brief' | 'plan' | 'publication';
 
 const SECTIONS: readonly { readonly id: Section; readonly label: string }[] = [
   { id: 'profiles', label: 'Profiles' },
   { id: 'connectors', label: 'Connectors' },
   { id: 'intake', label: 'Intake' },
   { id: 'brief', label: 'Brief' },
+  { id: 'plan', label: 'Plan' },
+  { id: 'publication', label: 'Publication' },
 ];
 
 function Shell(): ReactElement {
@@ -22,6 +26,16 @@ function Shell(): ReactElement {
   const [activeProfileId, setActiveProfileId] = useState('');
   const [activeProfileLabel, setActiveProfileLabel] = useState('');
   const [activeIdeaId, setActiveIdeaId] = useState('');
+  /**
+   * The plan the plan and publication screens are looking at.
+   *
+   * Held here rather than in either page because the two are two views of one plan, in
+   * the same way the intake and brief screens are two views of one captured request: a
+   * per-page selection would let publication act on a plan the plan screen is not
+   * showing, which is exactly the case where an owner creates an issue at a provider
+   * for work they were not reviewing (F10-AC1).
+   */
+  const [activePlanId, setActivePlanId] = useState('');
   const [signingOut, setSigningOut] = useState(false);
 
   const selectProfile = (profileId: string, label: string): void => {
@@ -89,10 +103,10 @@ function Shell(): ReactElement {
       </nav>
 
       {/*
-        Intake and the brief share one selected request rather than each holding their
-        own copy of it: the two screens are two views of one captured request, and a
-        per-page selection would let the brief describe a different request than the
-        intake screen is showing.
+        Intake, brief, plan and publication share one selected request and one selected
+        plan rather than each holding their own copies: they are four views of one
+        captured request moving towards a ticket, and a per-page selection would let the
+        publication screen act on a plan the plan screen is not showing (F10-AC1).
       */}
       <main className="app__main" id="main">
         {section === 'profiles' ? (
@@ -119,10 +133,27 @@ function Shell(): ReactElement {
             }}
             epoch={connectionEpoch}
           />
-        ) : (
+        ) : section === 'brief' ? (
           <BriefPage
             ideaId={activeIdeaId}
             onBackToIntake={() => setSection('intake')}
+            epoch={connectionEpoch}
+          />
+        ) : section === 'plan' ? (
+          <PlanPage
+            ideaId={activeIdeaId}
+            onOpenPublication={(planId) => {
+              setActivePlanId(planId);
+              setSection('publication');
+            }}
+            epoch={connectionEpoch}
+          />
+        ) : (
+          <PublicationPage
+            planId={activePlanId}
+            ideaId={activeIdeaId}
+            projectId={projectId}
+            onBackToPlan={() => setSection('plan')}
             epoch={connectionEpoch}
           />
         )}

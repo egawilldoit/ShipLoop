@@ -42,6 +42,7 @@ import { registerConnectorRoutes } from './routes/connectors.ts';
 import { registerHealthRoutes } from './routes/health.ts';
 import { registerIntakeRoutes } from './routes/intake.ts';
 import { registerOwnerRoutes } from './routes/owner.ts';
+import { registerPlanningRoutes } from './routes/planning.ts';
 import { registerProfileRoutes } from './routes/profiles.ts';
 
 const CONTENT_SECURITY_POLICY = [
@@ -105,6 +106,7 @@ export async function buildApp(deps: AppDependencies): Promise<FastifyInstance> 
   registerProfileRoutes(app, { controller, guard, now });
   registerConnectorRoutes(app, { controller, guard, now });
   registerIntakeRoutes(app, { controller, guard, now });
+  registerPlanningRoutes(app, { controller, guard, now });
 
   const staticRoot = config.staticRoot;
   if (staticRoot !== null) {

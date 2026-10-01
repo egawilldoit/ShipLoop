@@ -57,8 +57,17 @@ import {
   type IdeaExportView,
   type IntakeDetailView,
   type IntakeIdeaView,
+  type AdoptedEvaluationView,
+  type AdoptedIssueView,
   type CaptureIdeaCommand,
+  type DraftPlanCommand,
+  type EditPlanCommand,
+  type LinkedChangeView,
   type OwnerView,
+  type PlanTaskView,
+  type PlanView,
+  type PublicationReportView,
+  type ReadinessAssessmentView,
   type ProfileContent,
   type ProfileVersionView,
   type ProvisionOwnerCommand,
@@ -138,6 +147,10 @@ interface ConnectorPayload {
   readonly connector: ConnectorView;
 }
 
+interface PlanPayload {
+  readonly plan: PlanView;
+}
+
 interface ConnectorListPayload {
   readonly connectors: readonly ConnectorView[];
 }
@@ -194,6 +207,7 @@ class InMemoryController implements ControllerSurface {
   private readonly profileVersions = new Map<string, ProfileVersionView[]>();
   private readonly connectorRecords = new Map<string, ConnectorView>();
   private readonly intakeIdeas = new Map<string, IntakeIdeaView>();
+  private readonly plans = new Map<string, PlanView>();
   private readonly capabilities: CapabilityDeclarationsByProvider;
   private passwordHash = '';
   private readonly scripted = new Map<string, DomainError>();
@@ -290,6 +304,168 @@ class InMemoryController implements ControllerSurface {
     answerClarifyingQuestion: async (): Promise<Result<ClarifyingQuestionView, DomainError>> => notImplemented('answerClarifyingQuestion'),
     applyOwnerCorrection: async (): Promise<Result<CorrectionView, DomainError>> => notImplemented('applyOwnerCorrection'),
     exportIdea: async (): Promise<Result<IdeaExportView, DomainError>> => notImplemented('exportIdea'),
+  };
+
+  /**
+   * The planning group of this double.
+   *
+   * A draft, an edit and a publication are real, because the F10 tests assert on what
+   * the transport reports per ticket and a double that refused would let a route that
+   * dropped a field read as covered. The readiness assessment is a fixed record with
+   * every area F09-AC1 names, so a route that rendered only the open areas would be
+   * visible here; the browser suite drives the real assessment through the shipped
+   * entrypoint instead.
+   *
+   * Adoption members refuse by name. The real adoption path needs a ticket and git
+   * provider, which this double has none of, and a double that adopted something would
+   * make F11-AC1 look proved when no provider read happened (F11-AC1, F03-AC2).
+   */
+  readonly planning = {
+    draftPlan: async (command: DraftPlanCommand): Promise<Result<PlanView, DomainError>> => {
+      const scripted = this.takeScripted('draftPlan');
+      if (scripted !== null) return { ok: false, error: scripted };
+      const proposal = command.proposal as {
+        readonly briefId: string;
+        readonly requestedOutcomes: readonly { readonly id: string; readonly statement: string }[];
+        readonly tasks: readonly PlanTaskView[];
+      };
+      const plan: PlanView = {
+        planId: command.planId,
+        ideaId: command.ideaId,
+        briefId: proposal.briefId,
+        revision: 1,
+        draftedAt: '2026-03-01T12:00:00.000Z',
+        lastEditedAt: null,
+        lastEditedBy: null,
+        requestedOutcomes: proposal.requestedOutcomes.map((outcome) => ({ ...outcome })),
+        exclusions: [],
+        coverage: proposal.requestedOutcomes.map((outcome) => ({
+          outcomeId: outcome.id,
+          via: 'Task' as const,
+          taskId: proposal.tasks[0]?.taskId ?? '',
+        })),
+        split: {
+          split: true,
+          reason: 'Two surfaces carry independently reviewable behaviour (F08-AC2).',
+          justifications: ['IndependentlyReviewable'],
+          surfacesWithoutOwnBehaviour: [],
+        },
+        tasks: proposal.tasks.map((task) => ({ ...task, publishable: false })),
+        agreedSequence: proposal.tasks.map((task) => task.taskId),
+        proposedOrder: proposal.tasks.map((task) => task.taskId),
+        taskReadiness: proposal.tasks.map((task) => ({ taskId: task.taskId, ready: true, readyAfter: [], blockedBy: [] })),
+        digest: 'sha256:plan',
+        workItemIdByTaskId: Object.fromEntries(
+          proposal.tasks.map((task) => [task.taskId, `wi_${command.planId}_${task.taskId}`]),
+        ),
+      };
+      this.plans.set(plan.planId, plan);
+      return { ok: true, value: plan };
+    },
+    getPlan: async (planId: string): Promise<Result<PlanView, DomainError>> => {
+      const plan = this.plans.get(planId);
+      if (plan === undefined) return { ok: false, error: { code: 'NotFound', reason: 'No such plan.' } };
+      return { ok: true, value: plan };
+    },
+    listPlansForIdea: async (ideaId: string): Promise<Result<readonly PlanView[], DomainError>> => ({
+      ok: true,
+      value: [...this.plans.values()].filter((plan) => plan.ideaId === ideaId),
+    }),
+    editPlan: async (command: EditPlanCommand): Promise<Result<PlanView, DomainError>> => {
+      const scripted = this.takeScripted('editPlan');
+      if (scripted !== null) return { ok: false, error: scripted };
+      const plan = this.plans.get(command.planId);
+      if (plan === undefined) return { ok: false, error: { code: 'NotFound', reason: 'No such plan.' } };
+      const edit = command.edit as { readonly kind: string; readonly expectedRevision: number; readonly taskId?: string };
+      if (edit.expectedRevision !== plan.revision) {
+        return {
+          ok: false,
+          error: conflict('The plan changed since this edit was prepared.', `revision ${plan.revision}`, `revision ${edit.expectedRevision}`),
+        };
+      }
+      const tasks = plan.tasks.map((task) => {
+        if (edit.kind !== 'Accept' || task.taskId !== edit.taskId) return task;
+        return { ...task, acceptance: 'Accepted' as const, acceptedBy: OWNER_ID, acceptedAt: '2026-03-01T12:05:00.000Z', publishable: true };
+      });
+      const edited: PlanView = { ...plan, revision: plan.revision + 1, tasks, lastEditedAt: '2026-03-01T12:05:00.000Z', lastEditedBy: OWNER_ID };
+      this.plans.set(edited.planId, edited);
+      return { ok: true, value: edited };
+    },
+    assessPlan: async (): Promise<Result<ReadinessAssessmentView, DomainError>> => ({
+      ok: true,
+      value: {
+        subjectId: 'plan_http',
+        assessedAt: '2026-03-01T12:00:00.000Z',
+        verdict: 'NeedsInformation',
+        mayStartBuild: true,
+        mayStartInvestigation: true,
+        buildBlockingAreas: [],
+        areas: ['Scope', 'Criteria', 'Repository', 'Target', 'Dependencies', 'Verification', 'Access'].map((area) => ({
+          area,
+          status: area === 'Access' ? ('Unmet' as const) : ('Satisfied' as const),
+          reason: area === 'Access' ? 'No connector for this project is configured.' : `The ${area} area was observed.`,
+          remedy: area === 'Access' ? 'Register a working ticket connector.' : null,
+        })),
+        reasons: [{ area: 'Access', status: 'Unmet', reason: 'No connector for this project is configured.' }],
+      },
+    }),
+    publishPlan: async (command: { readonly planId: string; readonly requestId: string }): Promise<Result<PublicationReportView, DomainError>> => {
+      /**
+       * The work item a task publishes as, and `[]` for a task that is not there.
+       *
+       * A partial failure is one success and one refusal, so the double needs to name
+       * the remainder rather than the whole list, or a test asserting on `unpublished`
+       * would pass against a report that published everything (F10-AC2).
+       */
+      const workItemOf = (plan: PlanView, taskId: string): string[] =>
+        taskId === '' ? [] : [plan.workItemIdByTaskId[taskId] ?? ''];
+      const scripted = this.takeScripted('publishPlan');
+      if (scripted !== null) return { ok: false, error: scripted };
+      const plan = this.plans.get(command.planId);
+      if (plan === undefined) return { ok: false, error: { code: 'NotFound', reason: 'No such plan.' } };
+      const publishable = plan.tasks.filter((task) => task.publishable);
+      if (publishable.length === 0) {
+        return { ok: false, error: { code: 'Invalid', reason: 'Only an accepted proposal may be published (F08-AC3, F10-AC1).', fields: [] } };
+      }
+      return {
+        ok: true,
+        value: {
+          requestId: command.requestId,
+          planId: plan.planId,
+          tickets: publishable.map((task, index) => ({
+            workItemId: plan.workItemIdByTaskId[task.taskId] ?? '',
+            taskId: task.taskId,
+            kind: index === 0 ? ('Published' as const) : ('Failed' as const),
+            issueId: index === 0 ? 'issue_http_1' : null,
+            identifier: index === 0 ? 'OCT-1' : null,
+            url: index === 0 ? 'https://example.invalid/oct-1' : null,
+            disposition: index === 0 ? ('CreatedNew' as const) : null,
+            unlinked: [],
+            detail: index === 0 ? 'Published as OCT-1.' : 'The provider refused this ticket.',
+          })),
+          published: workItemOf(plan, publishable[0]?.taskId ?? ''),
+          unpublished: workItemOf(plan, publishable[1]?.taskId ?? ''),
+          reconciled: false,
+        },
+      };
+    },
+    reconcilePublication: async (): Promise<Result<{ readonly resolution: string; readonly workItemId: string | null; readonly detail: string }, DomainError>> =>
+      notImplemented('reconcilePublication'),
+    adoptExistingIssue: async (): Promise<Result<AdoptedIssueView, DomainError>> => notImplemented('adoptExistingIssue'),
+    linkExistingChange: async (): Promise<Result<LinkedChangeView, DomainError>> => notImplemented('linkExistingChange'),
+    requestAdoptedEvaluation: async (command: { readonly mode: 'Test' | 'Review' | 'Build' }): Promise<Result<AdoptedEvaluationView, DomainError>> => {
+      if (command.mode === 'Build') {
+        return {
+          ok: false,
+          error: {
+            code: 'Invalid',
+            reason: 'An adopted candidate cannot be sent to Build (F11-AC5).',
+            fields: [{ path: 'mode', message: 'Request Test or Review for adopted work instead.' }],
+          },
+        };
+      }
+      return { ok: true, value: { workItemId: 'wi_http', mode: command.mode, dedupKey: 'k', created: true, jobEnqueued: false } };
+    },
   };
 
   readonly owners = {
@@ -1267,8 +1443,29 @@ test('the loaded controller module is validated before it can serve a request', 
       applyOwnerCorrection() {},
       exportIdea() {},
     },
+    planning: {
+      draftPlan() {},
+      getPlan() {},
+      listPlansForIdea() {},
+      editPlan() {},
+      assessPlan() {},
+      publishPlan() {},
+      reconcilePublication() {},
+      adoptExistingIssue() {},
+      linkExistingChange() {},
+      requestAdoptedEvaluation() {},
+    },
   };
   assert.equal(isControllerSurface(complete), true);
+  const missingPlanningMethod = {
+    ...complete,
+    planning: { ...complete.planning, publishPlan: undefined },
+  };
+  assert.equal(
+    isControllerSurface(missingPlanningMethod),
+    false,
+    'a planning group without publication must not pass the guard: reaching the provider has to be a declared method',
+  );
 });
 test('F01-AC1: a request over the body limit is refused with its own status', async (t) => {
   const h = await harness({ config: { bodyLimitBytes: 1024 } });
@@ -1463,4 +1660,411 @@ test('F01-AC1: SHIPLOOP_PORT 0 is the OS-assigned port, and only the port may be
     assert.ok(problem !== undefined, `the refusal must name ${path}`);
     assert.equal(problem.message, 'Expected a positive number.');
   }
+});
+
+/* -------------------------------------------------------------------------- */
+/* Planning, readiness, publication and adoption (F08, F09, F10, F11)          */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * A plan body the transport accepts, and the double turns into a plan.
+ *
+ * Two independently reviewable surfaces, so the plan is a split and the split carries
+ * a reason; a single surface would be refused by the domain for over-decomposition and
+ * this file would then be testing the wrong thing (F08-AC2).
+ */
+function planProposalBody(): Record<string, unknown> {
+  return {
+    kind: 'PlanProposal',
+    briefId: 'brief_http_1',
+    draftedAt: '2026-03-01T12:00:00.000Z',
+    basedOnRevision: null,
+    requestedOutcomes: [{ id: 'out_1', statement: 'The owner can see why a build was refused.' }],
+    tasks: [
+      {
+        taskId: 'task_1',
+        outcome: 'The readiness screen names every area it assessed.',
+        scope: 'Add the readiness assessment to the plan screen.',
+        acceptanceCriteria: ['Every area F09-AC1 names is on screen with a reason.'],
+        verificationMethod: 'The browser suite reads each area.',
+        dependencies: [],
+        relevantProjectContext: ['apps/web/src/ui'],
+        implementationLocation: {
+          kind: 'ProposedLocation',
+          candidates: ['apps/web/src/ui/pages/PlanPage.tsx'],
+          basis: 'The plan screen renders readiness.',
+        },
+        coversOutcomeIds: ['out_1'],
+      },
+      {
+        taskId: 'task_2',
+        outcome: 'A refused build still allows read-only investigation.',
+        scope: 'Disable the build control and keep the investigation control.',
+        acceptanceCriteria: ['The build control is disabled and says which area blocks it.'],
+        verificationMethod: 'The browser suite reads the two controls.',
+        dependencies: ['task_1'],
+        relevantProjectContext: ['apps/web/src/ui'],
+        implementationLocation: {
+          kind: 'ProposedLocation',
+          candidates: ['apps/web/src/ui/pages/PlanPage.tsx'],
+          basis: 'The same screen owns both controls.',
+        },
+        coversOutcomeIds: ['out_1'],
+      },
+    ],
+    exclusions: [],
+  };
+}
+
+async function draftPlan(h: Harness, session: Session): Promise<PlanPayload> {
+  const response = await h.app.inject({
+    method: 'POST',
+    url: '/api/plans',
+    headers: { cookie: session.cookie, 'x-shiploop-csrf': session.csrfToken },
+    payload: {
+      ideaId: 'idea_1',
+      planId: 'plan_http_1',
+      change: {
+        summary: 'Show readiness on the plan screen.',
+        surfaces: [
+          {
+            surfaceId: 'readiness_panel',
+            description: 'The readiness assessment panel.',
+            observableBehaviour: 'Every area and its reason are readable.',
+            independentlyReviewable: true,
+          },
+          {
+            surfaceId: 'build_control',
+            description: 'The build and investigation controls.',
+            observableBehaviour: 'Build is disabled with a named blocker; investigation is not.',
+            independentlyReviewable: true,
+          },
+        ],
+        dependencyEdges: [{ surface: 'build_control', dependsOn: 'readiness_panel' }],
+      },
+      proposal: planProposalBody(),
+    },
+  });
+  assert.equal(response.statusCode, 201, `plan draft failed: ${response.body}`);
+  return parse<PlanPayload>(response);
+}
+
+test('F08-AC1, F08-AC2, F08-AC5: a drafted plan carries every field F08-AC1 names and the reason for its split', async (t) => {
+  const h = await harness();
+  t.after(() => h.close());
+  const session = await signIn(h.app);
+  const { plan } = await draftPlan(h, session);
+
+  assert.equal(plan.revision, 1);
+  assert.equal(plan.split.split, true, 'two independently reviewable surfaces justify a split (F08-AC2)');
+  assert.ok(plan.split.reason.length > 0, 'the split reason must be inspectable (F08-AC2)');
+
+  for (const outcome of plan.requestedOutcomes) {
+    assert.ok(
+      plan.coverage.some((entry) => entry.outcomeId === outcome.id),
+      `requested outcome ${outcome.id} must be accounted for (F08-AC5)`,
+    );
+  }
+
+  for (const task of plan.tasks) {
+    assert.ok(task.outcome.length > 0, 'F08-AC1: outcome');
+    assert.ok(task.scope.length > 0, 'F08-AC1: scope');
+    assert.ok(task.acceptanceCriteria.length > 0, 'F08-AC1: acceptance criteria');
+    assert.ok(task.verificationMethod.length > 0, 'F08-AC1: verification method');
+    assert.ok(Array.isArray(task.dependencies), 'F08-AC1: dependencies');
+    assert.ok(task.relevantProjectContext.length > 0, 'F08-AC1: relevant project context');
+    assert.equal(task.implementationLocation.kind, 'ProposedLocation', 'F08-AC5: a location is a proposal');
+    assert.ok(task.implementationLocation.candidates.length > 0, 'F08-AC5: a proposal offers candidates');
+    assert.ok(task.implementationLocation.basis.length > 0, 'F08-AC5: a proposal states its basis');
+  }
+
+  // F08-AC4: the proposed order puts the prerequisite first, which is what makes the
+  // dependency visible rather than implied by the dependency list.
+  assert.deepEqual(plan.proposedOrder, ['task_1', 'task_2']);
+});
+
+test('F08-AC3: an unaccepted proposal is not publishable, and accepting is what makes it so', async (t) => {
+  const h = await harness();
+  t.after(() => h.close());
+  const session = await signIn(h.app);
+  const { plan } = await draftPlan(h, session);
+  assert.equal(
+    plan.tasks.every((task) => !task.publishable),
+    true,
+    'a freshly drafted plan has no publishable task (F08-AC3)',
+  );
+
+  const publishAttempt = await h.app.inject({
+    method: 'POST',
+    url: `/api/plans/${plan.planId}/publish`,
+    headers: { cookie: session.cookie, 'x-shiploop-csrf': session.csrfToken },
+    payload: { requestId: 'req_no_acceptances' },
+  });
+  assert.equal(publishAttempt.statusCode, 400, 'publishing nothing accepted must be refused (F08-AC3)');
+  assert.ok(!publishAttempt.body.includes('"published"'), 'the refusal must not carry a publication report');
+
+  const accepted = await h.app.inject({
+    method: 'POST',
+    url: `/api/plans/${plan.planId}/edit`,
+    headers: { cookie: session.cookie, 'x-shiploop-csrf': session.csrfToken },
+    payload: { kind: 'Accept', taskId: 'task_1', expectedRevision: plan.revision },
+  });
+  assert.equal(accepted.statusCode, 200, `accept failed: ${accepted.body}`);
+  const afterAccept = parse<PlanPayload>(accepted).plan;
+  assert.equal(afterAccept.revision, 2, 'an edit appends the next revision (F08-AC3)');
+  assert.equal(afterAccept.lastEditedBy, OWNER_ID, 'the edit records the owner the session proved (F01-AC1)');
+  assert.equal(afterAccept.tasks.find((task) => task.taskId === 'task_1')?.acceptance, 'Accepted');
+  assert.equal(afterAccept.tasks.find((task) => task.taskId === 'task_1')?.publishable, true);
+  assert.equal(
+    afterAccept.tasks.find((task) => task.taskId === 'task_2')?.publishable,
+    false,
+    'accepting one task must not publish the other (F08-AC3)',
+  );
+});
+
+test('F08-AC3: a stale edit is a conflict rather than a merge into a newer revision', async (t) => {
+  const h = await harness();
+  t.after(() => h.close());
+  const session = await signIn(h.app);
+  const { plan } = await draftPlan(h, session);
+
+  const first = await h.app.inject({
+    method: 'POST',
+    url: `/api/plans/${plan.planId}/edit`,
+    headers: { cookie: session.cookie, 'x-shiploop-csrf': session.csrfToken },
+    payload: { kind: 'Accept', taskId: 'task_1', expectedRevision: plan.revision },
+  });
+  assert.equal(first.statusCode, 200);
+
+  const stale = await h.app.inject({
+    method: 'POST',
+    url: `/api/plans/${plan.planId}/edit`,
+    headers: { cookie: session.cookie, 'x-shiploop-csrf': session.csrfToken },
+    payload: { kind: 'Accept', taskId: 'task_2', expectedRevision: plan.revision },
+  });
+  assert.equal(stale.statusCode, 409, 'an edit against a revision the owner no longer sees is a conflict (F08-AC3)');
+  const refusal = parse<ErrorPayload>(stale).error;
+  assert.equal(refusal.code, 'Conflict');
+  assert.equal(refusal.expected, 'revision 2');
+  assert.equal(refusal.actual, 'revision 1');
+});
+
+test('F08-AC3: an edit naming a lifecycle field is refused at the boundary', async (t) => {
+  const h = await harness();
+  t.after(() => h.close());
+  const session = await signIn(h.app);
+  const { plan } = await draftPlan(h, session);
+
+  const refusal = await h.app.inject({
+    method: 'POST',
+    url: `/api/plans/${plan.planId}/edit`,
+    headers: { cookie: session.cookie, 'x-shiploop-csrf': session.csrfToken },
+    payload: {
+      kind: 'Edit',
+      taskId: 'task_1',
+      expectedRevision: plan.revision,
+      changes: { scope: 'A wider scope.', acceptance: 'Accepted' },
+    },
+  });
+  assert.equal(refusal.statusCode, 400);
+  const fields = parse<ErrorPayload>(refusal).error.fields ?? [];
+  assert.ok(
+    fields.some((field) => field.path.includes('acceptance')),
+    `the refusal must name the lifecycle field: ${JSON.stringify(fields)}`,
+  );
+});
+
+test('F09-AC1, F09-AC2: readiness is a recorded assessment over every area, with build and build-blocking areas together', async (t) => {
+  const h = await harness();
+  t.after(() => h.close());
+  const session = await signIn(h.app);
+  const { plan } = await draftPlan(h, session);
+
+  const response = await h.app.inject({
+    method: 'GET',
+    url: `/api/plans/${plan.planId}/readiness`,
+    headers: { cookie: session.cookie },
+  });
+  assert.equal(response.statusCode, 200, response.body);
+  const { assessment } = parse<{ assessment: ReadinessAssessmentView }>(response);
+
+  assert.equal(assessment.areas.length, 7, 'every area F09-AC1 names is present, satisfied or not (F09-AC1)');
+  assert.deepEqual(
+    assessment.areas.map((area) => area.area),
+    ['Scope', 'Criteria', 'Repository', 'Target', 'Dependencies', 'Verification', 'Access'],
+    'the areas are in the order the specification lists them (F09-AC1)',
+  );
+  for (const area of assessment.areas) {
+    assert.ok(area.reason.length > 0, `the ${area.area} area must carry a reason (F09-AC1)`);
+    if (area.status !== 'Satisfied') {
+      assert.ok(area.remedy !== null, `an open ${area.area} area must name a remedy (F09-AC1)`);
+    }
+  }
+  // F09-AC2: the boolean and the blocking areas are two readings of one decision, and
+  // the transport must not let them disagree.
+  if (assessment.mayStartBuild) {
+    assert.deepEqual(assessment.buildBlockingAreas, [], 'nothing is blocking while the build may start (F09-AC2)');
+  } else {
+    assert.ok(assessment.buildBlockingAreas.length > 0, 'a disabled build names the areas blocking it (F09-AC2)');
+  }
+  assert.equal(typeof assessment.mayStartInvestigation, 'boolean', 'investigation permission is stated separately (F09-AC2)');
+});
+
+test('F10-AC2: publication reports per proposed ticket and names what remains unpublished', async (t) => {
+  const h = await harness();
+  t.after(() => h.close());
+  const session = await signIn(h.app);
+  const { plan } = await draftPlan(h, session);
+
+  let revision = plan.revision;
+  for (const taskId of ['task_1', 'task_2']) {
+    const accepted = await h.app.inject({
+      method: 'POST',
+      url: `/api/plans/${plan.planId}/edit`,
+      headers: { cookie: session.cookie, 'x-shiploop-csrf': session.csrfToken },
+      payload: { kind: 'Accept', taskId, expectedRevision: revision },
+    });
+    assert.equal(accepted.statusCode, 200, accepted.body);
+    revision = parse<PlanPayload>(accepted).plan.revision;
+  }
+
+  const published = await h.app.inject({
+    method: 'POST',
+    url: `/api/plans/${plan.planId}/publish`,
+    headers: { cookie: session.cookie, 'x-shiploop-csrf': session.csrfToken },
+    payload: { requestId: 'req_partial_1' },
+  });
+  assert.equal(published.statusCode, 200, published.body);
+  const { report } = parse<{ report: PublicationReportView }>(published);
+
+  assert.equal(report.requestId, 'req_partial_1', 'the report echoes the caller\'s request id (F10-AC3)');
+  assert.equal(report.tickets.length, 2, 'every proposed ticket is reported on (F10-AC2)');
+  assert.equal(report.published.length, 1, 'one ticket succeeded (F10-AC2)');
+  assert.equal(report.unpublished.length, 1, 'the remainder is named rather than inferred (F10-AC2)');
+  assert.equal(report.reconciled, false, 'this request wrote, so it did not reconcile (F10-AC3)');
+
+  const succeeded = report.tickets.find((ticket) => ticket.kind === 'Published');
+  assert.ok(succeeded !== undefined, 'the successful ticket is present (F10-AC2)');
+  assert.equal(succeeded?.identifier, 'OCT-1');
+  assert.ok((succeeded?.url ?? '').length > 0, 'a published ticket saves its URL (F10-AC2)');
+
+  const failed = report.tickets.find((ticket) => ticket.kind === 'Failed');
+  assert.ok(failed !== undefined, 'the failed ticket is present (F10-AC2)');
+  assert.ok((failed?.detail ?? '').length > 0, 'a refused ticket carries a useful explanation (F10-AC5)');
+  assert.ok(report.unpublished.includes(failed?.workItemId ?? 'absent'), 'the failure appears in what remains (F10-AC2)');
+});
+
+test('F10-AC3: a publication without a request id is refused, because a retry must be able to present the same one', async (t) => {
+  const h = await harness();
+  t.after(() => h.close());
+  const session = await signIn(h.app);
+  const { plan } = await draftPlan(h, session);
+
+  const refused = await h.app.inject({
+    method: 'POST',
+    url: `/api/plans/${plan.planId}/publish`,
+    headers: { cookie: session.cookie, 'x-shiploop-csrf': session.csrfToken },
+    payload: {},
+  });
+  assert.equal(refused.statusCode, 400);
+  assert.ok(
+    (parse<ErrorPayload>(refused).error.fields ?? []).some((field) => field.path === 'requestId'),
+    'the refusal names the request id (F10-AC3)',
+  );
+});
+
+test('F11-AC3, F11-AC5: adoption refusals arrive intact and a Build request for adopted work is refused', async (t) => {
+  const h = await harness();
+  t.after(() => h.close());
+  const session = await signIn(h.app);
+
+  const wrongTeam = await h.app.inject({
+    method: 'POST',
+    url: '/api/adoption/issue',
+    headers: { cookie: session.cookie, 'x-shiploop-csrf': session.csrfToken },
+    payload: {
+      projectId: PROJECT_ID,
+      profileVersionId: 'pv_1',
+      procedureVersionId: 'proc_1',
+      issueId: 'issue_foreign',
+      expectedIdentifier: 'OCT-664',
+      title: 'Existing work',
+    },
+  });
+  assert.equal(wrongTeam.statusCode, 503, 'the double refuses adoption by name (F03-AC2)');
+  assert.ok(wrongTeam.body.includes('adoptExistingIssue'), `the refusal names the use case: ${wrongTeam.body}`);
+
+  const buildRequest = await h.app.inject({
+    method: 'POST',
+    url: '/api/adoption/evaluate',
+    headers: { cookie: session.cookie, 'x-shiploop-csrf': session.csrfToken },
+    payload: { workItemId: 'wi_http', mode: 'Build' },
+  });
+  assert.equal(buildRequest.statusCode, 400);
+  const fields = parse<ErrorPayload>(buildRequest).error.fields ?? [];
+  assert.ok(
+    fields.some((field) => field.path === 'mode'),
+    `a Build request must be refused by name: ${JSON.stringify(fields)}`,
+  );
+  assert.ok(
+    parse<ErrorPayload>(buildRequest).error.message.includes('F11-AC5'),
+    `the refusal must cite the criterion it enforces: ${buildRequest.body}`,
+  );
+});
+
+test('F01-AC1: every planning and adoption route refuses an anonymous request', async (t) => {
+  const h = await harness();
+  t.after(() => h.close());
+
+  const anonymous: { readonly method: 'GET' | 'POST'; readonly url: string; readonly payload?: Record<string, unknown> }[] = [
+    { method: 'POST', url: '/api/plans', payload: { ideaId: 'idea_1', planId: 'plan_1', change: {}, proposal: {} } },
+    { method: 'GET', url: '/api/plans/plan_1' },
+    { method: 'GET', url: '/api/plans/plan_1/readiness' },
+    { method: 'POST', url: '/api/plans/plan_1/edit', payload: { kind: 'Accept', taskId: 'task_1', expectedRevision: 1 } },
+    { method: 'POST', url: '/api/plans/plan_1/publish', payload: { requestId: 'req_1' } },
+    { method: 'POST', url: '/api/plans/plan_1/reconcile-publication', payload: { operationId: 'pub:req_1:wi_1' } },
+    { method: 'POST', url: '/api/adoption/issue', payload: { projectId: PROJECT_ID } },
+    { method: 'POST', url: '/api/adoption/change', payload: { workItemId: 'wi_1', branch: 'main' } },
+    { method: 'POST', url: '/api/adoption/evaluate', payload: { workItemId: 'wi_1', mode: 'Review' } },
+  ];
+
+  for (const request of anonymous) {
+    const response = await h.app.inject({
+      method: request.method,
+      url: request.url,
+      ...(request.payload === undefined ? {} : { payload: request.payload }),
+    });
+    assert.equal(response.statusCode, 401, `${request.method} ${request.url} must refuse an anonymous request`);
+    assert.ok(
+      !response.body.includes(PROJECT_ID) && !response.body.includes('plan_1'),
+      `${request.url} leaked plan content: ${response.body}`,
+    );
+  }
+});
+
+test('F02-AC4: an unknown key in a plan proposal is refused rather than dropped', async (t) => {
+  const h = await harness();
+  t.after(() => h.close());
+  const session = await signIn(h.app);
+
+  const response = await h.app.inject({
+    method: 'POST',
+    url: '/api/plans',
+    headers: { cookie: session.cookie, 'x-shiploop-csrf': session.csrfToken },
+    payload: {
+      ideaId: 'idea_1',
+      planId: 'plan_unknown_key',
+      change: {
+        summary: 'A change.',
+        surfaces: [{ surfaceId: 's1', description: 'd', observableBehaviour: 'b', independentlyReviewable: true }],
+        dependencyEdges: [],
+      },
+      proposal: { ...planProposalBody(), status: 'Ready' },
+    },
+  });
+  assert.equal(response.statusCode, 400);
+  assert.ok(
+    (parse<ErrorPayload>(response).error.fields ?? []).some((field) => field.path.includes('status')),
+    `a lifecycle key must be refused by name: ${response.body}`,
+  );
 });
