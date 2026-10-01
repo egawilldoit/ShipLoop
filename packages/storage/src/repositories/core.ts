@@ -24,6 +24,7 @@ import {
   conflict,
   err,
   fingerprint,
+  hashSessionToken,
   invalid,
   ok,
   redact,
@@ -68,6 +69,7 @@ import type {
   ConnectorRecord,
   ConnectorState,
   ConnectorStore,
+  CreateSessionByDigestInput,
   CreateSessionInput,
   CreateWorkItemInput,
   EvidenceRecord,
@@ -80,7 +82,6 @@ import type {
   OwnerDecisionState,
   OwnerDecisionStore,
   OwnerCredentialInput,
-  OwnerCredentialRecord,
   OwnerDecisionType,
   OwnerRecord,
   OwnerSession,
@@ -116,14 +117,22 @@ import type {
 } from './types.ts';
 
 /**
- * Session tokens are stored only as a SHA-256 digest.
+ * Session tokens are stored only as the domain's digest (F01-AC2).
  *
- * A database copy must not be replayable as a live session, so the token itself
- * never reaches a column, a log or a backup (F01-AC2).
+ * `@shiploop/domain`'s `hashSessionToken` is the single authority for that
+ * digest: it is domain-separated, so a digest of a session token can never be
+ * confused with a digest of any other ShipLoop value, and it is the same
+ * function `authorizeSession` re-derives a presented token against. This
+ * repository deliberately holds no digest function of its own — a second
+ * format in one column makes a correctly stored session permanently
+ * unreachable, which is a 401 on every request and no error anywhere.
  */
-export function sessionTokenHash(token: string): string {
-  return createHash('sha256').update(token, 'utf8').digest('hex');
+function sessionDigest(token: string): string {
+  return hashSessionToken(token);
 }
+
+/** The only shape a stored token digest may take, checked before it is written. */
+const HEX_SHA256 = /^[0-9a-f]{64}$/;
 
 const transactionDepth = new WeakMap<StorageConnection, number>();
 
@@ -273,7 +282,7 @@ abstract class SqlRepository {
 
 const OWNER_COLUMNS = 'owner_id, identity_subject, display_name, email, password_digest, created_at';
 const SESSION_COLUMNS =
-  'session_id, owner_id, token_hash, issued_at, expires_at, revoked_at, rotated_from_session_id';
+  'session_id, owner_id, token_hash, issued_at, expires_at, revoked_at, rotated_from_session_id, last_seen_at';
 
 function toOwner(row: SqlRow): OwnerRecord {
   return {
@@ -281,14 +290,6 @@ function toOwner(row: SqlRow): OwnerRecord {
     displayName: requiredText(row, 'display_name'),
     email: nullableText(row, 'email'),
     createdAt: requiredText(row, 'created_at'),
-  };
-}
-
-function toCredential(row: SqlRow): OwnerCredentialRecord {
-  return {
-    ownerId: requiredText(row, 'owner_id') as OwnerId,
-    email: requiredText(row, 'email'),
-    passwordDigest: requiredText(row, 'password_digest'),
   };
 }
 
@@ -301,6 +302,7 @@ function toSession(row: SqlRow): OwnerSession {
     expiresAt: requiredText(row, 'expires_at'),
     revokedAt: nullableText(row, 'revoked_at'),
     rotatedFromSessionId: nullableText(row, 'rotated_from_session_id'),
+    lastSeenAt: nullableText(row, 'last_seen_at'),
   };
 }
 
@@ -319,6 +321,13 @@ function toSession(row: SqlRow): OwnerSession {
  * a backup. The address is the sign-in identity and is unique, which is what
  * makes "unknown address" and "wrong password" the same question to ask
  * (N02-AC1).
+ *
+ * `provision` is the only way an owner and their credential come into
+ * existence, and it does all of it inside one bounded transaction: the
+ * existence checks, the insert and the credential write either all land or none
+ * do. A crash between an owner row and its credential used to leave an owner
+ * that could never sign in and could never be re-provisioned, because the
+ * existence check refused the retry against its own orphan.
  */
 export class OwnerRepository extends SqlRepository implements OwnerStore {
   provision(
@@ -329,14 +338,8 @@ export class OwnerRepository extends SqlRepository implements OwnerStore {
   ): Result<OwnerRecord> {
     return this.attempt('provision owner', () =>
       this.bounded(() => {
-        const existing = this.statement(`SELECT ${OWNER_COLUMNS} FROM owners WHERE owner_id = ?`).get(ownerId);
-        if (existing !== undefined) {
-          return err(
-            conflict('The owner is already provisioned.', 'no owner', requiredText(existing, 'owner_id')),
-          );
-        }
-        const email = credential?.email.trim().toLowerCase() ?? null;
-        if (credential !== undefined && (email === null || email === '' || credential.passwordDigest === '')) {
+        const email = credential === undefined ? null : credential.email.trim().toLowerCase();
+        if (credential !== undefined && (email === '' || credential.passwordDigest === '')) {
           return err(
             invalid('An owner credential needs an email address and a password digest.', [
               { path: 'email', message: 'Required.' },
@@ -344,6 +347,40 @@ export class OwnerRepository extends SqlRepository implements OwnerStore {
             ]),
           );
         }
+
+        const existing = this.statement(`SELECT ${OWNER_COLUMNS} FROM owners WHERE owner_id = ?`).get(ownerId);
+        if (existing !== undefined) {
+          // An owner row that already holds a credential is a real owner: refuse,
+          // so a repeat call cannot reset someone's password (F01-AC1). A call with
+          // no credential is not a credential operation at all and must not touch
+          // an owner it did not create.
+          if (credential === undefined || nullableText(existing, 'password_digest') !== null) {
+            return err(conflict('The owner is already provisioned.', 'no owner', requiredText(existing, 'owner_id')));
+          }
+          // An owner row with no credential is the orphan an interrupted
+          // provision leaves behind, and completing it in this same transaction
+          // is the only way it ever becomes usable again.
+          this.statement('UPDATE owners SET display_name = ?, email = ?, password_digest = ? WHERE owner_id = ?').run(
+            displayName,
+            email,
+            credential.passwordDigest,
+            ownerId,
+          );
+          return ok<OwnerRecord>({
+            ownerId,
+            displayName,
+            email,
+            createdAt: requiredText(existing, 'created_at'),
+          });
+        }
+
+        if (email !== null) {
+          const byEmail = this.statement('SELECT owner_id FROM owners WHERE email = ?').get(email);
+          if (byEmail !== undefined) {
+            return err(conflict('An owner with that sign-in address already exists.', 'no owner', email));
+          }
+        }
+
         this.statement(
           'INSERT INTO owners (owner_id, identity_subject, display_name, email, password_digest, created_at) VALUES (?, ?, ?, ?, ?, ?)',
         // `identity_subject` names the subject an identity PROVIDER knows this
@@ -372,98 +409,104 @@ export class OwnerRepository extends SqlRepository implements OwnerStore {
   }
 
   /**
-   * Records the owner's credential after provisioning.
+   * Resolves a sign-in identifier to its owner.
    *
-   * A second write is refused rather than overwriting, because a silent
-   * replacement would let a caller change the identity the owner signs in with
-   * without that being an explicit act.
+   * One statement matching either the display name or the stored address,
+   * normalised, so an unknown identifier is answered by the same query and the
+   * same amount of work as a known one (N02-AC1). A row with no display name
+   * cannot be named by one and so never matches; it is not an error, because an
+   * owner this product provisioned always has a name.
    */
-  setCredential(input: OwnerCredentialInput): Result<OwnerCredentialRecord> {
-    return this.attempt('record owner credential', () =>
-      this.bounded(() => {
-        const email = input.email.trim().toLowerCase();
-        if (email === '' || input.passwordDigest === '') {
-          return err(
-            invalid('An owner credential needs an email address and a password digest.', [
-              { path: 'email', message: 'Required.' },
-              { path: 'passwordDigest', message: 'Required.' },
-            ]),
-          );
-        }
-        const owner = this.statement('SELECT owner_id, email, password_digest FROM owners WHERE owner_id = ?').get(
-          input.ownerId,
-        );
-        if (owner === undefined) return err(notFound('Owner', input.ownerId));
-        if (nullableText(owner, 'password_digest') !== null) {
-          return err(
-            conflict('This owner already has a credential; it was not overwritten.', 'no credential', input.email),
-          );
-        }
-        this.statement('UPDATE owners SET email = ?, password_digest = ? WHERE owner_id = ?').run(
-          email,
-          input.passwordDigest,
-          input.ownerId,
-        );
-        return ok(toCredential({ ...owner, email, password_digest: input.passwordDigest }));
-      }),
-    );
+  findBySignInIdentifier(identifier: string): Result<OwnerRecord | null> {
+    return this.attempt('read owner by sign-in identifier', () => {
+      const normalized = identifier.trim().toLowerCase();
+      const row = this.statement(
+        `SELECT ${OWNER_COLUMNS} FROM owners WHERE lower(display_name) = ? OR lower(email) = ? ORDER BY created_at ASC, owner_id ASC LIMIT 1`,
+      ).get(normalized, normalized);
+      return ok(row === undefined ? null : toOwner(row));
+    });
   }
 
   /**
-   * Looks a credential up by address.
+   * Stores a session, digesting the presented token with the domain's own
+   * function.
    *
-   * Lookups are by normalised address so an unknown address and a wrong
-   * password are indistinguishable to the caller (N02-AC1).
+   * `last_seen_at` is set to the issue instant, so the idle deadline starts at
+   * sign-in rather than at the first request: a session created without it could
+   * never be idle-expired, because an absent activity time is not a time.
    */
-  findCredentialByEmail(email: string): Result<OwnerCredentialRecord | null> {
-    return this.attempt('read owner credential by email', () => {
-      const row = this.statement(
-        'SELECT owner_id, email, password_digest FROM owners WHERE email = ?',
-      ).get(email.trim().toLowerCase());
-      return ok(row === undefined ? null : toCredential(row));
-    });
-  }
-
-  findCredentialByOwnerId(ownerId: OwnerId): Result<OwnerCredentialRecord | null> {
-    return this.attempt('read owner credential by owner', () => {
-      const row = this.statement(
-        'SELECT owner_id, email, password_digest FROM owners WHERE owner_id = ? AND password_digest IS NOT NULL',
-      ).get(ownerId);
-      return ok(row === undefined ? null : toCredential(row));
-    });
-  }
-
   createSession(input: CreateSessionInput): Result<OwnerSession> {
+    if (input.token === '') {
+      return err(invalid('A session token is required.', [{ path: 'token', message: 'Required.' }]));
+    }
+    return this.createSessionByDigest({
+      ownerId: input.ownerId,
+      tokenDigest: sessionDigest(input.token),
+      issuedAt: input.issuedAt,
+      expiresAt: input.expiresAt,
+    });
+  }
+
+  /**
+   * Stores a session whose digest the caller already holds.
+   *
+   * The single write path for a session row, so the digest policy and the
+   * activity instant cannot diverge between the two ways in. The digest is
+   * accepted only when it is well-formed hex SHA-256: storing anything else
+   * would put a value in the column that `verifySessionToken` can never match,
+   * which is precisely how a correctly created session became unusable.
+   */
+  createSessionByDigest(input: CreateSessionByDigestInput): Result<OwnerSession> {
     return this.attempt('create owner session', () =>
       this.bounded(() => {
-        if (input.token === '') {
-          return err(invalid('A session token is required.', [{ path: 'token', message: 'Required.' }]));
+        if (!HEX_SHA256.test(input.tokenDigest)) {
+          return err(
+            invalid('A session can only be stored as a hex SHA-256 token digest.', [
+              { path: 'tokenDigest', message: 'Must be 64 lowercase hex characters.' },
+            ]),
+          );
         }
         const owner = this.statement(`SELECT ${OWNER_COLUMNS} FROM owners WHERE owner_id = ?`).get(
           input.ownerId,
         );
         if (owner === undefined) return err(notFound('Owner', input.ownerId));
+        const sessionId = newId<'SessionId'>();
         this.statement(
-          `INSERT INTO sessions (${SESSION_COLUMNS}) VALUES (?, ?, ?, ?, ?, NULL, NULL)`,
-        ).run(newId<'SessionId'>(), input.ownerId, sessionTokenHash(input.token), input.issuedAt, input.expiresAt);
-        const created = this.statement(`SELECT ${SESSION_COLUMNS} FROM sessions WHERE token_hash = ?`).get(
-          sessionTokenHash(input.token),
-        );
+          `INSERT INTO sessions (${SESSION_COLUMNS}) VALUES (?, ?, ?, ?, ?, NULL, NULL, ?)`,
+        ).run(sessionId, input.ownerId, input.tokenDigest, input.issuedAt, input.expiresAt, input.issuedAt);
+        const created = this.statement(`SELECT ${SESSION_COLUMNS} FROM sessions WHERE session_id = ?`).get(sessionId);
         if (created === undefined) return err(notFound('Session', 'created session'));
         return ok(toSession(created));
       }),
     );
   }
 
+  /**
+   * Resolves a presented token to its row without judging it.
+   *
+   * Deliberately does not apply the revoked or expiry rules: `authenticate`
+   * exists for callers that want storage to refuse, while an authorization path
+   * has to receive the stored `revoked_at` and hand it to the domain, or the
+   * domain's `authorizeSession` could never report why it said no (F01-AC2).
+   */
+  findSessionByToken(token: string): Result<OwnerSession | null> {
+    return this.attempt('read owner session by token', () => {
+      if (token === '') return ok(null);
+      const row = this.statement(`SELECT ${SESSION_COLUMNS} FROM sessions WHERE token_hash = ?`).get(
+        sessionDigest(token),
+      );
+      return ok(row === undefined ? null : toSession(row));
+    });
+  }
+
   authenticate(token: string, now: string): Result<OwnerSession> {
     return this.attempt('authenticate owner session', () => {
-      const row = this.statement(`SELECT ${SESSION_COLUMNS} FROM sessions WHERE token_hash = ?`).get(
-        sessionTokenHash(token),
-      );
-      if (row === undefined) {
+      const found = this.findSessionByToken(token);
+      if (!found.ok) return err(found.error);
+      if (found.value === null) {
         return err({ code: 'Forbidden', reason: 'The session is unknown.' });
       }
-      const session = toSession(row);
+      const session = found.value;
       if (session.revokedAt !== null) {
         return err({ code: 'Forbidden', reason: 'The session was revoked.' });
       }
@@ -487,7 +530,7 @@ export class OwnerRepository extends SqlRepository implements OwnerStore {
         }
         const current = this.authenticate(input.token, input.issuedAt);
         if (!current.ok) return current;
-        const nextHash = sessionTokenHash(input.newToken);
+        const nextHash = sessionDigest(input.newToken);
         if (nextHash === current.value.tokenHash) {
           return err(invalid('The replacement token must differ from the current token.', [
             { path: 'newToken', message: 'Must differ from the current token.' },
@@ -496,13 +539,16 @@ export class OwnerRepository extends SqlRepository implements OwnerStore {
         this.statement(
           'UPDATE sessions SET revoked_at = ? WHERE token_hash = ? AND revoked_at IS NULL',
         ).run(input.issuedAt, current.value.tokenHash);
-        this.statement(`INSERT INTO sessions (${SESSION_COLUMNS}) VALUES (?, ?, ?, ?, ?, NULL, ?)`).run(
+        this.statement(
+          `INSERT INTO sessions (${SESSION_COLUMNS}) VALUES (?, ?, ?, ?, ?, NULL, ?, ?)`,
+        ).run(
           newId<'SessionId'>(),
           current.value.ownerId,
           nextHash,
           input.issuedAt,
           input.expiresAt,
           current.value.sessionId,
+          input.issuedAt,
         );
         const created = this.statement(`SELECT ${SESSION_COLUMNS} FROM sessions WHERE token_hash = ?`).get(
           nextHash,
@@ -514,21 +560,57 @@ export class OwnerRepository extends SqlRepository implements OwnerStore {
   }
 
   revokeSession(token: string, revokedAt: string): Result<OwnerSession> {
-    return this.attempt('revoke owner session', () =>
+    return this.attempt('revoke owner session', () => {
+      const found = this.findSessionByToken(token);
+      if (!found.ok) return err(found.error);
+      if (found.value === null) return err(notFound('Session', 'unknown token'));
+      return this.revokeSessionById(found.value.sessionId, revokedAt);
+    });
+  }
+
+  /**
+   * Revokes by stored identity rather than by presented token.
+   *
+   * Sign-out runs on the request path, where the session has already been
+   * resolved to its row, so keying the write on the row keeps the two facts
+   * consistent and avoids hashing a token a second time. Revoking twice is
+   * idempotent rather than a conflict, so a retried sign-out is not an error
+   * (F01-AC2).
+   */
+  revokeSessionById(sessionId: string, revokedAt: string): Result<OwnerSession> {
+    return this.attempt('revoke owner session by identity', () =>
       this.bounded(() => {
-        const hash = sessionTokenHash(token);
-        const row = this.statement(`SELECT ${SESSION_COLUMNS} FROM sessions WHERE token_hash = ?`).get(hash);
-        if (row === undefined) return err(notFound('Session', 'unknown token'));
+        const row = this.statement(`SELECT ${SESSION_COLUMNS} FROM sessions WHERE session_id = ?`).get(sessionId);
+        if (row === undefined) return err(notFound('Session', sessionId));
         const session = toSession(row);
         if (session.revokedAt !== null) return ok(session);
-        this.statement('UPDATE sessions SET revoked_at = ? WHERE session_id = ?').run(
-          revokedAt,
-          session.sessionId,
+        this.statement('UPDATE sessions SET revoked_at = ? WHERE session_id = ?').run(revokedAt, sessionId);
+        const updated = this.statement(`SELECT ${SESSION_COLUMNS} FROM sessions WHERE session_id = ?`).get(sessionId);
+        if (updated === undefined) return err(notFound('Session', sessionId));
+        return ok(toSession(updated));
+      }),
+    );
+  }
+
+  /**
+   * Moves the idle deadline forward.
+   *
+   * Written on every authorized request, which is the only thing that makes a
+   * configured idle timeout able to fire; without a write, the stored activity
+   * instant never moves and a quiet session stays open forever (F01-AC2). Only
+   * an existing row is moved: a touch for an unknown session is a `NotFound`
+   * rather than a silent insert, so activity can never invent a session.
+   */
+  touchSession(sessionId: string, lastSeenAt: string): Result<OwnerSession> {
+    return this.attempt('record owner session activity', () =>
+      this.bounded(() => {
+        const changes = this.statement('UPDATE sessions SET last_seen_at = ? WHERE session_id = ?').run(
+          lastSeenAt,
+          sessionId,
         );
-        const updated = this.statement(`SELECT ${SESSION_COLUMNS} FROM sessions WHERE session_id = ?`).get(
-          session.sessionId,
-        );
-        if (updated === undefined) return err(notFound('Session', session.sessionId));
+        if (changeCount(changes.changes) === 0) return err(notFound('Session', sessionId));
+        const updated = this.statement(`SELECT ${SESSION_COLUMNS} FROM sessions WHERE session_id = ?`).get(sessionId);
+        if (updated === undefined) return err(notFound('Session', sessionId));
         return ok(toSession(updated));
       }),
     );

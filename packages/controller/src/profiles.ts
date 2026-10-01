@@ -22,13 +22,13 @@
  *     profile cannot be reached without a session (F01-AC1).
  */
 
+import { createHash } from 'node:crypto';
 import {
+  authorizeSession,
   canonicalize,
-  conflict,
   describeSessionRejection,
   err,
   evaluateGrant,
-  evaluateSession,
   fingerprint,
   generateSessionToken,
   hashPassword,
@@ -83,6 +83,7 @@ import type {
   ProjectProfileVersion,
 } from '@shiploop/storage';
 import type { AdapterRegistry } from './connectors.ts';
+import type { SessionUseCases, StoredSessionRecord } from './sessions.ts';
 
 /**
  * Injected time source.
@@ -130,9 +131,13 @@ export interface OwnerCredentialRecord {
  * A port rather than a bound table, so the encoding, comparison and no-oracle
  * rules are independent of where the row lives and the storage shape can change
  * without touching a use case.
+ *
+ * Read-only on purpose: an owner and their credential are created together, in one
+ * transaction, by the repository's `provision`. A credential write that could
+ * follow the owner insert separately is exactly what left an owner unable to sign
+ * in and unable to be re-provisioned, so there is no second way in (F01-AC1).
  */
 export interface OwnerCredentialStore {
-  put(record: OwnerCredentialRecord): Result<OwnerCredentialRecord>;
   findByEmail(email: string): Result<OwnerCredentialRecord | null>;
   findByOwnerId(ownerId: OwnerId): Result<OwnerCredentialRecord | null>;
 }
@@ -159,6 +164,46 @@ const DECOY_CREDENTIAL = 'shiploop-decoy-credential-value-for-equal-cost';
 const UNVERIFIABLE_DECOD = 'unverifiable-decod';
 
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@.]+(?:\.[^\s@.]+)+$/;
+
+/**
+ * The reserved domain a provisioned owner's sign-in address is derived from.
+ *
+ * `.invalid` is reserved by RFC 2606, so an address built here can never be
+ * delivered to, routed to, or registered by anyone. The column is still populated
+ * because it is the unique sign-in identity the schema owns, not because
+ * anything sends mail to it.
+ */
+const DERIVED_OWNER_DOMAIN = 'owners.shiploop.invalid';
+
+const NON_ADDRESS_CHARACTERS = /[^a-z0-9]+/g;
+
+/**
+ * The stored sign-in address for a display name.
+ *
+ * A slug rather than the raw name so the value is address-shaped, and a stable
+ * one so the same owner keeps the same identity. An owner whose name reduces to
+ * nothing falls back to a fixed local part, which cannot collide with a real
+ * owner because there is only one.
+ */
+export function derivedOwnerAddress(displayName: string): string {
+  const slug = displayName.trim().toLowerCase().replace(NON_ADDRESS_CHARACTERS, '-').replace(/^-+|-+$/g, '');
+  return `${slug === '' ? 'owner' : slug}@${DERIVED_OWNER_DOMAIN}`;
+}
+
+/**
+ * The owner identity a display name provisions, derived from it.
+ *
+ * Deterministic so that provisioning the same name twice is a conflict about one
+ * owner rather than the silent arrival of a second one, which is the difference
+ * between a `Conflict` and an account-existence oracle (F01-AC1).
+ */
+export function derivedOwnerId(displayName: string): OwnerId {
+  // A JSON array rather than a delimiter: no display name can be mistaken for a
+  // boundary between the domain and the name, however it is spelled.
+  const seed = JSON.stringify([DERIVED_OWNER_DOMAIN, displayName.trim().toLowerCase()]);
+  const digest = createHash('sha256').update(seed, 'utf8').digest('hex').slice(0, 32);
+  return `own_${digest}` as OwnerId;
+}
 
 /** A successful sign-in. The token leaves the process exactly once (F01-AC2). */
 export interface OwnerSignIn {
@@ -188,6 +233,60 @@ export interface AuthenticateOwnerInput {
   readonly email: string;
   readonly password: string;
 }
+
+/**
+ * Provision an owner the way the API names one.
+ *
+ * The transport identifies an owner by a display name and a password, with no
+ * address, so the sign-in address is derived here rather than asked for: the
+ * reserved `owners.shiploop.invalid` domain can never be delivered to, and the
+ * unique index on `owners.email` still guarantees one identity (F01-AC1).
+ */
+export interface ProvisionNamedOwnerInput {
+  readonly displayName: string;
+  readonly password: string;
+  /** The owner row's creation instant; the transport's clock, not this one. */
+  readonly at: string;
+}
+
+/**
+ * Sign in with whatever name the owner typed.
+ *
+ * `identifier` is matched against both the display name and the derived
+ * address, so an owner does not have to remember which one they provisioned with
+ * (N02-AC1).
+ */
+export interface AuthenticateNamedOwnerInput {
+  readonly identifier: string;
+  readonly password: string;
+}
+
+/**
+ * Sign in and open a session in one step.
+ *
+ * `tokenDigest` is the domain digest of a token the caller minted: the plaintext
+ * never reaches this layer, so a copy of this store cannot be replayed as a live
+ * session (F01-AC2).
+ */
+export interface AuthenticateOwnerSessionInput {
+  readonly identifier: string;
+  readonly password: string;
+  readonly tokenDigest: string;
+  readonly issuedAt: string;
+  readonly absoluteTtlSeconds: number;
+  readonly idleTimeoutSeconds: number;
+}
+
+/**
+ * A session opened by sign-in, in the terms the transport carries it.
+ *
+ * The whole stored record rather than five fields of it, because a caller that
+ * has just signed an owner in has to be able to state the session's identity,
+ * its deadline and its digest without reading the row back again — and because a
+ * partial return would invite a second, differently-shaped session type
+ * (F01-AC2).
+ */
+export type OwnerSessionGrant = StoredSessionRecord;
 
 /** The owner as the API returns it. The credential reference is never included. */
 export interface OwnerRecordView {
@@ -304,6 +403,14 @@ export interface ProfileUseCaseDeps {
   readonly procedures: ProcedureRepository;
   readonly credentials: OwnerCredentialStore;
   readonly adapters: AdapterRegistry;
+  /**
+   * The idle limit this deployment runs with, applied by `authorizeRequest`.
+   *
+   * Injected rather than defaulted here so the gate enforces the configured limit
+   * and not a constant that happens to match today's default; a limit that no
+   * configured value can change is not a limit (F01-AC2).
+   */
+  readonly sessionIdleTimeoutSeconds: number;
   /** Cost override so a test can exercise real hashing without production cost. */
   readonly passwordParameters?: Partial<ScryptParameters>;
   /** Injected runner; absent means preflight cannot be attempted (F04-AC2). */
@@ -312,7 +419,22 @@ export interface ProfileUseCaseDeps {
 
 export interface ProfileUseCases {
   readonly provisionOwner: (input: ProvisionOwnerInput) => Result<OwnerRecordView, DomainError>;
+  readonly provisionNamedOwner: (input: ProvisionNamedOwnerInput) => Result<OwnerRecordView, DomainError>;
   readonly authenticateOwner: (input: AuthenticateOwnerInput) => Result<OwnerSignIn, DomainError>;
+  readonly authenticateNamedOwner: (input: AuthenticateNamedOwnerInput) => Result<OwnerRecordView, DomainError>;
+  readonly openOwnerSession: (
+    input: AuthenticateOwnerSessionInput,
+    sessions: SessionUseCases,
+  ) => Result<OwnerSessionGrant, DomainError>;
+  /**
+   * The owner actor a transport that has already authorized a request acts as.
+   *
+   * Exists because the HTTP ports name no caller on a read: by the time a read
+   * reaches the controller the request guard has proven who is asking. There is
+   * exactly one provisioned owner, so "the owner" is unambiguous, and a database
+   * with no owner answers no read at all rather than an anonymous one (F01-AC1).
+   */
+  readonly resolveOwnerActor: () => Result<OwnerActor, DomainError>;
   readonly signOut: (credential: SessionCredential) => Result<true, DomainError>;
   readonly authorizeRequest: (credential: SessionCredential) => Result<OwnerActor, DomainError>;
   readonly saveProfile: (input: SaveProfileInput, actor: OwnerActor) => Result<ProjectProfileVersion, DomainError>;
@@ -504,40 +626,44 @@ export function createProfileUseCases(deps: ProfileUseCaseDeps): ProfileUseCases
   /**
    * The single gate a privileged request passes (F01-AC1, F01-AC2).
    *
-   * Two layers, each owning what it is authoritative for. Storage resolves the
-   * presented token to its row and refuses a revoked or expired one, because it
-   * owns the stored digest format; the domain then evaluates the window itself, so
-   * revocation is judged by the same policy everywhere and a correct token can never
-   * outlive a sign-out. Every refusal reaches the caller as `Forbidden`, so this
-   * gate is not an oracle either.
+   * Storage resolves the presented token to its row and nothing more; the domain's
+   * `authorizeSession` then judges that row, so token correctness, revocation,
+   * the window and the idle deadline are all decided by one piece of policy that
+   * every caller shares, and a correct token can never outlive a sign-out. There
+   * is no second, storage-side token comparison to drift from it: storage writes
+   * the domain's digest and this layer re-derives that same digest, so the two
+   * agree by construction rather than by convention.
    *
-   * The split is required rather than stylistic: `OwnerRepository` stores a plain
-   * SHA-256 of the token while the domain's `hashSessionToken` is domain-separated,
-   * so `authorizeSession` would compare a digest this row does not hold. The token
-   * comparison therefore stays with storage and the window rules stay with the
-   * domain; reconciling the two digest formats is a storage change, not a controller
-   * workaround.
+   * Every refusal reaches the caller as `Forbidden`, so this gate is not an
+   * account-existence oracle either.
    */
   const authorizeRequest = (credential: SessionCredential): Result<OwnerActor, DomainError> => {
     const anonymous = { code: 'Forbidden', reason: 'Sign in to continue (F01-AC1).' } as const;
     if (credential.token === '') return err(anonymous);
     const now = deps.clock.now();
-    const session = deps.owners.authenticate(credential.token, now);
-    if (!session.ok) return err(anonymous);
-    const window = evaluateSession({
-      issuedAt: session.value.issuedAt,
-      expiresAt: session.value.expiresAt,
-      revokedAt: session.value.revokedAt,
+    const found = deps.owners.findSessionByToken(credential.token);
+    if (!found.ok) return err(anonymous);
+    if (found.value === null) return err(anonymous);
+    const session = found.value;
+    const authorized = authorizeSession({
+      sessionId: session.sessionId,
+      token: credential.token,
+      storedDigest: session.tokenHash,
+      issuedAt: session.issuedAt,
+      expiresAt: session.expiresAt,
+      revokedAt: session.revokedAt,
+      lastActivityAt: session.lastSeenAt,
+      idleTimeoutSeconds: deps.sessionIdleTimeoutSeconds,
       now,
     });
-    if (!window.valid) {
-      return err({ code: 'Forbidden', reason: describeSessionRejection(window.reason ?? 'Malformed') });
+    if (!authorized.ok) {
+      return err({ code: 'Forbidden', reason: describeSessionRejection(authorized.error) });
     }
     return ok({
-      actorId: session.value.ownerId,
+      actorId: session.ownerId,
       role: 'Owner',
-      ownerId: session.value.ownerId,
-      sessionId: session.value.sessionId,
+      ownerId: session.ownerId,
+      sessionId: session.sessionId,
     });
   };
 
@@ -554,10 +680,13 @@ export function createProfileUseCases(deps: ProfileUseCaseDeps): ProfileUseCases
   /**
    * Provisions the single owner and their credential (F01-AC1).
    *
-   * The password is hashed before anything is written, and the two refusals that
-   * matter are typed rather than silent: an existing credential for the owner or the
-   * address is a `Conflict`, and the repository's own conflict for an existing owner
-   * row is passed through unchanged.
+   * The password is hashed before anything is written, and the whole write is
+   * one repository call: the existence checks, the owner insert and the
+   * credential write share a transaction, so an interruption cannot leave an
+   * owner that can neither sign in nor be re-provisioned. Both refusals that
+   * matter are typed rather than silent — a second credential is a `Conflict`,
+   * never a silent overwrite — and the repository's own conflict is passed
+   * through unchanged.
    */
   const provisionOwner = (input: ProvisionOwnerInput): Result<OwnerRecordView, DomainError> => {
     const email = input.email.trim().toLowerCase();
@@ -569,32 +698,133 @@ export function createProfileUseCases(deps: ProfileUseCaseDeps): ProfileUseCases
       );
     }
 
-    const byEmail = deps.credentials.findByEmail(email);
-    if (!byEmail.ok) return err(byEmail.error);
-    const byOwner = deps.credentials.findByOwnerId(input.ownerId);
-    if (!byOwner.ok) return err(byOwner.error);
-    if (byEmail.value !== null || byOwner.value !== null) {
-      return err(
-        conflict(
-          'An owner credential already exists; provisioning is refused rather than overwriting it.',
-          'no owner credential',
-          byEmail.value?.ownerId ?? byOwner.value?.ownerId ?? input.ownerId,
-        ),
-      );
-    }
-
     const now = deps.clock.now();
-    const provisioned = deps.owners.provision(input.ownerId, input.displayName ?? email, now);
-    if (!provisioned.ok) return err(provisioned.error);
-
-    const stored = deps.credentials.put({
+    const provisioned = deps.owners.provision(input.ownerId, input.displayName ?? email, now, {
       ownerId: input.ownerId,
       email,
-      passwordHash: hashed.value,
-      updatedAt: now,
+      passwordDigest: hashed.value,
     });
-    if (!stored.ok) return err(stored.error);
-    return ok({ ownerId: input.ownerId, provisionedAt: now });
+    if (!provisioned.ok) return err(provisioned.error);
+    return ok({ ownerId: input.ownerId, provisionedAt: provisioned.value.createdAt });
+  };
+
+  /**
+   * Provisions an owner named the way the transport names one (F01-AC1).
+   *
+   * `ownerId` is derived from the display name so the same name always yields the
+   * same identity, which is what makes a repeated provision a `Conflict` about
+   * this owner rather than a second owner. The transport's `at` is recorded
+   * instead of this layer's clock, so the row states when the caller's request was
+   * made.
+   */
+  const provisionNamedOwner = (input: ProvisionNamedOwnerInput): Result<OwnerRecordView, DomainError> => {
+    const displayName = input.displayName.trim();
+    if (displayName === '') {
+      return err(
+        invalid('The owner could not be provisioned.', [{ path: 'displayName', message: 'A display name is required.' }]),
+      );
+    }
+    return provisionOwner({
+      ownerId: derivedOwnerId(displayName),
+      email: derivedOwnerAddress(displayName),
+      password: input.password,
+      displayName,
+    });
+  };
+
+  /**
+   * Signs an owner in by whatever name they typed, and refuses identically either
+   * way (N02-AC1).
+   *
+   * The identifier is resolved in one statement against the display name and the
+   * derived address, so an unknown identifier costs exactly what a known one
+   * costs. A token is never produced here: the caller that owns the cookie
+   * mints it, so the plaintext does not pass through this layer (F01-AC2).
+   */
+  const authenticateNamedOwner = (input: AuthenticateNamedOwnerInput): Result<OwnerRecordView, DomainError> => {
+    const credential = resolveCredential(input.identifier);
+    if (!credential.ok) return err(credential.error);
+    if (credential.value === null) {
+      verifyPassword(input.password, decoyHash);
+      return err(ownerRefusal());
+    }
+    if (!verifyPassword(input.password, credential.value.passwordHash)) return err(ownerRefusal());
+    const owner = deps.owners.current();
+    if (!owner.ok) return err(owner.error);
+    if (owner.value === null) return err(ownerRefusal());
+    return ok({ ownerId: owner.value.ownerId, provisionedAt: owner.value.createdAt });
+  };
+
+  /**
+   * Verifies a credential and opens a session, in one step.
+   *
+   * The session is opened through the session use cases rather than by writing
+   * the row here, so the deadline rules and the activity instant have exactly one
+   * implementation (F01-AC2). The grant carries no token: the caller minted it,
+   * and the digest it passed in is all this layer ever saw.
+   */
+  const openOwnerSession = (
+    input: AuthenticateOwnerSessionInput,
+    sessions: SessionUseCases,
+  ): Result<OwnerSessionGrant, DomainError> => {
+    const credential = resolveCredential(input.identifier);
+    if (!credential.ok) return err(credential.error);
+    if (credential.value === null) {
+      verifyPassword(input.password, decoyHash);
+      return err(ownerRefusal());
+    }
+    if (!verifyPassword(input.password, credential.value.passwordHash)) return err(ownerRefusal());
+
+    const owner = deps.owners.current();
+    if (!owner.ok) return err(owner.error);
+    if (owner.value === null) return err(ownerRefusal());
+
+    const opened = sessions.open({
+      ownerId: owner.value.ownerId,
+      displayName: owner.value.displayName,
+      tokenDigest: input.tokenDigest,
+      issuedAt: input.issuedAt,
+      absoluteTtlSeconds: input.absoluteTtlSeconds,
+      idleTimeoutSeconds: input.idleTimeoutSeconds,
+    });
+    if (!opened.ok) return err(opened.error);
+    return ok(opened.value);
+  };
+
+  /**
+   * The one provisioned owner, as an actor.
+   *
+   * Refused when nothing is provisioned rather than answered anonymously: a
+   * surface that could read profiles with no owner at all would make the
+   * transport's guard the only thing standing between a request and a private row
+   * (F01-AC1).
+   */
+  const resolveOwnerActor = (): Result<OwnerActor, DomainError> => {
+    const owner = deps.owners.current();
+    if (!owner.ok) return err(owner.error);
+    if (owner.value === null) {
+      return err({ code: 'Forbidden', reason: 'No owner is provisioned, so there is nobody to act as (F01-AC1).' });
+    }
+    return ok({
+      actorId: owner.value.ownerId,
+      role: 'Owner',
+      ownerId: owner.value.ownerId,
+      sessionId: null,
+    });
+  };
+
+  /**
+   * Resolves an identifier to a credential, or to null when there is none.
+   *
+   * Split out so both sign-in paths ask the same question in the same way, and so
+   * an unknown identifier pays one lookup and one full verification, exactly like a
+   * known one (N02-AC1).
+   */
+  const resolveCredential = (identifier: string): Result<OwnerCredentialRecord | null, DomainError> => {
+    const owner = deps.owners.findBySignInIdentifier(identifier);
+    if (!owner.ok) return err(owner.error);
+    if (owner.value === null) return ok(null);
+    return deps.credentials.findByOwnerId(owner.value.ownerId);
   };
 
   /**
@@ -881,7 +1111,11 @@ export function createProfileUseCases(deps: ProfileUseCaseDeps): ProfileUseCases
 
   return {
     provisionOwner,
+    provisionNamedOwner,
     authenticateOwner,
+    authenticateNamedOwner,
+    openOwnerSession,
+    resolveOwnerActor,
     signOut,
     authorizeRequest,
     saveProfile,

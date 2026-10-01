@@ -27,7 +27,14 @@ import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import { asCommitSha, asFingerprint, fingerprint } from '@shiploop/domain';
+import {
+  asCommitSha,
+  asFingerprint,
+  fingerprint,
+  generateSessionToken,
+  hashSessionToken,
+  verifySessionToken,
+} from '@shiploop/domain';
 import type {
   AuthorizationSubject,
   CapabilityDeclaration,
@@ -55,7 +62,6 @@ import {
   ProcedureRepository,
   ProjectProfileRepository,
   WorkItemRepository,
-  sessionTokenHash,
 } from './core.ts';
 import type {
   AppendProcedureVersionInput,
@@ -650,8 +656,13 @@ test('a revoked or rotated-away session is never returned as valid (F01-AC2)', a
         }),
       );
       assert.notEqual(created.tokenHash, SESSION_TOKEN);
-      assert.equal(created.tokenHash, sessionTokenHash(SESSION_TOKEN));
+      assert.equal(created.tokenHash, hashSessionToken(SESSION_TOKEN));
       assert.equal(created.revokedAt, null);
+      assert.equal(
+        created.lastSeenAt,
+        '2026-01-02T03:00:00.000Z',
+        'a new session must already carry an activity instant or the idle limit can never fire',
+      );
       expectOk(owners.authenticate(SESSION_TOKEN, '2026-01-02T04:00:00.000Z'));
 
       const rotated = expectOk(
@@ -664,6 +675,7 @@ test('a revoked or rotated-away session is never returned as valid (F01-AC2)', a
         }),
       );
       assert.equal(rotated.rotatedFromSessionId, created.sessionId);
+      assert.equal(rotated.lastSeenAt, '2026-01-02T05:00:00.000Z');
       expectError(owners.authenticate(SESSION_TOKEN, '2026-01-02T05:01:00.000Z'), 'Forbidden');
       expectOk(owners.authenticate(ROTATED_TOKEN, '2026-01-02T05:01:00.000Z'));
 
@@ -691,9 +703,67 @@ test('a revoked or rotated-away session is never returned as valid (F01-AC2)', a
       const onDisk = bytes.toString('latin1');
       assert.ok(!onDisk.includes(SESSION_TOKEN), 'the session token must not be recoverable from the file');
       assert.ok(!onDisk.includes(ROTATED_TOKEN), 'the rotated token must not be recoverable from the file');
-      assert.ok(onDisk.includes(sessionTokenHash(SESSION_TOKEN)), 'the token digest must be stored instead');
+      assert.ok(onDisk.includes(hashSessionToken(SESSION_TOKEN)), 'the token digest must be stored instead');
     },
   );
+});
+
+test('a token minted by the domain authenticates through this repository (F01-AC2)', async () => {
+  await withDatabase(async ({ connection }) => {
+    const owners = new OwnerRepository(connection);
+    expectOk(owners.provision(OWNER_ID, 'Solo owner', '2026-01-01T00:00:00.000Z'));
+
+    const token = generateSessionToken();
+    const created = expectOk(
+      owners.createSession({
+        ownerId: OWNER_ID,
+        token,
+        issuedAt: '2026-01-02T03:00:00.000Z',
+        expiresAt: '2026-01-03T03:00:00.000Z',
+      }),
+    );
+
+    assert.equal(created.tokenHash, hashSessionToken(token));
+    assert.ok(
+      verifySessionToken(token, created.tokenHash),
+      'the domain digest function must be the only one this column ever holds, or no session can authorize',
+    );
+    const found = expectOk(owners.findSessionByToken(token));
+    assert.equal(found?.sessionId, created.sessionId);
+    assert.equal(expectOk(owners.findSessionByToken('a-different-token')), null);
+  });
+});
+
+test('activity moves the idle deadline and revocation by identity is idempotent (F01-AC2)', async () => {
+  await withDatabase(async ({ connection }) => {
+    const owners = new OwnerRepository(connection);
+    expectOk(owners.provision(OWNER_ID, 'Solo owner', '2026-01-01T00:00:00.000Z'));
+    const created = expectOk(
+      owners.createSession({
+        ownerId: OWNER_ID,
+        token: SESSION_TOKEN,
+        issuedAt: '2026-01-02T03:00:00.000Z',
+        expiresAt: '2026-01-03T03:00:00.000Z',
+      }),
+    );
+
+    const touched = expectOk(owners.touchSession(created.sessionId, '2026-01-02T03:30:00.000Z'));
+    assert.equal(touched.lastSeenAt, '2026-01-02T03:30:00.000Z');
+    expectError(owners.touchSession('no-such-session', '2026-01-02T03:31:00.000Z'), 'NotFound');
+
+    const revoked = expectOk(owners.revokeSessionById(created.sessionId, '2026-01-02T04:00:00.000Z'));
+    assert.equal(revoked.revokedAt, '2026-01-02T04:00:00.000Z');
+    assert.equal(revoked.lastSeenAt, '2026-01-02T03:30:00.000Z', 'revocation must not rewrite activity');
+    const again = expectOk(owners.revokeSessionById(created.sessionId, '2026-01-02T05:00:00.000Z'));
+    assert.equal(again.revokedAt, '2026-01-02T04:00:00.000Z', 'a retried sign-out keeps the first instant');
+    expectError(owners.revokeSessionById('no-such-session', '2026-01-02T04:00:00.000Z'), 'NotFound');
+
+    assert.equal(
+      expectOk(owners.findSessionByToken(SESSION_TOKEN))?.revokedAt,
+      '2026-01-02T04:00:00.000Z',
+      'a revoked session still resolves, so the domain can be the one that refuses it (F01-AC2)',
+    );
+  });
 });
 
 test('a connector stores a credential reference and refuses a secret value (F03-AC2, F03-AC3)', async () => {
@@ -1851,10 +1921,11 @@ test('an owner credential is stored as a digest, never as a password (F01-AC1, R
     );
     assert.equal(provisioned.email, 'owner@example.test', 'the address is normalised for sign-in');
 
-    const credential = expectOk(owners.findCredentialByEmail('OWNER@EXAMPLE.TEST'));
-    assert.ok(credential !== null);
-    assert.equal(credential.passwordDigest, PASSWORD_DIGEST);
-    assert.equal(expectOk(owners.findCredentialByEmail('absent@example.test')), null);
+    // One statement resolves either name an owner may sign in with, and an
+    // unknown one costs the same query (N02-AC1).
+    assert.equal(expectOk(owners.findBySignInIdentifier('  solo OWNER '))?.ownerId, OWNER_ID);
+    assert.equal(expectOk(owners.findBySignInIdentifier('OWNER@EXAMPLE.TEST'))?.ownerId, OWNER_ID);
+    assert.equal(expectOk(owners.findBySignInIdentifier('nobody@example.test')), null);
 
     // R2: a locally provisioned owner has no identity-provider subject, and the
     // column says so rather than holding a substitute value.
@@ -1863,5 +1934,49 @@ test('an owner credential is stored as a digest, never as a password (F01-AC1, R
       .get(OWNER_ID);
     assert.equal(row?.['identity_subject'], null, 'the column must not lie about what it holds');
     assert.equal(row?.['password_digest'], PASSWORD_DIGEST);
+  });
+});
+
+test('provisioning cannot leave an owner without a credential, and cannot be retried into one (F01-AC1)', async () => {
+  await withDatabase(async ({ connection }) => {
+    const owners = new OwnerRepository(connection);
+    connection.prepare('INSERT INTO owners (owner_id, identity_subject, display_name, created_at) VALUES (?, ?, ?, ?)').run(
+      OWNER_ID,
+      null,
+      'Interrupted owner',
+      '2026-01-01T00:00:00.000Z',
+    );
+
+    const recovered = expectOk(
+      owners.provision(OWNER_ID, 'Recovered owner', '2026-01-05T00:00:00.000Z', {
+        ownerId: OWNER_ID,
+        email: 'Owner@Example.test',
+        passwordDigest: PASSWORD_DIGEST,
+      }),
+    );
+    assert.equal(recovered.createdAt, '2026-01-01T00:00:00.000Z', 'the original row is kept, not duplicated');
+
+    expectError(
+      owners.provision(OWNER_ID, 'Someone else', '2026-01-06T00:00:00.000Z', {
+        ownerId: OWNER_ID,
+        email: 'Other@Example.test',
+        passwordDigest: PASSWORD_DIGEST,
+      }),
+      'Conflict',
+    );
+    expectError(
+      owners.provision(OTHER_OWNER_ID, 'Someone else', '2026-01-06T00:00:00.000Z', {
+        ownerId: OTHER_OWNER_ID,
+        email: 'OWNER@example.test',
+        passwordDigest: PASSWORD_DIGEST,
+      }),
+      'Conflict',
+    );
+
+    const stored = connection.prepare('SELECT display_name, password_digest FROM owners WHERE owner_id = ?').get(
+      OWNER_ID,
+    );
+    assert.equal(stored?.['display_name'], 'Recovered owner');
+    assert.equal(stored?.['password_digest'], PASSWORD_DIGEST, 'a refused retry must not reset the credential');
   });
 });
