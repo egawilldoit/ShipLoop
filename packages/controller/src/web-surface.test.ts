@@ -76,6 +76,23 @@ const REQUIRED_METHODS = {
   sessions: ['loadByToken', 'create', 'revoke', 'touch'],
   profiles: ['saveVersion', 'currentVersion', 'listVersions'],
   connectors: ['register', 'listForProject', 'revoke'],
+  intake: [
+    'captureIdea',
+    'listIdeas',
+    'getIdea',
+    'attachFile',
+    'recordSummary',
+    'archiveIdea',
+    'deferIdea',
+    'findRelatedWork',
+    'recordRelatedWorkChoice',
+    'draftBrief',
+    'agreeBrief',
+    'askClarifyingQuestions',
+    'answerClarifyingQuestion',
+    'applyOwnerCorrection',
+    'exportIdea',
+  ],
 } as const satisfies Record<keyof ControllerSurface, readonly string[]>;
 
 /**

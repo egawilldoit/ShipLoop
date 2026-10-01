@@ -175,6 +175,198 @@ export interface CreateConnectorRequest {
   readonly credentialReference: string;
 }
 
+export type IntakeRequestKind = 'FeatureRequest' | 'Bug';
+
+export type IntakeDisposition = 'Unpublished' | 'Published' | 'Deferred' | 'Archived';
+
+export interface BugDetail {
+  readonly expected: string | null;
+  readonly actual: string | null;
+  readonly reproduction: string | null;
+}
+
+/** A named attachment row. Never its content: attachments are files (F06-AC1). */
+export interface IntakeAttachment {
+  readonly name: string;
+  readonly mediaType: string;
+  readonly byteSize: number;
+  readonly addedAt: string;
+}
+
+/**
+ * A generated summary, kept apart from the raw request (F06-AC1).
+ *
+ * `rawRequestFingerprint` is the fingerprint of the exact request this describes, so
+ * the two can always be traced to each other. `null` means no summary has been
+ * generated, which is different from an empty summary.
+ */
+export interface GeneratedSummary {
+  readonly text: string;
+  readonly generatedAt: string;
+  readonly generatedBy: string;
+  readonly rawRequestFingerprint: string;
+}
+
+/** One captured request (F06-AC1, F06-AC3, F06-AC5). */
+export interface IntakeIdea {
+  readonly ideaId: string;
+  readonly rawRequest: string;
+  readonly projectId: string | null;
+  readonly notes: string | null;
+  readonly kind: IntakeRequestKind;
+  readonly bugDetail: BugDetail;
+  readonly attachments: readonly IntakeAttachment[];
+  readonly summary: GeneratedSummary | null;
+  readonly disposition: IntakeDisposition;
+  readonly dispositionDetail: string | null;
+  readonly capturedAt: string;
+}
+
+export interface AcceptanceCriterion {
+  readonly id: string;
+  readonly text: string;
+  readonly verification: string | null;
+}
+
+/** The seven sections F07-AC1 names. Every section is present; a list may be empty. */
+export interface BriefSections {
+  readonly problem: string;
+  readonly desiredOutcome: string;
+  readonly includedBehaviour: readonly string[];
+  readonly excludedBehaviour: readonly string[];
+  readonly assumptions: readonly string[];
+  readonly acceptanceCriteria: readonly AcceptanceCriterion[];
+  readonly unresolvedQuestions: readonly string[];
+}
+
+export interface BriefVersion {
+  readonly version: number;
+  readonly state: 'Proposed' | 'Agreed';
+  readonly authoredBy: string;
+  readonly authoredAt: string;
+  readonly supersedesVersion: number | null;
+  readonly rawRequestFingerprint: string;
+  readonly sections: BriefSections;
+  readonly agreedBy: string | null;
+  readonly agreedAt: string | null;
+  readonly withdrawnCriterionIds: readonly string[];
+}
+
+export interface Brief {
+  readonly briefId: string | null;
+  readonly currentVersion: number | null;
+  readonly current: BriefVersion | null;
+  readonly versions: readonly BriefVersion[];
+}
+
+export interface ClarifyingQuestion {
+  readonly questionId: string;
+  readonly topic: string;
+  readonly prompt: string;
+  readonly readings: readonly string[];
+  readonly whyMaterial: string;
+  readonly origin: 'Ambiguity' | 'UnobservableCriterion';
+  readonly state: 'Open' | 'Answered';
+  readonly answer: string | null;
+  readonly askedAt: string;
+  readonly answeredAt: string | null;
+}
+
+/** A candidate question that was considered and declined (F07-AC2). */
+export interface RejectedCandidate {
+  readonly topic: string;
+  readonly rejection: string;
+  readonly explanation: string;
+}
+
+export interface IntakeTurn {
+  readonly kind: 'RawRequest' | 'Question' | 'Answer' | 'Correction';
+  readonly at: string;
+  readonly text: string;
+  readonly reference: string | null;
+}
+
+export interface IntakeDetail {
+  readonly idea: IntakeIdea;
+  readonly brief: Brief;
+  readonly questions: readonly ClarifyingQuestion[];
+  readonly rejected: readonly RejectedCandidate[];
+  readonly turns: readonly IntakeTurn[];
+}
+
+/**
+ * A resemblance report and the choices the owner holds (F06-AC4).
+ *
+ * `mergeable` and `discardable` are literal `false`, so no score can be read as a
+ * merge, and `disposition` is one literal: the owner has not decided yet.
+ */
+export interface RelatednessReport {
+  readonly candidateIdeaId: string;
+  readonly score: number;
+  readonly reasons: readonly string[];
+  readonly mergeable: false;
+  readonly discardable: false;
+  readonly disposition: 'OwnerChoiceRequired';
+  readonly ownerChoices: readonly RelatedWorkChoice[];
+}
+
+export type RelatedWorkChoice = 'LinkToExisting' | 'ExtendExisting' | 'CreateNewIssue';
+
+export interface RelatedWorkChoiceOutcome {
+  readonly candidateIdeaId: string;
+  readonly choice: RelatedWorkChoice;
+  readonly score: number;
+  readonly reasons: readonly string[];
+  readonly merged: false;
+  readonly dispositionAfterChoice: {
+    readonly idea: IntakeDisposition;
+    readonly candidate: IntakeDisposition;
+  };
+}
+
+export interface IntakeAmbiguity {
+  readonly kind:
+    | 'UnspecifiedSubject'
+    | 'ConflictingStatement'
+    | 'MissingAcceptanceThreshold'
+    | 'UnstatedScopeBoundary'
+    | 'UnresolvedDependency';
+  readonly topic: string;
+  readonly readings: readonly string[];
+  readonly answeredBy: readonly string[];
+  readonly impact: 'ChangesBehaviour' | 'ChangesAcceptance' | 'Cosmetic';
+  readonly evidence: string;
+}
+
+export interface ClarificationRound {
+  readonly questions: readonly ClarifyingQuestion[];
+  readonly rejected: readonly RejectedCandidate[];
+}
+
+export interface CorrectionOutcome {
+  readonly currentVersion: BriefVersion;
+  readonly priorVersion: BriefVersion;
+  readonly withdrawnCriterionIds: readonly string[];
+}
+
+export interface IntakeIdeaExport {
+  readonly ideaId: string;
+  readonly kind: IntakeRequestKind;
+  readonly capturedAt: string;
+  readonly rawRequest: string;
+  readonly notes: string | null;
+  readonly projectId: string | null;
+  readonly bugDetail: BugDetail;
+  readonly summary: GeneratedSummary | null;
+  readonly disposition: { readonly state: string; readonly detail: string | null };
+  readonly attachments: readonly {
+    readonly fileName: string;
+    readonly mediaType: string;
+    readonly byteSize: number;
+    readonly contentDigest: string;
+  }[];
+}
+
 export interface SessionResponse {
   readonly owner: OwnerIdentity;
   readonly csrfToken: string;
@@ -316,6 +508,32 @@ function readFields(value: unknown): readonly ApiFieldError[] {
  * instead of being repeated in every caller. Each endpoint below documents the shape it
  * expects, so a mismatch is a single-file fix.
  */
+/**
+ * The server's refusal, read out of the envelope it actually sends.
+ *
+ * `apps/web/src/server/http-error.ts` answers `{ error: { code, message, fields } }`, so
+ * reading a bare `code` and `reason` off the top level finds neither and would report
+ * every refusal as an unreachable server. Reading the envelope is what lets a rejected
+ * field's message reach the input it belongs to, which is the whole reason the server
+ * returns one (F02-AC4, N03-AC3). The bare form is still accepted as a fallback so a
+ * proxy or a future shape does not turn a refusal into a transport failure.
+ */
+function readRefusal(body: unknown, status: number): ApiFailure {
+  const envelope = isRecord(body) && isRecord(body['error']) ? (body['error'] as Record<string, unknown>) : null;
+  const source = envelope ?? (isRecord(body) ? body : null);
+  const message = source !== null && typeof source['message'] === 'string'
+    ? source['message']
+    : typeof source?.['reason'] === 'string'
+      ? source['reason']
+      : `The server refused the request (${status}).`;
+  const rawCode = source === null ? undefined : (source['code'] ?? source['reason']);
+  return {
+    code: isApiErrorCode(rawCode) ? rawCode : 'Unavailable',
+    reason: message,
+    fields: readFields(source),
+  };
+}
+
 function request<T>(path: string, options: SendOptions): Promise<ApiResult<T>> {
   return send(path, options).then(async (outcome) => {
     if (outcome.kind === 'offline') return failure('Unavailable', 'The server could not be reached.');
@@ -329,12 +547,11 @@ function request<T>(path: string, options: SendOptions): Promise<ApiResult<T>> {
       noteReachable(new Date().toISOString());
       return { ok: true, value: body.value as T };
     }
-    const reason = isRecord(body.value) && typeof body.value['reason'] === 'string'
-      ? body.value['reason']
-      : `The server refused the request (${response.status}).`;
-    const code = isRecord(body.value) && isApiErrorCode(body.value['code']) ? body.value['code'] : 'Unavailable';
-    noteFailure(reason);
-    return failure(code, reason, readFields(body.value));
+    // A refusal is an answer, so the transport is not treated as lost. Marking the
+    // connection down here would tell the owner their view had stopped being current
+    // when in fact the server received the request and declined it, which is the
+    // confusion the banner exists to prevent (N03-AC1, N03-AC3).
+    return { ok: false, error: readRefusal(body.value, response.status) };
   });
 }
 
@@ -342,8 +559,169 @@ function pathFor(prefix: string, id: string, suffix = ''): string {
   return `${prefix}/${encodeURIComponent(id)}${suffix}`;
 }
 
+/**
+ * Signs in with whatever the owner typed.
+ *
+ * The submitted body speaks the server's vocabulary rather than the form's: the route
+ * accepts an `identifier`, which it matches against both a display name and a derived
+ * address, so sending the typed value under a field named `email` is what makes
+ * "sign in with the name you provisioned" work against the real entrypoint instead of
+ * being refused as an unrecognised key (F01-AC1).
+ */
 export function signIn(credentials: SignInRequest): Promise<ApiResult<SignInResponse>> {
-  return request<SignInResponse>('/api/owner/sign-in', { method: 'POST', csrf: false, body: credentials });
+  return request<SignInResponse>('/api/owner/sign-in', {
+    method: 'POST',
+    csrf: false,
+    body: { identifier: credentials.email, password: credentials.password },
+  });
+}
+
+const INTAKE_ROOT = '/api/intake';
+
+export function fetchIntakeIdeas(): Promise<ApiResult<{ readonly ideas: readonly IntakeIdea[] }>> {
+  return request<{ readonly ideas: readonly IntakeIdea[] }>(`${INTAKE_ROOT}/ideas`, { method: 'GET', csrf: false });
+}
+
+export function captureIdea(draft: {
+  readonly rawRequest: string;
+  readonly kind: IntakeRequestKind;
+  readonly projectId: string | null;
+  readonly notes: string | null;
+  readonly detail: BugDetail | null;
+}): Promise<ApiResult<{ readonly idea: IntakeIdea }>> {
+  return request<{ readonly idea: IntakeIdea }>(`${INTAKE_ROOT}/ideas`, {
+    method: 'POST',
+    csrf: true,
+    body: draft,
+  });
+}
+
+export function fetchIntakeIdea(ideaId: string): Promise<ApiResult<IntakeDetail>> {
+  return request<IntakeDetail>(`${INTAKE_ROOT}/ideas/${encodeURIComponent(ideaId)}`, {
+    method: 'GET',
+    csrf: false,
+  });
+}
+
+export function attachIntakeFile(
+  ideaId: string,
+  attachment: { readonly name: string; readonly mediaType: string; readonly content: string },
+): Promise<ApiResult<{ readonly idea: IntakeIdea }>> {
+  return request<{ readonly idea: IntakeIdea }>(`${INTAKE_ROOT}/ideas/${encodeURIComponent(ideaId)}/attachments`, {
+    method: 'POST',
+    csrf: true,
+    body: attachment,
+  });
+}
+
+export function recordIntakeSummary(
+  ideaId: string,
+  summary: { readonly text: string; readonly generatedBy: string },
+): Promise<ApiResult<{ readonly idea: IntakeIdea }>> {
+  return request<{ readonly idea: IntakeIdea }>(`${INTAKE_ROOT}/ideas/${encodeURIComponent(ideaId)}/summary`, {
+    method: 'POST',
+    csrf: true,
+    body: summary,
+  });
+}
+
+export function archiveIntakeIdea(ideaId: string, reason: string | null): Promise<ApiResult<{ readonly idea: IntakeIdea }>> {
+  return request<{ readonly idea: IntakeIdea }>(`${INTAKE_ROOT}/ideas/${encodeURIComponent(ideaId)}/archive`, {
+    method: 'POST',
+    csrf: true,
+    body: { reason },
+  });
+}
+
+export function deferIntakeIdea(ideaId: string, reason: string | null): Promise<ApiResult<{ readonly idea: IntakeIdea }>> {
+  return request<{ readonly idea: IntakeIdea }>(`${INTAKE_ROOT}/ideas/${encodeURIComponent(ideaId)}/defer`, {
+    method: 'POST',
+    csrf: true,
+    body: { reason },
+  });
+}
+
+export function fetchRelatedWork(
+  ideaId: string,
+): Promise<ApiResult<{ readonly related: readonly RelatednessReport[] }>> {
+  return request<{ readonly related: readonly RelatednessReport[] }>(
+    `${INTAKE_ROOT}/ideas/${encodeURIComponent(ideaId)}/related`,
+    { method: 'GET', csrf: false },
+  );
+}
+
+export function recordRelatedWorkChoice(
+  ideaId: string,
+  candidateIdeaId: string,
+  choice: RelatedWorkChoice,
+): Promise<ApiResult<{ readonly choice: RelatedWorkChoiceOutcome }>> {
+  return request<{ readonly choice: RelatedWorkChoiceOutcome }>(
+    `${INTAKE_ROOT}/ideas/${encodeURIComponent(ideaId)}/related/choice/${encodeURIComponent(candidateIdeaId)}`,
+    { method: 'POST', csrf: true, body: { choice } },
+  );
+}
+
+export function draftIntakeBrief(
+  ideaId: string,
+  draft: {
+    readonly authoredBy: 'Owner' | 'ClarificationModel' | 'OwnerEdit';
+    readonly sections: BriefSections;
+    readonly basedOnBriefVersion: number | null;
+  },
+): Promise<ApiResult<{ readonly brief: BriefVersion }>> {
+  return request<{ readonly brief: BriefVersion }>(`${INTAKE_ROOT}/ideas/${encodeURIComponent(ideaId)}/brief`, {
+    method: 'POST',
+    csrf: true,
+    body: draft,
+  });
+}
+
+export function agreeIntakeBrief(ideaId: string): Promise<ApiResult<{ readonly brief: BriefVersion }>> {
+  return request<{ readonly brief: BriefVersion }>(`${INTAKE_ROOT}/ideas/${encodeURIComponent(ideaId)}/brief/agree`, {
+    method: 'POST',
+    csrf: true,
+    body: {},
+  });
+}
+
+export function askIntakeQuestions(
+  ideaId: string,
+  round: { readonly sections: BriefSections; readonly ambiguities: readonly IntakeAmbiguity[] },
+): Promise<ApiResult<ClarificationRound>> {
+  return request<ClarificationRound>(`${INTAKE_ROOT}/ideas/${encodeURIComponent(ideaId)}/questions`, {
+    method: 'POST',
+    csrf: true,
+    body: round,
+  });
+}
+
+export function answerIntakeQuestion(
+  ideaId: string,
+  questionId: string,
+  answer: string,
+): Promise<ApiResult<{ readonly question: ClarifyingQuestion }>> {
+  return request<{ readonly question: ClarifyingQuestion }>(
+    `${INTAKE_ROOT}/ideas/${encodeURIComponent(ideaId)}/questions/${encodeURIComponent(questionId)}/answer`,
+    { method: 'POST', csrf: true, body: { answer } },
+  );
+}
+
+export function applyIntakeCorrection(
+  ideaId: string,
+  correction: { readonly text: string; readonly sections: BriefSections; readonly basedOnBriefVersion: number },
+): Promise<ApiResult<CorrectionOutcome>> {
+  return request<CorrectionOutcome>(`${INTAKE_ROOT}/ideas/${encodeURIComponent(ideaId)}/corrections`, {
+    method: 'POST',
+    csrf: true,
+    body: correction,
+  });
+}
+
+export function exportIntakeIdea(ideaId: string): Promise<ApiResult<{ readonly export: IntakeIdeaExport }>> {
+  return request<{ readonly export: IntakeIdeaExport }>(`${INTAKE_ROOT}/ideas/${encodeURIComponent(ideaId)}/export`, {
+    method: 'GET',
+    csrf: false,
+  });
 }
 
 export function fetchSession(): Promise<ApiResult<SessionResponse>> {

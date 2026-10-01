@@ -19,6 +19,7 @@ import type {
   CapabilityKind,
   ConnectorId,
   DomainError,
+  IdeaId,
   OwnerId,
   ProfileVersionId,
   ProjectId,
@@ -39,6 +40,11 @@ export function asProjectId(value: string): ProjectId {
 /** Narrows validated HTTP text to a connector identifier. See `asProjectId`. */
 export function asConnectorId(value: string): ConnectorId {
   return value as ConnectorId;
+}
+
+/** Narrows validated HTTP text to an idea identifier. See `asProjectId`. */
+export function asIdeaId(value: string): IdeaId {
+  return value as IdeaId;
 }
 
 /**
@@ -313,12 +319,334 @@ export interface ConnectorUseCases {
   revoke(command: RevokeConnectorCommand): Promise<Result<ConnectorView, DomainError>>;
 }
 
+
+/** How a request was captured (F06-AC1, F06-AC3). */
+export type IntakeRequestKind = 'FeatureRequest' | 'Bug';
+
+/**
+ * Expected, actual and reproduction detail, each independently optional (F06-AC3).
+ *
+ * A bug is still a valid capture when the owner can only describe the symptom, so
+ * every member is nullable and none of them is required.
+ */
+export interface BugDetailInput {
+  readonly expected: string | null;
+  readonly actual: string | null;
+  readonly reproduction: string | null;
+}
+
+/**
+ * An attachment as a row records it: a named file, never its content (F06-AC1).
+ *
+ * The bytes live under the artifact root. A view with no content field is a type
+ * that cannot be asked for an inline attachment at all.
+ */
+export interface IntakeAttachmentView {
+  readonly name: string;
+  readonly mediaType: string;
+  readonly byteSize: number;
+  readonly addedAt: string;
+}
+
+/**
+ * A generated summary, held apart from the raw request (F06-AC1).
+ *
+ * `rawRequestFingerprint` is the fingerprint of the exact request text this summary
+ * describes, so the two can always be traced to each other. The type is separate
+ * from the request because one owner action produces both and conflating them is
+ * how a generated sentence starts being read as the owner's own words.
+ */
+export interface GeneratedSummaryView {
+  readonly text: string;
+  readonly generatedAt: string;
+  readonly generatedBy: string;
+  readonly rawRequestFingerprint: string;
+}
+
+/**
+ * One captured request (F06-AC1, F06-AC3, F06-AC5).
+ *
+ * `disposition` is the terminal state the owner reached without producing work.
+ * There is no publication field on this view because nothing in intake publishes:
+ * an archived request has no ticket and no coding run behind it (F06-AC5).
+ */
+export interface IntakeIdeaView {
+  readonly ideaId: IdeaId;
+  readonly rawRequest: string;
+  readonly projectId: string | null;
+  readonly notes: string | null;
+  readonly kind: IntakeRequestKind;
+  readonly bugDetail: BugDetailInput;
+  readonly attachments: readonly IntakeAttachmentView[];
+  readonly summary: GeneratedSummaryView | null;
+  readonly disposition: 'Unpublished' | 'Published' | 'Deferred' | 'Archived';
+  readonly dispositionDetail: string | null;
+  readonly capturedAt: string;
+}
+
+export interface AcceptanceCriterionView {
+  readonly id: string;
+  readonly text: string;
+  readonly verification: string | null;
+}
+
+/**
+ * The seven sections F07-AC1 names, as the owner reads them.
+ *
+ * Every section is required in the type, so a brief that omitted one could not be
+ * typed as one. A list may be empty, which says "present and nothing yet" rather
+ * than "absent".
+ */
+export interface BriefSectionsView {
+  readonly problem: string;
+  readonly desiredOutcome: string;
+  readonly includedBehaviour: readonly string[];
+  readonly excludedBehaviour: readonly string[];
+  readonly assumptions: readonly string[];
+  readonly acceptanceCriteria: readonly AcceptanceCriterionView[];
+  readonly unresolvedQuestions: readonly string[];
+}
+
+/** One brief version, with the criteria a correction withdrew from the one before (F07-AC3). */
+export interface BriefVersionView {
+  readonly version: number;
+  readonly state: 'Proposed' | 'Agreed';
+  readonly authoredBy: string;
+  readonly authoredAt: string;
+  readonly supersedesVersion: number | null;
+  readonly rawRequestFingerprint: string;
+  readonly sections: BriefSectionsView;
+  readonly agreedBy: string | null;
+  readonly agreedAt: string | null;
+  readonly withdrawnCriterionIds: readonly string[];
+}
+
+/**
+ * The current brief and every earlier version (F07-AC3).
+ *
+ * `versions` is oldest first so an owner can read what they agreed to before a
+ * correction as readily as what the correction produced.
+ */
+export interface BriefView {
+  readonly briefId: string | null;
+  readonly currentVersion: number | null;
+  readonly current: BriefVersionView | null;
+  readonly versions: readonly BriefVersionView[];
+}
+
+/** A clarifying question and why it was worth asking (F07-AC2). */
+export interface ClarifyingQuestionView {
+  readonly questionId: string;
+  readonly topic: string;
+  readonly prompt: string;
+  readonly readings: readonly string[];
+  readonly whyMaterial: string;
+  readonly state: 'Open' | 'Answered';
+  readonly answer: string | null;
+  readonly askedAt: string;
+  readonly answeredAt: string | null;
+}
+
+/** A candidate question that was considered and declined (F07-AC2). */
+export interface RejectedCandidateView {
+  readonly topic: string;
+  readonly rejection: string;
+  readonly explanation: string;
+}
+
+/** One turn of the owner conversation, in the order it happened (F07-AC3). */
+export interface IntakeTurnView {
+  readonly kind: 'RawRequest' | 'Question' | 'Answer' | 'Correction';
+  readonly at: string;
+  readonly text: string;
+  readonly reference: string | null;
+}
+
+/** Everything one captured request currently consists of. */
+export interface IntakeDetailView {
+  readonly idea: IntakeIdeaView;
+  readonly brief: BriefView;
+  readonly questions: readonly ClarifyingQuestionView[];
+  readonly rejected: readonly RejectedCandidateView[];
+  readonly turns: readonly IntakeTurnView[];
+}
+
+/** An enumerated ambiguity the caller believes a request leaves open (F07-AC2). */
+export interface AmbiguityInput {
+  readonly kind: 'UnspecifiedSubject' | 'ConflictingStatement' | 'MissingAcceptanceThreshold' | 'UnstatedScopeBoundary' | 'UnresolvedDependency';
+  readonly topic: string;
+  readonly readings: readonly string[];
+  readonly answeredBy: readonly string[];
+  readonly impact: 'ChangesBehaviour' | 'ChangesAcceptance' | 'Cosmetic';
+  readonly evidence: string;
+}
+
+/**
+ * How similar another request is, and what the owner may choose about it (F06-AC4).
+ *
+ * `mergeable` and `discardable` are literal `false` and `disposition` is a single
+ * literal, so no client can read a merge or a discard out of a perfect score. The
+ * resemblance is shown before publication and the choice stays with the owner.
+ */
+export interface RelatednessReportView {
+  readonly candidateIdeaId: IdeaId;
+  readonly score: number;
+  readonly reasons: readonly string[];
+  readonly mergeable: false;
+  readonly discardable: false;
+  readonly disposition: 'OwnerChoiceRequired';
+  readonly ownerChoices: readonly ('LinkToExisting' | 'ExtendExisting' | 'CreateNewIssue')[];
+}
+
+/** What the owner's explicit choice did, which is never a merge (F06-AC4). */
+export interface RelatedWorkChoiceView {
+  readonly candidateIdeaId: IdeaId;
+  readonly choice: 'LinkToExisting' | 'ExtendExisting' | 'CreateNewIssue';
+  readonly score: number;
+  readonly reasons: readonly string[];
+  readonly merged: false;
+  readonly dispositionAfterChoice: {
+    readonly idea: 'Unpublished' | 'Published' | 'Deferred' | 'Archived';
+    readonly candidate: 'Unpublished' | 'Published' | 'Deferred' | 'Archived';
+  };
+}
+
+/** One round of generated questions and the candidates that were declined (F07-AC2). */
+export interface ClarificationRoundView {
+  readonly questions: readonly ClarifyingQuestionView[];
+  readonly rejected: readonly RejectedCandidateView[];
+}
+
+/** What a correction changed, with the version it superseded (F07-AC3). */
+export interface CorrectionView {
+  readonly currentVersion: BriefVersionView;
+  readonly priorVersion: BriefVersionView;
+  readonly withdrawnCriterionIds: readonly string[];
+}
+
+/** A sanitized export of one request: the owner's text, facts and an attachment index (F32-AC2). */
+export interface IdeaExportView {
+  readonly ideaId: IdeaId;
+  readonly kind: IntakeRequestKind;
+  readonly capturedAt: string;
+  readonly rawRequest: string;
+  readonly notes: string | null;
+  readonly projectId: string | null;
+  readonly bugDetail: BugDetailInput;
+  readonly summary: GeneratedSummaryView | null;
+  readonly disposition: { readonly state: string; readonly detail: string | null };
+  readonly attachments: readonly {
+    readonly fileName: string;
+    readonly mediaType: string;
+    readonly byteSize: number;
+    readonly contentDigest: string;
+  }[];
+}
+
+export interface CaptureIdeaCommand {
+  readonly rawRequest: string;
+  readonly kind: IntakeRequestKind;
+  readonly projectId: string | null;
+  readonly notes: string | null;
+  readonly detail: BugDetailInput | null;
+  readonly actor: OwnerId;
+}
+
+export interface AttachFileCommand {
+  readonly ideaId: IdeaId;
+  readonly name: string;
+  readonly mediaType: string;
+  readonly content: string;
+  readonly actor: OwnerId;
+}
+
+export interface RecordSummaryCommand {
+  readonly ideaId: IdeaId;
+  readonly text: string;
+  readonly generatedBy: string;
+  readonly actor: OwnerId;
+}
+
+export interface DispositionCommand {
+  readonly ideaId: IdeaId;
+  readonly reason: string | null;
+  readonly actor: OwnerId;
+}
+
+export interface RecordRelatedWorkChoiceCommand {
+  readonly ideaId: IdeaId;
+  readonly candidateIdeaId: IdeaId;
+  readonly choice: 'LinkToExisting' | 'ExtendExisting' | 'CreateNewIssue';
+  readonly actor: OwnerId;
+}
+
+export interface DraftBriefCommand {
+  readonly ideaId: IdeaId;
+  readonly authoredBy: 'Owner' | 'ClarificationModel' | 'OwnerEdit';
+  readonly sections: BriefSectionsView;
+  readonly basedOnBriefVersion: number | null;
+  readonly actor: OwnerId;
+}
+
+export interface AnswerClarifyingQuestionCommand {
+  readonly ideaId: IdeaId;
+  readonly questionId: string;
+  readonly answer: string;
+  readonly actor: OwnerId;
+}
+
+export interface AskClarifyingQuestionsCommand {
+  readonly ideaId: IdeaId;
+  readonly sections: BriefSectionsView;
+  readonly ambiguities: readonly AmbiguityInput[];
+  readonly actor: OwnerId;
+}
+
+export interface ApplyCorrectionCommand {
+  readonly ideaId: IdeaId;
+  readonly text: string;
+  readonly sections: BriefSectionsView;
+  readonly basedOnBriefVersion: number;
+  readonly actor: OwnerId;
+}
+
+/**
+ * Intake: capture, brief, clarification and the owner's disposition (F06, F07).
+ *
+ * Every method returns a typed `Result` and none of them publishes or schedules:
+ * there is no member that creates a ticket or consumes a coding run, which is what
+ * makes archiving safe (F06-AC5). Reads carry no caller, matching the other groups;
+ * writes carry the owner the transport proved (F01-AC1).
+ */
+export interface IntakeUseCases {
+  captureIdea(command: CaptureIdeaCommand): Promise<Result<IntakeIdeaView, DomainError>>;
+  listIdeas(): Promise<Result<readonly IntakeIdeaView[], DomainError>>;
+  getIdea(ideaId: IdeaId): Promise<Result<IntakeDetailView, DomainError>>;
+  attachFile(command: AttachFileCommand): Promise<Result<IntakeIdeaView, DomainError>>;
+  recordSummary(command: RecordSummaryCommand): Promise<Result<IntakeIdeaView, DomainError>>;
+  archiveIdea(command: DispositionCommand): Promise<Result<IntakeIdeaView, DomainError>>;
+  deferIdea(command: DispositionCommand): Promise<Result<IntakeIdeaView, DomainError>>;
+  findRelatedWork(ideaId: IdeaId): Promise<Result<readonly RelatednessReportView[], DomainError>>;
+  recordRelatedWorkChoice(
+    command: RecordRelatedWorkChoiceCommand,
+  ): Promise<Result<RelatedWorkChoiceView, DomainError>>;
+  draftBrief(command: DraftBriefCommand): Promise<Result<BriefVersionView, DomainError>>;
+  agreeBrief(command: { readonly ideaId: IdeaId; readonly actor: OwnerId }): Promise<Result<BriefVersionView, DomainError>>;
+  askClarifyingQuestions(command: AskClarifyingQuestionsCommand): Promise<Result<ClarificationRoundView, DomainError>>;
+  answerClarifyingQuestion(
+    command: AnswerClarifyingQuestionCommand,
+  ): Promise<Result<ClarifyingQuestionView, DomainError>>;
+  applyOwnerCorrection(command: ApplyCorrectionCommand): Promise<Result<CorrectionView, DomainError>>;
+  exportIdea(ideaId: IdeaId): Promise<Result<IdeaExportView, DomainError>>;
+}
+
 /** The whole injected surface. One argument, so a missing use case is a type error. */
 export interface ControllerSurface {
   readonly owners: OwnerUseCases;
   readonly sessions: SessionUseCases;
   readonly profiles: ProfileUseCases;
   readonly connectors: ConnectorUseCases;
+  readonly intake: IntakeUseCases;
 }
 
 const REQUIRED_METHODS = {
@@ -326,6 +654,23 @@ const REQUIRED_METHODS = {
   sessions: ['loadByToken', 'create', 'revoke', 'touch'],
   profiles: ['saveVersion', 'currentVersion', 'listVersions'],
   connectors: ['register', 'listForProject', 'revoke'],
+  intake: [
+    'captureIdea',
+    'listIdeas',
+    'getIdea',
+    'attachFile',
+    'recordSummary',
+    'archiveIdea',
+    'deferIdea',
+    'findRelatedWork',
+    'recordRelatedWorkChoice',
+    'draftBrief',
+    'agreeBrief',
+    'askClarifyingQuestions',
+    'answerClarifyingQuestion',
+    'applyOwnerCorrection',
+    'exportIdea',
+  ],
 } as const satisfies Record<keyof ControllerSurface, readonly string[]>;
 
 export type ControllerGroup = keyof typeof REQUIRED_METHODS;
