@@ -1,4 +1,6 @@
 export * from './db.ts';
+export * from './jobs/queue.ts';
+export * from './jobs/lease.ts';
 export * from './migrations.ts';
 export * from './tx.ts';
 export * from './repositories/types.ts';
@@ -16,6 +18,12 @@ export * from './reconciliation/pending.ts';
  * declared its own narrow SQLite port. The ports are NOT the same shape: the jobs
  * transaction runner takes `(connection, work)` while the events runner takes
  * `(work)`, so unifying them is a design change rather than a rename.
+ *
+ * The durable job queue and its writer-lease manager are published here because a
+ * process that has to claim and renew a coding writer (F13-AC2, F17-AC5) cannot
+ * construct one without this package's own entry point: the subpath is not in the
+ * `exports` map, and a second writer owner would be the failure F17-AC5 exists to
+ * prevent.
  *
  * Only the non-overlapping names are re-exported here. The three ports stay
  * private to their own modules, and the jobs/event transaction runners are

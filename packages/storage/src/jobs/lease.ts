@@ -473,6 +473,45 @@ export function renewLeaseOnConnection(
 }
 
 /**
+ * Carries a recorded holder-stopped confirmation onto the lease that replaces it.
+ *
+ * A fresh lease starts with no confirmation, so a takeover would otherwise erase the only
+ * recorded evidence that the previous writer was ever observed stopped, and the next silence
+ * would look unexamined again (F17-AC5).
+ */
+function carryConfirmationOnward(lease: WriterLease, replaced: WriterLease): WriterLease {
+  if (replaced.confirmedStoppedBy === null) return lease;
+  return {
+    ...lease,
+    confirmedStoppedBy: replaced.confirmedStoppedBy,
+    confirmedStoppedAt: replaced.confirmedStoppedAt,
+    confirmedStoppedEvidence: replaced.confirmedStoppedEvidence,
+  };
+}
+
+/**
+ * Gives the job row to the holder that just took the writer lease.
+ *
+ * `reclaimLease` grants the single coding writer without touching `jobs`, so without this the row
+ * would keep naming the previous holder: `queue.checkpoint` would refuse the new holder's resume
+ * point, and the eventual state transition would not release a slot the row no longer claims.
+ * Both tables name the same writer, so they are written in the same transaction (F17-AC5, N01-AC1).
+ */
+export function transferJobHolderOnConnection(
+  connection: SqlConnection,
+  jobId: JobId,
+  holder: string,
+  now: string,
+): void {
+  const updated = connection
+    .prepare('UPDATE jobs SET holder = ?, updated_at = ? WHERE job_id = ?')
+    .run(holder, now, jobId);
+  if (Number(updated.changes) === 0) {
+    throw new Error(`Job ${jobId} does not exist, so its writer ownership cannot be transferred.`);
+  }
+}
+
+/**
  * Records a holder's declared job state when it gives the slot up.
  *
  * The transition is validated against the domain attempt transitions, so
@@ -615,6 +654,7 @@ export function createLeaseManager(store: LeaseStore): LeaseManager {
           writeLeaseOnConnection(connection, lease);
           const claimed = claimSlotOnConnection(connection, request, lease);
           if (!claimed.ok) return claimed;
+          transferJobHolderOnConnection(connection, request.jobId, request.holder, request.now);
           return ok({ granted: true, lease, slot: claimed.value, previousHolder: null });
         }
 
@@ -651,10 +691,11 @@ export function createLeaseManager(store: LeaseStore): LeaseManager {
           });
         }
 
-        const lease = mintWriterLease(request);
+        const lease = carryConfirmationOnward(mintWriterLease(request), existing);
         writeLeaseOnConnection(connection, lease);
         const claimed = claimSlotOnConnection(connection, request, lease);
         if (!claimed.ok) return claimed;
+        transferJobHolderOnConnection(connection, request.jobId, request.holder, request.now);
         return ok({ granted: true, lease, slot: claimed.value, previousHolder: existing.holder });
       }),
     );

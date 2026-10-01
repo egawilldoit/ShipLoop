@@ -108,6 +108,18 @@
           "maxOutputBytes": 65536
         },
         {
+          "id": "typecheck-worker",
+          "argv": [
+            "node",
+            "node_modules/typescript/bin/tsc",
+            "--noEmit",
+            "-p",
+            "apps/worker/tsconfig.json"
+          ],
+          "timeoutMs": 180000,
+          "maxOutputBytes": 65536
+        },
+        {
           "id": "typecheck-web",
           "argv": [
             "node",
