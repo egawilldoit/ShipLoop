@@ -1501,6 +1501,448 @@ CREATE TABLE procedure_versions_aligned (
 `;
 
 /**
+ * One column per concept in a versioned brief (F07-AC1, F07-AC3).
+ *
+ * This arrives as version 9 rather than as an edit to version 2, which created
+ * `briefs`. An applied migration is recorded and never re-run, so rewriting one
+ * would leave every database that already applied it on the old shape while a
+ * freshly created one got the new shape (N08-AC3, ADR 0003). `briefs` is
+ * replaced by a rebuild for the reason migration 8 gave for
+ * `procedure_versions`: the table carried two names for one idea and none for
+ * two ideas.
+ *
+ *   - `revision` becomes `version`, because a brief version is the concept and
+ *     "revision" is a second word for it. The domain calls the same number
+ *     `version` (`Brief.version`), so the column and the type now agree.
+ *   - `brief_id` stops being the primary key on its own and becomes the first
+ *     half of a composite key with `version`. This is the defect that made
+ *     F07-AC3 unrepresentable: a correction produces the next version of the
+ *     *same* brief (`bindProposalToRequest` keeps the brief id and increments
+ *     the version), so a single-column key could only ever hold one version and
+ *     the append a correction requires was refused by the primary key. The
+ *     `UNIQUE (idea_id, version)` from version 2 is kept, so an idea still has
+ *     exactly one version per number.
+ *   - `agreed_body` becomes `sections_json`. A brief is not a body of prose: the
+ *     domain types it as seven sections plus structured acceptance criteria
+ *     (`BriefSections`), and F07-AC1 requires every one of them. The domain
+ *     names the list `BRIEF_SECTION_NAMES`; the reader parses what the
+ *     repository wrote, and the CHECK below refuses a document that is not
+ *     valid JSON.
+ *   - The four columns the domain's `Brief` needs and the table had none of are
+ *     added: `authored_by`, `authored_at`, `raw_request_fingerprint` and
+ *     `supersedes_version`, plus `agreed_by` and `agreed_at` so agreement names
+ *     the owner who gave it (F05-AC5).
+ *
+ * Every constraint version 2 carried is kept: the positive `version` CHECK,
+ * `UNIQUE (idea_id, version)`, the `ON DELETE CASCADE` to `ideas`, the `state`
+ * vocabulary ('Draft' | 'Agreed' | 'Superseded') and the rule that an agreed
+ * brief has content. The state vocabulary is not changed, so a version proposed
+ * by the clarification model is stored as 'Draft' and the domain's `Proposed`
+ * is that same row; supersession is a `supersedes_version` pointer rather than
+ * a state, which is what keeps a prior version readable exactly as it was
+ * (F07-AC3). Two invariants are added rather than removed:
+ * `supersedes_version` must be the version immediately before this one, and an
+ * agreement must name an owner and an instant.
+ *
+ * `authored_by` and `raw_request_fingerprint` cannot be NOT NULL here. The
+ * table existed since version 2 but no repository ever wrote it, so a carried
+ * row has neither value, and inventing one - "the owner wrote it", or a
+ * fingerprint of a request that was never recorded for that row - would be a
+ * fabrication. The `authored_by` default of an empty string follows the same
+ * reasoning migration 8 used for `subject_key` and `created_by`: the repository
+ * always binds one of the three `BriefAuthor` values, and a row that carries
+ * neither is reported by the reader rather than completed by guesswork.
+ */
+const MIGRATION_10_BRIEF_VERSIONS = `
+CREATE TABLE briefs_versioned (
+  brief_id                TEXT NOT NULL,
+  idea_id                 TEXT NOT NULL REFERENCES ideas(idea_id) ON DELETE CASCADE,
+  version                 INTEGER NOT NULL CHECK (version > 0),
+  sections_json           TEXT NOT NULL,
+  state                   TEXT NOT NULL DEFAULT 'Draft' CHECK (state IN ('Draft', 'Agreed', 'Superseded')),
+  created_at              TEXT NOT NULL DEFAULT ${NOW},
+  updated_at              TEXT NOT NULL DEFAULT ${NOW},
+  authored_by             TEXT NOT NULL DEFAULT '',
+  authored_at             TEXT NOT NULL DEFAULT ${NOW},
+  raw_request_fingerprint TEXT ${nullableFingerprintCheck('raw_request_fingerprint')},
+  supersedes_version      INTEGER,
+  agreed_by               TEXT,
+  agreed_at               TEXT,
+  UNIQUE (idea_id, version),
+  PRIMARY KEY (brief_id, version),
+  CHECK (supersedes_version IS NULL OR supersedes_version = version - 1),
+  CHECK (state <> 'Agreed' OR (length(trim(sections_json)) > 0 AND json_valid(sections_json)))
+);
+`;
+
+/**
+ * The restore for the `briefs` rebuild.
+ *
+ * Only the three columns version 2 defined are carried across, because those are
+ * the only ones a pre-existing row can hold. The new columns take the defaults
+ * a row written before this version could not have had: an empty author, the
+ * row's own creation instant, no request fingerprint and no supersession. An
+ * 'Agreed' row therefore carries no approver, which the reader reports rather
+ * than inventing; the trigger installed after the swap refuses any new agreement
+ * that does not name one.
+ */
+const COPY_BRIEFS = `
+INSERT INTO briefs (
+  brief_id, idea_id, version, sections_json, state, created_at, updated_at
+)
+SELECT
+  brief_id,
+  idea_id,
+  revision,
+  '{}',
+  state,
+  created_at,
+  updated_at
+FROM stash_briefs`;
+
+/**
+ * The provenance and lifecycle facts the domain's `IdeaDraft` needs and the
+ * migrated `ideas` table did not carry.
+ *
+ * `ideas` is NOT rebuilt here. It is referenced by `idea_messages`,
+ * `idea_attachments`, `briefs`, `idea_questions`, `plans` and `work_items`, and
+ * a rebuild would have to stash and restore all six; every fact below can be
+ * added beside the existing columns with `ALTER TABLE ADD COLUMN`, which is the
+ * change that keeps those foreign keys pointing at the definition they already
+ * point at. The invariants that span columns are installed as triggers for the
+ * same reason the append-only guards on `scope_snapshots` are triggers.
+ *
+ * The four gaps this closes, and the rule each one exists for:
+ *
+ *   - `summary_generated_at`, `summary_generated_by` and
+ *     `summary_raw_request_fingerprint` are the provenance the existing
+ *     `generated_summary` text had no room for. F06-AC1 requires the saved raw
+ *     request to stay distinct from generated summaries, and a summary that
+ *     records which raw text it was derived from is what keeps a generated
+ *     sentence from being presented as the owner's words. The fingerprint column
+ *     carries the same length, prefix and hex CHECK as every other fingerprint
+ *     in this schema, so a truncated value is refused by the column.
+ *   - `deferred_at` and `deferred_reason` exist because `Archived` and
+ *     `Deferred` are different states in `IdeaDisposition` and one 'Abandoned'
+ *     value cannot tell them apart. Which timestamp is set is what distinguishes
+ *     them, so no second state vocabulary is introduced (F06-AC5).
+ *   - `archived_by` is the actor the domain's `Archived` state names, and
+ *     `published_at` is the instant `Published` names; `ideas` carried neither.
+ *     Neither is required by a trigger, for the same reason the summary
+ *     provenance is not: `IdeaRepository.archive` in `repositories/core.ts`
+ *     records an archive with an instant and a reason but no actor, and
+ *     `IdeaRepository.markPublished` records a publication with no instant.
+ *     Refusing either would break a repository that already exists. Every write
+ *     through `IntakeRepository` binds them, because the domain's `Archived` and
+ *     `Published` states require them.
+ *   - `coding_run_ids` holds the coding runs an idea consumed, as canonical JSON
+ *     like `open_questions` and `related_work_item_ids` already do. Work items
+ *     are not stored this way: they have a table, so the produced work is a
+ *     child table with a real foreign key.
+ *
+ * One reference is recorded rather than constrained, and the reason is the shape
+ * of the brief key. A brief is keyed by `(brief_id, version)` now, because a
+ * correction appends the next version of the same brief, and `ALTER TABLE ADD
+ * COLUMN` cannot add a composite foreign key. `idea_questions.brief_id` is
+ * therefore a soft pointer that carries the version beside it in
+ * `brief_version`. It cannot dangle in practice: `briefs_append_only_delete`
+ * refuses to remove a version and `briefs_version_immutable_update` refuses to
+ * change its number.
+ */
+const MIGRATION_10_INTAKE_DURABLE = `
+-- Generated-summary provenance (F06-AC1). The summary text itself is the
+-- 'generated_summary' column version 5 added; these columns record what
+-- generated it and which raw text it describes.
+ALTER TABLE ideas ADD COLUMN summary_generated_at TEXT;
+ALTER TABLE ideas ADD COLUMN summary_generated_by TEXT;
+ALTER TABLE ideas ADD COLUMN summary_raw_request_fingerprint TEXT ${nullableFingerprintCheck('summary_raw_request_fingerprint')};
+
+-- Deferred and archived detail (F06-AC5). 'state' keeps its existing vocabulary;
+-- a 'Deferred' idea and an 'Archived' idea are both 'Abandoned' and are told
+-- apart by which of these two instants is recorded.
+ALTER TABLE ideas ADD COLUMN deferred_at TEXT;
+ALTER TABLE ideas ADD COLUMN deferred_reason TEXT;
+ALTER TABLE ideas ADD COLUMN archived_by TEXT;
+ALTER TABLE ideas ADD COLUMN published_at TEXT;
+ALTER TABLE ideas ADD COLUMN coding_run_ids TEXT;
+
+-- The raw request is the owner's own words and is captured once (F06-AC1). This
+-- trigger is the enforcement: a generated summary, a correction or a direct
+-- statement cannot rewrite it, so "the summary overwrote the request" is a
+-- refused write rather than a convention.
+CREATE TRIGGER ideas_raw_request_immutable_update
+BEFORE UPDATE OF raw_request ON ideas
+WHEN NEW.raw_request IS NOT OLD.raw_request
+BEGIN
+  SELECT RAISE(ABORT, 'ideas.raw_request is the owner''s own words and is never rewritten (F06-AC1)');
+END;
+
+-- The request kind is a closed vocabulary, because the domain models it as a
+-- discriminated union: a feature request and a bug are different shapes and an
+-- absent kind is neither.
+CREATE TRIGGER ideas_kind_recorded_insert
+BEFORE INSERT ON ideas
+WHEN NEW.kind IS NULL OR NEW.kind NOT IN ('FeatureRequest', 'Bug')
+BEGIN
+  SELECT RAISE(ABORT, 'ideas.kind is FeatureRequest or Bug (F06-AC3)');
+END;
+
+CREATE TRIGGER ideas_kind_recorded_update
+BEFORE UPDATE ON ideas
+WHEN NEW.kind IS NULL OR NEW.kind NOT IN ('FeatureRequest', 'Bug')
+BEGIN
+  SELECT RAISE(ABORT, 'ideas.kind is FeatureRequest or Bug (F06-AC3)');
+END;
+
+-- Summary provenance is all-or-nothing (F06-AC1). A summary that records WHEN it
+-- was generated, by WHAT, and from WHICH raw text is the only kind that can be
+-- traced back to the request it describes, and a half-recorded one cannot: it
+-- would carry a fingerprint with no instant, or an instant with no fingerprint,
+-- and either reads as provenance it does not have.
+--
+-- A summary with no provenance at all is not refused here, and the reason is a
+-- constraint outside this file: the existing IdeaRepository.recordSummary writes
+-- exactly that shape, and this slice does not own repositories/core.ts, so
+-- refusing it would break a repository that already exists. Every summary
+-- written through IntakeRepository.summarize carries the full record, and the
+-- reader treats a summary without one as a row it cannot interpret rather than
+-- inventing the missing values.
+CREATE TRIGGER ideas_summary_provenance_insert
+BEFORE INSERT ON ideas
+WHEN (NEW.generated_summary IS NULL AND (NEW.summary_generated_at IS NOT NULL
+      OR NEW.summary_generated_by IS NOT NULL
+      OR NEW.summary_raw_request_fingerprint IS NOT NULL))
+  OR (NEW.generated_summary IS NOT NULL AND (NEW.summary_generated_at IS NULL
+      OR coalesce(length(trim(NEW.summary_generated_by)), 0) = 0
+      OR NEW.summary_raw_request_fingerprint IS NULL)
+      AND (NEW.summary_generated_at IS NOT NULL
+      OR NEW.summary_generated_by IS NOT NULL
+      OR NEW.summary_raw_request_fingerprint IS NOT NULL))
+BEGIN
+  SELECT RAISE(ABORT, 'a generated summary records when, by what, and from which raw request (F06-AC1)');
+END;
+
+CREATE TRIGGER ideas_summary_provenance_update
+BEFORE UPDATE ON ideas
+WHEN (NEW.generated_summary IS NULL AND (NEW.summary_generated_at IS NOT NULL
+      OR NEW.summary_generated_by IS NOT NULL
+      OR NEW.summary_raw_request_fingerprint IS NOT NULL))
+  OR (NEW.generated_summary IS NOT NULL AND (NEW.summary_generated_at IS NULL
+      OR coalesce(length(trim(NEW.summary_generated_by)), 0) = 0
+      OR NEW.summary_raw_request_fingerprint IS NULL)
+      AND (NEW.summary_generated_at IS NOT NULL
+      OR NEW.summary_generated_by IS NOT NULL
+      OR NEW.summary_raw_request_fingerprint IS NOT NULL))
+BEGIN
+  SELECT RAISE(ABORT, 'a generated summary records when, by what, and from which raw request (F06-AC1)');
+END;
+
+-- Deferred and archived are different outcomes and neither is a publication
+-- (F06-AC5). An idea is exactly one of: still being worked on, published, set
+-- aside with a reason, or discarded with an actor - and the instants say which.
+CREATE TRIGGER ideas_disposition_consistent_insert
+BEFORE INSERT ON ideas
+WHEN (NEW.deferred_at IS NOT NULL AND NEW.archived_at IS NOT NULL)
+  OR (NEW.deferred_at IS NOT NULL AND (NEW.published_at IS NOT NULL OR NEW.published_work_item_id IS NOT NULL))
+  OR (NEW.archived_at IS NOT NULL AND NEW.published_at IS NOT NULL)
+  OR (NEW.state NOT IN ('Abandoned', 'Published') AND (NEW.deferred_at IS NOT NULL OR NEW.archived_at IS NOT NULL))
+BEGIN
+  SELECT RAISE(ABORT, 'an idea is either being worked on, published, deferred or archived, never two of those (F06-AC5)');
+END;
+
+CREATE TRIGGER ideas_disposition_consistent_update
+BEFORE UPDATE ON ideas
+WHEN (NEW.deferred_at IS NOT NULL AND NEW.archived_at IS NOT NULL)
+  OR (NEW.deferred_at IS NOT NULL AND (NEW.published_at IS NOT NULL OR NEW.published_work_item_id IS NOT NULL))
+  OR (NEW.archived_at IS NOT NULL AND NEW.published_at IS NOT NULL)
+  OR (NEW.state NOT IN ('Abandoned', 'Published') AND (NEW.deferred_at IS NOT NULL OR NEW.archived_at IS NOT NULL))
+BEGIN
+  SELECT RAISE(ABORT, 'an idea is either being worked on, published, deferred or archived, never two of those (F06-AC5)');
+END;
+
+-- The work an idea produced (F06-AC5). A child table rather than a JSON list
+-- because 'work_items' exists: the foreign key is what makes "this idea
+-- produced work" a fact about a real ticket rather than a string that claims
+-- one. An idea that has rows here can no longer be archived, which is the rule
+-- the domain enforces in 'archiveIdea'.
+CREATE TABLE idea_produced_work (
+  idea_id      TEXT NOT NULL REFERENCES ideas(idea_id) ON DELETE CASCADE,
+  work_item_id TEXT NOT NULL REFERENCES work_items(work_item_id) ON DELETE RESTRICT,
+  produced_at  TEXT NOT NULL,
+  PRIMARY KEY (idea_id, work_item_id)
+);
+CREATE INDEX idea_produced_work_by_item ON idea_produced_work(work_item_id);
+
+-- An idea that produced work is not archivable, whichever repository asks. The
+-- trigger reads the child table rather than a flag, so the rule cannot be
+-- satisfied by forgetting to set one.
+CREATE TRIGGER ideas_with_produced_work_are_not_archived
+BEFORE UPDATE OF state ON ideas
+WHEN NEW.state = 'Abandoned' AND OLD.state <> 'Abandoned'
+  AND EXISTS (SELECT 1 FROM idea_produced_work WHERE idea_id = NEW.idea_id)
+BEGIN
+  SELECT RAISE(ABORT, 'this idea produced work and cannot be archived (F06-AC5)');
+END;
+
+-- A clarifying question (F07-AC2). 'body' is the prompt the owner is asked;
+-- these columns are the claim that earns the question at all: what it is about,
+-- which readings it separates, why it changes the work, and whether it came
+-- from an enumerated ambiguity or from a criterion that cannot be checked.
+ALTER TABLE idea_questions ADD COLUMN topic TEXT;
+ALTER TABLE idea_questions ADD COLUMN readings TEXT;
+ALTER TABLE idea_questions ADD COLUMN why_material TEXT;
+ALTER TABLE idea_questions ADD COLUMN origin TEXT ${nullableEnum('origin', ['Ambiguity', 'UnobservableCriterion'])};
+ALTER TABLE idea_questions ADD COLUMN brief_id TEXT;
+ALTER TABLE idea_questions ADD COLUMN brief_version INTEGER;
+
+CREATE TRIGGER idea_questions_material_insert
+BEFORE INSERT ON idea_questions
+WHEN NEW.origin IS NULL
+  OR NEW.topic IS NULL OR length(trim(NEW.topic)) = 0
+  OR NEW.why_material IS NULL OR length(trim(NEW.why_material)) = 0
+  OR NEW.readings IS NULL OR NOT json_valid(NEW.readings)
+BEGIN
+  SELECT RAISE(ABORT, 'a clarifying question names its topic, why it is material, and where it came from (F07-AC2)');
+END;
+
+-- A question the owner has not answered yet is open, and one recorded as
+-- answered carries the instant it was answered. The state column already CHECKs
+-- the second half; this keeps the first from being unrecorded.
+CREATE TRIGGER idea_questions_open_insert
+BEFORE INSERT ON idea_questions
+WHEN NEW.state = 'Open' AND NEW.answered_at IS NOT NULL
+BEGIN
+  SELECT RAISE(ABORT, 'an open clarifying question has no answer instant (F07-AC2)');
+END;
+
+-- Rejected candidates are reported rather than dropped, so the owner can see
+-- that something was considered and why it was not asked (F07-AC2). They are not
+-- questions, so they are their own rows rather than 'idea_questions' rows with a
+-- state no column can express.
+CREATE TABLE idea_question_rejections (
+  rejection_id    TEXT PRIMARY KEY,
+  idea_id         TEXT NOT NULL REFERENCES ideas(idea_id) ON DELETE CASCADE,
+  brief_id        TEXT,
+  brief_version   INTEGER,
+  topic           TEXT NOT NULL,
+  rejection       TEXT NOT NULL
+                    CHECK (rejection IN ('AlreadyAnswered', 'SingleReading', 'CosmeticOnly', 'NoEvidence', 'NoTopic')),
+  explanation     TEXT NOT NULL,
+  created_at      TEXT NOT NULL DEFAULT ${NOW},
+  CHECK (length(trim(topic)) > 0),
+  CHECK (length(trim(explanation)) > 0)
+);
+CREATE INDEX idea_question_rejections_by_idea ON idea_question_rejections(idea_id, created_at);
+
+-- The owner conversation (F07-AC3). 'body_redacted' holds the turn's text and
+-- 'author_role' who said it; 'turn_kind' is which of the four turns it is, and
+-- the remaining columns are the reference that turn names. A turn is append-only
+-- and the triggers below enforce that, so the owner's original words and every
+-- later decision stay readable in order.
+ALTER TABLE idea_messages ADD COLUMN turn_kind TEXT ${nullableEnum('turn_kind', ['RawRequest', 'Question', 'Answer', 'Correction'])};
+ALTER TABLE idea_messages ADD COLUMN question_id TEXT REFERENCES idea_questions(question_id) ON DELETE RESTRICT;
+ALTER TABLE idea_messages ADD COLUMN correction_id TEXT;
+ALTER TABLE idea_messages ADD COLUMN brief_version INTEGER;
+
+CREATE TRIGGER idea_messages_turn_shape_insert
+BEFORE INSERT ON idea_messages
+WHEN (NEW.turn_kind = 'Question' AND NEW.question_id IS NULL)
+  OR (NEW.turn_kind = 'Answer' AND NEW.question_id IS NULL)
+  OR (NEW.turn_kind = 'Correction' AND (NEW.correction_id IS NULL OR NEW.brief_version IS NULL))
+  OR (NEW.turn_kind = 'RawRequest' AND (NEW.question_id IS NOT NULL OR NEW.correction_id IS NOT NULL OR NEW.brief_version IS NOT NULL))
+  OR (NEW.turn_kind = 'Question' AND NEW.author_role <> 'Agent')
+  OR (NEW.turn_kind IN ('RawRequest', 'Answer', 'Correction') AND NEW.author_role <> 'Owner')
+BEGIN
+  SELECT RAISE(ABORT, 'a conversation turn carries the reference its kind names (F07-AC3)');
+END;
+
+CREATE TRIGGER idea_messages_append_only_update
+BEFORE UPDATE ON idea_messages
+BEGIN
+  SELECT RAISE(ABORT, 'conversation turns are appended, never edited: record a correction instead (F07-AC3)');
+END;
+
+CREATE TRIGGER idea_messages_append_only_delete
+BEFORE DELETE ON idea_messages
+BEGIN
+  SELECT RAISE(ABORT, 'conversation turns are retained so the owner can see what changed (F07-AC3)');
+END;
+`;
+
+/**
+ * The append-only and agreement guards on `briefs` (F07-AC3, F05-AC5).
+ *
+ * A brief version's content is immutable: a correction appends the next version
+ * rather than editing this one, so `version`, `sections_json`, the author, the
+ * instant and the request fingerprint may not change. The owner's agreement is
+ * the one thing that may land afterwards, and only in the forward direction: a
+ * version that is already agreed cannot be un-agreed or re-agreed, because that
+ * would rewrite a decision the owner already made.
+ *
+ * `suspended` is why the agreement guard is listed here rather than being created
+ * inside the migration body: `rebuildTables` drops the triggers named here before
+ * the swap and recreates them after it, so the restore below is never judged
+ * against a rule the rows it is restoring predate. Every other statement in
+ * version 9 runs after the swap, so those rows are the only exception.
+ */
+const BRIEF_TRIGGERS: readonly SuspendedTrigger[] = [
+  {
+    name: 'briefs_version_immutable_update',
+    create: `CREATE TRIGGER IF NOT EXISTS briefs_version_immutable_update
+     BEFORE UPDATE ON briefs
+     WHEN NEW.brief_id IS NOT OLD.brief_id
+       OR NEW.idea_id IS NOT OLD.idea_id
+       OR NEW.version IS NOT OLD.version
+       OR NEW.sections_json IS NOT OLD.sections_json
+       OR NEW.authored_by IS NOT OLD.authored_by
+       OR NEW.authored_at IS NOT OLD.authored_at
+       OR NEW.raw_request_fingerprint IS NOT OLD.raw_request_fingerprint
+       OR NEW.supersedes_version IS NOT OLD.supersedes_version
+       OR NEW.created_at IS NOT OLD.created_at
+       OR OLD.state = 'Agreed'
+     BEGIN
+       SELECT RAISE(ABORT, 'a brief version is immutable: append the corrected version instead (F07-AC3)');
+     END`,
+  },
+  {
+    name: 'briefs_append_only_delete',
+    create: `CREATE TRIGGER IF NOT EXISTS briefs_append_only_delete
+     BEFORE DELETE ON briefs
+     BEGIN
+       SELECT RAISE(ABORT, 'brief versions are retained so prior decisions stay readable (F07-AC3)');
+     END`,
+  },
+  {
+    name: 'briefs_agreement_recorded_insert',
+    create: `CREATE TRIGGER IF NOT EXISTS briefs_agreement_recorded_insert
+     BEFORE INSERT ON briefs
+     WHEN NEW.state = 'Agreed' AND (NEW.agreed_by IS NULL OR length(trim(NEW.agreed_by)) = 0 OR NEW.agreed_at IS NULL)
+     BEGIN
+       SELECT RAISE(ABORT, 'an agreed brief names the owner who agreed it and when (F05-AC5)');
+     END`,
+  },
+];
+
+/**
+ * Replaces `briefs` with the versioned shape and installs its guards.
+ *
+ * `briefs` is referenced by nothing in this schema, so the stash-and-restore
+ * sequence `rebuildTables` performs has no children to move and cannot lose a
+ * row. The swap runs inside the migration's own transaction, so a failure
+ * restores the previous table with its rows.
+ */
+function versionBriefs(db: Database): void {
+  db.exec(MIGRATION_10_BRIEF_VERSIONS);
+  rebuildTables(db, [
+    { table: 'briefs', replacement: 'briefs_versioned', copy: COPY_BRIEFS, suspended: BRIEF_TRIGGERS },
+  ]);
+  db.exec('CREATE INDEX briefs_by_idea_version ON briefs(idea_id, version DESC)');
+  for (const trigger of BRIEF_TRIGGERS) {
+    db.exec(trigger.create);
+  }
+}
+
+/**
  * The copy that replaces a rebuild's column-for-column restore.
  *
  * Written out rather than derived from `PRAGMA table_info` because the shapes
@@ -2162,6 +2604,18 @@ const MIGRATIONS: readonly Migration[] = [
       ]) {
         db.exec(trigger);
       }
+    },
+  },
+  {
+    version: 10,
+    name: 'intake_durable',
+    up: (db) => {
+      // The brief table is replaced first because everything below adds a foreign
+      // key to it: 'idea_questions.brief_id' and
+      // 'idea_question_rejections.brief_id' must point at the definition that
+      // survives the swap, not at the one that is dropped.
+      versionBriefs(db);
+      db.exec(MIGRATION_10_INTAKE_DURABLE);
     },
   },
 ];
