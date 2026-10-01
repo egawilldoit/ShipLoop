@@ -13,9 +13,12 @@ the run drove the shipped entrypoint rather than a substitute, so a server that 
 `browser-e2e` instead of being worked around. Startup is documented in
 [docs/handoff/slice-a.md](docs/handoff/slice-a.md); the web server and owner UI cover owner
 access, project profiles, credential references, recipes/preflight, intake, brief and
-clarification. The coding worker, execution engine, Git adapter, verification workflow, owner
-acceptance and delivery do not exist yet, so this is a partially assembled application, not a
-finished product.
+clarification. The coding worker, the Codex engine adapter, the GitHub adapter, isolated
+workspaces, required checks, criterion evidence, the review card, owner acceptance, delivery
+authorization and release receipts all exist and are wired into production composition. What is
+still absent: manual owner testing has no UI, a deployment adapter is not written, and no live
+provider delivery has been performed. Treat this as a working vertical slice, not a finished
+product.
 Node 24, pnpm **11.15.0** (package.json), Linux VM. Preserve the pnpm lockfile.
 Run commands from this checkout; never paste `set -e` into the parent SSH shell.
 
@@ -29,12 +32,18 @@ Run commands from this checkout; never paste `set -e` into the parent SSH shell.
 | `pnpm verify:app` | Foundation + lint + all package typechecks + `pnpm test` + web build + browser E2E |
 | `pnpm e2e` | Browser E2E alone; needs `pnpm build` first (the harness serves `dist/client`) |
 
-The application profile is configured and it stops at its first failure. Its current state at
-commit `b0ab89d` is that all eleven commands pass on the VM: foundation check, policy lint, six
-typechecks, the test suite, the production web build, and `browser-e2e` in real Chromium. A green
-`browser-e2e` means the real entrypoint served a real browser against a real SQLite database; it
-does not prove any criterion whose product code does not exist yet. [TESTING.md](TESTING.md)
-records the per-command evidence and the criterion coverage matrix.
+The application profile is configured, not blocked, and it stops at its first failure. Its
+current state at commit `1556c83` is that all **twelve** commands pass on the VM: foundation check,
+policy lint, seven typechecks, the test suite, the production web build, and `browser-e2e` in real
+Chromium. A green `browser-e2e` means the real entrypoint served a real browser against a real
+SQLite database; it does not prove any criterion whose product code does not exist yet, and it
+proves nothing against a hosted provider. [TESTING.md](TESTING.md) records the per-command evidence
+and the criterion coverage matrix, and
+[docs/product/acceptance-evidence.md](docs/product/acceptance-evidence.md) is the register of which
+of the 184 criteria are actually proven.
+
+The owner journey is not yet end to end. No deployment credential exists on this host, so preview,
+release and receipt proof stop at the adapter boundary.
 
 [TESTING.md](TESTING.md) owns verification selection and the report format.
 [VM development](docs/runbooks/vm-development.md) owns setup, processes, ports,

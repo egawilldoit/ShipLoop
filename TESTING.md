@@ -17,28 +17,27 @@ for agent verification. A missing test prerequisite is Blocked, never Passed.
 
 ### Current state of the application profile
 
-The application profile is configured and executable. It is **red**, at one command:
+The application profile is configured and executable. At commit `1556c83` on the
+Oracle ARM64 VM all **twelve** commands pass:
 
 | Command | Result |
 | --- | --- |
 | foundation-check, policy-lint | Passing |
-| typecheck-domain, -storage, -adapters, -verification, -controller, -web | Passing |
-| app-tests | Passing |
+| typecheck-domain, -storage, -adapters, -verification, -controller, -worker, -web | Passing |
+| app-tests | Passing — eight suites |
 | web-build | Passing |
-| browser-e2e | **Failing**, and only for the reason below |
+| browser-e2e | Passing — 61 specs in real Chromium 1243 |
 
-`browser-e2e` fails on one assertion, `this run drove the shipped server entrypoint, not a
-substitute`. Ten of its eleven specs pass. The reason is that `apps/web/src/server/main.ts`
-refuses to start: `SHIPLOOP_CONTROLLER_MODULE` (`@shiploop/controller`) does not export the
-`ControllerSurface` that `apps/web/src/server/contracts.ts` requires. The harness prints that
-startup failure and substitutes a real in-process HTTP server so the remaining specs still run;
-the assertion above exists so that substitution can never turn a broken startup into a passing
-gate. It is an assertion, not a skip, so the command goes green by itself the moment the
-controller is wired.
+`browser-e2e` asserts that the run drove `apps/web/src/server/main.ts` rather than a
+substitute, in more than one spec, so a server that cannot start fails the gate
+instead of being worked around. That assertion passes on this candidate.
 
-Consequently the browser suite currently proves the shipped client bundle, the responsive layout
-and the domain session/CSRF rules. It does **not** yet prove server startup or the owner API. Do
-not read a browser pass as application proof until that assertion passes on the same candidate.
+What a green gate therefore proves: the shipped entrypoint starts against the real
+controller, serves a real browser against a real SQLite database, and the domain,
+storage, adapter, verification, controller and worker suites pass. What it does not
+prove: any criterion whose product code does not exist yet, and nothing at all
+against a hosted provider. [docs/product/acceptance-evidence.md](docs/product/acceptance-evidence.md)
+is the criterion-level register.
 
 The verification runner needs Linux. The product targets browser clients across
 platforms; Windows/macOS runners are a later explicit portability milestone.
