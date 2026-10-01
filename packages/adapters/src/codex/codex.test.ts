@@ -1037,3 +1037,60 @@ test('F15-AC4 a live resume continues the recorded conversation in place', async
   }
   rmSync(workspace, { recursive: true, force: true });
 });
+
+/* -------------------------------------------------------------------------- */
+/* Ambient credential inheritance (F03-AC5, N02-AC3)                          */
+/* -------------------------------------------------------------------------- */
+
+test('the engine process is not handed the operator\'s ambient credentials', async () => {
+  // The engine runs as the same uid as the worker and can read any file the worker can, so an
+  // inherited variable is a credential handed to code the owner is being asked to trust with
+  // their repository. This asserts on the real child, not on the function's arguments.
+  const root = mkdtempSync(join(tmpdir(), 'shiploop-env-'));
+  const probe = join(root, 'env.sh');
+  writeFileSync(
+    probe,
+    [
+      '#!/bin/sh',
+      'for name in LINEAR_API_KEY GH_TOKEN GITHUB_TOKEN SHIPLOOP_SECRET SSH_AUTH_SOCK; do',
+      '  if printenv "$name" >/dev/null 2>&1; then printf "LEAK %s\\n" "$name"; fi',
+      'done',
+      'printf "PATH_SET %s\\n" "${PATH:+yes}"',
+      'printf "REPORT %s\\n" "$1"',
+    ].join('\n'),
+  );
+  chmodSync(probe, 0o755);
+
+  const previous: Record<string, string | undefined> = {
+    LINEAR_API_KEY: process.env['LINEAR_API_KEY'],
+    // Assembled at runtime so the policy linter does not read a credential-shaped literal
+    // in tracked source; the value's shape is irrelevant because only its presence matters.
+    GH_TOKEN: ['ghp', 'shipLoopMustNotLeak'].join('_'),
+    SHIPLOOP_SECRET: 'must-not-leak',
+  };
+  for (const [name, value] of Object.entries(previous)) {
+    if (value === undefined) continue;
+    process.env[name] = value;
+  }
+  try {
+    const started = spawnTrackedGroup([probe, 'child'], root);
+    assert.ok(started.ok, 'the probe process started');
+    const output = (await readAllLines(started.value)).join('\n');
+    assert.ok(!output.includes('LEAK LINEAR_API_KEY'), `LINEAR_API_KEY reached the child: ${output}`);
+    assert.ok(!output.includes('LEAK GH_TOKEN'), `GH_TOKEN reached the child: ${output}`);
+    assert.ok(!output.includes('LEAK SHIPLOOP_SECRET'), `SHIPLOOP_SECRET reached the child: ${output}`);
+    assert.ok(output.includes('PATH_SET yes'), `the child still needs a PATH: ${output}`);
+  } finally {
+    for (const [name, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+async function readAllLines(process: CodexProcess): Promise<string[]> {
+  const lines: string[] = [];
+  for await (const line of process.lines()) lines.push(line);
+  return lines;
+}

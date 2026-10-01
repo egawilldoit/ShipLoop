@@ -403,6 +403,36 @@ function signalGroup(child: CodexChildProcess, signal: NodeJS.Signals): void {
  * place a process is ever created, so there is one implementation of "detached, stdin closed, no
  * shell, one tracked group" rather than two that could drift.
  */
+/**
+ * Variables whose presence would hand the engine an ambient credential.
+ *
+ * The list is a denylist over names, deliberately in addition to the scrub below, so a
+ * variable added to the operator's shell after this was written is still caught. It cannot be
+ * exhaustive — a secret can arrive under any name — which is why the worker-side scrub and the
+ * separate-identity decision in docs/evidence/2026-10-01-credential-separation.md are the
+ * durable answer and this is defence in depth, not the boundary itself.
+ */
+const CREDENTIAL_VARIABLE = /^(?:.*_)?(?:TOKEN|SECRET|PASSWORD|PASS|APIKEY|API_KEY|CREDENTIALS?|PRIVATE_KEY|SESSION)$/i;
+const CREDENTIAL_AGENT = /^(?:SSH_AUTH_SOCK|GIT_ASKPASS|SSH_ASKPASS|GIT_CONFIG_GLOBAL)$/;
+
+/** The engine receives a PATH and nothing that carries authority. */
+function engineEnvironment(parent: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const scrubbed: NodeJS.ProcessEnv = {
+    PATH: parent['PATH'] ?? '/usr/local/bin:/usr/bin:/bin',
+    HOME: parent['HOME'] ?? '/tmp',
+    TMPDIR: parent['TMPDIR'] ?? '/tmp',
+    LANG: parent['LANG'] ?? 'C.UTF-8',
+    TZ: parent['TZ'] ?? 'UTC',
+    CODEX_HOME: parent['CODEX_HOME'] ?? '',
+  };
+  for (const [name, value] of Object.entries(parent)) {
+    if (value === undefined) continue;
+    if (CREDENTIAL_VARIABLE.test(name) || CREDENTIAL_AGENT.test(name)) continue;
+    scrubbed[name] = value;
+  }
+  return scrubbed;
+}
+
 export function spawnTrackedGroup(argv: readonly string[], cwd: string): Result<CodexProcess> {
   let child: CodexChildProcess;
   try {
@@ -415,6 +445,12 @@ export function spawnTrackedGroup(argv: readonly string[], cwd: string): Result<
       // that never writes would leave the session waiting on input it will never send.
       stdio: ['ignore', 'pipe', 'pipe'],
       shell: false,
+      // The engine must not inherit the operator's ambient authority. It runs as the same uid
+      // and can read any file the worker can, so an inherited `LINEAR_API_KEY`, `GH_TOKEN` or
+      // `SSH_AUTH_SOCK` is a credential handed to code the owner is being asked to trust with
+      // their repository. Only what the attempt needs is passed, and anything that looks like
+      // an ambient credential is removed rather than forwarded (F03-AC5, N02-AC3).
+      env: engineEnvironment(process.env),
     });
   } catch (cause) {
     return err({ code: 'Unavailable', reason: `the process could not be spawned (${describe(cause)})` });
