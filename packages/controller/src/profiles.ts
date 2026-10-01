@@ -378,11 +378,19 @@ function requiredCapabilities(content: ProjectProfileContent): readonly Capabili
   return requirements;
 }
 
-function isNonEmpty(value: string): boolean {
-  return value.trim().length > 0;
+/**
+ * Whether a value is a usable string.
+ *
+ * A caller may omit a required field entirely, so the absence of the value is a
+ * field problem to report, not a crash: validation exists to enumerate every
+ * missing field at once so a form can show them all (F02-AC4), and a throw here
+ * would surface only the first one as a server error.
+ */
+function isNonEmpty(value: string | null | undefined): value is string {
+  return typeof value === 'string' && value.trim().length > 0;
 }
 
-function required(path: string, value: string): FieldProblem[] {
+function required(path: string, value: string | null | undefined): FieldProblem[] {
   return isNonEmpty(value) ? [] : [{ path, message: 'Required.' }];
 }
 
@@ -392,7 +400,7 @@ function required(path: string, value: string): FieldProblem[] {
  * The domain's own redaction rules decide, so this refusal cannot drift from the
  * patterns stripped from logs, issue text and exports (F03-AC3, N02-AC2).
  */
-function secretReferenceProblem(value: string): string | null {
+function secretReferenceProblem(value: string | null | undefined): string | null {
   if (!isNonEmpty(value)) return 'Required.';
   const applied = redact(value).appliedLabels;
   if (applied.length === 0) return null;

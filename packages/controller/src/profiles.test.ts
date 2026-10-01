@@ -64,31 +64,14 @@ const PROJECT_ID = 'project_fixture_01' as ProjectId;
  */
 const SECRET_SHAPED_VALUE = ['AIza', 'FixtureKeyMaterialNotARealSecret01'].join('');
 
-const REPOSITORY_SCHEMA = `
-CREATE TABLE owner (
-  owner_id TEXT PRIMARY KEY, display_name TEXT NOT NULL, created_at TEXT NOT NULL) STRICT;
-CREATE TABLE owner_session (
-  session_id TEXT PRIMARY KEY, owner_id TEXT NOT NULL REFERENCES owner(owner_id),
-  token_hash TEXT NOT NULL UNIQUE, issued_at TEXT NOT NULL, expires_at TEXT NOT NULL,
-  revoked_at TEXT, rotated_from_session_id TEXT) STRICT;
-CREATE TABLE project_profile_version (
-  profile_version_id TEXT PRIMARY KEY, project_id TEXT NOT NULL, version_number INTEGER NOT NULL,
-  supersedes_version_id TEXT, content_json TEXT NOT NULL, content_fingerprint TEXT NOT NULL,
-  note TEXT, created_at TEXT NOT NULL, created_by TEXT NOT NULL,
-  UNIQUE (project_id, version_number)) STRICT;
-CREATE TABLE connector (
-  connector_id TEXT PRIMARY KEY, project_id TEXT NOT NULL, provider TEXT NOT NULL, kind TEXT NOT NULL,
-  resource_scope TEXT NOT NULL, credential_reference TEXT NOT NULL,
-  credential_reference_digest TEXT NOT NULL, capability_json TEXT NOT NULL, state TEXT NOT NULL,
-  error TEXT, last_checked_at TEXT, last_success_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
-  UNIQUE (project_id, kind)) STRICT;
-CREATE TABLE procedure_version (
-  procedure_version_id TEXT PRIMARY KEY, project_id TEXT NOT NULL, subject_key TEXT NOT NULL,
-  version_number INTEGER NOT NULL, kind TEXT NOT NULL, scope TEXT NOT NULL, source TEXT NOT NULL,
-  source_revision TEXT, content TEXT NOT NULL, content_fingerprint TEXT NOT NULL, status TEXT NOT NULL,
-  last_verified_revision TEXT, last_verified_at TEXT, accepted_at TEXT, created_at TEXT NOT NULL,
-  created_by TEXT NOT NULL, note TEXT, UNIQUE (project_id, subject_key, version_number)) STRICT;
-`;
+/**
+ * Deliberately absent.
+ *
+ * These tests used to install a hand-written fixture schema, which is exactly why
+ * they stayed green while the real `migrate(db)` produced tables the repositories
+ * could not read. Every case here now runs against the schema `@shiploop/storage`
+ * actually installs, so a schema/repository disagreement fails here first.
+ */
 
 const FAST_PASSWORD_COST = { N: 1024, r: 8, p: 1, keyLength: 32, saltLength: 16 };
 
@@ -218,8 +201,9 @@ async function withHarness(body: (harness: Harness) => Promise<void> | void): Pr
     const opened = openDatabase(join(directory, 'shiploop.sqlite'));
     assert.ok(opened.ok, 'the real database opened');
     migrate(opened.value);
-    opened.value.exec(REPOSITORY_SCHEMA);
-    assert.ok(ensureOwnerCredentialSchema(opened.value).ok, 'the credential schema was installed');
+    const migrated = migrate(opened.value);
+    assert.ok(migrated.ok, 'the real schema migrated');
+    assert.ok(ensureOwnerCredentialSchema(opened.value).ok, 'the owner row carries credential columns');
 
     const build = (
       options: { readonly adapters?: AdapterRegistry; readonly preflight?: PreflightDeps } = {},

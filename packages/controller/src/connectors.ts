@@ -156,8 +156,14 @@ export interface ConnectorUseCases {
 
 const CONNECTOR_KINDS: readonly ConnectorKind[] = ['Ticket', 'Git', 'Deployment', 'Engine'];
 
-function isNonEmpty(value: string): boolean {
-  return value.trim().length > 0;
+/**
+ * Whether a value is a usable string.
+ *
+ * An omitted optional field is a legitimate input, so absence is a validation
+ * result rather than a crash (F02-AC4).
+ */
+function isNonEmpty(value: string | null | undefined): boolean {
+  return typeof value === 'string' && value.trim().length > 0;
 }
 
 /**

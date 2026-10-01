@@ -15,15 +15,12 @@
  *   - the clock and the adapter registry are injected, so a test contacts no
  *     provider and records no ambient time.
  *
- * Known gap, reported rather than papered over: `@shiploop/storage`'s
- * `migrations.ts` installs plural table names (`owners`, `connectors`, …) while
- * `repositories/core.ts` reads and writes singular ones (`owner`, `connector`, …).
- * The root verifies the tables its repositories need and refuses to start with a
- * named cause rather than handing out a root whose every use case would throw
- * "no such table". The controller-owned `owner_credential` table below is likewise
- * provisional: `OwnerRepository.provision` takes no credential column, so a
- * migration in `@shiploop/storage` carrying owner email and password digest is the
- * change that removes it.
+ * The root verifies that the tables and columns its repositories need actually
+ * exist after migrating, and refuses to start with a named cause rather than
+ * handing out a root whose every use case would throw "no such table" or "no such
+ * column". Owner credentials are read from and written to the owner row itself,
+ * because `@shiploop/storage` owns those columns and a second credential table
+ * would put sign-in state outside the backup.
  */
 
 import {
@@ -87,30 +84,21 @@ export interface CompositionRoot {
 
 /** The tables the bound repositories read and write. */
 const REQUIRED_TABLES: readonly string[] = [
-  'owner',
-  'owner_session',
-  'project_profile_version',
-  'connector',
-  'procedure_version',
+  'owners',
+  'sessions',
+  'project_profile_versions',
+  'connectors',
+  'procedure_versions',
 ];
 
 /**
- * Provisional owner credential table.
+ * Owner credentials live on the owner row itself.
  *
- * It exists because the owner row has nowhere to keep an email or a password
- * digest. Move it into `@shiploop/storage`'s migrations with a credential column on
- * the owner table; nothing else here depends on its shape.
+ * `@shiploop/storage`'s migrations own `owners.email` and `owners.password_digest`,
+ * so there is no second credential table here: one place stores an owner, which is
+ * what lets a restored backup carry sign-in with everything else.
  */
-const OWNER_CREDENTIAL_SCHEMA = `
-CREATE TABLE IF NOT EXISTS owner_credential (
-  owner_id      TEXT PRIMARY KEY,
-  email         TEXT NOT NULL UNIQUE,
-  password_hash TEXT NOT NULL,
-  updated_at    TEXT NOT NULL
-) STRICT;
-`;
-
-const OWNER_CREDENTIAL_COLUMNS = 'owner_id, email, password_hash, updated_at';
+const OWNER_CREDENTIAL_COLUMNS = 'owner_id, email, password_digest, created_at';
 
 function requiredText(row: SqlRow, column: string): string {
   const value = row[column];
@@ -137,15 +125,15 @@ export class SqliteOwnerCredentialStore implements OwnerCredentialStore {
     try {
       this.connection
         .prepare(
-          `INSERT INTO owner_credential (${OWNER_CREDENTIAL_COLUMNS}) VALUES (?, ?, ?, ?)`,
+          `UPDATE owners SET email = ?, password_digest = ? WHERE owner_id = ?`,
         )
-        .run(record.ownerId, record.email, record.passwordHash, record.updatedAt);
+        .run(record.email, record.passwordHash, record.ownerId);
     } catch (error) {
       return err({
         code: 'Conflict',
-        reason: `An owner credential already exists for that identity; it was not overwritten (${describe(error)}).`,
-        expected: 'no owner credential',
-        actual: 'existing owner credential',
+        reason: `The owner credential could not be stored; it was not overwritten (${describe(error)}).`,
+        expected: 'a writable owners row',
+        actual: describe(error),
       });
     }
     return ok(record);
@@ -162,14 +150,20 @@ export class SqliteOwnerCredentialStore implements OwnerCredentialStore {
   private find(column: 'email' | 'owner_id', value: string): Result<OwnerCredentialRecord | null> {
     try {
       const row = this.connection
-        .prepare(`SELECT ${OWNER_CREDENTIAL_COLUMNS} FROM owner_credential WHERE ${column} = ?`)
+        .prepare(`SELECT ${OWNER_CREDENTIAL_COLUMNS} FROM owners WHERE ${column} = ?`)
         .get(value);
       if (row === undefined) return ok(null);
+      const email = requiredText(row, 'email');
+      const passwordHash = requiredText(row, 'password_digest');
+      // A row with no credential is an owner provisioned by another path, not a
+      // failed sign-in: returning null keeps unknown-address and wrong-password
+      // indistinguishable to the caller (N02-AC1).
+      if (email === '' || passwordHash === '') return ok(null);
       return ok({
         ownerId: requiredText(row, 'owner_id') as OwnerId,
-        email: requiredText(row, 'email'),
-        passwordHash: requiredText(row, 'password_hash') as PasswordHash,
-        updatedAt: requiredText(row, 'updated_at'),
+        email,
+        passwordHash: passwordHash as PasswordHash,
+        updatedAt: requiredText(row, 'created_at'),
       });
     } catch (error) {
       return err({ code: 'Unavailable', reason: `owner credential lookup failed: ${describe(error)}` });
@@ -182,17 +176,26 @@ function describe(error: unknown): string {
 }
 
 /**
- * Installs the provisional owner credential table.
+ * Confirms the owner row carries somewhere to keep an email and a password digest.
  *
  * Exported so a caller that binds repositories itself, rather than through
- * `createCompositionRoot`, still gets the same table instead of a "no such table"
- * failure at the first sign-in.
+ * `createCompositionRoot`, fails at setup with a named cause instead of at the
+ * first sign-in with a "no such column" error.
  */
 export function ensureOwnerCredentialSchema(connection: StorageConnection): Result<true, DomainError> {
+  let rows: SqlRow[];
   try {
-    connection.exec(OWNER_CREDENTIAL_SCHEMA);
+    rows = connection.prepare("SELECT name FROM pragma_table_info('owners')").all();
   } catch (error) {
-    return err({ code: 'Unavailable', reason: `owner credential schema could not be created: ${describe(error)}` });
+    return err({ code: 'Unavailable', reason: `owner credential columns could not be inspected: ${describe(error)}` });
+  }
+  const present = new Set(rows.map((row) => (typeof row['name'] === 'string' ? row['name'] : '')));
+  const missing = ['email', 'password_digest'].filter((column) => !present.has(column));
+  if (missing.length > 0) {
+    return err({
+      code: 'Unavailable',
+      reason: `The owners table has no ${missing.join(' or ')} column, so an owner cannot sign in. Apply the @shiploop/storage migrations that carry owner credentials.`,
+    });
   }
   return ok(true);
 }
@@ -242,7 +245,7 @@ export function createCompositionRoot(config: CompositionRootConfig): Result<Com
     if (missing !== null) {
       return refuse(database, {
         code: 'Unavailable',
-        reason: `The database has no "${missing}" table, so the storage repositories cannot read or write it. @shiploop/storage migrations and repositories currently disagree on table names; the controller refuses to start rather than hand out a root whose use cases would all fail.`,
+        reason: `The database has no "${missing}" table after migrating, so the storage repositories cannot read or write it. The controller refuses to start rather than hand out a root whose use cases would all fail.`,
       });
     }
     const credentials = ensureOwnerCredentialSchema(database);

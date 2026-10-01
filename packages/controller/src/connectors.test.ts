@@ -45,14 +45,6 @@ const CREDENTIAL_REFERENCE = 'vault:shiploop/fixture-linear-token';
 /** A synthetic value shaped like a provider key, never a real credential. */
 const SECRET_SHAPED_VALUE = ['AIza', 'FixtureKeyMaterialNotARealSecret01'].join('');
 
-const CONNECTOR_SCHEMA = `
-CREATE TABLE connector (
-  connector_id TEXT PRIMARY KEY, project_id TEXT NOT NULL, provider TEXT NOT NULL, kind TEXT NOT NULL,
-  resource_scope TEXT NOT NULL, credential_reference TEXT NOT NULL,
-  credential_reference_digest TEXT NOT NULL, capability_json TEXT NOT NULL, state TEXT NOT NULL,
-  error TEXT, last_checked_at TEXT, last_success_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
-  UNIQUE (project_id, kind)) STRICT;
-`;
 
 const GIT_DECLARATIONS: readonly CapabilityDeclaration[] = [
   declaration('Git:ReadRepository', true),
@@ -144,8 +136,7 @@ async function withHarness(
   try {
     const opened = openDatabase(join(directory, 'shiploop.sqlite'));
     assert.ok(opened.ok, 'the real database opened');
-    migrate(opened.value);
-    opened.value.exec(CONNECTOR_SCHEMA);
+    assert.ok(migrate(opened.value).ok, 'the real schema migrated');
 
     const stored = new ConnectorRepository(opened.value);
     const useCases = createConnectorUseCases({ clock, connectors: stored, adapters: registryWith(probes) });

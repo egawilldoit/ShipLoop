@@ -563,6 +563,20 @@ function toProfileVersion(row: SqlRow): ProjectProfileVersion {
 }
 
 /**
+ * The project's display name, derived from the repository it targets.
+ *
+ * `projects.name` is NOT NULL, and the profile is the only thing that exists when a
+ * project is first saved. Deriving the name from the repository keeps the row honest
+ * rather than storing a placeholder that would later contradict the profile.
+ */
+function projectNameFrom(content: ProjectProfileContent): string {
+  const repository = content.references.repository.trim();
+  if (repository.length === 0) return 'project';
+  const segments = repository.replace(/\.git$/, '').split('/');
+  return segments[segments.length - 1] ?? repository;
+}
+
+/**
  * Versioned project profiles (F02-AC3).
  *
  * `saveVersion` only INSERTs. There is deliberately no update method, because a
@@ -574,6 +588,16 @@ export class ProjectProfileRepository extends SqlRepository implements ProjectPr
   saveVersion(input: SaveProfileVersionInput): Result<ProjectProfileVersion> {
     return this.attempt('save project profile version', () =>
       this.bounded(() => {
+        // The project row is created on first save rather than demanded separately.
+        // A profile version is what makes a project exist in ShipLoop's terms, so
+        // making the caller provision an empty project first would mean a project
+        // with no saved version, which is not a state any criterion describes.
+        // The insert is ignored when the row already exists, so an existing project
+        // is never reset by a later profile save.
+        this.statement(
+          'INSERT INTO projects (project_id, name, created_at, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT (project_id) DO NOTHING',
+        ).run(input.projectId, projectNameFrom(input.content), input.createdAt, input.createdAt);
+
         const newest = this.statement(
           'SELECT profile_version_id, version FROM project_profile_versions WHERE project_id = ? ORDER BY version DESC LIMIT 1',
         ).get(input.projectId);
@@ -684,6 +708,13 @@ function toConnector(row: SqlRow): ConnectorRecord {
  * A row holds a credential *reference* and nothing else. A value that matches a
  * configured secret pattern is refused rather than stored, because the cheapest
  * moment to keep a secret out of a backup and an export is before it is written.
+ *
+ * The project row is created on first registration. F03-AC1 configures connectors
+ * before a profile version necessarily exists, and the schema makes
+ * `connectors.project_id` a foreign key; requiring an empty project to exist first
+ * would mean a project in a state no criterion describes. `name` is derived from
+ * the resource scope so the row never carries a placeholder a later profile save
+ * would contradict.
  */
 export class ConnectorRepository extends SqlRepository implements ConnectorStore {
   upsert(input: UpsertConnectorInput): Result<ConnectorRecord> {
@@ -716,6 +747,10 @@ export class ConnectorRepository extends SqlRepository implements ConnectorStore
           );
         }
         const digest = createHash('sha256').update(input.credentialReference, 'utf8').digest('hex');
+        const scope = input.resourceScope.trim();
+        this.statement(
+          'INSERT INTO projects (project_id, name, created_at, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT (project_id) DO NOTHING',
+        ).run(input.projectId, scope === '' ? String(input.projectId) : scope, input.at, input.at);
         const existing = this.statement(
           `SELECT ${CONNECTOR_COLUMNS} FROM connectors WHERE project_id = ? AND kind = ?`,
         ).get(input.projectId, input.kind);

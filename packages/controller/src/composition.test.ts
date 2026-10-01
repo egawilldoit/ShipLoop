@@ -46,31 +46,6 @@ const FAST_PASSWORD_COST = { N: 1024, r: 8, p: 1, keyLength: 32, saltLength: 16 
  * a case that wants a working root has to state the same fact rather than have the
  * controller paper over it.
  */
-const REPOSITORY_SCHEMA = `
-CREATE TABLE owner (
-  owner_id TEXT PRIMARY KEY, display_name TEXT NOT NULL, created_at TEXT NOT NULL) STRICT;
-CREATE TABLE owner_session (
-  session_id TEXT PRIMARY KEY, owner_id TEXT NOT NULL REFERENCES owner(owner_id),
-  token_hash TEXT NOT NULL UNIQUE, issued_at TEXT NOT NULL, expires_at TEXT NOT NULL,
-  revoked_at TEXT, rotated_from_session_id TEXT) STRICT;
-CREATE TABLE project_profile_version (
-  profile_version_id TEXT PRIMARY KEY, project_id TEXT NOT NULL, version_number INTEGER NOT NULL,
-  supersedes_version_id TEXT, content_json TEXT NOT NULL, content_fingerprint TEXT NOT NULL,
-  note TEXT, created_at TEXT NOT NULL, created_by TEXT NOT NULL,
-  UNIQUE (project_id, version_number)) STRICT;
-CREATE TABLE connector (
-  connector_id TEXT PRIMARY KEY, project_id TEXT NOT NULL, provider TEXT NOT NULL, kind TEXT NOT NULL,
-  resource_scope TEXT NOT NULL, credential_reference TEXT NOT NULL,
-  credential_reference_digest TEXT NOT NULL, capability_json TEXT NOT NULL, state TEXT NOT NULL,
-  error TEXT, last_checked_at TEXT, last_success_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
-  UNIQUE (project_id, kind)) STRICT;
-CREATE TABLE procedure_version (
-  procedure_version_id TEXT PRIMARY KEY, project_id TEXT NOT NULL, subject_key TEXT NOT NULL,
-  version_number INTEGER NOT NULL, kind TEXT NOT NULL, scope TEXT NOT NULL, source TEXT NOT NULL,
-  source_revision TEXT, content TEXT NOT NULL, content_fingerprint TEXT NOT NULL, status TEXT NOT NULL,
-  last_verified_revision TEXT, last_verified_at TEXT, accepted_at TEXT, created_at TEXT NOT NULL,
-  created_by TEXT NOT NULL, note TEXT, UNIQUE (project_id, subject_key, version_number)) STRICT;
-`;
 
 const DECLARED: Readonly<Record<ConnectorKind, readonly CapabilityKind[]>> = {
   Ticket: ['Ticket:ReadScope', 'Ticket:UpdateManagedProgress'],
@@ -112,7 +87,6 @@ function prepareFile(databasePath: string): void {
   assert.ok(opened.ok, 'the real database opened');
   const migrated = migrate(opened.value);
   assert.ok(migrated.ok, 'the real migration ran');
-  opened.value.exec(REPOSITORY_SCHEMA);
   assert.ok(closeDatabase(opened.value).ok, 'the database closed cleanly');
 }
 
@@ -235,13 +209,24 @@ test('no root is returned when migration fails', async () => {
   });
 });
 
-test('no root is returned when the repositories have no tables to read', async () => {
+test('no root is returned when a repository table is absent after migrating', async () => {
   await withDirectory(async (databasePath) => {
+    // A migrated database now HAS its tables, so the refusal can no longer be
+    // produced by an empty file. Removing one required table is the real failure
+    // this guard exists for: a schema that migrated partially, or one that an
+    // operator rolled back by hand.
+    const prepared = openDatabase(databasePath);
+    assert.ok(prepared.ok);
+    const migrated = migrate(prepared.value);
+    assert.ok(migrated.ok);
+    prepared.value.exec('DROP TABLE connectors');
+    assert.ok(closeDatabase(prepared.value).ok);
+
     const root = createCompositionRoot(config(databasePath));
     assert.equal(root.ok, false);
     if (root.ok) return;
     assert.equal(root.error.code, 'Unavailable');
-    assert.match(root.error.reason, /"owner"/);
-    assert.match(root.error.reason, /table names/);
+    assert.match(root.error.reason, /"connectors"/);
+    assert.match(root.error.reason, /refuses to start/);
   });
 });
