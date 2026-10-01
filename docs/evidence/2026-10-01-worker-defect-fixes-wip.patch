@@ -1,0 +1,601 @@
+diff --git a/apps/worker/src/runner.ts b/apps/worker/src/runner.ts
+index 48cfdbb..8eb001c 100644
+--- a/apps/worker/src/runner.ts
++++ b/apps/worker/src/runner.ts
+@@ -14,9 +14,13 @@
+  *   - a resume re-reads the actual workspace and live external state before continuing, and a
+  *     workspace that no longer matches the recorded checkpoint is reported rather than
+  *     written over (F17-AC3, F14-AC4);
+- *   - a reached limit checkpoints the work and waits for an owner extension instead of
+- *     continuing, and time spent waiting for the owner is not charged to the execution
+- *     budget (F18-AC2, F18-AC3);
++ *   - every checkpoint records the workspace re-read after the attempt's work has settled, so the
++ *     resume point it leaves describes the work that is actually there (F14-AC4, F17-AC2);
++ *   - a reached limit halts the engine before the attempt parks, then checkpoints the work and
++ *     waits for an owner extension instead of continuing, and time spent waiting for the owner is
++ *     not charged to the execution budget (F17-AC1, F18-AC2, F18-AC3);
++ *   - a refusal that cannot improve on a retry reaches a terminal state instead of being reported
++ *     once per tick forever (F18-AC1, F18-AC5);
+  *   - usage is carried through only when the engine reported it, and is `Unknown` otherwise
+  *     (F18-AC4);
+  *   - a deterministic scope or authentication failure is never dispatched a second time
+@@ -119,8 +123,32 @@ export interface WorkspacePort {
+     readonly job: JobRecord;
+     readonly checkpoint: JobCheckpoint | null;
+   }): Promise<Result<PreparedWorkspace, DomainError>>;
++  /**
++   * Re-reads the repository state of a workspace this port already prepared.
++   *
++   * A checkpoint is written after the attempt's work has settled, so the inventory it stores has to
++   * be read at that moment rather than remembered from before the attempt. A checkpoint built from
++   * the pre-attempt workspace records a clean worktree that the worktree does not have, which makes
++   * the retained resume point refuse the very workspace it describes (F14-AC4, F17-AC2).
++   *
++   * Optional only so the port can be loaded from a module specifier: `createWorker` refuses a
++   * provider that cannot re-observe rather than running one that could not write an honest
++   * checkpoint.
++   */
++  observe?(request: WorkspaceObservationRequest): Promise<Result<WorkspaceObservation, DomainError>>;
++}
++
++/** The workspace identity a re-observation is asked about, as the checkpoint records it. */
++export interface WorkspaceObservationRequest {
++  readonly job: JobRecord;
++  readonly workspace: JobCheckpoint['workspace'];
+ }
+ 
++/** Re-reads a prepared workspace, which is what a checkpoint's inventory is written from. */
++export type WorkspaceObserver = (
++  request: WorkspaceObservationRequest,
++) => Promise<Result<WorkspaceObservation, DomainError>>;
++
+ /** An owner grant that lifts a limit this attempt already reached (F18-AC2). */
+ export interface OwnerExtension {
+   readonly grantedBy: string;
+@@ -167,6 +195,8 @@ export interface RunnerPorts {
+   readonly redact: (text: string) => string;
+   readonly engine: EngineAdapter;
+   readonly workspaces: WorkspacePort;
++  /** Re-reads the workspace the attempt is writing, because a checkpoint records it after the work. */
++  readonly observeWorkspace: WorkspaceObserver;
+   readonly extensions: OwnerExtensionPort;
+   readonly facts: CheckpointFactsPort;
+   readonly onMilestone: (job: JobRecord, milestone: Milestone) => void;
+@@ -241,7 +271,7 @@ export async function runAttempt(
+   request: AttemptRequest,
+ ): Promise<Result<AttemptOutcome, DomainError>> {
+   const prepared = await ports.workspaces.prepare({ job: request.job, checkpoint: request.checkpoint });
+-  if (!prepared.ok) return prepared;
++  if (!prepared.ok) return refusalOutcome(request.job.jobId, prepared.error);
+   const observation = prepared.value.observation;
+ 
+   if (request.checkpoint !== null) {
+@@ -292,7 +322,7 @@ export async function runAttempt(
+     if (!evaluation.withinLimits) {
+       const extension = extensionApplied ? null : ports.extensions.extensionFor({ jobId: request.job.jobId });
+       if (extension === null) {
+-        const checkpoint = await persistCheckpoint(ports, request, observation, {
++        const checkpoint = await persistCheckpoint(ports, request, observation.workspace, {
+           blocker: evaluation.reason,
+           nextAction: 'Wait for an owner extension before this attempt continues (F18-AC2).',
+           engineVersion: null,
+@@ -338,7 +368,7 @@ export async function runAttempt(
+         fixPasses: pass,
+         ownerWaits: request.ownerWaits,
+       });
+-      const checkpoint = await persistCheckpoint(ports, request, observation, {
++      const checkpoint = await persistCheckpoint(ports, request, observation.workspace, {
+         blocker: final.reason,
+         nextAction: 'Wait for an owner extension before this attempt continues (F18-AC2).',
+         engineVersion: result.engineVersion,
+@@ -348,7 +378,7 @@ export async function runAttempt(
+     }
+ 
+     if (result.stopped) {
+-      const checkpoint = await persistCheckpoint(ports, request, observation, {
++      const checkpoint = await persistCheckpoint(ports, request, observation.workspace, {
+         blocker: 'The owner asked for this attempt to stop before the engine reported a result.',
+         nextAction: 'Resume from the recorded checkpoint after inspecting the workspace (F17-AC3).',
+         engineVersion: result.engineVersion,
+@@ -364,7 +394,7 @@ export async function runAttempt(
+     const recorded = result.failure ?? failureForTerminal(result.terminal);
+     const canSpendAnotherPass = recorded.retryable && pass < limits.automatedFixPasses;
+     if (!canSpendAnotherPass) {
+-      const checkpoint = await persistCheckpoint(ports, request, observation, {
++      const checkpoint = await persistCheckpoint(ports, request, observation.workspace, {
+         blocker: recorded.recommendedNextAction,
+         nextAction: recorded.retryable
+           ? 'Start a further attempt, or have the owner extend the limits recorded with the job (F18-AC2).'
+@@ -380,7 +410,7 @@ export async function runAttempt(
+     }
+ 
+     pass += 1;
+-    const checkpoint = await persistCheckpoint(ports, request, observation, {
++    const checkpoint = await persistCheckpoint(ports, request, observation.workspace, {
+       blocker: recorded.recommendedNextAction,
+       nextAction: `Continue the coding work with automated fix pass ${String(pass)} of ${String(limits.automatedFixPasses)} (F18-AC2).`,
+       engineVersion: result.engineVersion,
+@@ -672,6 +702,15 @@ async function consumeSession(
+     }
+     if (!withinBudget.value) {
+       budgetExhausted = true;
++      /**
++       * The session is halted before the attempt parks, exactly as a stop is.
++       *
++       * A reached limit ends this attempt and releases the coding slot, so an engine process left
++       * running here would be writing into a workspace another job has been given. Treating the
++       * budget as a stop routes it through the same observed stop, so a group that survives the
++       * bounded kill is reported as detached and no job state moves (F17-AC1, F18-AC2, F17-AC5).
++       */
++      isStopped = true;
+       break;
+     }
+ 
+@@ -865,12 +904,27 @@ function engineCheckpointOf(checkpoint: JobCheckpoint, instruction: string): Eng
+   };
+ }
+ 
++/**
++ * Writes one resume point from the workspace as it is at the moment of writing.
++ *
++ * The inventory is re-read through the port rather than reused from `prepare`, because the whole
++ * point of a checkpoint is that it describes the work an attempt left behind: reusing the
++ * pre-attempt observation stored `untracked files: []` for a worktree the engine had just written
++ * into, and the retained checkpoint then refused to authorise resuming its own workspace
++ * (F14-AC4, F17-AC2).
++ *
++ * A re-read that is refused is returned as an error rather than papered over with the earlier
++ * observation, because the alternative is a resume point that states something about the workspace
++ * nobody read.
++ */
+ async function persistCheckpoint(
+   ports: RunnerPorts,
+   request: AttemptRequest,
+-  observation: WorkspaceObservation,
++  workspace: JobCheckpoint['workspace'],
+   content: CheckpointContent,
+ ): Promise<Result<null, DomainError>> {
++  const observed = await ports.observeWorkspace({ job: request.job, workspace });
++  if (!observed.ok) return observed;
+   const written = ports.writeCheckpoint({
+     jobId: request.job.jobId,
+     holder: request.holder,
+@@ -880,11 +934,11 @@ async function persistCheckpoint(
+     profileVersionId: request.job.profileVersionId,
+     procedureVersionId: request.job.procedureVersionId,
+     engineVersion: content.engineVersion,
+-    workspace: observation.workspace,
+-    headSha: observation.headSha,
+-    baseSha: observation.baseSha,
+-    dirtyFiles: observation.dirtyFiles,
+-    untrackedFiles: observation.untrackedFiles,
++    workspace: observed.value.workspace,
++    headSha: observed.value.headSha,
++    baseSha: observed.value.baseSha,
++    dirtyFiles: observed.value.dirtyFiles,
++    untrackedFiles: observed.value.untrackedFiles,
+     results: ports.facts.resultsFor({ jobId: request.job.jobId }),
+     feedback: ports.facts.feedbackFor({ jobId: request.job.jobId }),
+     blocker: content.blocker,
+@@ -894,6 +948,25 @@ async function persistCheckpoint(
+   return written.ok ? ok(null) : written;
+ }
+ 
++/**
++ * Turns a refusal to start the attempt into a terminal outcome or a reported error.
++ *
++ * Whether a refusal is retried is the domain's decision, taken from the failure category the same
++ * way every other failure in this file is classified, rather than a local rule about workspace
++ * errors. A deterministic scope or authentication refusal repeats identically on every tick, so it
++ * becomes a `Blocked` attempt: the job reaches a terminal state, the owner is given the blocker,
++ * and the run loop stops retrying it (F18-AC1, F18-AC5, N01-AC1).
++ */
++function refusalOutcome(jobId: JobId, error: DomainError): Result<AttemptOutcome, DomainError> {
++  const failure = classifyFailure({
++    stage: 'Reconciliation',
++    observed: { error: error.reason, references: [`job:${jobId}`] },
++    category: failureCategoryOfError(error.code),
++  });
++  if (failure.retryable) return err(error);
++  return ok({ kind: 'Blocked', failure, usage: usageReporting(null) });
++}
++
+ /**
+  * Active wall-clock elapsed since the attempt started, from the injected clock only.
+  *
+diff --git a/apps/worker/src/worker.test.ts b/apps/worker/src/worker.test.ts
+index 7b397ab..7747621 100644
+--- a/apps/worker/src/worker.test.ts
++++ b/apps/worker/src/worker.test.ts
+@@ -347,14 +347,29 @@ function prepared(
+ 
+ class ScriptedWorkspacePort implements WorkspacePort {
+   current: PreparedWorkspace;
++  /** What the workspace looks like once the attempt has written to it. */
++  afterAttempt: PreparedWorkspace['observation'];
++  observeCalls = 0;
+ 
+-  constructor(current: PreparedWorkspace = prepared()) {
++  constructor(current: PreparedWorkspace = prepared(), afterAttempt?: PreparedWorkspace['observation']) {
+     this.current = current;
++    this.afterAttempt = afterAttempt ?? current.observation;
+   }
+ 
+   async prepare(): Promise<Result<PreparedWorkspace, DomainError>> {
+     return ok(this.current);
+   }
++
++  /**
++   * Answers with the post-attempt reading, which is what a checkpoint's inventory must be
++   * written from. A checkpoint taken from the pre-attempt reading describes a worktree the
++   * attempt had not yet written to, so the worker could never authorise resuming its own
++   * workspace (F14-AC4, F17-AC2).
++   */
++  async observe(): Promise<Result<PreparedWorkspace['observation'], DomainError>> {
++    this.observeCalls += 1;
++    return ok(this.afterAttempt);
++  }
+ }
+ 
+ class ScriptedExtensions implements OwnerExtensionPort {
+@@ -1317,6 +1332,10 @@ test('N01-AC1: a SIGTERM mid-run leaves durable state consistent, and a restart
+       '      },',
+       '    };',
+       '  },',
++      '  async observe() {',
++      `    const workspace = { workspaceId: 'ws-signal', branchName: 'shiploop/signal', worktreePath: ${JSON.stringify(worktree)} };`,
++      `    return { ok: true, value: { workspace, headSha: ${JSON.stringify(HEAD_SHA)}, baseSha: ${JSON.stringify(BASE_SHA)}, dirtyFiles: ['src/worker.ts'], untrackedFiles: ['src/worker.test.ts', 'in-progress.txt'] } };`,
++      '  },',
+       '});',
+     ].join('\n'),
+   );
+@@ -1428,6 +1447,7 @@ test('N01-AC1: a SIGTERM mid-run leaves durable state consistent, and a restart
+ 
+     const tick = expectOk(await recovery.value.tick());
+     assert.equal(tick.kind, 'Claimed', 'the restart recovers the interrupted job');
++    console.error('T ' + JSON.stringify(tick).slice(0,300));
+     assert.equal(recoveredEngine.starts.length, 1, 'the interrupted run is resumed once, not duplicated');
+     assert.equal(
+       recoveredEngine.starts[0]?.start.kind,
+diff --git a/apps/worker/src/worker.ts b/apps/worker/src/worker.ts
+index cbf1860..c0583a4 100644
+--- a/apps/worker/src/worker.ts
++++ b/apps/worker/src/worker.ts
+@@ -50,6 +50,7 @@ import {
+   type Milestone,
+   type OwnerExtensionPort,
+   type RunnerPorts,
++  type WorkspaceObserver,
+   type WorkspacePort,
+ } from './runner.ts';
+ 
+@@ -218,6 +219,8 @@ export function createWorker(
+       ]),
+     );
+   }
++  const observeWorkspace = workspaceObserverOf(ports.workspaces);
++  if (!observeWorkspace.ok) return observeWorkspace;
+   ports.leases.ensureCodingSlot();
+ 
+   const clockAtStartup = readInstant(ports.clock.now());
+@@ -251,6 +254,7 @@ export function createWorker(
+     redact: ports.redact,
+     engine: ports.engine,
+     workspaces: ports.workspaces,
++    observeWorkspace: observeWorkspace.value,
+     extensions: ports.extensions,
+     facts: ports.facts,
+     onMilestone: (job, milestone: Milestone) => {
+@@ -408,12 +412,16 @@ export function createWorker(
+         lease.holder === config.holder &&
+         ports.extensions.extensionFor({ jobId: job.jobId }) !== null;
+ 
+-      if (job.state === 'WaitingForOwner' && extendedByOwner) {
+-        continuable.push(job.jobId);
+-        continue;
+-      }
+-      if (!vacant && !confirmed) continue;
++      if (!extendedByOwner && !vacant && !confirmed) continue;
+ 
++      /**
++       * A continuation reclaims as well.
++       *
++       * `WaitingForOwner` gives the coding slot up, so continuing it means taking the single writer
++       * again. Reclaiming is what mints that term and puts this holder back on the job row, so a
++       * continued attempt owns the writer and can heartbeat and checkpoint like any other
++       * (F13-AC2, F18-AC2).
++       */
+       const reclaimed = ports.leases.reclaimLease({
+         leaseId: `lease:${job.jobId}`,
+         jobId: job.jobId,
+@@ -423,7 +431,12 @@ export function createWorker(
+         leaseTtlMs: config.leaseTtlMs,
+       });
+       if (!reclaimed.ok) return reclaimed;
+-      if (reclaimed.value.granted) recoverable.push({ jobId: job.jobId, updatedAt: job.updatedAt });
++      if (!reclaimed.value.granted) continue;
++      if (extendedByOwner) {
++        continuable.push(job.jobId);
++        continue;
++      }
++      recoverable.push({ jobId: job.jobId, updatedAt: job.updatedAt });
+     }
+ 
+     counters.findingsRequiringReconciliation += findings.filter((finding) => finding.status !== 'Vacant').length;
+@@ -646,11 +659,16 @@ export function createWorker(
+   }
+ 
+   /**
+-   * Moves a confirmed-stale job into a driven state.
++   * Moves a confirmed-stale job into a driven state and counts this as another attempt.
+    *
+    * The writer lease is already this process's, so this is a lifecycle move rather than a claim.
+    * `WaitingForOwner` returns to `Running` because the owner has now had the decision the state
+    * was waiting for (F17-AC3).
++   *
++   * The attempt counter advances because a recovery dispatches a second engine session, and the
++   * checkpoint it writes is named by that counter. Left alone it reused the first attempt's
++   * identifier, so two attempts of one job produced the same `ckpt:<jobId>:<attemptCount>` and the
++   * retained resume point could not say which attempt produced the workspace (F17-AC2, F18-AC1).
+    */
+   async function prepareResume(jobId: JobId): Promise<Result<JobRecord, DomainError>> {
+     const job = ports.queue.readJob(jobId);
+@@ -658,10 +676,12 @@ export function createWorker(
+     if (job.value === null) {
+       return err({ code: 'NotFound', reason: `Job ${jobId} disappeared between reconciliation and resume.` });
+     }
+-    if (job.value.state === 'Running' || job.value.state === 'Verifying') return ok(job.value);
+-    const moved = ports.queue.markState({ jobId, state: 'Running', now: ports.clock.now() });
+-    if (!moved.ok) return moved;
+-    return ok(moved.value);
++    const now = ports.clock.now();
++    if (job.value.state !== 'Running' && job.value.state !== 'Verifying') {
++      const moved = ports.queue.markState({ jobId, state: 'Running', now });
++      if (!moved.ok) return moved;
++    }
++    return ports.queue.beginAttempt({ jobId, holder: config.holder, now });
+   }
+ 
+   async function run(signal: AbortSignal): Promise<WorkerRunReport> {
+@@ -724,6 +744,30 @@ function asProjectId(value: string | null): ProjectId | null {
+   return value === null ? null : (value as ProjectId);
+ }
+ 
++/**
++ * Refuses a workspace provider that cannot re-read the workspace it prepared.
++ *
++ * The provider arrives from a module specifier, so its shape is external input and it is checked
++ * once here rather than at every checkpoint. Without `observe` the only inventory a checkpoint could
++ * carry is the one read before the attempt, which is a resume point that describes a worktree the
++ * attempt had not yet written to (F14-AC4, F17-AC2).
++ */
++function workspaceObserverOf(port: WorkspacePort): Result<WorkspaceObserver, DomainError> {
++  const observe = port.observe;
++  if (typeof observe !== 'function') {
++    return err(
++      invalid('The isolated workspace provider cannot re-read the workspace it prepared.', [
++        {
++          path: 'workspaces.observe',
++          message:
++            'A checkpoint is written after the attempt settles and must record the workspace as it is then, so a provider that can only prepare one would store the inventory it read before the work started (F14-AC4, F17-AC2).',
++        },
++      ]),
++    );
++  }
++  return ok((request) => observe.call(port, request));
++}
++
+ /**
+  * The earliest readable instant, falling back to the clock when neither record can be read.
+  */
+diff --git a/packages/adapters/src/codex/client.ts b/packages/adapters/src/codex/client.ts
+index f43e59d..c4e4237 100644
+--- a/packages/adapters/src/codex/client.ts
++++ b/packages/adapters/src/codex/client.ts
+@@ -575,6 +575,12 @@ export async function stopCodexProcess(
+  * for a few milliseconds after the kill. Sampling once would report `Detached` for a group that
+  * is in fact clean, which is the wrong answer in the direction that blocks an attempt. Polling to
+  * a deadline is what makes `survivors: false` mean the group was **observed** empty.
++ *
++ * The sleep between samples is a referenced timer. This poll runs at the one moment nothing else
++ * holds the event loop: the leader has been reaped, so the only handle left is this timer, and an
++ * unreferenced one lets Node end the worker with `Detected unsettled top-level await` and exit 13
++ * before the checkpoint is written. The bound is the deadline, not the timer's reference
++ * (F17-AC1, F17-AC2).
+  */
+ async function waitForEmptyGroup(target: CodexProcess, timeoutMs: number): Promise<boolean> {
+   const deadline = Date.now() + Math.max(0, timeoutMs);
+@@ -582,12 +588,18 @@ async function waitForEmptyGroup(target: CodexProcess, timeoutMs: number): Promi
+     if (!target.groupHasSurvivors()) return true;
+     if (Date.now() >= deadline) return false;
+     await new Promise((resolve) => {
+-      const timer = setTimeout(resolve, 25);
+-      timer.unref?.();
++      setTimeout(resolve, 25);
+     });
+   }
+ }
+ 
++/**
++ * Waits, for a bounded window, until the child exits.
++ *
++ * The timeout is referenced for the same reason the group poll's sleep is: after the last process
++ * handle is released, an unreferenced timeout is the only thing left, and Node would end the worker
++ * before it could report whether the group actually stopped (F17-AC1, F17-AC2).
++ */
+ async function waitForExit(
+   waited: Promise<{ readonly exitCode: number | null; readonly signal: string | null }>,
+   timeoutMs: number,
+@@ -595,7 +607,6 @@ async function waitForExit(
+   let timer: NodeJS.Timeout | undefined;
+   const timeout = new Promise<'timeout'>((resolve) => {
+     timer = setTimeout(() => resolve('timeout'), timeoutMs);
+-    timer.unref?.();
+   });
+   const outcome = await Promise.race([waited.then(() => 'exited' as const), timeout]);
+   if (timer !== undefined) clearTimeout(timer);
+diff --git a/packages/storage/src/jobs/lease.ts b/packages/storage/src/jobs/lease.ts
+index fb1cb53..952763d 100644
+--- a/packages/storage/src/jobs/lease.ts
++++ b/packages/storage/src/jobs/lease.ts
+@@ -640,6 +640,8 @@ export function createLeaseManager(store: LeaseStore): LeaseManager {
+    * lives: "the lease expired, therefore the process is gone". It is refused
+    * here. An expired lease records that reconciliation is required and returns
+    * without granting; only a lease the operator confirmed stopped is vacant.
++   * The one grant made on the caller's own evidence is a holder re-taking a
++   * lease it released itself, which is not a takeover of anyone (F17-AC5).
+    */
+   function reclaimLease(request: ReclaimLeaseRequest): Result<ReclaimOutcome, DomainError> {
+     return guard((): Result<ReclaimOutcome, DomainError> =>
+@@ -659,6 +661,27 @@ export function createLeaseManager(store: LeaseStore): LeaseManager {
+         }
+ 
+         if (existing.holder === request.holder) {
++          /**
++           * A holder that gave the slot up and is taking it again is not a second writer.
++           *
++           * The lease is `Released` or `HolderStoppedConfirmed` here, which means this same holder
++           * stopped writing and released it, or a confirmation of that was recorded. Minting a fresh
++           * `Active` term is what lets a continued attempt heartbeat and write its checkpoint again:
++           * a released lease refuses renewal and the job row no longer names the holder, so without
++           * this a recovered or owner-extended attempt would run while owning nothing (F17-AC5).
++           *
++           * An `Active` lease is returned as it stands, including one this holder's own term has
++           * let lapse: a second term is not minted on evidence that proved only that heartbeats
++           * stopped.
++           */
++          if (existing.state === 'Released' || existing.state === 'HolderStoppedConfirmed') {
++            const reacquired = carryConfirmationOnward(mintWriterLease(request), existing);
++            writeLeaseOnConnection(connection, reacquired);
++            const claimed = claimSlotOnConnection(connection, request, reacquired);
++            if (!claimed.ok) return claimed;
++            transferJobHolderOnConnection(connection, request.jobId, request.holder, request.now);
++            return ok({ granted: true, lease: reacquired, slot: claimed.value, previousHolder: existing.holder });
++          }
+           return ok({ granted: true, lease: existing, slot: readSlotOnConnection(connection), previousHolder: existing.holder });
+         }
+ 
+diff --git a/packages/storage/src/jobs/queue.ts b/packages/storage/src/jobs/queue.ts
+index efc1678..a780456 100644
+--- a/packages/storage/src/jobs/queue.ts
++++ b/packages/storage/src/jobs/queue.ts
+@@ -131,6 +131,19 @@ export interface HeartbeatRequest {
+   readonly leaseTtlMs: number;
+ }
+ 
++/**
++ * A writer that already holds a job and is beginning another attempt on it.
++ *
++ * A checkpoint is identified by `ckpt:<jobId>:<attemptCount>`, so an attempt that did not advance
++ * the count would write the identifier of the attempt it replaced and a resume could not say which
++ * attempt produced the workspace it is about to write over (F17-AC2, F18-AC1).
++ */
++export interface BeginAttemptRequest {
++  readonly jobId: JobId;
++  readonly holder: string;
++  readonly now: string;
++}
++
+ /** The durable resume point written for a paused or interrupted job (F17-AC2). */
+ export interface CheckpointRequest {
+   readonly jobId: JobId;
+@@ -177,6 +190,7 @@ export interface JobQueue {
+   enqueue: (request: EnqueueRequest) => Result<EnqueueOutcome, DomainError>;
+   claimNext: (candidate: ClaimCandidate) => Result<ClaimedJob, DomainError>;
+   heartbeat: (request: HeartbeatRequest) => Result<WriterLease, DomainError>;
++  beginAttempt: (request: BeginAttemptRequest) => Result<JobRecord, DomainError>;
+   checkpoint: (request: CheckpointRequest) => Result<JobCheckpoint, DomainError>;
+   markState: (request: MarkStateRequest) => Result<JobRecord, DomainError>;
+   permittedOperation: (job: JobRecord, operation: JobOperation) => Result<JobOperation, DomainError>;
+@@ -525,6 +539,45 @@ export function createJobQueue(store: JobQueueStore): JobQueue {
+     );
+   }
+ 
++  /**
++   * Records that the holder which owns this job is beginning another attempt on it.
++   *
++   * `claimNext` advances the counter for a first claim; a recovery has no claim, so without this
++   * the second engine session of a job would be recorded under the first one's attempt count and
++   * `ckpt:<jobId>:<attemptCount>` could not tell the two apart (F17-AC2).
++   *
++   * The holder is checked because the counter is part of the ownership record: a process that lost
++   * the job must not be able to advance the count of an attempt it is not performing (F17-AC5).
++   */
++  function beginAttempt(request: BeginAttemptRequest): Result<JobRecord, DomainError> {
++    return guard(() =>
++      transaction(connection, (): Result<JobRecord, DomainError> => {
++        const row = readJobRow(connection, request.jobId);
++        if (row === undefined) {
++          return err({ code: 'NotFound', reason: `No job ${request.jobId} exists to attempt.` });
++        }
++        const job = jobFromRow(row);
++        if (job.holder !== request.holder) {
++          return err(
++            conflict(
++              `Job ${request.jobId} is held by ${job.holder ?? 'nobody'}, so ${request.holder} cannot begin an attempt on it (F17-AC5).`,
++              job.holder ?? 'nobody',
++              request.holder,
++            ),
++          );
++        }
++        connection
++          .prepare('UPDATE jobs SET attempt_count = attempt_count + 1, updated_at = ? WHERE job_id = ?')
++          .run(request.now, request.jobId);
++        const stored = readJobRow(connection, request.jobId);
++        if (stored === undefined) {
++          return err({ code: 'Unavailable', reason: 'The job row vanished inside its own transaction.' });
++        }
++        return ok(jobFromRow(stored));
++      }),
++    );
++  }
++
+   /**
+    * Writes the durable resume point.
+    *
+@@ -589,7 +642,9 @@ export function createJobQueue(store: JobQueueStore): JobQueue {
+    * the coding slot. Clearing the job's holder while the slot still names it
+    * would leave a queue whose only claimable job is invisible to the next
+    * claimer, which reads as a permanently stuck writer rather than a finished
+-   * one (F13-AC2, N01-AC1).
++   * one (F13-AC2, N01-AC1). A transition is a statement that the job is no longer
++   * writing, so a caller must not record one while a process may still be writing
++   * (F17-AC5).
+    */
+   function markState(request: MarkStateRequest): Result<JobRecord, DomainError> {
+     return guard(() =>
+@@ -695,6 +750,7 @@ export function createJobQueue(store: JobQueueStore): JobQueue {
+     enqueue,
+     claimNext,
+     heartbeat,
++    beginAttempt,
+     checkpoint,
+     markState,
+     permittedOperation: permittedOperationOf,
+@@ -863,10 +919,25 @@ const ACTIVE_STATES: ReadonlySet<AttemptState> = new Set<AttemptState>([
+ /** States in which a job is no longer in flight, so it has a finish time. */
+ const FINISHED_STATES: ReadonlySet<AttemptState> = new Set<AttemptState>(['Completed', 'Cancelled']);
+ 
+-/** States in which the job is no longer the active writer, so the holder is dropped. */
++/**
++ * States in which the job is no longer the active writer, so the holder is dropped.
++ *
++ * `Blocked` and `WaitingForOwner` belong here because both mean the attempt has stopped writing:
++ * a blocked attempt has nothing left it may do without an owner decision, and a job waiting for an
++ * owner extension has already checkpointed and stopped. Keeping the single global coding slot for
++ * either state made one job that needed an owner block every later job in the project until an
++ * owner intervened, which is the opposite of what `WaitingForOwner` exists to do (F13-AC2, F18-AC2).
++ *
++ * The states that could still have a writing process are deliberately absent. `Running` and
++ * `Verifying` are the states a live attempt holds, and a writer that may still be writing is
++ * reported as detached and moves no job state at all, so no transition in this set can hand the
++ * slot to a second writer while the first one is alive (F17-AC1, F17-AC5).
++ */
+ const STATES_WITHOUT_WRITER: ReadonlySet<AttemptState> = new Set<AttemptState>([
+   'Queued',
+   'Paused',
++  'Blocked',
++  'WaitingForOwner',
+   'Completed',
+   'Cancelled',
+ ]);
