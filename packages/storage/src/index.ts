@@ -5,6 +5,7 @@ export * from './repositories/types.ts';
 export * from './repositories/core.ts';
 export * from './repositories/scope.ts';
 export * from './repositories/intake.ts';
+export * from './repositories/publication.ts';
 export * from './events/inbox.ts';
 export * from './events/outbox.ts';
 export * from './events/operations.ts';

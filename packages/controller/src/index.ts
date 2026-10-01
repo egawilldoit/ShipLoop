@@ -15,8 +15,10 @@
  */
 
 export { default } from './web-surface.ts';
+export * from './adoption.ts';
 export * from './composition.ts';
 export * from './connectors.ts';
 export * from './profiles.ts';
+export * from './publication.ts';
 export * from './sessions.ts';
 export * from './web-surface.ts';

@@ -2522,6 +2522,31 @@ function appendOnlyTriggers(table: string, reason: string): readonly string[] {
   ];
 }
 
+/**
+ * The revision a publication last read from the provider (F10-AC4).
+ *
+ * A published work item is a snapshot, not a second editable ticket, and a snapshot is
+ * only a snapshot if it names the revision it was taken from: without this column a row
+ * can say an issue is published but not which state of that issue it saw, so a later
+ * comparison would have to guess whether the provider has moved since.
+ *
+ * `scope_snapshots.provider_revision` was the obvious home and is deliberately not used.
+ * That table is the run's own capture: its reader requires a `procedure_version_id`
+ * because F12-AC1 binds a snapshot to the recipe the run was working from, and a
+ * publication is not a run and has no recipe. Putting a publication's revision there
+ * would mean inventing a procedure version, which is the kind of plausible-looking lie
+ * this schema is written to prevent.
+ *
+ * Added with `ALTER TABLE ADD COLUMN` rather than a table rebuild because the column is
+ * nullable and every existing row's honest value is NULL: nothing has been published
+ * through this build yet, and a row that has claims nothing. `ADD COLUMN` is also the
+ * cheapest forward-only step available, and the project already used it for
+ * `external_issue_id` in migration 5.
+ */
+const MIGRATION_11_PUBLISHED_PROVIDER_REVISION = `
+ALTER TABLE work_items ADD COLUMN provider_revision TEXT;
+`;
+
 const MIGRATIONS: readonly Migration[] = [
   {
     version: 1,
@@ -2616,6 +2641,13 @@ const MIGRATIONS: readonly Migration[] = [
       // survives the swap, not at the one that is dropped.
       versionBriefs(db);
       db.exec(MIGRATION_10_INTAKE_DURABLE);
+    },
+  },
+  {
+    version: 11,
+    name: 'published_provider_revision',
+    up: (db) => {
+      db.exec(MIGRATION_11_PUBLISHED_PROVIDER_REVISION);
     },
   },
 ];

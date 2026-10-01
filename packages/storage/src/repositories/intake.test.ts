@@ -44,7 +44,7 @@ import type {
   WorkItemId,
 } from '@shiploop/domain';
 import { openDatabase, type Database } from '../db.ts';
-import { LATEST_SCHEMA_VERSION, migrate } from '../migrations.ts';
+import { LATEST_SCHEMA_VERSION, migrate, migrationDefinitions } from '../migrations.ts';
 import { IntakeRepository } from './intake.ts';
 
 const PROJECT = '0a5f1c22-0000-4000-8000-00000000000a' as ProjectId;
@@ -949,7 +949,13 @@ test('migrating a fresh database twice applies nothing the second time, and no f
       .prepare('SELECT version, name FROM schema_migrations ORDER BY version')
       .all()
       .map((row) => `${row['version']}:${row['name']}`);
-    assert.equal(versions[versions.length - 1], `${LATEST_SCHEMA_VERSION}:intake_durable`);
+    // The newest recorded migration is checked against this build's own definition rather
+    // than a name written into the assertion. Pinning the name made every later migration a
+    // failure in an unrelated file, which is how a real schema change gets "fixed" by
+    // weakening something else (N08-AC3).
+    const newest = migrationDefinitions[migrationDefinitions.length - 1];
+    assert.notEqual(newest, undefined, 'this build must define at least one migration');
+    assert.equal(versions[versions.length - 1], `${LATEST_SCHEMA_VERSION}:${newest?.name}`);
 
     const before = connection
       .prepare("SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name")
