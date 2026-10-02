@@ -36,6 +36,26 @@
  * about money or a quota window. The contract has no field for the cached or reasoning splits,
  * so they are not folded into `outputTokens` — that would be inventing a number. Absent usage
  * is an explicit `Unknown` with a reason, never a zero (F18-AC4).
+ *
+ * **A structured result is a separate channel, and it fails closed.** The session's final
+ * answer is requested through `--output-schema` and read from the artifact `--output-last-message`
+ * writes; both are built in `client.ts`, which also confines that artifact to the attempt's own
+ * directory. What arrives here is bytes plus a schema, and the terminal decision is the only place
+ * they are turned into an event. Four properties hold there:
+ *
+ *   - the summary cap is untouched. A `Progress` summary and the `Succeeded` summary are still
+ *     capped at {@link MAX_SUMMARY_CHARS}, and the result is **not** merged into either of them, so
+ *     a structured answer can never be smuggled through the bounded channel (F15-AC2).
+ *   - the payload is checked for completeness against the schema the caller asked for: every
+ *     property the schema declares must be present, recursively, and a declared `enum` must be
+ *     respected. This is not a general JSON Schema validator and does not claim to be — it checks
+ *     the property this module can check without reimplementing one, and `README.md` says exactly
+ *     that.
+ *   - a session that asked for a result and did not produce a valid one emits a
+ *     `MalformedOutput` diagnostic and **no** `Result` event. That is the same rule the malformed
+ *     stream follows, for the same reason: a partial answer is not an answer (F15-AC2).
+ *   - the payload passes through the caller's `redact` before it reaches any caller, because it is
+ *     engine text on its way into stored rows, logs and refusals (N02-AC2).
  */
 
 import type { ProviderId } from '@shiploop/domain';
@@ -45,16 +65,49 @@ import type {
   EngineEvent,
   EngineOutcome,
   EngineReportedUsage,
+  EngineResultPayload,
+  EngineResultSchema,
   EngineStage,
   EngineUsage,
 } from '../contracts/index.ts';
 import { classifyCodexFailure, codexBlockedOutcome, codexDiagnosticRetry, isCodexBlocker } from './errors.ts';
 
-/** Upper bound on any engine text that becomes an event summary. */
+/**
+ * Upper bound on any engine text that becomes an event **summary**.
+ *
+ * This bound is a property of the summary channel and of nothing else. It exists because a
+ * summary is a line a person reads in a progress update, so it is truncated to stay one. It is
+ * deliberately *not* the way a structured answer travels: a plan proposal is thousands of
+ * characters, and the defect this bound was next to was a real `codex exec` session whose
+ * structured answer arrived on stdout and was cut off here, leaving `applyPlanProposal` with half
+ * an object and no way to tell it from a short one. A complete structured result now arrives on
+ * its own channel (`EngineOutcome.Succeeded.result`), and `MAX_SUMMARY_CHARS` is unchanged and
+ * still applies to summaries only (F15-AC2).
+ */
 const MAX_SUMMARY_CHARS = 400;
 
 /** Upper bound on retained malformed-line text, so a diagnostic cannot carry a whole stream. */
 const MAX_MALFORMED_CHARS = 200;
+
+/**
+ * Upper bound on how deep the result check will walk a nested schema.
+ *
+ * A depth the schema cannot express is not a shape this adapter can validate, so a schema that
+ * nests deeper is refused rather than partially checked (F15-AC2).
+ */
+const MAX_RESULT_SCHEMA_DEPTH = 12;
+
+/**
+ * Upper bound on schema-declared properties checked in one result.
+ *
+ * Fail-closed on purpose: when the budget runs out the result is refused and the refusal says so.
+ * Checking the first N nodes and reporting success would be a completeness claim this adapter
+ * could not support (F15-AC2).
+ */
+const MAX_RESULT_CHECKED_PROPERTIES = 4_096;
+
+/** Upper bound on schema failures named in one refusal, so a diagnostic cannot carry a whole object. */
+const MAX_RESULT_FAILURES = 8;
 
 /**
  * A Codex thread id is an opaque provider identity.
@@ -474,6 +527,181 @@ export interface CodexFinalizeInput {
   readonly startedAt: string;
   readonly interruption: CodexStreamInterruption | null;
   readonly exitCode: number | null;
+  /** Whether this session was asked to produce a structured result. Required, never defaulted. */
+  readonly resultExpected: boolean;
+  /** What was read from the result artifact, or null when this session asked for no result. */
+  readonly result: CodexResultOutcome | null;
+  /**
+   * The schema the result was asked to satisfy, or null when this session asked for no result.
+   *
+   * Required rather than inferred from `result`, so "this session wants a checked result" is one
+   * fact at the call site rather than two that can disagree (F15-AC2).
+   */
+  readonly schema: EngineResultSchema | null;
+}
+
+/**
+ * What the result channel produced for one session.
+ *
+ * `Read` and `Unreadable` are both answers. `Unreadable` is not an absence of an answer: it is the
+ * adapter's own statement that the artifact could not be read, with the reason already redacted by
+ * whoever read it. Both reach {@link finalizeCodexStream}, which is the only place a result may
+ * become an event.
+ */
+export type CodexResultOutcome =
+  | { readonly kind: 'Read'; readonly text: string; readonly byteLength: number; readonly sourcePath: string }
+  | { readonly kind: 'Unreadable'; readonly detail: string };
+
+/**
+ * What one schema check found in a decoded result.
+ *
+ * `failures` is bounded by {@link MAX_RESULT_FAILURES} and `totalFailures` counts all of them, so a
+ * refusal can name a handful and still say how many there were.
+ */
+export interface CodexSchemaCheck {
+  readonly failures: readonly string[];
+  readonly totalFailures: number;
+  readonly checkedProperties: number;
+  /** Set when the check stopped early: the budget or the depth bound was reached. */
+  readonly boundReached: 'PropertyBudget' | 'DepthBudget' | null;
+}
+
+/**
+ * Checks a decoded result against the schema the caller asked for.
+ *
+ * **What this is.** A completeness check: every property the schema declares must be present, all
+ * the way down through nested objects and array items, every `required` name must be present, and a
+ * declared `enum` must be respected. That is the property that matters at this boundary — that
+ * nothing the caller asked for was dropped on the way out of the engine — and it is the part a
+ * general validator would still have to be told about.
+ *
+ * **What this is not.** A JSON Schema implementation. `type`, `minItems`, numeric bounds,
+ * `pattern`, `oneOf` and the rest of the vocabulary are not evaluated, and this function does not
+ * pretend otherwise: an unrecognised keyword contributes no check rather than a guess. A caller
+ * that needs full conformance must validate the payload itself, which it can do because the whole
+ * payload is handed over.
+ *
+ * **Why it fails closed.** Running out of the property budget or the depth budget is a refusal,
+ * not a pass. A check that stopped early has not established completeness, and reporting it as one
+ * would be the same defect as reading a truncated summary as a whole answer.
+ */
+export function checkCodexResultAgainstSchema(value: unknown, schema: EngineResultSchema): CodexSchemaCheck {
+  const failures: string[] = [];
+  let totalFailures = 0;
+  let checkedProperties = 0;
+  let boundReached: CodexSchemaCheck['boundReached'] = null;
+
+  const note = (message: string): void => {
+    totalFailures += 1;
+    if (failures.length < MAX_RESULT_FAILURES) failures.push(message);
+  };
+
+  const walk = (current: unknown, node: unknown, path: string, depth: number): void => {
+    if (boundReached !== null) return;
+    if (depth > MAX_RESULT_SCHEMA_DEPTH) {
+      boundReached = 'DepthBudget';
+      note(`the schema nests deeper than the ${String(MAX_RESULT_SCHEMA_DEPTH)} levels this adapter can check at ${path || 'the root'}`);
+      return;
+    }
+    if (!isRecord(node)) return;
+
+    const enumValues = node['enum'];
+    if (Array.isArray(enumValues) && !enumValues.some((allowed) => allowed === current)) {
+      note(`${path || 'the result'} is ${JSON.stringify(current)} and the schema allows only ${JSON.stringify(enumValues)}`);
+    }
+
+    const required = node['required'];
+    if (Array.isArray(required) && isRecord(current)) {
+      for (const name of required) {
+        if (typeof name !== 'string') continue;
+        checkedProperties += 1;
+        if (checkedProperties > MAX_RESULT_CHECKED_PROPERTIES) {
+          boundReached = 'PropertyBudget';
+          note(`the result declares more than the ${String(MAX_RESULT_CHECKED_PROPERTIES)} schema-declared properties this adapter can check`);
+          return;
+        }
+        if (!(name in current)) note(`${path === '' ? 'the result' : path} is missing the schema-required property "${name}"`);
+      }
+    }
+
+    const properties = node['properties'];
+    if (isRecord(properties) && isRecord(current)) {
+      for (const [name, child] of Object.entries(properties)) {
+        checkedProperties += 1;
+        if (checkedProperties > MAX_RESULT_CHECKED_PROPERTIES) {
+          boundReached = 'PropertyBudget';
+          note(`the result declares more than the ${String(MAX_RESULT_CHECKED_PROPERTIES)} schema-declared properties this adapter can check`);
+          return;
+        }
+        const here = `${path === '' ? '' : `${path}.`}${name}`;
+        if (!(name in current)) {
+          note(`the result is missing the schema-declared property "${here}"`);
+          continue;
+        }
+        walk(current[name], child, here, depth + 1);
+      }
+    }
+
+    const items = node['items'];
+    if (items !== undefined && Array.isArray(current)) {
+      for (const [index, entry] of current.entries()) {
+        walk(entry, items, `${path}[${String(index)}]`, depth + 1);
+        if (boundReached !== null) return;
+      }
+    }
+  };
+
+  walk(value, schema, '', 0);
+  return { failures, totalFailures, checkedProperties, boundReached };
+}
+
+/**
+ * Turns one read artifact into the payload an event carries, or into the refusal that replaces it.
+ *
+ * The text is redacted *after* it has been read and measured, so `byteLength` reports what the
+ * engine actually wrote even when redaction shortened the string (N02-AC2). Nothing here mutates
+ * the payload: the whole text is handed on so a caller that wants a stricter schema check than
+ * this one can apply it.
+ */
+export function codexResultPayloadOf(input: {
+  readonly outcome: { readonly kind: 'Read'; readonly text: string; readonly byteLength: number; readonly sourcePath: string };
+  readonly schema: EngineResultSchema;
+  readonly redact: (text: string) => string;
+}): { readonly ok: true; readonly payload: EngineResultPayload } | { readonly ok: false; readonly detail: string } {
+  const trimmed = input.outcome.text.trim();
+  if (trimmed.length === 0) {
+    return { ok: false, detail: `The structured result at ${input.outcome.sourcePath} holds no text at all.` };
+  }
+
+  let decoded: unknown;
+  try {
+    decoded = JSON.parse(trimmed);
+  } catch (cause) {
+    return {
+      ok: false,
+      detail: `The structured result at ${input.outcome.sourcePath} is ${String(input.outcome.byteLength)} bytes and is not readable JSON (${cause instanceof Error ? cause.message : String(cause)}). A payload that cannot be parsed cannot be checked for completeness, so it is refused rather than reported as a result (F15-AC2).`,
+    };
+  }
+
+  const check = checkCodexResultAgainstSchema(decoded, input.schema);
+  if (check.totalFailures > 0) {
+    const shown = check.failures.join('; ');
+    const more = check.totalFailures > check.failures.length ? ` (and ${String(check.totalFailures - check.failures.length)} more)` : '';
+    return {
+      ok: false,
+      detail: `The structured result at ${input.outcome.sourcePath} does not satisfy the schema it was asked for: ${shown}${more}. The turn completed and the payload is present, so this is the engine's answer rather than a transport failure (F15-AC2).`,
+    };
+  }
+
+  return {
+    ok: true,
+    payload: {
+      json: input.redact(input.outcome.text),
+      byteLength: input.outcome.byteLength,
+      sourcePath: input.outcome.sourcePath,
+      checkedProperties: check.checkedProperties,
+    },
+  };
 }
 
 /**
@@ -489,7 +717,14 @@ export interface CodexFinalizeInput {
  * 3. Codex emitted no terminal event → `Incomplete` with `OutputTruncated`. An engine that
  *    stops talking is not a success, which is the other half of F15-AC2.
  * 4. `turn.failed` → `Blocked` for the four blocker categories, `Failed` otherwise (F15-AC3).
- * 5. `turn.completed` → `Succeeded`, with the engine's own last message as the summary.
+ * 5. The session asked for a structured result and did not produce a valid one →
+ *    `MalformedOutput` and **no** `Result`. Placed after the interruption check so a paused turn
+ *    reports the pause rather than complaining about a payload the engine was never asked for
+ *    again, and before `turn.completed` is read as a success so a turn that completed with an
+ *    unreadable, truncated or incomplete answer is still not a completion.
+ * 6. `turn.completed` → `Succeeded`, with the engine's own last message as the summary and, when
+ *    one was asked for, the whole result on `outcome.result`. The summary stays capped either
+ *    way: the result is a different field, not a longer summary.
  *
  * Exactly one `Usage` event is emitted, always. F18-AC4 asks for `Unknown` when usage is
  * absent, and a stream that sometimes omits the record entirely makes "absent" and "not
@@ -562,17 +797,67 @@ export function finalizeCodexStream(input: CodexFinalizeInput): readonly EngineE
     return events;
   }
 
-  events.push({
-    kind: 'Result',
-    at,
-    outcome: {
-      kind: 'Succeeded',
-      summary: options.redact(
-        truncate(state.lastAgentMessage ?? 'Codex reported a completed turn with no final message.', MAX_SUMMARY_CHARS),
-      ),
-    },
-  });
+  const outcome = succeededOutcomeOf(input);
+  if (outcome.kind === 'Refused') {
+    events.push({
+      kind: 'Diagnostic',
+      at,
+      category: 'MalformedOutput',
+      detail: options.redact(outcome.detail),
+      retry: 'Terminal',
+      evidence: null,
+    });
+    return events;
+  }
+
+  events.push({ kind: 'Result', at, outcome: outcome.outcome });
   return events;
+}
+
+/** The outcome of the final decision, or the refusal that replaces it. */
+type CodexTerminalDecision =
+  | { readonly kind: 'Outcome'; readonly outcome: EngineOutcome }
+  | { readonly kind: 'Refused'; readonly detail: string };
+
+/**
+ * The `Succeeded` outcome for a completed turn, or the refusal that replaces it.
+ *
+ * A refusal is what makes a bad result *not* a completion: the caller receives a diagnostic and no
+ * `Result` event at all, so nothing downstream can read this turn as the last word (F15-AC2).
+ *
+ * The summary is capped either way, and the result is a separate field on the same outcome. That
+ * is the whole separation: widening `summary` would have made the bound a lie, and merging the
+ * result into it would have made the result unreachable to anything that reads the payload rather
+ * than the prose.
+ */
+function succeededOutcomeOf(input: CodexFinalizeInput): CodexTerminalDecision {
+  const summary = input.options.redact(
+    truncate(input.state.lastAgentMessage ?? 'Codex reported a completed turn with no final message.', MAX_SUMMARY_CHARS),
+  );
+  if (!input.resultExpected) return { kind: 'Outcome', outcome: { kind: 'Succeeded', summary } };
+
+  const result = input.result;
+  if (result === null) {
+    return {
+      kind: 'Refused',
+      detail: `This session asked for a structured result and none was read, so the turn cannot be called successful. A completed turn with no answer is not an empty answer (F15-AC2).`,
+    };
+  }
+  if (result.kind === 'Unreadable') return { kind: 'Refused', detail: result.detail };
+
+  // The schema travels with the session rather than with the bytes, so a result with nothing to be
+  // checked against is refused rather than reported unchecked.
+  const schema = input.schema;
+  if (schema === null) {
+    return {
+      kind: 'Refused',
+      detail: `A structured result was read from ${result.sourcePath} but this session carried no schema, so nothing about it was verified. A result nobody checked is not a result (F15-AC2).`,
+    };
+  }
+
+  const checked = codexResultPayloadOf({ outcome: result, schema, redact: input.options.redact });
+  if (!checked.ok) return { kind: 'Refused', detail: checked.detail };
+  return { kind: 'Outcome', outcome: { kind: 'Succeeded', summary, result: checked.payload } };
 }
 
 /**

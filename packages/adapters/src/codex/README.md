@@ -14,6 +14,11 @@ for a reader to discover.
 
 - Probed live on **1 October 2026**, `linux/arm64` (2 x Neoverse-N1, ~12 GiB RAM, no swap),
   Node v24.18.0, against `codex-cli 0.159.1` authenticated with `Logged in using ChatGPT`.
+- The **structured-result channel** was probed separately on **2 October 2026** against
+  `codex-cli 0.160.0`, which is what this host currently runs. Two constants rather than one,
+  because the two sets of facts came off two binaries: `CODEX_VERIFIED_VERSION` is the version the
+  event schema was read off, `CODEX_RESULT_CHANNEL_VERSION` is the version the result-channel
+  behaviour was read off.
 - Every live run was confined to a throwaway Git workspace under `/tmp` and asked for **one** small
   file. Nothing outside that workspace was written, and no account, plan or credential was changed.
 
@@ -21,7 +26,7 @@ for a reader to discover.
 
 | File | What it owns |
 | --- | --- |
-| `client.ts` | Process transport: version probe, argv construction, the sandbox allowlist, detached process groups, bounded shutdown |
+| `client.ts` | Process transport: version probe, argv construction, the sandbox allowlist, detached process groups, bounded shutdown, and the structured-result channel (schema write, artifact confinement, whole read) |
 | `events.ts` | Codex JSONL to the closed `EngineEvent` union, and the deferred terminal decision |
 | `errors.ts` | Engine failure to `DomainError`, `EngineDiagnosticCategory` and blocked outcomes |
 | `adapter.ts` | `EngineAdapter`: capability declarations, compatibility, session lifecycle, continuation, stop |
@@ -47,6 +52,10 @@ SHIPLOOP_CODEX_LIVE=1 node --test 'packages/adapters/src/codex/codex.test.ts'
 # the opt-in live continuation pass, against a thread recorded by an earlier run
 SHIPLOOP_CODEX_LIVE=1 SHIPLOOP_CODEX_LIVE_THREAD=<thread-uuid> \
   node --test 'packages/adapters/src/codex/codex.test.ts'
+
+# the opt-in live result pass (one turn; separate flag so it can run without the other two)
+SHIPLOOP_CODEX_LIVE=1 SHIPLOOP_CODEX_LIVE_RESULT=1 \
+  node --test 'packages/adapters/src/codex/codex.test.ts'
 ```
 
 Both live tests are skipped by default and say why, naming the missing prerequisite:
@@ -56,6 +65,9 @@ Both live tests are skipped by default and say why, naming the missing prerequis
   # no SHIPLOOP_CODEX_LIVE=1; the live pass needs an authenticated codex on PATH and spends account quota
 ﹣ F15-AC4 a live resume continues the recorded conversation in place
   # no SHIPLOOP_CODEX_LIVE=1 with SHIPLOOP_CODEX_LIVE_THREAD; name a recorded Codex thread id to continue
+﹣ F15-AC2 a live Codex turn delivers a structured result longer than the summary cap, whole
+  # no SHIPLOOP_CODEX_LIVE=1 with SHIPLOOP_CODEX_LIVE_RESULT=1; the live result pass needs an
+  # authenticated codex on PATH and spends one account turn
 ```
 
 ## Proven against the LIVE `codex` binary
@@ -83,6 +95,11 @@ documentation or from a fixture.
 | An unknown thread id fails with **no JSONL at all** and exit 1: `Error: thread/resume: thread/resume failed: no rollout found for thread id <id> (code -32600)` | `codex exec resume 00000000-0000-4000-8000-000000000000` | that exact condition, and only that condition, produces `RestartedFromCheckpoint` with a fresh session seeded from the checkpoint |
 | `--` ends flag parsing, so an instruction beginning with `-` is still an instruction | `codex exec --sandbox read-only --cd <dir> --json -- "<prompt>"` started normally | the prompt is passed after `--` and can never be read as an option |
 | The binary's `ThreadEvent` serde names corroborate the observed set: `thread.started`, `turn.started`, `turn.completed`, `turn.failed`, `item.started`, `item.updated`, `item.completed`, `error` | `strings` over the shipped binary | `CODEX_MODELLED_EVENT_TYPES` matches the wire, so a type this adapter does not model is a deliberate omission rather than a guess |
+| `codex exec --help` and `codex exec resume --help` both list `--output-schema <FILE>` ("Path to a JSON Schema file describing the model's final response shape") **and** `-o, --output-last-message <FILE>` | `--help` on 0.160.0, read for both subcommands rather than assumed for one | the result channel is available on a fresh run *and* a resumed one, so `buildArgv` emits both flags under either invocation |
+| A turn given `--output-schema` answered with **exactly** the requested object and no prose, and the same text was written to the `-o` file | a bounded live run with a `PlanProposal` schema | the engine's own channel is constrained rather than merely requested, which is what makes the payload machine-readable at all |
+| `-o` wrote **2250 bytes** under `--sandbox read-only`, the same text the final `agent_message` carried on stdout | the same run | the artifact is written by the CLI process, not by a sandboxed command. A plan-mode session is read-only, so this is the case that had to work |
+| The provider **rejects** a schema whose object nodes omit `additionalProperties: false`: `Invalid schema for response_format 'codex_output_schema': In context=(), 'additionalProperties' is required to be supplied and to be false.` | a live run with the first draft of the test schema | the turn failed and the adapter reported the engine's own refusal as a `Failed` outcome with no result — correct, but the fault is the caller's schema. `codex.test.ts` now asserts every object node of the shipped fixture declares it, and `README.md` states the constraint where a caller will read it |
+| A live turn through the **shipped adapter** produced a 2876-byte `PlanProposal` with a single 491-character field, two acceptance criteria and a 412-character truncated terminal summary | `SHIPLOOP_CODEX_LIVE_RESULT=1 node --test` | the payload arrives whole on `EngineOutcome.Succeeded.result` while every summary stays at the 400-character cap. This is the proof the whole channel exists for |
 
 ## Proven against CAPTURED output, not a live run
 
@@ -105,6 +122,102 @@ detached process group, line queue, translation, terminal decision, shutdown —
 code. It exists because proving those properties does not require spending engine quota, and
 because the shutdown contract needs a process that **ignores `SIGTERM`** in order to prove that
 escalation is what ended it.
+
+## The structured result channel: a payload that is not a longer summary
+
+`MAX_SUMMARY_CHARS` is 400 and it stays 400. That bound is a property of the **summary channel**:
+a progress line and a terminal summary are text a person reads, so they are truncated to stay one.
+It was never a way to move a structured answer, and the reason it became one is the defect this
+channel fixes — a real `codex exec` session put a whole plan on stdout, `finalizeCodexStream` kept
+only the truncated summary, and `applyPlanProposal` was handed half an object that read as
+`Invalid`.
+
+**The two channels are separate, in the type.** `EngineOutcome.Succeeded` carries `summary` (bounded,
+human-readable) and `result` (whole, machine-readable), and only a session that asked for one via
+`EngineStartRequest.result` can have the second. Nothing merges them, and no summary was widened.
+`EngineOutcome` is in `../contracts/engine.ts`; that file grew two optional members
+(`Succeeded.result`, `EngineStartRequest.result`, `ResumeEngineSessionRequest.result`) and the two
+schema types, and nothing else changed there.
+
+**What the CLI actually supports**, measured on 0.160.0 rather than assumed:
+
+| Flag | What it does | Why both are needed |
+| --- | --- | --- |
+| `--output-schema <FILE>` | constrains the model's **final response** to a JSON Schema | without it `-o` captures whatever prose the model chose |
+| `-o/--output-last-message <FILE>` | writes that final message to a file | without it the payload stays on stdout, where the summary cap cuts it |
+
+Both appear under `codex exec --help` **and** `codex exec resume --help`, so a resumed run gets the
+same channel. `-o` writes the artifact even under `--sandbox read-only`, because the CLI process
+writes it rather than a sandboxed command — which is what makes the channel usable for the read-only
+sessions that need a structured answer most.
+
+**Where the artifact lives, and what is checked.** Under
+`<stateRoot>/home/<attemptKey>/.shiploop/results/<token>.json` — inside the ShipLoop-owned home
+`prepareEngineState` already creates 0700 for this workspace and already hands the engine as `HOME`.
+Not inside the workspace: an untracked file in the attempt's own worktree appears in its change
+inventory, which is exactly the marker `apps/worker/src/isolation.ts` deletes after its probe so a
+no-code run cannot look like a change (F14-AC4, F19-AC5).
+
+Five things are checked, and each is checked **after** resolving symlinks, because a containment
+test on the unresolved path passes for a link that points outside:
+
+| Check | What it refuses | Test |
+| --- | --- | --- |
+| the results directory resolves inside the attempt home | a planted `.shiploop` symlink that moves the channel out | `a results directory that resolves outside the attempt home is refused` |
+| the result path resolves against its **resolved parent** and lands inside it | `..` traversal, and a symlinked parent — the same comparison catches both | `a result path is confined after symlinks are resolved, not before` |
+| the path must be absolute, and must name a file | a relative path, which resolves against whatever the process considers its working directory | same |
+| **the path must not already exist** | a file an earlier attempt on this worktree left behind | `a result file left over from an earlier launch is refused, never read as this one` |
+| at read time: a regular file, still resolving inside the home | a symbolic link, planted before or swapped in during the run | `an artifact that is a symbolic link is never followed, and neither is one outside the home` |
+
+The stale check is the interesting one. A per-launch UUID token makes a collision improbable; the
+existence check makes it impossible, and it is also what refuses a *deliberately* reused token —
+which is how the test proves it rather than asserting it.
+
+**What is refused, and how.** Four faults, each naming itself, none of which becomes a partial
+success:
+
+| Fault | Refusal |
+| --- | --- |
+| nothing written | `No structured result was written to <path> … A completed turn with no answer is not an empty answer` |
+| empty artifact | `is empty` |
+| past `MAX_RESULT_BYTES` (256 KiB) | `is N bytes, past the M-byte bound … refused rather than truncated: a cut-off payload cannot be told apart from a whole one` |
+| decoded to fewer bytes than the file held | `cut off mid-character` — a file truncated inside a UTF-8 sequence decodes losslessly-looking text that is not the text that was written |
+
+Any of these, plus a payload that is not readable JSON or does not satisfy the schema, produces a
+**`MalformedOutput` diagnostic with `retry: 'Terminal'` and no `Result` event at all** — the same
+rule a malformed event stream already follows, for the same reason (F15-AC2). A turn that completed
+with an unusable answer is not a completion.
+
+**What the schema check is, precisely.** `checkCodexResultAgainstSchema` verifies **completeness**:
+every property the schema declares is present, recursively through nested objects and array items,
+every `required` name is present, and a declared `enum` is respected. It is **not** a JSON Schema
+validator. `type`, `minItems`, numeric bounds, `pattern`, `oneOf` and the rest are not evaluated,
+and an unrecognised keyword contributes no check rather than a guess — a caller that needs full
+conformance validates the payload itself, which it can do because the whole payload is handed over.
+Running out of the property budget (4096) or the depth budget (12) is a **refusal**, not a pass: a
+check that stopped early has not established completeness. `Succeeded.result.checkedProperties`
+reports how many properties were actually verified, so the claim is inspectable.
+
+The payload and the refusal both pass through `AdapterContext.redact` before they reach a caller,
+and `byteLength` reports what the engine wrote rather than what survived redaction (N02-AC2).
+
+**One provider rule belongs to the caller.** The provider rejects a schema whose object nodes omit
+`additionalProperties: false`, and names itself rather than naming anything ShipLoop could check in
+advance. `codex.test.ts` asserts the shipped fixture satisfies it; the adapter does not rewrite a
+caller's schema, because silently editing the document the engine was asked to honour would make
+`--output-schema` mean something other than what it says.
+
+### Known limits of this channel
+
+- **Artifacts accumulate.** Nothing deletes `<home>/.shiploop/results/` after a read. Each is bounded
+  at 256 KiB and each carries a per-launch token, so nothing stale is ever read, but a long-lived
+  state root accumulates them. Retention is not this unit's decision.
+- **The completeness check is a subset of JSON Schema**, named above rather than implied.
+- **`--output-schema` is a request, not a guarantee.** A model that ignores it produces a payload the
+  schema check rejects, which is a refusal. Nothing here converts that into a usable result.
+- **Proven on 0.160.0 only.** `--output-schema` and `-o` are listed by 0.159.1's help as well, but
+  the behaviour recorded above — read-only artifact write, `additionalProperties` requirement — was
+  measured on 0.160.0 and is not claimed for 0.159.1.
 
 ## `resumeSession`: what it actually does, and what it is honest about
 
@@ -232,9 +345,11 @@ does the same through a scripted engine whose `sh` body is `trap '' TERM` with a
   `resolveSandboxMode` is an **allowlist**: a denylist that missed a future Codex sandbox name
   would fail open, and an allowlist fails closed. The refusal names both permitted modes so an
   owner correcting the profile does not have to read this file.
-- **`--output-last-message` is deliberately unused.** It writes a file, and this unit has no
-  artifact store to own it. The engine's final message already arrives as a completed
-  `agent_message` item, which is what the success summary uses.
+- **The result artifact is an engine-owned file, not a ShipLoop artifact.** `Progress.detail`
+  (`ArtifactReference`) is still always null and no artifact store is referenced: this unit has no
+  store to point at, so naming one would fabricate evidence (F15-AC2). What the result channel
+  writes is a transport file, read back inside the same session and reported by a path relative to
+  the attempt home — not a durable artefact a UI could open.
 - **Stage attribution is a translation, not a provider fact.** `reasoning` items are dropped
   deliberately: promoting the engine's private scratch text into owner-visible progress would put
   model reasoning into product state.

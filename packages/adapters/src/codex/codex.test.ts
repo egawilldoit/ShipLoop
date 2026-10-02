@@ -24,7 +24,19 @@
 
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -39,15 +51,21 @@ import {
   CODEX_VERIFIED_VERSION,
   CodexClient,
   ENGINE_ENVIRONMENT_VARIABLES,
+  ENGINE_RESULT_DIRECTORY,
+  ENGINE_RESULT_SCHEMA_FILE,
+  MAX_RESULT_BYTES,
   MINIMUM_CODEX_VERSION,
   attemptKeyOf,
   buildArgv,
   checkCodexVersion,
+  confineResultPath,
   defaultEngineStateRoot,
   engineEnvironment,
   engineStateLayout,
   parseCodexVersion,
+  prepareEngineResultChannel,
   prepareEngineState,
+  readCodexResult,
   resolveSandboxMode,
   spawnTrackedGroup,
   stopCodexProcess,
@@ -165,6 +183,12 @@ async function collect(events: AsyncIterable<EngineEvent>): Promise<readonly Eng
 
 function resultOutcomes(events: readonly EngineEvent[]): readonly Extract<EngineEvent, { kind: 'Result' }>['outcome'][] {
   return events.filter((event): event is Extract<EngineEvent, { kind: 'Result' }> => event.kind === 'Result').map((event) => event.outcome);
+}
+
+/** Whether the session's single `Usage` event reported the engine's own numbers or refused to guess. */
+function usageKindOf(events: readonly EngineEvent[]): 'Reported' | 'Unknown' | null {
+  const usage = events.find((event) => event.kind === 'Usage');
+  return usage !== undefined && usage.kind === 'Usage' ? usage.usage.kind : null;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -328,8 +352,13 @@ test('F03-AC5 a fresh argv carries the sandbox, the workspace, --json and no byp
     model: null,
     skipGitRepoCheck: false,
     configOverrides: [],
+    resultChannel: null,
   });
   assert.deepEqual(argv, ['exec', '--sandbox', 'workspace-write', '--cd', '/tmp/attempt', '--json', '--', 'create probe.txt']);
+  // A session that asked for no structured result puts no result flags on the command line, so
+  // there is no artifact for anything to read and nothing that could be read instead.
+  assert.equal(argv.includes('--output-schema'), false);
+  assert.equal(argv.includes('-o'), false);
   assert.equal(argv.includes('--dangerously-bypass-approvals-and-sandbox'), false);
   assert.equal(argv.includes('--dangerously-bypass-hook-trust'), false);
 });
@@ -343,6 +372,7 @@ test('F15-AC4 a resume argv carries the sandbox as a config override and the thr
     model: 'gpt-6-luna',
     skipGitRepoCheck: true,
     configOverrides: ['approval_policy="never"'],
+    resultChannel: null,
     priorSessionId: '01a0f699-7149-7d20-831e-98f7b7b43a71',
   });
   // `codex exec resume` accepts neither --sandbox nor --cd on 0.159.1, so both are carried elsewhere.
@@ -376,6 +406,7 @@ test('F03-AC5 an instruction that looks like a shell command stays one argument 
     model: null,
     skipGitRepoCheck: false,
     configOverrides: [],
+    resultChannel: null,
   });
   assert.equal(argv[argv.length - 1], '; rm -rf / && echo pwned');
   assert.equal(argv.filter((entry) => entry.includes('rm -rf')).length, 1);
@@ -430,6 +461,666 @@ test('F15-AC4 a resume without a thread id is refused rather than falling back t
     assert.equal(continuation.ok === true && continuation.value.kind === 'ResumedInPlace', false);
   } finally {
     rmSync(engine.dir, { recursive: true, force: true });
+  }
+});
+
+/* -------------------------------------------------------------------------- */
+/* F15-AC2: the structured result channel, separate from bounded summaries     */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The JSON Schema a plan-mode result is asked to satisfy.
+ *
+ * The same shape `applyPlanProposal` needs, kept small here: what is under test is that the schema
+ * reaches `codex` and that the payload comes back whole, not that this adapter can describe a plan.
+ */
+const RESULT_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['kind', 'briefId', 'draftedAt', 'requestedOutcomes', 'tasks', 'exclusions'],
+  properties: {
+    kind: { type: 'string', enum: ['PlanProposal'] },
+    briefId: { type: 'string' },
+    draftedAt: { type: 'string' },
+    requestedOutcomes: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['id', 'statement'],
+        properties: { id: { type: 'string' }, statement: { type: 'string' } },
+      },
+    },
+    tasks: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: [
+          'taskId',
+          'coversOutcomeIds',
+          'outcome',
+          'scope',
+          'acceptanceCriteria',
+          'verificationMethod',
+          'dependencies',
+          'relevantProjectContext',
+          'implementationLocation',
+        ],
+        properties: {
+          taskId: { type: 'string' },
+          coversOutcomeIds: { type: 'array', items: { type: 'string' } },
+          outcome: { type: 'string' },
+          scope: { type: 'string' },
+          acceptanceCriteria: { type: 'array', minItems: 1, items: { type: 'string' } },
+          verificationMethod: { type: 'string' },
+          dependencies: { type: 'array', items: { type: 'string' } },
+          relevantProjectContext: { type: 'array', items: { type: 'string' } },
+          implementationLocation: {
+            type: 'object',
+            additionalProperties: false,
+            required: ['kind', 'candidates', 'basis'],
+            properties: {
+              kind: { type: 'string', enum: ['ProposedLocation'] },
+              candidates: { type: 'array', minItems: 1, items: { type: 'string' } },
+              basis: { type: 'string' },
+            },
+          },
+        },
+      },
+    },
+    exclusions: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['outcomeId', 'excluded', 'reason'],
+        properties: {
+          outcomeId: { type: 'string' },
+          excluded: { type: 'string' },
+          reason: { type: 'string' },
+        },
+      },
+    },
+  },
+} as const;
+
+/** Every object node in a schema, so the rule below can be checked rather than remembered. */
+function objectNodesOf(schema: unknown, found: Record<string, unknown>[] = []): Record<string, unknown>[] {
+  if (schema === null || typeof schema !== 'object' || Array.isArray(schema)) return found;
+  const node = schema as Record<string, unknown>;
+  if (node['type'] === 'object') found.push(node);
+  for (const value of Object.values(node)) {
+    if (Array.isArray(value)) for (const entry of value) objectNodesOf(entry, found);
+    else objectNodesOf(value, found);
+  }
+  return found;
+}
+
+test('F15-AC2 the schema this adapter writes must declare additionalProperties false everywhere', () => {
+  // Measured on 2 October 2026 against a live `codex exec --output-schema`: the provider refused a
+  // schema whose object nodes did not say so, with
+  //   `Invalid schema for response_format 'codex_output_schema': In context=(),
+  //    'additionalProperties' is required to be supplied and to be false.`
+  // and the turn failed. The adapter reported that as the engine's own refusal rather than as a
+  // success with an empty result, which is the right answer, but the fix belongs here: a caller
+  // that writes a schema without it gets a failed turn and no payload, and the error names a
+  // provider constraint rather than anything ShipLoop could have checked in advance.
+  //
+  // So this test exists to keep the shipped fixture honest. It cannot make every caller's schema
+  // valid, and it does not pretend to: `EngineResultSchema` is the engine's document, and the
+  // provider's rules for it are the provider's. What it does is make sure the example this adapter
+  // ships and proves against is one the provider accepts.
+  const nodes = objectNodesOf(RESULT_SCHEMA);
+  assert.ok(nodes.length >= 5, `expected several object nodes in the fixture schema, saw ${String(nodes.length)}`);
+  for (const node of nodes) {
+    assert.equal(node['additionalProperties'], false, 'an object node in the fixture schema omits additionalProperties: false');
+  }
+});
+
+/**
+ * A payload that is unambiguously longer than the 400-character summary cap.
+ *
+ * Built rather than pasted so the test can state the property it depends on — every prose field is
+ * a distinct sentence, so no amount of compression could bring the whole object under the cap.
+ */
+function longResultPayload(): string {
+  const sentence = (topic: string): string =>
+    `A ${topic} sentence long enough that no reader would treat it as incidental, written here so the payload cannot be summarised away.`;
+  return JSON.stringify({
+    kind: 'PlanProposal',
+    briefId: 'brief_result_001',
+    draftedAt: '2026-10-02T00:00:00.000Z',
+    requestedOutcomes: [
+      { id: 'brief.desiredOutcome', statement: sentence('desired outcome') },
+      { id: 'AC-1', statement: sentence('acceptance') },
+    ],
+    tasks: [
+      {
+        taskId: 'T-1',
+        coversOutcomeIds: ['brief.desiredOutcome', 'AC-1'],
+        outcome: sentence('outcome'),
+        scope: sentence('scope'),
+        acceptanceCriteria: [sentence('criterion one'), sentence('criterion two')],
+        verificationMethod: sentence('verification'),
+        dependencies: [],
+        relevantProjectContext: [sentence('context'), sentence('more context')],
+        implementationLocation: {
+          kind: 'ProposedLocation',
+          candidates: ['packages/adapters/src/codex/client.ts'],
+          basis: sentence('basis'),
+        },
+      },
+    ],
+    exclusions: [],
+  });
+}
+
+/** One JSONL line carrying `text` as a completed `agent_message`, as Codex emits it. */
+function agentMessageLine(text: string): string {
+  return JSON.stringify({ type: 'item.completed', item: { id: 'item_0', type: 'agent_message', text } });
+}
+
+/**
+ * A scripted engine that honours the result channel the way the real CLI does.
+ *
+ * It reads `-o <file>` out of its own argv and writes the payload there, which is exactly what
+ * `codex exec -o` was observed doing under `--sandbox read-only`. It also emits the same payload as
+ * a completed `agent_message` on stdout, which is what the old channel had to truncate. Everything
+ * downstream — argv, the confined artifact, the read, the check, the terminal decision — is shipped
+ * code.
+ */
+function scriptedResultEngine(payload: string, extra = ''): { readonly binary: string; readonly dir: string } {
+  return scriptedEngine(
+    [
+      // Record what this process was actually given, so the argv assertions are about the process
+      // the adapter spawned rather than about `buildArgv` in isolation.
+      `printf '%s\\n' "$@" > "$(dirname "$0")/argv.txt"`,
+      'out=""',
+      'prev=""',
+      'for arg in "$@"; do',
+      '  if [ "$prev" = "-o" ]; then out="$arg"; fi',
+      '  prev="$arg"',
+      'done',
+      'mkdir -p "$(dirname "$out")"',
+      // `$(cat <<...)` rather than a bare heredoc: a heredoc appends a newline, and the point of
+      // the fixture is that the artifact holds exactly the payload and nothing else.
+      `printf '%s' "$(cat <<'SHIPLOOP_RESULT_EOF'`,
+      payload,
+      'SHIPLOOP_RESULT_EOF',
+      ')" > "$out"',
+      `printf '%s\\n' '{"type":"thread.started","thread_id":"01a0fd2d-02db-78d3-931e-061b2b3832f5"}'`,
+      `printf '%s\\n' '{"type":"turn.started"}'`,
+      `printf '%s\\n' '${agentMessageLine(payload)}'`,
+      `printf '%s\\n' '{"type":"turn.completed","usage":{"input_tokens":14876,"output_tokens":1530}}'`,
+      extra,
+    ].join('\n'),
+  );
+}
+
+function attemptLayout(workspace: string, stateRoot: string): EngineStateLayout {
+  return engineStateLayout({ stateRoot, attempt: workspace });
+}
+
+test('F15-AC2 the result channel is put on the command line for a fresh run, and the prompt stays last', () => {
+  const argv = buildArgv({
+    sandbox: 'read-only',
+    invocation: 'Fresh',
+    prompt: 'answer with the proposal',
+    cwd: '/tmp/attempt',
+    model: null,
+    skipGitRepoCheck: false,
+    configOverrides: [],
+    resultChannel: { schemaPath: '/state/home/k/.shiploop/results/schema.json', resultPath: '/state/home/k/.shiploop/results/t.json' },
+  });
+  assert.deepEqual(argv, [
+    'exec',
+    '--sandbox',
+    'read-only',
+    '--cd',
+    '/tmp/attempt',
+    '--json',
+    '--output-schema',
+    '/state/home/k/.shiploop/results/schema.json',
+    '-o',
+    '/state/home/k/.shiploop/results/t.json',
+    '--',
+    'answer with the proposal',
+  ]);
+  // Both flags precede `--`, so neither path can be read as the prompt.
+  assert.ok(argv.indexOf('--output-schema') < argv.indexOf('--'));
+  assert.ok(argv.indexOf('-o') < argv.indexOf('--'));
+  assert.equal(argv[argv.length - 1], 'answer with the proposal');
+});
+
+test('F15-AC2 a resumed run gets the same result channel, which `codex exec resume --help` lists', () => {
+  const argv = buildArgv({
+    sandbox: 'read-only',
+    invocation: 'Resume',
+    prompt: 'continue',
+    cwd: '/tmp/attempt',
+    model: null,
+    skipGitRepoCheck: true,
+    configOverrides: [],
+    resultChannel: { schemaPath: '/state/home/k/.shiploop/results/schema.json', resultPath: '/state/home/k/.shiploop/results/t.json' },
+    priorSessionId: '01a0f699-7149-7d20-831e-98f7b7b43a71',
+  });
+  assert.equal(argv.includes('--output-schema'), true);
+  assert.equal(argv.includes('-o'), true);
+  assert.ok(argv.indexOf('-o') < argv.indexOf('--'));
+  assert.equal(argv[argv.length - 1], 'continue');
+  assert.equal(argv[argv.length - 2], '01a0f699-7149-7d20-831e-98f7b7b43a71');
+});
+
+test('F15-AC2 the channel is confined to the attempt home, and the schema is written inside it', () => {
+  const workspace = tempDir();
+  const stateRoot = join(workspace, 'state');
+  try {
+    const layout = attemptLayout(workspace, stateRoot);
+    const prepared = prepareEngineState({ stateRoot, attempt: workspace });
+    assert.ok(prepared.ok);
+    if (!prepared.ok) return;
+
+    const channel = prepareEngineResultChannel({ layout: layout, schema: RESULT_SCHEMA, token: 'token-1' });
+    assert.ok(channel.ok, channel.ok === false ? channel.error.reason : '');
+    if (!channel.ok) return;
+
+    // The artifact is inside the attempt home, and reported relative to it so an event carries no
+    // host path.
+    assert.equal(channel.value.root, realpathSync(layout.home));
+    assert.equal(channel.value.resultPath, join(realpathSync(layout.home), ENGINE_RESULT_DIRECTORY, 'token-1.json'));
+    assert.equal(channel.value.resultRelativePath, join(ENGINE_RESULT_DIRECTORY, 'token-1.json'));
+    assert.equal(channel.value.maxBytes, MAX_RESULT_BYTES);
+    assert.equal(existsSync(channel.value.resultPath), false, 'the result path must not exist before the run');
+
+    // The schema the engine is constrained by is the caller's, byte for byte.
+    assert.equal(channel.value.schemaPath, join(realpathSync(layout.home), ENGINE_RESULT_DIRECTORY, ENGINE_RESULT_SCHEMA_FILE));
+    assert.deepEqual(JSON.parse(readFileSync(channel.value.schemaPath, 'utf8')), RESULT_SCHEMA);
+    assert.equal(statSync(channel.value.schemaPath).mode & 0o777, 0o600);
+  } finally {
+    rmSync(workspace, { recursive: true, force: true });
+  }
+});
+
+test('F15-AC2 a result path is confined after symlinks are resolved, not before', () => {
+  const workspace = tempDir();
+  const stateRoot = join(workspace, 'state');
+  try {
+    const layout = attemptLayout(workspace, stateRoot);
+    const prepared = prepareEngineState({ stateRoot, attempt: workspace });
+    assert.ok(prepared.ok);
+    if (!prepared.ok) return;
+    const root = realpathSync(layout.home);
+    mkdirSync(join(root, ENGINE_RESULT_DIRECTORY), { recursive: true });
+
+    // A relative path resolves against whatever the process considers its working directory, which
+    // is not a boundary at all.
+    const relative = confineResultPath(root, join(ENGINE_RESULT_DIRECTORY, 'x.json'));
+    assert.equal(relative.ok, false);
+    assert.match(relative.ok === false ? relative.error.reason : '', /must be absolute/);
+
+    // `..` traversal out of the attempt directory, resolved before it is compared.
+    const traversal = confineResultPath(root, join(root, '..', 'escape.json'));
+    assert.equal(traversal.ok, false);
+    assert.equal(traversal.ok === false ? traversal.error.code : null, 'Forbidden');
+    assert.match(traversal.ok === false ? traversal.error.reason : '', /outside the attempt directory/);
+
+    // A symlinked parent that leaves the attempt directory. This is the case a prefix test on the
+    // unresolved path would pass and a containment test on the resolved one does not.
+    const elsewhere = join(workspace, 'elsewhere');
+    mkdirSync(elsewhere, { recursive: true });
+    symlinkSync(elsewhere, join(layout.home, 'escape'));
+    const throughLink = confineResultPath(root, join(layout.home, 'escape', 'stolen.json'));
+    assert.equal(throughLink.ok, false);
+    assert.equal(throughLink.ok === false ? throughLink.error.code : null, 'Forbidden');
+
+    // A path whose directory does not exist cannot be resolved, so it cannot be shown to be inside.
+    const missing = confineResultPath(root, join(root, 'no-such-directory', 'x.json'));
+    assert.equal(missing.ok, false);
+    assert.match(missing.ok === false ? missing.error.reason : '', /does not exist/);
+
+    // The honest case still works, and returns the resolved path rather than the requested one.
+    const inside = confineResultPath(root, join(root, ENGINE_RESULT_DIRECTORY, 'ok.json'));
+    assert.ok(inside.ok);
+    if (!inside.ok) return;
+    assert.equal(inside.value, join(root, ENGINE_RESULT_DIRECTORY, 'ok.json'));
+    // A prefix is not containment: `/a/bc` must not read as inside `/a/b`.
+    assert.equal(confineResultPath(root, join(root, '..', 'bc', 'x.json')).ok, false);
+  } finally {
+    rmSync(workspace, { recursive: true, force: true });
+  }
+});
+
+test('F15-AC2 a results directory that resolves outside the attempt home is refused, not created', () => {
+  const workspace = tempDir();
+  const stateRoot = join(workspace, 'state');
+  try {
+    const layout = attemptLayout(workspace, stateRoot);
+    const prepared = prepareEngineState({ stateRoot, attempt: workspace });
+    assert.ok(prepared.ok);
+    if (!prepared.ok) return;
+
+    // A `.shiploop` planted as a link to a directory the attempt does not own. Creating the
+    // results directory through it succeeds, so only a check on the *resolved* directory refuses.
+    const elsewhere = join(workspace, 'elsewhere');
+    mkdirSync(join(elsewhere, 'results'), { recursive: true });
+    symlinkSync(elsewhere, join(layout.home, '.shiploop'));
+
+    const refused = prepareEngineResultChannel({ layout, schema: RESULT_SCHEMA, token: 'token-1' });
+    assert.equal(refused.ok, false);
+    assert.equal(refused.ok === false ? refused.error.code : null, 'Forbidden');
+    assert.match(refused.ok === false ? refused.error.reason : '', /does not resolve to a location inside the attempt directory/);
+    assert.equal(existsSync(join(elsewhere, 'results', 'token-1.json')), false);
+  } finally {
+    rmSync(workspace, { recursive: true, force: true });
+  }
+});
+
+test('F15-AC2 a result file left over from an earlier launch is refused, never read as this one', () => {
+  const workspace = tempDir();
+  const stateRoot = join(workspace, 'state');
+  try {
+    const layout = attemptLayout(workspace, stateRoot);
+    const prepared = prepareEngineState({ stateRoot, attempt: workspace });
+    assert.ok(prepared.ok);
+    if (!prepared.ok) return;
+
+    const first = prepareEngineResultChannel({ layout, schema: RESULT_SCHEMA, token: 'shared-token' });
+    assert.ok(first.ok);
+    if (!first.ok) return;
+    // An earlier attempt on this worktree left its answer here. The token makes that improbable; the
+    // existence check is what makes it impossible, so a pinned token is what proves it.
+    writeFileSync(first.value.resultPath, '{"kind":"PlanProposal"}', 'utf8');
+
+    const second = prepareEngineResultChannel({ layout, schema: RESULT_SCHEMA, token: 'shared-token' });
+    assert.equal(second.ok, false);
+    assert.equal(second.ok === false ? second.error.code : null, 'Conflict');
+    assert.match(second.ok === false ? second.error.reason : '', /already exists/);
+    assert.match(second.ok === false ? second.error.reason : '', /earlier attempt/);
+
+    // And the stale bytes are what is still on disk: nothing overwrote them, so the guard refused
+    // rather than quietly starting over.
+    assert.equal(readFileSync(first.value.resultPath, 'utf8'), '{"kind":"PlanProposal"}');
+  } finally {
+    rmSync(workspace, { recursive: true, force: true });
+  }
+});
+
+test('F15-AC2 a byte bound this adapter will not honour is refused rather than silently applied', () => {
+  const workspace = tempDir();
+  const stateRoot = join(workspace, 'state');
+  try {
+    const layout = attemptLayout(workspace, stateRoot);
+    const prepared = prepareEngineState({ stateRoot, attempt: workspace });
+    assert.ok(prepared.ok);
+    if (!prepared.ok) return;
+    for (const maxBytes of [0, -1, 1.5, MAX_RESULT_BYTES + 1, Number.NaN]) {
+      const refused = prepareEngineResultChannel({ layout, schema: RESULT_SCHEMA, token: 't', maxBytes });
+      assert.equal(refused.ok, false, `maxBytes ${String(maxBytes)} was accepted`);
+      assert.match(refused.ok === false ? refused.error.reason : '', /byte bound|integer from 1/);
+    }
+    assert.equal(prepareEngineResultChannel({ layout, schema: RESULT_SCHEMA, token: 't', maxBytes: MAX_RESULT_BYTES }).ok, true);
+  } finally {
+    rmSync(workspace, { recursive: true, force: true });
+  }
+});
+
+test('F15-AC2 an artifact that cannot be read names which of the four faults it was', () => {
+  const workspace = tempDir();
+  const stateRoot = join(workspace, 'state');
+  try {
+    const layout = attemptLayout(workspace, stateRoot);
+    const prepared = prepareEngineState({ stateRoot, attempt: workspace });
+    assert.ok(prepared.ok);
+    if (!prepared.ok) return;
+    const channel = prepareEngineResultChannel({ layout, schema: RESULT_SCHEMA, token: 'token-1' });
+    assert.ok(channel.ok);
+    if (!channel.ok) return;
+
+    // Nothing written.
+    const missing = readCodexResult(channel.value);
+    assert.equal(missing.ok, false);
+    assert.match(missing.ok === false ? missing.error.reason : '', /No structured result was written/);
+
+    // Written, but empty.
+    writeFileSync(channel.value.resultPath, '', 'utf8');
+    const empty = readCodexResult(channel.value);
+    assert.equal(empty.ok, false);
+    assert.match(empty.ok === false ? empty.error.reason : '', /is empty/);
+
+    // Written, and past the bound. A payload this adapter will not read whole is refused rather
+    // than truncated, because it cannot tell a cut-off result from a complete one.
+    writeFileSync(channel.value.resultPath, 'x'.repeat(MAX_RESULT_BYTES + 1), 'utf8');
+    const oversize = readCodexResult(channel.value);
+    assert.equal(oversize.ok, false);
+    assert.match(oversize.ok === false ? oversize.error.reason : '', /past the .*-byte bound/);
+    assert.match(oversize.ok === false ? oversize.error.reason : '', /refused rather than truncated/);
+
+    // Whole, and inside the bound.
+    writeFileSync(channel.value.resultPath, '{"kind":"PlanProposal"}', 'utf8');
+    const read = readCodexResult(channel.value);
+    assert.ok(read.ok);
+    if (!read.ok) return;
+    assert.equal(read.value.text, '{"kind":"PlanProposal"}');
+    assert.equal(read.value.byteLength, Buffer.byteLength('{"kind":"PlanProposal"}', 'utf8'));
+    assert.equal(read.value.sourcePath, join(ENGINE_RESULT_DIRECTORY, 'token-1.json'));
+  } finally {
+    rmSync(workspace, { recursive: true, force: true });
+  }
+});
+
+test('F15-AC2 an artifact cut mid-character is refused, because a lossy decode is not a result', () => {
+  const workspace = tempDir();
+  const stateRoot = join(workspace, 'state');
+  try {
+    const layout = attemptLayout(workspace, stateRoot);
+    const prepared = prepareEngineState({ stateRoot, attempt: workspace });
+    assert.ok(prepared.ok);
+    if (!prepared.ok) return;
+    const channel = prepareEngineResultChannel({ layout, schema: RESULT_SCHEMA, token: 'token-1' });
+    assert.ok(channel.ok);
+    if (!channel.ok) return;
+
+    // The two leading bytes of a three-byte sequence, appended to text that is otherwise valid JSON.
+    // The file holds bytes no decoder can turn back into the character that was written.
+    const whole = Buffer.from('{"note":"café"}', 'utf8');
+    const cutAt = whole.indexOf(0xc3) + 1;
+    writeFileSync(channel.value.resultPath, whole.subarray(0, cutAt));
+    assert.equal(statSync(channel.value.resultPath).size, cutAt);
+
+    const read = readCodexResult(channel.value);
+    assert.equal(read.ok, false);
+    assert.match(read.ok === false ? read.error.reason : '', /cut off mid-character/);
+  } finally {
+    rmSync(workspace, { recursive: true, force: true });
+  }
+});
+
+test('F15-AC2 an artifact that is a symbolic link is never followed, and neither is one outside the home', () => {
+  const workspace = tempDir();
+  const stateRoot = join(workspace, 'state');
+  try {
+    const layout = attemptLayout(workspace, stateRoot);
+    const prepared = prepareEngineState({ stateRoot, attempt: workspace });
+    assert.ok(prepared.ok);
+    if (!prepared.ok) return;
+    const channel = prepareEngineResultChannel({ layout, schema: RESULT_SCHEMA, token: 'token-1' });
+    assert.ok(channel.ok);
+    if (!channel.ok) return;
+
+    // The escape this refuses: a real answer somewhere else entirely, reached through a link.
+    const elsewhere = join(workspace, 'elsewhere');
+    mkdirSync(elsewhere, { recursive: true });
+    writeFileSync(join(elsewhere, 'planted.json'), '{"kind":"PlanProposal"}', 'utf8');
+    symlinkSync(join(elsewhere, 'planted.json'), channel.value.resultPath);
+
+    const throughLink = readCodexResult(channel.value);
+    assert.equal(throughLink.ok, false);
+    assert.match(throughLink.ok === false ? throughLink.error.reason : '', /not a regular file/);
+    assert.match(throughLink.ok === false ? throughLink.error.reason : '', /never followed/);
+
+    // And a channel whose recorded path is outside the attempt home, which is what a link swapped in
+    // during the run would produce. The containment check runs again at read time for that reason.
+    const outside = readCodexResult({
+      ...channel.value,
+      resultPath: join(elsewhere, 'planted.json'),
+      resultRelativePath: join(ENGINE_RESULT_DIRECTORY, 'token-1.json'),
+    });
+    assert.equal(outside.ok, false);
+    assert.equal(outside.ok === false ? outside.error.code : null, 'Forbidden');
+    assert.match(outside.ok === false ? outside.error.reason : '', /outside the attempt directory/);
+  } finally {
+    rmSync(workspace, { recursive: true, force: true });
+  }
+});
+
+test('F15-AC2 a live-shaped session delivers a result longer than the cap, whole, and keeps every summary bounded', async () => {
+  const payload = longResultPayload();
+  assert.ok(Buffer.byteLength(payload, 'utf8') > 400, 'the fixture must be longer than the summary cap');
+
+  const engine = scriptedResultEngine(payload);
+  const workspace = tempDir();
+  const stateRoot = join(workspace, 'state');
+  try {
+    const adapter = new CodexEngineAdapter({
+      connectorId: connectorId('connector_codex_result'),
+      client: { binary: engine.binary, stateRoot },
+      sessionStartTimeoutMs: 15_000,
+      sandbox: 'read-only',
+    });
+    const context: AdapterContext = { ...adapterContext('op_codex_result'), signal: AbortSignal.timeout(30_000) };
+    const started = await adapter.startSession(context, {
+      operationId: operationId('op_codex_result'),
+      workspace: { ...FIXTURE_WORKSPACE, absolutePath: workspace },
+      start: { kind: 'Fresh', instruction: 'propose a plan' },
+      mode: 'Headless',
+      grantedCapabilities: ['Git:ReadRepository'],
+      bounds: { activeWallClockMs: 20_000, retryBudget: 1, eventCountLimit: 64 },
+      result: { schema: RESULT_SCHEMA },
+    });
+    assert.equal(started.ok, true, started.ok === false ? started.error.reason : '');
+    if (!started.ok) return;
+
+    const events = await collect(started.value.events);
+    const outcomes = resultOutcomes(events);
+    assert.equal(outcomes.length, 1);
+    assert.equal(outcomes[0]?.kind, 'Succeeded');
+
+    const outcome = outcomes[0]?.kind === 'Succeeded' ? outcomes[0] : null;
+    assert.ok(outcome?.result !== undefined, 'the structured result did not reach the outcome');
+    assert.equal(outcome.result.byteLength, Buffer.byteLength(payload, 'utf8'));
+    assert.equal(outcome.result.json, payload);
+    assert.deepEqual(JSON.parse(outcome.result.json), JSON.parse(payload));
+
+    // The bounded channel stayed bounded, and visibly did not carry the answer.
+    assert.ok(outcome.summary.length <= 412, `the terminal summary grew past the cap: ${String(outcome.summary.length)}`);
+    assert.match(outcome.summary, /\[truncated\]$/);
+    for (const event of events) {
+      if (event.kind !== 'Progress') continue;
+      assert.ok(event.summary.length <= 412, `a progress summary grew past the cap: ${String(event.summary.length)}`);
+      assert.ok(!event.summary.includes('acceptanceCriteria'), 'a progress summary carried the payload');
+    }
+
+    // The spawned process really was given both flags, with the paths inside the attempt's home.
+    const layout = attemptLayout(workspace, stateRoot);
+    const home = realpathSync(layout.home);
+    const argv = readFileSync(join(engine.dir, 'argv.txt'), 'utf8').split('\n').filter((line) => line.length > 0);
+    const schemaFlag = argv.indexOf('--output-schema');
+    const outputFlag = argv.indexOf('-o');
+    assert.ok(schemaFlag >= 0 && outputFlag >= 0, `the spawned engine was given neither result flag: ${argv.join(' ')}`);
+    assert.equal(argv[outputFlag + 1], join(home, outcome.result.sourcePath));
+    assert.equal(argv[schemaFlag + 1], join(home, ENGINE_RESULT_DIRECTORY, ENGINE_RESULT_SCHEMA_FILE));
+    assert.ok(argv.indexOf('--output-schema') < argv.indexOf('--'));
+    assert.equal(argv[argv.length - 1], 'propose a plan');
+
+    // The artifact really is where the event said it was, and really is inside the attempt home.
+    assert.ok(outcome.result.sourcePath.startsWith(ENGINE_RESULT_DIRECTORY));
+    assert.ok(existsSync(join(home, outcome.result.sourcePath)), 'the artifact is not where the event said it was');
+    assert.equal(realpathSync(join(home, outcome.result.sourcePath)).startsWith(home), true);
+    // Nothing landed in the workspace, which is what would make a read-only run look like a change.
+    assert.deepEqual(readdirSync(workspace).sort(), ['state']);
+  } finally {
+    rmSync(engine.dir, { recursive: true, force: true });
+    rmSync(workspace, { recursive: true, force: true });
+  }
+});
+
+test('F15-AC2 a turn that completes without writing its result is a diagnostic, never an empty success', async () => {
+  // The scripted engine emits a full successful stream and writes nothing, which is what a real
+  // turn looks like when it does not honour the result channel.
+  const engine = scriptedEngine(
+    [
+      `printf '%s\\n' '{"type":"thread.started","thread_id":"01a0f699-7149-7d20-831e-98f7b7b43a71"}'`,
+      `printf '%s\\n' '{"type":"turn.started"}'`,
+      `printf '%s\\n' '{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"Here is the plan."}}'`,
+      `printf '%s\\n' '{"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":2}}'`,
+    ].join('\n'),
+  );
+  const workspace = tempDir();
+  try {
+    const adapter = new CodexEngineAdapter({
+      connectorId: connectorId('connector_codex_noresult'),
+      client: { binary: engine.binary, stateRoot: join(workspace, 'state') },
+      sessionStartTimeoutMs: 15_000,
+    });
+    const context: AdapterContext = { ...adapterContext('op_codex_noresult'), signal: AbortSignal.timeout(30_000) };
+    const started = await adapter.startSession(context, {
+      operationId: operationId('op_codex_noresult'),
+      workspace: { ...FIXTURE_WORKSPACE, absolutePath: workspace },
+      start: { kind: 'Fresh', instruction: 'propose a plan' },
+      mode: 'Headless',
+      grantedCapabilities: ['Git:ReadRepository'],
+      bounds: { activeWallClockMs: 20_000, retryBudget: 1, eventCountLimit: 64 },
+      result: { schema: RESULT_SCHEMA },
+    });
+    assert.equal(started.ok, true);
+    if (!started.ok) return;
+
+    const events = await collect(started.value.events);
+    assert.equal(resultOutcomes(events).length, 0, 'a turn with no result was reported as a completion');
+    const seen = events.filter((event): event is Extract<EngineEvent, { kind: 'Diagnostic' }> => event.kind === 'Diagnostic');
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0]?.category, 'MalformedOutput');
+    assert.equal(seen[0]?.retry, 'Terminal');
+    assert.match(seen[0]?.detail ?? '', /No structured result was written/);
+    assert.equal(events.find((event) => event.kind === 'Usage')?.kind === 'Usage' ? usageKindOf(events) : null, 'Reported');
+  } finally {
+    rmSync(engine.dir, { recursive: true, force: true });
+    rmSync(workspace, { recursive: true, force: true });
+  }
+});
+
+test('F15-AC2 a session that asks for no result carries no result channel and behaves as before', async () => {
+  const engine = scriptedResultEngine(longResultPayload());
+  const workspace = tempDir();
+  const stateRoot = join(workspace, 'state');
+  try {
+    const adapter = new CodexEngineAdapter({
+      connectorId: connectorId('connector_codex_plain'),
+      client: { binary: engine.binary, stateRoot },
+      sessionStartTimeoutMs: 15_000,
+    });
+    const context: AdapterContext = { ...adapterContext('op_codex_plain'), signal: AbortSignal.timeout(30_000) };
+    const started = await adapter.startSession(context, {
+      operationId: operationId('op_codex_plain'),
+      workspace: { ...FIXTURE_WORKSPACE, absolutePath: workspace },
+      start: { kind: 'Fresh', instruction: 'create probe.txt' },
+      mode: 'Headless',
+      grantedCapabilities: ['Git:ReadRepository'],
+      bounds: { activeWallClockMs: 20_000, retryBudget: 1, eventCountLimit: 64 },
+    });
+    assert.equal(started.ok, true);
+    if (!started.ok) return;
+    const events = await collect(started.value.events);
+    const outcome = resultOutcomes(events)[0];
+    assert.equal(outcome?.kind, 'Succeeded');
+    assert.equal(outcome?.kind === 'Succeeded' ? outcome.result : undefined, undefined);
+    // No results directory was created at all, so there is nothing that could later be read.
+    assert.equal(existsSync(join(stateRoot, 'home')), true);
+    assert.equal(existsSync(join(attemptLayout(workspace, stateRoot).home, ENGINE_RESULT_DIRECTORY)), false);
+  } finally {
+    rmSync(engine.dir, { recursive: true, force: true });
+    rmSync(workspace, { recursive: true, force: true });
   }
 });
 
@@ -973,46 +1664,191 @@ test('F15-AC1, F15-AC4 a live Codex turn reports its real thread id, writes one 
   }
 
   const workspace = tempDir();
-  execFileSync('git', ['init', '-q', '.'], { cwd: workspace });
-  execFileSync('git', ['config', 'user.email', 'probe@example.invalid'], { cwd: workspace });
-  execFileSync('git', ['config', 'user.name', 'probe'], { cwd: workspace });
-  const baseSha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: workspace, encoding: 'utf8' }).trim();
-  execFileSync('git', ['commit', '-q', '--allow-empty', '-m', 'init'], { cwd: workspace });
+  try {
+    execFileSync('git', ['init', '-q', '.'], { cwd: workspace });
+    execFileSync('git', ['config', 'user.email', 'probe@example.invalid'], { cwd: workspace });
+    execFileSync('git', ['config', 'user.name', 'probe'], { cwd: workspace });
+    execFileSync('git', ['commit', '-q', '--allow-empty', '-m', 'init'], { cwd: workspace });
+    // Read after the commit. Reading it before produced `ambiguous argument 'HEAD'` on an empty
+    // repository, so this live test could never pass on its own workspace.
+    const baseSha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: workspace, encoding: 'utf8' }).trim();
 
-  const adapter = new CodexEngineAdapter({
-    connectorId: connectorId('connector_codex_live'),
-    client: { binary: 'codex', gracefulStopMs: 5_000, killWaitMs: 5_000 },
-    sandbox: 'workspace-write',
-  });
-  const context: AdapterContext = { ...adapterContext('op_codex_live'), signal: AbortSignal.timeout(600_000) };
+    const adapter = new CodexEngineAdapter({
+      connectorId: connectorId('connector_codex_live'),
+      client: { binary: 'codex', gracefulStopMs: 5_000, killWaitMs: 5_000 },
+      sandbox: 'workspace-write',
+    });
+    const context: AdapterContext = { ...adapterContext('op_codex_live'), signal: AbortSignal.timeout(600_000) };
 
-  const compatibility = await adapter.checkCompatibility(context);
-  assert.equal(compatibility.ok, true);
-  assert.equal(compatibility.ok === true ? compatibility.value.compatible : false, true);
-  assert.equal(compatibility.ok === true ? compatibility.value.runtimeVersion : null, CODEX_VERIFIED_VERSION);
+    // What a compatibility check actually promises is that the binary is at or above the declared
+    // floor. Asserting that it reports *exactly* the pinned constant made this test fail on a host
+    // running a newer Codex, which is the one case the check is supposed to accept.
+    const compatibility = await adapter.checkCompatibility(context);
+    assert.equal(compatibility.ok, true);
+    assert.equal(compatibility.ok === true ? compatibility.value.compatible : false, true);
+    const observed = compatibility.ok === true ? compatibility.value.runtimeVersion : null;
+    assert.ok(observed !== null);
+    assert.equal(checkCodexVersion(observed ?? '').compatible, true);
+    assert.match(compatibility.ok === true ? compatibility.value.detail : '', new RegExp(MINIMUM_CODEX_VERSION.replace(/\./g, '\\.')));
 
-  const started = await adapter.startSession(context, {
-    operationId: operationId('op_codex_live'),
-    workspace: { ...FIXTURE_WORKSPACE, absolutePath: workspace, headSha: baseSha as never, baseSha: baseSha as never },
-    start: { kind: 'Fresh', instruction: 'create a file named probe.txt containing exactly HELLO and nothing else' },
-    mode: 'Headless',
-    grantedCapabilities: ['Git:ReadRepository', 'Engine:ReportUsage'],
-    bounds: { activeWallClockMs: 600_000, retryBudget: 1, eventCountLimit: 512 },
-  });
-  assert.equal(started.ok, true, started.ok === false ? started.error.reason : '');
-  if (!started.ok) return;
-  assert.match(started.value.sessionId, /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+    const started = await adapter.startSession(context, {
+      operationId: operationId('op_codex_live'),
+      workspace: { ...FIXTURE_WORKSPACE, absolutePath: workspace, headSha: baseSha as never, baseSha: baseSha as never },
+      start: { kind: 'Fresh', instruction: 'create a file named probe.txt containing exactly HELLO and nothing else' },
+      mode: 'Headless',
+      grantedCapabilities: ['Git:ReadRepository', 'Engine:ReportUsage'],
+      bounds: { activeWallClockMs: 600_000, retryBudget: 1, eventCountLimit: 512 },
+    });
+    assert.equal(started.ok, true, started.ok === false ? started.error.reason : '');
+    if (!started.ok) return;
+    assert.match(started.value.sessionId, /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
 
-  const events = await collect(started.value.events);
-  assert.equal(execFileSync('cat', [join(workspace, 'probe.txt')], { encoding: 'utf8' }), 'HELLO');
-  const outcomes = resultOutcomes(events);
-  assert.equal(outcomes.length, 1);
-  assert.equal(outcomes[0]?.kind, 'Succeeded');
-  const usage = events.find((event) => event.kind === 'Usage');
-  assert.equal(usage?.kind === 'Usage' ? usage.usage.kind : null, 'Reported');
-  assert.ok((usage?.kind === 'Usage' && usage.usage.kind === 'Reported' ? usage.usage.usage.inputTokens ?? 0 : 0) > 0);
+    const events = await collect(started.value.events);
+    assert.equal(execFileSync('cat', [join(workspace, 'probe.txt')], { encoding: 'utf8' }), 'HELLO');
+    const outcomes = resultOutcomes(events);
+    assert.equal(outcomes.length, 1);
+    assert.equal(outcomes[0]?.kind, 'Succeeded');
+    const usage = events.find((event) => event.kind === 'Usage');
+    assert.equal(usage?.kind === 'Usage' ? usage.usage.kind : null, 'Reported');
+    assert.ok((usage?.kind === 'Usage' && usage.usage.kind === 'Reported' ? usage.usage.usage.inputTokens ?? 0 : 0) > 0);
 
-  rmSync(workspace, { recursive: true, force: true });
+  } finally {
+    rmSync(workspace, { recursive: true, force: true });
+  }
+});
+
+/**
+ * The live structured-result pass. Opt-in, and it is the only proof in this file that the result
+ * channel survives a **real** Codex turn rather than a script that was written to cooperate.
+ *
+ * It spends one engine turn, and it asks for something a real plan proposal is made of: several
+ * outcomes, one task, and prose long enough that the payload cannot possibly fit inside
+ * `MAX_SUMMARY_CHARS`. The assertions are the two halves of the claim — the payload arrives whole,
+ * and every summary stays capped — plus the confinement of the artifact it came from. The run
+ * reports its own evidence through `t.diagnostic` so the proof is in the test output rather than in
+ * a claim about it.
+ *
+ * Gated on its own variable so this can be exercised without also spending the two live turns the
+ * other opt-in tests make.
+ */test('F15-AC2 a live Codex turn delivers a structured result longer than the summary cap, whole', async (t) => {
+  if (process.env['SHIPLOOP_CODEX_LIVE'] !== '1' || process.env['SHIPLOOP_CODEX_LIVE_RESULT'] !== '1') {
+    t.skip(
+      'no SHIPLOOP_CODEX_LIVE=1 with SHIPLOOP_CODEX_LIVE_RESULT=1; the live result pass needs an authenticated codex on PATH and spends one account turn',
+    );
+    return;
+  }
+
+  // Every live pass cleans up in a `finally`, not at the end of the body: a failing assertion
+  // would otherwise leave a throwaway Git workspace behind, which is what happened when this
+  // test first failed on its own schema.
+  const workspace = tempDir();
+  try {
+    const workspace = tempDir();
+    execFileSync('git', ['init', '-q', '.'], { cwd: workspace });
+    execFileSync('git', ['config', 'user.email', 'probe@example.invalid'], { cwd: workspace });
+    execFileSync('git', ['config', 'user.name', 'probe'], { cwd: workspace });
+    execFileSync('git', ['commit', '-q', '--allow-empty', '-m', 'init'], { cwd: workspace });
+    const stateRoot = join(workspace, 'shiploop-state');
+
+    const adapter = new CodexEngineAdapter({
+      connectorId: connectorId('connector_codex_live_result'),
+      client: { binary: 'codex', stateRoot, gracefulStopMs: 5_000, killWaitMs: 5_000 },
+      // Read-only, because that is what a plan-mode session holds. The artifact still appears: the CLI
+      // process writes it rather than a sandboxed command, which is what makes the channel usable for
+      // the read-only sessions that need a structured answer most.
+      sandbox: 'read-only',
+    });
+    const context: AdapterContext = { ...adapterContext('op_codex_live_result'), signal: AbortSignal.timeout(600_000) };
+
+    // The version the binary actually reports, so the evidence below names the engine that produced
+    // it rather than the constant this adapter was measured against.
+    const compatibility = await adapter.checkCompatibility(context);
+    assert.equal(compatibility.ok, true);
+    assert.equal(compatibility.ok === true ? compatibility.value.compatible : false, true);
+    const runtimeVersion = compatibility.ok === true ? compatibility.value.runtimeVersion : 'unknown';
+    t.diagnostic(`codex --version reported ${String(runtimeVersion)}; this adapter's verified constant is ${CODEX_VERIFIED_VERSION}`);
+
+    const started = await adapter.startSession(context, {
+      operationId: operationId('op_codex_live_result'),
+      workspace: { ...FIXTURE_WORKSPACE, absolutePath: workspace },
+      start: {
+        kind: 'Fresh',
+        instruction: [
+          'ShipLoop plan mode. Read only: do not change the repository, publish anything, or run a delivery action.',
+          'Answer with exactly one JSON object matching the required output schema, and no prose.',
+          '',
+          'brief: brief_live_result_001 (version 1)',
+          'requested outcomes, copied verbatim:',
+          '- brief.desiredOutcome: The reader can resume an interrupted attempt without re-reading the whole transcript.',
+          '- AC-1: A pause records a checkpoint within two seconds of the pause request.',
+          '',
+          'Propose exactly one task, taskId "T-1", covering both outcomes, and no exclusions.',
+          'Give `outcome`, `scope`, `verificationMethod`, each acceptance criterion and each relevantProjectContext',
+          'entry a full sentence of at least 30 words, and give implementationLocation.basis a full sentence.',
+          'Set draftedAt to "2026-10-02T00:00:00.000Z". Do not read the repository.',
+        ].join('\n'),
+      },
+      mode: 'Headless',
+      grantedCapabilities: ['Git:ReadRepository', 'Engine:ReportUsage'],
+      bounds: { activeWallClockMs: 600_000, retryBudget: 1, eventCountLimit: 512 },
+      result: { schema: RESULT_SCHEMA },
+    });
+    assert.equal(started.ok, true, started.ok === false ? started.error.reason : '');
+    if (!started.ok) return;
+
+    const events = await collect(started.value.events);
+    const outcome = resultOutcomes(events)[0];
+    assert.equal(outcome?.kind, 'Succeeded', outcome === undefined ? 'no terminal outcome' : JSON.stringify(outcome));
+    assert.ok(outcome?.kind === 'Succeeded' && outcome.result !== undefined, 'the live turn produced no structured result');
+    if (outcome?.kind !== 'Succeeded' || outcome.result === undefined) return;
+    const result = outcome.result;
+
+    const decoded = JSON.parse(result.json) as { tasks?: readonly { acceptanceCriteria?: readonly string[] }[] };
+    const criteria = decoded.tasks?.[0]?.acceptanceCriteria ?? [];
+    const longestField = Math.max(
+      ...Object.values(decoded.tasks?.[0] ?? {}).map((value) => JSON.stringify(value ?? '').length),
+      0,
+    );
+
+    // The claim this pass exists for: a payload far longer than the summary cap arrived whole.
+    assert.ok(result.byteLength > 400, `the live payload was ${String(result.byteLength)} bytes, not longer than the cap`);
+    assert.ok(result.json.length > 400, `the live payload was ${String(result.json.length)} characters`);
+    assert.ok(longestField > 400, `no single field exceeded the cap, so truncation anywhere would have gone unnoticed: ${String(longestField)}`);
+    assert.ok(criteria.length >= 1, 'the live payload carried no acceptance criteria to have survived');
+
+    // And the bounded channel stayed bounded, visibly cut, and separate from the result.
+    assert.ok(outcome.summary.length <= 412, `the terminal summary grew past the cap: ${String(outcome.summary.length)}`);
+    assert.match(outcome.summary, /\[truncated\]$/);
+    for (const event of events) {
+      if (event.kind !== 'Progress') continue;
+      assert.ok(event.summary.length <= 412, `a progress summary grew past the cap: ${String(event.summary.length)}`);
+      assert.ok(!event.summary.includes('acceptanceCriteria'), 'a progress summary carried the payload');
+    }
+
+    // The artifact is real, and confined to the attempt's own directory.
+    const home = realpathSync(attemptLayout(workspace, stateRoot).home);
+    const artifact = join(home, result.sourcePath);
+    assert.ok(result.sourcePath.startsWith(ENGINE_RESULT_DIRECTORY));
+    assert.ok(existsSync(artifact), `no artifact at ${String(artifact)}`);
+    assert.equal(realpathSync(artifact).startsWith(home), true);
+    assert.equal(statSync(artifact).size, result.byteLength);
+    // Nothing landed in the workspace, so a read-only planning turn does not look like a change.
+    assert.deepEqual(readdirSync(workspace).sort(), ['.git', 'shiploop-state']);
+
+    const usage = events.find((event) => event.kind === 'Usage');
+    assert.equal(usage?.kind === 'Usage' ? usage.usage.kind : null, 'Reported');
+
+    t.diagnostic(`codex ${String(runtimeVersion)} thread ${started.value.sessionId}, sandbox read-only`);
+    t.diagnostic(`result.sourcePath (relative to the attempt home): ${result.sourcePath}`);
+    t.diagnostic(`result.byteLength: ${String(result.byteLength)}; result.json.length: ${String(result.json.length)}`);
+    t.diagnostic(`longest single field in the payload: ${String(longestField)} characters`);
+    t.diagnostic(`acceptance criteria that survived: ${String(criteria.length)}`);
+    t.diagnostic(`terminal Succeeded.summary.length: ${String(outcome.summary.length)} (capped; ends "[truncated]")`);
+    t.diagnostic(`payload head: ${result.json.slice(0, 240)}`);
+    t.diagnostic(`payload tail: ${result.json.slice(-160)}`);
+  } finally {
+    rmSync(workspace, { recursive: true, force: true });
+  }
 });
 
 test('F15-AC4 a live resume continues the recorded conversation in place', async (t) => {
@@ -1023,42 +1859,42 @@ test('F15-AC4 a live resume continues the recorded conversation in place', async
   }
   const workspace = tempDir();
   execFileSync('git', ['init', '-q', '.'], { cwd: workspace });
-  const adapter = new CodexEngineAdapter({
-    connectorId: connectorId('connector_codex_live_resume'),
-    client: { binary: 'codex', gracefulStopMs: 5_000, killWaitMs: 5_000 },
-    sandbox: 'read-only',
+    const adapter = new CodexEngineAdapter({
+      connectorId: connectorId('connector_codex_live_resume'),
+      client: { binary: 'codex', gracefulStopMs: 5_000, killWaitMs: 5_000 },
+      sandbox: 'read-only',
+    });
+    const context: AdapterContext = { ...adapterContext('op_codex_live_resume'), signal: AbortSignal.timeout(600_000) };
+    const request: ResumeEngineSessionRequest = {
+      operationId: operationId('op_codex_live_resume'),
+      workspace: { ...FIXTURE_WORKSPACE, absolutePath: workspace },
+      priorSession: { sessionId: providerId(prior), engineVersion: CODEX_VERIFIED_VERSION, lastEventAt: '2026-10-01T08:34:07.000Z' },
+      checkpoint: {
+        checkpointId: 'checkpoint_live',
+        capturedAt: '2026-10-01T08:34:07.000Z',
+        scopeFingerprint: FIXTURE_WORKSPACE.scopeFingerprint,
+        headSha: FIXTURE_WORKSPACE.headSha,
+        baseSha: FIXTURE_WORKSPACE.baseSha,
+        dirtyPaths: [],
+        untrackedPaths: [],
+        blocker: null,
+        nextAction: 'continue',
+        resumeInstructions: 'stay in scope',
+      },
+      instruction: 'state the filename you created earlier in this conversation, without running any tool',
+      grantedCapabilities: ['Git:ReadRepository'],
+      bounds: { activeWallClockMs: 600_000, retryBudget: 1, eventCountLimit: 256 },
+    };
+    const continuation = await adapter.resumeSession(context, request);
+    assert.equal(continuation.ok, true);
+    assert.equal(continuation.ok === true ? continuation.value.kind : null, 'ResumedInPlace');
+    if (continuation.ok && continuation.value.kind === 'ResumedInPlace') {
+      assert.equal(continuation.value.session.sessionId, prior);
+      const events = await collect(continuation.value.session.events);
+      assert.ok(events.some((event) => event.kind === 'SessionStarted'));
+    }
+    rmSync(workspace, { recursive: true, force: true });
   });
-  const context: AdapterContext = { ...adapterContext('op_codex_live_resume'), signal: AbortSignal.timeout(600_000) };
-  const request: ResumeEngineSessionRequest = {
-    operationId: operationId('op_codex_live_resume'),
-    workspace: { ...FIXTURE_WORKSPACE, absolutePath: workspace },
-    priorSession: { sessionId: providerId(prior), engineVersion: CODEX_VERIFIED_VERSION, lastEventAt: '2026-10-01T08:34:07.000Z' },
-    checkpoint: {
-      checkpointId: 'checkpoint_live',
-      capturedAt: '2026-10-01T08:34:07.000Z',
-      scopeFingerprint: FIXTURE_WORKSPACE.scopeFingerprint,
-      headSha: FIXTURE_WORKSPACE.headSha,
-      baseSha: FIXTURE_WORKSPACE.baseSha,
-      dirtyPaths: [],
-      untrackedPaths: [],
-      blocker: null,
-      nextAction: 'continue',
-      resumeInstructions: 'stay in scope',
-    },
-    instruction: 'state the filename you created earlier in this conversation, without running any tool',
-    grantedCapabilities: ['Git:ReadRepository'],
-    bounds: { activeWallClockMs: 600_000, retryBudget: 1, eventCountLimit: 256 },
-  };
-  const continuation = await adapter.resumeSession(context, request);
-  assert.equal(continuation.ok, true);
-  assert.equal(continuation.ok === true ? continuation.value.kind : null, 'ResumedInPlace');
-  if (continuation.ok && continuation.value.kind === 'ResumedInPlace') {
-    assert.equal(continuation.value.session.sessionId, prior);
-    const events = await collect(continuation.value.session.events);
-    assert.ok(events.some((event) => event.kind === 'SessionStarted'));
-  }
-  rmSync(workspace, { recursive: true, force: true });
-});
 
 /* -------------------------------------------------------------------------- */
 /* The engine environment is an allowlist (F03-AC5, N02-AC3)                   */

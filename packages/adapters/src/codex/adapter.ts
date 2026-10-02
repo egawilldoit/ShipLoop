@@ -31,7 +31,19 @@
  * directory. Both were verified live and both are named in the `Engine:ResumeSession`
  * capability declaration, so the limitation is visible before a resume is attempted rather than
  * discovered afterwards (F15-AC4).
+ *
+ * **A structured result is a channel, not a longer summary.** `EngineStartRequest.result` asks for
+ * one; without it a session behaves exactly as it always did and the 400-character summary cap is
+ * the only bound on its text. With it, `client.ts` writes the caller's schema, puts `--output-schema`
+ * and `-o` on the command line for either invocation, confines the artifact to the attempt's own
+ * directory, and this file reads it after the process has exited. What arrives reaches the contract
+ * as `EngineOutcome.Succeeded.result` — a separate field from `summary`, which stays capped — and a
+ * session that asked for a result and did not produce a usable one ends as a `MalformedOutput`
+ * diagnostic with **no** `Result` event, which is the rule F15-AC2 already applies to a malformed
+ * event stream.
  */
+
+import { randomUUID } from 'node:crypto';
 
 import { err, ok, type CapabilityDeclaration, type ConnectorId, type DomainError, type ProviderId, type Result } from '@shiploop/domain';
 
@@ -47,6 +59,7 @@ import {
   type EngineContinuation,
   type EngineEvent,
   type EngineMode,
+  type EngineResultRequest,
   type EngineSessionHandle,
   type EngineSessionStart,
   type EngineStartRequest,
@@ -57,9 +70,11 @@ import {
 } from '../contracts/index.ts';
 
 import {
+  CODEX_RESULT_CHANNEL_VERSION,
   CODEX_VERIFIED_VERSION,
   CodexClient,
   MINIMUM_CODEX_VERSION,
+  readCodexResult,
   resolveSandboxMode,
   stopCodexProcess,
   type CodexClientOptions,
@@ -71,6 +86,7 @@ import {
   finalizeCodexStream,
   initialCodexStreamState,
   translateCodexLine,
+  type CodexResultOutcome,
   type CodexStreamInterruption,
   type CodexStreamState,
   type CodexTranslationOptions,
@@ -91,7 +107,7 @@ const DECLARATIONS: readonly CapabilityDeclaration[] = [
   {
     kind: 'Engine:StartScoped',
     supported: true,
-    limitation: null,
+    limitation: `A session may ask for a structured result through EngineStartRequest.result, which carries the JSON Schema the engine's final answer must satisfy. On ${CODEX_RESULT_CHANNEL_VERSION} the adapter passes it as --output-schema and reads the answer from the artifact -o/--output-last-message writes, inside the attempt's own ShipLoop-owned home. Both flags are supported by \`codex exec\` and \`codex exec resume\`, and the artifact was written by a real turn under --sandbox read-only because the CLI process writes it rather than a sandboxed command. The payload is checked for completeness against the schema's declared properties and delivered whole on EngineOutcome.Succeeded.result; it is never carried by a progress summary, which stays bounded. A result that is missing, past the byte bound, unparseable or incomplete ends the session as MalformedOutput with no Result event (F15-AC2).`,
     privileged: false,
     supportsPrecondition: false,
   },
@@ -151,6 +167,13 @@ interface LaunchRequest {
   readonly mode: EngineMode;
   readonly grantedCapabilities: readonly CodingSessionCapability[];
   readonly bounds: EngineBounds;
+  /**
+   * A structured result this session must produce, or null when its text is enough.
+   *
+   * Null rather than optional so "asked for one" is a fact every launch states, including the
+   * checkpoint-seeded fallback a resume makes (F15-AC2).
+   */
+  readonly result: EngineResultRequest | null;
 }
 
 export class CodexEngineAdapter implements EngineAdapter {
@@ -209,7 +232,7 @@ export class CodexEngineAdapter implements EngineAdapter {
    * addresses, so a placeholder would make every continuation impossible (F15-AC1).
    */
   async startSession(context: AdapterContext, request: EngineStartRequest): Promise<Result<EngineSessionHandle>> {
-    return this.launch(context, request, 'Fresh');
+    return this.launch(context, { ...request, result: request.result ?? null }, 'Fresh');
   }
 
   /**
@@ -233,6 +256,7 @@ export class CodexEngineAdapter implements EngineAdapter {
       mode: 'Headless',
       grantedCapabilities: request.grantedCapabilities,
       bounds: request.bounds,
+      result: request.result ?? null,
     };
 
     const resumed = await this.launch(context, launch, 'Resume', request.priorSession.sessionId);
@@ -335,12 +359,18 @@ export class CodexEngineAdapter implements EngineAdapter {
     // there is no adapter-level default to fall back to and none is invented here (F18-AC2).
     const bounds = request.bounds;
 
+    // One token per launch, minted here because this is the layer that owns randomness. The client
+    // takes it rather than generating one so the artifact it prepares belongs to *this* launch and
+    // to nothing else on this worktree (F15-AC2).
+    const resultToken = randomUUID();
     const spawned = this.client.start({
       cwd: request.workspace.absolutePath,
       sandbox: sandbox.value,
       prompt,
       invocation,
       signal: context.signal,
+      result: request.result,
+      resultToken,
       ...(priorSessionId === undefined ? {} : { priorSessionId }),
     });
     if (!spawned.ok) return err(spawned.error);
@@ -406,12 +436,22 @@ export class CodexEngineAdapter implements EngineAdapter {
         context.signal.removeEventListener('abort', onAbort);
       }
 
-      if (stopReason.current !== null) {
-        channel.push({ kind: 'Stopped', at: context.clock.now(), reason: stopReason.current });
+if (stopReason.current !== null) {
+      channel.push({ kind: 'Stopped', at: context.clock.now(), reason: stopReason.current });
       }
       const exit = await running.waited();
       if (observedSessionId !== null) this.tracked.delete(observedSessionId);
       running.dispose();
+
+      /**
+       * The structured result is read only after the process has exited and its group is settled.
+       *
+       * Reading it any earlier would race the engine's own write: a partially written artifact
+       * would be read as a short answer, which is the same defect as a truncated summary arriving
+       * as a whole one. `readCodexResult` re-verifies confinement after the run, so an artifact
+       * swapped in while the engine held the directory cannot be read as this session's.
+       */
+      const result: CodexResultOutcome | null = readSessionResult(running);
 
       for (const event of finalizeCodexStream({
         state,
@@ -419,6 +459,9 @@ export class CodexEngineAdapter implements EngineAdapter {
         startedAt,
         interruption: stopReason.current === null ? interruption : 'Stopped',
         exitCode: exit.exitCode,
+        resultExpected: request.result !== null,
+        result,
+        schema: request.result?.schema ?? null,
       })) {
         channel.push(event);
       }
@@ -491,6 +534,25 @@ function pathsOrNone(paths: readonly string[]): string {
   if (paths.length === 0) return 'none';
   const shown = paths.slice(0, MAX_CHECKPOINT_PATHS).join(', ');
   return paths.length > MAX_CHECKPOINT_PATHS ? `${shown} (and ${String(paths.length - MAX_CHECKPOINT_PATHS)} more)` : shown;
+}
+
+/**
+ * What this launch's result channel produced.
+ *
+ * `Unreadable` is only produced when a channel existed at all: a session that asked for no result
+ * reports null, which is what keeps "no result was wanted" distinct from "a result was wanted and
+ * could not be had" (F15-AC2). No redaction happens here — `readCodexResult` is transport, and the
+ * text and the refusal both pass through `finalizeCodexStream`, which redacts before either
+ * becomes an event (N02-AC2).
+ */
+function readSessionResult(running: CodexProcess): CodexResultOutcome | null {
+  const channel = running.resultChannel;
+  if (channel === null) return null;
+  const read = readCodexResult(channel);
+  if (read.ok) {
+    return { kind: 'Read', text: read.value.text, byteLength: read.value.byteLength, sourcePath: read.value.sourcePath };
+  }
+  return { kind: 'Unreadable', detail: read.error.reason };
 }
 
 /**

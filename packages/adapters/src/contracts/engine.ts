@@ -83,15 +83,65 @@ export type EngineReportedUsage =
   | { readonly kind: 'Unknown'; readonly reason: string };
 
 /**
+ * A JSON Schema, as a value, describing the shape a caller requires of a result.
+ *
+ * It is an opaque `Record<string, unknown>` rather than a local schema type because the
+ * schema is the engine's: `codex exec --output-schema` reads the very same document the
+ * adapter writes, so re-typing it here would create a second definition that could drift
+ * from the file the engine was actually given. The adapter's own job is the part it *can*
+ * check without reimplementing a validator: that every property the schema declares is
+ * present, and that a declared `enum` is respected.
+ */
+export type EngineResultSchema = Readonly<Record<string, unknown>>;
+
+/**
+ * A structured result the caller requires from one session.
+ *
+ * This is a **separate channel**, not a wider summary. `EngineEvent.Progress.summary` is a
+ * bounded human-readable line and stays bounded; a plan proposal, a review verdict or any
+ * other structured answer is larger than any summary cap and must not be smuggled through
+ * one. Asking for a result here is what makes the adapter request the engine's structured
+ * output channel and read the whole payload back (F15-AC2).
+ */
+export interface EngineResultRequest {
+  /** The schema the engine's final answer must satisfy. Written into the attempt directory. */
+  readonly schema: EngineResultSchema;
+}
+
+/**
+ * A complete structured result, read whole from the engine's own result channel.
+ *
+ * `json` is the engine's text exactly as it was read from the result artifact, then passed
+ * through the caller's redaction; it is never truncated. `byteLength` is what the artifact
+ * held *before* redaction, so a reader can tell how much the engine produced even when
+ * redaction shortened it. `sourcePath` is relative to the attempt-owned directory the
+ * artifact was confined to, so it identifies the evidence without carrying a host path, and
+ * `checkedProperties` is how many schema-declared properties were verified present, which is
+ * what makes the completeness claim checkable rather than asserted (F15-AC2, F05-AC5).
+ */
+export interface EngineResultPayload {
+  readonly json: string;
+  readonly byteLength: number;
+  readonly sourcePath: string;
+  readonly checkedProperties: number;
+}
+
+/**
  * The terminal outcome of a session.
  *
  * `Succeeded` is the only variant that may complete an attempt, and it is
  * produced solely from a well-formed engine result. Malformed output produces a
  * diagnostic and no `Succeeded` event (F15-AC2). Blocked variants name an
  * actionable remedy and leave the workspace intact (F15-AC3).
+ *
+ * `Succeeded.result` is present exactly when the caller asked for a structured result on
+ * `EngineStartRequest.result` or `ResumeEngineSessionRequest.result`. It is **not** the
+ * summary, and a session that asked for one and did not produce a valid payload never reaches
+ * this variant at all: it is a `MalformedOutput` diagnostic and no `Result`, which is the same
+ * rule F15-AC2 already applies to a malformed event stream.
  */
 export type EngineOutcome =
-  | { readonly kind: 'Succeeded'; readonly summary: string }
+  | { readonly kind: 'Succeeded'; readonly summary: string; readonly result?: EngineResultPayload }
   | {
       readonly kind: 'Failed';
       readonly category: EngineDiagnosticCategory;
@@ -165,6 +215,14 @@ export interface EngineStartRequest {
   /** Explicit grant. Delivery capability kinds are not assignable here (F03-AC5, N02-AC3). */
   readonly grantedCapabilities: readonly CodingSessionCapability[];
   readonly bounds: EngineBounds;
+  /**
+   * A structured result this session must produce, or absent when its text is enough.
+   *
+   * Absent is the default and is not a narrower `Result`: the adapter then asks for no
+   * structured channel at all and the session behaves exactly as it did before this field
+   * existed. Present, the session fails closed if the payload does not arrive whole (F15-AC2).
+   */
+  readonly result?: EngineResultRequest;
 }
 
 export interface EngineSessionHandle {
@@ -191,6 +249,8 @@ export interface ResumeEngineSessionRequest {
   readonly instruction: string;
   readonly grantedCapabilities: readonly CodingSessionCapability[];
   readonly bounds: EngineBounds;
+  /** Carried on a resumed run for the same reason as on {@link EngineStartRequest.result}. */
+  readonly result?: EngineResultRequest;
 }
 
 /**
