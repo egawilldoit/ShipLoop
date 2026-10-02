@@ -39,6 +39,7 @@ import type {
   CriterionStatus,
   DomainError,
   JobId,
+  OperationId,
   ProfileVersionId,
   ProjectId,
   ProcedureVersionId,
@@ -51,6 +52,7 @@ import type {
   AdapterClock,
   AdapterContext,
   AdapterLogger,
+  EngineAdapter,
   ArtifactReference,
   DraftBody,
   DraftLinkTarget,
@@ -98,6 +100,14 @@ import type {
 
 import { readWorkerConfig } from './config.ts';
 import type { ConfigProblem } from './config.ts';
+import { createIsolatedEngine, readIsolationConfiguration } from './isolation.ts';
+import type { IsolationSettings } from './isolation.ts';
+import {
+  controllerPrincipal,
+  createRestrictedBroker,
+  refusePrivilegedDelivery,
+} from './broker.ts';
+import type { Broker, BrokerRepository, PushReceipt } from './broker.ts';
 import { createCheckpointFactsPort, createHolderLivenessPort, createOwnerExtensionPort, createWorkspacePort, recipeOf } from './ports.ts';
 import type { ObservableWorkspacePort, WorkspaceFacts, WorkspacePortBinding } from './ports.ts';
 import { createWorker, openWorkerStore } from './worker.ts';
@@ -158,6 +168,16 @@ export interface RuntimeConfig {
   readonly git: GitSettings;
   /** Provider specifier replacing the built-in workspace provider, or null for the built-in one. */
   readonly workspaceModule: string | null;
+  /**
+   * How the coding engine is isolated from this operator, or null when the environment asks for no
+   * isolation at all (F03-AC5).
+   *
+   * Null is not a silent fallback from a failed isolation: a configuration that asks for isolation
+   * and cannot have it is refused by `createIsolatedEngine` before any work is dispatched. It is only
+   * reached when no `SHIPLOOP_ENGINE_*` variable is present, and the runtime says so once, loudly, at
+   * startup, rather than leaving a reader to assume the engine was confined.
+   */
+  readonly isolation: IsolationSettings | null;
 }
 
 export type RuntimeConfigResult =
@@ -195,6 +215,17 @@ export function readRuntimeConfig(env: NodeJS.ProcessEnv): RuntimeConfigResult {
   );
   if (errors.length > 0) return { ok: false, errors };
 
+  const isolation = readIsolationConfiguration(env);
+  if (!isolation.ok) {
+    return {
+      ok: false,
+      errors:
+        isolation.error.code === 'Invalid'
+          ? isolation.error.fields.map((field) => ({ path: field.path, message: field.message }))
+          : [{ path: 'SHIPLOOP_ENGINE_UID', message: isolation.error.reason }],
+    };
+  }
+
   return {
     ok: true,
     value: {
@@ -220,6 +251,7 @@ export function readRuntimeConfig(env: NodeJS.ProcessEnv): RuntimeConfigResult {
         remoteName: text(env['SHIPLOOP_WORKER_GIT_REMOTE']) ?? DEFAULT_GIT_REMOTE,
       },
       workspaceModule: builtIn ? null : base.value.workspaceModule,
+      isolation: isolation.value,
     },
   };
 }
@@ -356,15 +388,7 @@ export async function createWorkerRuntime(config: RuntimeConfig): Promise<Result
     clock: systemClock,
     logger: lifecycleLogger(),
     redact: (value: string): string => redact(value).text,
-    engine: new CodexEngineAdapter({
-      connectorId: `engine_${config.holder}` as ConnectorId,
-      client: {
-        binary: config.engine.binary,
-        gracefulStopMs: config.gracefulStopMs,
-        killWaitMs: config.killWaitMs,
-      },
-      sandbox: config.engine.sandbox,
-    }),
+    engine: enginePortFor(config),
     queue: jobs,
     leases,
     workItems,
@@ -390,6 +414,7 @@ export async function createWorkerRuntime(config: RuntimeConfig): Promise<Result
 
   const deliver = createDelivery({
     config,
+    broker: brokerFor(config),
     jobs,
     workItems,
     attention,
@@ -481,6 +506,105 @@ function countOutcome(report: OutcomeTally, kind: AttemptOutcome['kind']): void 
   else if (kind === 'WriterDetached') report.detached += 1;
 }
 
+/**
+ * The engine port every attempt goes through (F03-AC5).
+ *
+ * With isolation configured, this is `createIsolatedEngine`, which plans a boundary per attempt and
+ * refuses the attempt when it cannot establish one. Without any isolation configured, it is the real
+ * Codex adapter and the gap is announced once at startup: a worker whose engine runs as the operator
+ * is a real, measurable exposure, and the alternative — refusing to start a worker whose environment
+ * happens to omit these variables — would make this configuration a precondition of the whole
+ * product rather than the boundary it is (F03-AC5, N02-AC3).
+ */
+function enginePortFor(config: RuntimeConfig): EngineAdapter {
+  const build = (launcherPath: string): EngineAdapter =>
+    new CodexEngineAdapter({
+      connectorId: `engine_${config.holder}` as ConnectorId,
+      client: {
+        binary: launcherPath === '' ? config.engine.binary : launcherPath,
+        gracefulStopMs: config.gracefulStopMs,
+        killWaitMs: config.killWaitMs,
+      },
+      sandbox: config.engine.sandbox,
+    });
+
+  if (config.isolation === null) {
+    const uid = typeof process.getuid === 'function' ? String(process.getuid()) : 'unknown';
+    console.warn(
+      `ShipLoop worker ${config.holder} is starting the coding engine WITHOUT execution isolation: the engine will run as uid ${uid} and can read this operator's credential files (F03-AC5). Set SHIPLOOP_ENGINE_UID, SHIPLOOP_ENGINE_GID, SHIPLOOP_ENGINE_HOME_ROOT, SHIPLOOP_ENGINE_LAUNCHER_ROOT and SHIPLOOP_ENGINE_BINARY to confine it; see docs/evidence/2026-10-01-execution-isolation.md.`,
+    );
+    return build('');
+  }
+
+  return createIsolatedEngine({
+    isolation: config.isolation,
+    buildEngine: build,
+    connectorId: `engine_${config.holder}` as ConnectorId,
+    gracefulStopMs: config.gracefulStopMs,
+    killWaitMs: config.killWaitMs,
+    onRefusal: (error): void => {
+      console.error(`Error the coding engine could not be isolated, so no coding work was dispatched: ${describeBlocker(error)}`);
+    },
+  });
+}
+
+/**
+ * The broker this worker publishes through (F03-AC5, N02-AC3, F19-AC1).
+ *
+ * It holds the repository credential the worker was configured with and nothing privileged:
+ * `privilegedCredential` is null and the privileged deliverer refuses, so this process has no merge
+ * or deploy path at all. Publication is still routed through the broker rather than called directly,
+ * because the point of the boundary is that the publication path is the *only* path the engine's
+ * work can cause, and that is only true while every push goes through it.
+ */
+function brokerFor(config: RuntimeConfig): Broker {
+  const operationId = `${config.holder}:broker` as OperationId;
+  return createRestrictedBroker({
+    featureBranchCredential: { scope: 'FeatureBranchWrite', secret: config.git.token },
+    privilegedCredential: null,
+    publisher: {
+      publish: async (request): Promise<Result<PushReceipt, DomainError>> => {
+        const pair = gitPairFor(config, request.worktreePath);
+        if (!pair.ok) return err(pair.error);
+        const context: AdapterContext = {
+          correlationId: config.holder,
+          operationId,
+          clock: systemClock,
+          logger: lifecycleLogger(),
+          signal: new AbortController().signal,
+          redact: (value: string): string => redact(value).text,
+        };
+        const pushed = await pair.value.git.pushBranch(context, {
+          operationId,
+          repository: { ...request.repository, url: request.repository.fullName },
+          branch: request.branch,
+          headSha: request.headSha as CommitSha,
+          forceStrategy: 'RejectNonFastForward',
+        });
+        if (!pushed.ok) return err(pushed.error);
+        return ok({
+          repository: request.repository.fullName,
+          branch: request.branch,
+          headSha: request.headSha,
+          remoteRef: `refs/heads/${request.branch}`,
+          pushedAt: systemClock.now(),
+        });
+      },
+    },
+    deliverer: refusePrivilegedDelivery(
+      'This worker holds no privileged delivery credential. Merge and release are the controller\'s to perform on the owner\'s authorization, and a coding attempt cannot reach either (F03-AC5, N02-AC3).',
+    ),
+    now: systemClock.now,
+  });
+}
+
+/** A blocker's reason with each prerequisite's remedy, which is what an operator has to act on. */
+function describeBlocker(error: DomainError): string {
+  if (error.code !== 'Blocked') return error.reason;
+  const remedies = error.prerequisites.map((prerequisite) => `${prerequisite.name}: ${prerequisite.detail} ${prerequisite.remedy}`);
+  return remedies.length === 0 ? error.reason : `${error.reason} ${remedies.join(' ')}`;
+}
+
 interface WorkspaceBinding {
   readonly port: ObservableWorkspacePort;
   factsFor(jobId: JobId): WorkspaceFacts | null;
@@ -554,6 +678,8 @@ async function bindWorkspaces(
 
 interface DeliveryDeps {
   readonly config: RuntimeConfig;
+  /** The only path from an attempt's work to a remote write (F03-AC5, N02-AC3). */
+  readonly broker: Broker;
   readonly jobs: JobQueue;
   readonly workItems: WorkItemRepository;
   readonly attention: AttentionItemRepository;
@@ -631,15 +757,23 @@ function createDelivery(deps: DeliveryDeps): Deliverer {
     const committed = await commitWorkspace(deps.config, pair.value, context, snapshot.value.title);
     if (!committed.ok) return refused(job, `The attempt's work could not be committed, so nothing was delivered: ${committed.error.reason} (F19-AC1).`);
 
-    const pushed = await git.pushBranch(context, {
-      operationId: job.operationId,
-      repository,
+    /**
+     * Publication goes through the broker, which holds the repository credential (F03-AC5, N02-AC3).
+     *
+     * The worker is not the principal that caused this push and does not claim to be: the engine
+     * produced the work, and the broker performs the write on the controller's behalf with a
+     * credential the engine cannot reach. The principal recorded here is the one that asked, so an
+     * audit can tell an attempt-driven publication from an owner-driven one.
+     */
+    const published = await deps.broker.publishFeatureBranch({
+      principal: controllerPrincipal(deps.config.holder),
+      repository: brokerRepositoryOf(repository),
       branch: facts.branchName,
       headSha: committed.value,
-      forceStrategy: 'RejectNonFastForward',
+      worktreePath: facts.worktreePath,
     });
-    if (!pushed.ok) {
-      return refused(job, `The task branch could not be pushed, so nothing was delivered: ${pushed.error.reason} (F19-AC1, F19-AC4).`);
+    if (!published.ok) {
+      return refused(job, `The broker refused to publish the task branch, so nothing was delivered: ${published.error.reason} (F19-AC1, F19-AC4).`);
     }
 
     const link = linkTargetFor(work.value);
@@ -906,6 +1040,11 @@ async function commitWorkspace(
     return err({ code: 'Unavailable', reason: 'The committed head could not be read, so nothing was pushed.' });
   }
   return ok(head.value.stdout.trim() as CommitSha);
+}
+
+/** The broker's own view of a repository, so its boundary does not depend on the adapter's ref. */
+function brokerRepositoryOf(repository: GitRepositoryRef): BrokerRepository {
+  return { provider: 'github', fullName: repository.fullName, defaultBranch: repository.defaultBranch };
 }
 
 function adapterContextFor(job: JobRecord): AdapterContext {
