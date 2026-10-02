@@ -1068,6 +1068,107 @@ export interface AcceptanceUseCases {
   acceptanceGate(jobId: JobId): Promise<Result<AcceptanceGateView, DomainError>>;
 }
 
+/**
+ * Manual owner test recording (F23-AC1, F23-AC5, F24-AC4, F25-AC1, F25-AC4).
+ */
+
+/**
+ * What the owner reports they observed, as the transport names it.
+ *
+ * `CaptureFailed` travels as its own member rather than as a failed behaviour, because a
+ * screenshot that was never taken observed nothing and recording it as a behaviour failure
+ * misleads in one direction, while recording it as a pass misleads in the other (F23-AC5).
+ */
+export type OwnerObservationKind = 'BehaviorConfirmed' | 'BehaviorFailed' | 'CaptureFailed';
+
+/** The kinds of retained reference an observation may point at (F23-AC2). */
+export type OwnerEvidenceKind = 'Screenshot' | 'ApiExchange' | 'CheckOutput';
+
+/**
+ * The deployment an observation was made against, or the owner's statement that none applies.
+ *
+ * Two shapes and no third, because "somewhere" is the one that lets a local check or a stale
+ * preview stand in for the eligible deployment (F23-AC4). The controller resolves the named
+ * deployment against the candidate, so this port cannot express an observation of a
+ * deployment the candidate does not carry (F22-AC1).
+ */
+export type OwnerObservationTarget =
+  | {
+      readonly kind: 'Deployment';
+      readonly component: string;
+      readonly deploymentId: string;
+      readonly environment: string;
+    }
+  | {
+      readonly kind: 'NoDeployment';
+      readonly reason: string;
+    };
+
+/**
+ * One recorded owner observation, as the owner reads it back.
+ *
+ * `failureKind` is carried so the transport does not have to read the detail prose to tell a
+ * behaviour failure from a capture failure, and `methodKind` is a single literal so a failed
+ * owner test can never be rendered as a failed automated check (F23-AC5).
+ */
+export interface OwnerObservationView {
+  readonly evidenceId: string;
+  readonly criterionId: string;
+  readonly methodKind: 'OwnerTest';
+  readonly status: string;
+  readonly failureKind: 'BehaviorFailure' | 'CaptureFailure' | null;
+  /** The authenticated owner, which is never read from the request (F25-AC1, F25-AC4). */
+  readonly observedBy: string;
+  readonly observedAt: string;
+  readonly environment: string;
+  readonly component: string | null;
+  readonly deploymentId: string | null;
+  readonly evidenceKind: OwnerEvidenceKind;
+  readonly evidenceRef: string;
+  readonly detail: string | null;
+  readonly candidateId: string;
+  readonly candidateFingerprint: string;
+  readonly scopeFingerprint: string;
+  readonly correlationId: string;
+}
+
+export interface OwnerObservationReportView {
+  readonly observation: OwnerObservationView;
+  /** Always false and typed: recording an observation is not accepting the work (F25-AC1). */
+  readonly recordedForDelivery: false;
+  readonly outstandingCriterionIds: readonly string[];
+}
+
+/**
+ * Manual owner test recording (F23-AC1, F23-AC5, F24-AC4, F25-AC1, F25-AC4).
+ *
+ * Keyed by run, like the acceptance group, because the run is what the owner acted on and the
+ * controller resolves the candidate from it; a request therefore cannot name a candidate the
+ * run does not offer. `expectedCandidateFingerprint` is separate and required: it is the
+ * identity the owner's page was rendered against, and comparing it against the resolved
+ * candidate is what turns an action taken from an outdated card into a `Conflict` rather than
+ * a write against whatever is current now (F24-AC4). Writes carry the owner the transport
+ * proved and no caller-supplied instant, so an observation cannot be attributed to a session
+ * that did not make it or backdated (F25-AC4, F01-AC1).
+ */
+export interface OwnerTestUseCases {
+  recordOwnerObservation(command: {
+    readonly jobId: JobId;
+    readonly criterionId: string;
+    readonly expectedCandidateFingerprint: string;
+    readonly observation: OwnerObservationKind;
+    readonly observedAgainst: OwnerObservationTarget;
+    readonly evidence: { readonly kind: OwnerEvidenceKind; readonly reference: string };
+    readonly note: string | null;
+    readonly actor: OwnerId;
+  }): Promise<Result<OwnerObservationReportView, DomainError>>;
+  /** The observations bound to one exact candidate identity (F20-AC3, F23-AC1). */
+  listOwnerObservations(query: {
+    readonly jobId: JobId;
+    readonly candidateFingerprint: string;
+  }): Promise<Result<readonly OwnerObservationView[], DomainError>>;
+}
+
 /* -------------------------------------------------------------------------- */
 /* Plans, readiness, publication and adoption                                 */
 /* -------------------------------------------------------------------------- */
@@ -1398,6 +1499,7 @@ export interface ControllerSurface {
   readonly attention: AttentionUseCases;
   readonly reviewCards: ReviewCardUseCases;
   readonly acceptance: AcceptanceUseCases;
+  readonly ownerTests: OwnerTestUseCases;
   readonly planning: PlanningUseCases;
   readonly generation: GenerationUseCases;
 }
@@ -1437,6 +1539,7 @@ const REQUIRED_METHODS = {
   attention: ['collectAttention', 'acknowledge'],
   reviewCards: ['buildReviewCard'],
   acceptance: ['requestChanges', 'recordAcceptance', 'currentAcceptance', 'acceptanceGate'],
+  ownerTests: ['recordOwnerObservation', 'listOwnerObservations'],
   planning: [
     'draftPlan',
     'getPlan',

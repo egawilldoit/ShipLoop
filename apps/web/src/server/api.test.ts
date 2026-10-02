@@ -73,6 +73,9 @@ import {
   type EditPlanCommand,
   type LinkedChangeView,
   type OwnerView,
+  type OwnerObservationReportView,
+  type OwnerObservationTarget,
+  type OwnerObservationView,
   type CancelledRunView,
   type DeclinedExtensionView,
   type GrantedExtensionView,
@@ -175,6 +178,27 @@ const ATTENTION_BUCKET_OF: Readonly<Record<string, AttentionBucket>> = {
   Blocker: 'NeedsYourInput',
   ReadyForYourTest: 'ReadyForYourTest',
   DeliveryDecision: 'ReadyForRelease',
+};
+
+/**
+ * The status each reported observation produces, and how it failed to be a pass (F23-AC5).
+ *
+ * A capture failure is `Missing` and a behaviour failure is `Failed`, so the two are different
+ * outcomes rather than one failure; `failureKind` is what tells them apart without reading the
+ * detail prose.
+ */
+const STATUS_FOR_OBSERVATION: Readonly<Record<'BehaviorConfirmed' | 'BehaviorFailed' | 'CaptureFailed', string>> = {
+  BehaviorConfirmed: 'Verified',
+  BehaviorFailed: 'Failed',
+  CaptureFailed: 'Missing',
+};
+
+const FAILURE_KIND_FOR_OBSERVATION: Readonly<
+  Record<'BehaviorConfirmed' | 'BehaviorFailed' | 'CaptureFailed', 'BehaviorFailure' | 'CaptureFailure' | null>
+> = {
+  BehaviorConfirmed: null,
+  BehaviorFailed: 'BehaviorFailure',
+  CaptureFailed: 'CaptureFailure',
 };
 
 const CSRF_SECRET = ['server', 'secret', 'material', '0123456789abcdef'].join('-');
@@ -313,6 +337,7 @@ class InMemoryController implements ControllerSurface {
   private readonly gates = new Map<string, { readonly candidateId: string; readonly gate: AcceptanceGateView }>();
   private readonly acceptanceStates = new Map<string, AcceptanceView>();
   private readonly feedback: { readonly decisionId: string; readonly feedback: string }[] = [];
+  private readonly ownerObservations = new Map<string, OwnerObservationView[]>();
 
   constructor(
     _now: () => Date,
@@ -1185,6 +1210,93 @@ class InMemoryController implements ControllerSurface {
     acceptanceGate: async (jobId: JobId): Promise<Result<AcceptanceGateView, DomainError>> => {
       const gate = this.gateOf(jobId);
       return gate.ok ? ok(gate.value.gate) : gate;
+    },
+  };
+
+  /**
+   * The owner-test group of this double.
+   *
+   * Real rather than canned, because the two properties worth proving at this boundary are
+   * relational and a canned answer would pass without either: the observation is filed under
+   * the exact candidate fingerprint the request claimed, and a submission claiming a
+   * fingerprint that is no longer current is a `Conflict` naming both identities rather than a
+   * write against whatever happens to be current now (F24-AC4, F20-AC3).
+   *
+   * The deployment binding is not re-derived here. It is the controller's judgement, and
+   * `controller/src/owner-tests.test.ts` is where a deployment the candidate does not carry is
+   * proved to be refused; a double that copied that rule would be a second copy of it, and a
+   * double that ignored it would let a route dropping the field read as covered here.
+   */
+  readonly ownerTests = {
+    recordOwnerObservation: async (command: {
+      readonly jobId: JobId;
+      readonly criterionId: string;
+      readonly expectedCandidateFingerprint: string;
+      readonly observation: 'BehaviorConfirmed' | 'BehaviorFailed' | 'CaptureFailed';
+      readonly observedAgainst: OwnerObservationTarget;
+      readonly evidence: { readonly kind: 'Screenshot' | 'ApiExchange' | 'CheckOutput'; readonly reference: string };
+      readonly note: string | null;
+      readonly actor: OwnerId;
+    }): Promise<Result<OwnerObservationReportView, DomainError>> => {
+      const scripted = this.takeScripted('recordOwnerObservation');
+      if (scripted !== null) return { ok: false, error: scripted };
+      const gate = this.gateOf(command.jobId);
+      if (!gate.ok) return gate;
+      const currentFingerprint = gate.value.gate.candidateFingerprint;
+      if (command.expectedCandidateFingerprint !== currentFingerprint) {
+        return {
+          ok: false,
+          error: conflict(
+            'This submission was prepared against a candidate that is no longer the current one; nothing was recorded (F24-AC4).',
+            command.expectedCandidateFingerprint,
+            currentFingerprint,
+          ),
+        };
+      }
+      const deployed = command.observedAgainst.kind === 'Deployment';
+      const key = `${gate.value.candidateId}|${currentFingerprint}`;
+      const previous = this.ownerObservations.get(key) ?? [];
+      const observation: OwnerObservationView = {
+        evidenceId: `evid-owner-test-${previous.length + 1}`,
+        criterionId: command.criterionId,
+        methodKind: 'OwnerTest',
+        status: STATUS_FOR_OBSERVATION[command.observation],
+        failureKind: FAILURE_KIND_FOR_OBSERVATION[command.observation],
+        observedBy: command.actor,
+        observedAt: START,
+        environment: deployed ? 'Preview' : 'Local',
+        component: deployed ? command.observedAgainst.component : null,
+        deploymentId: deployed ? command.observedAgainst.deploymentId : null,
+        evidenceKind: command.evidence.kind,
+        evidenceRef: command.evidence.reference,
+        detail: command.note,
+        candidateId: gate.value.candidateId,
+        candidateFingerprint: currentFingerprint,
+        scopeFingerprint: gate.value.gate.scopeFingerprint,
+        correlationId: `owner-test:${String(command.jobId)}`,
+      };
+      this.ownerObservations.set(
+        key,
+        [...previous.filter((entry) => entry.criterionId !== command.criterionId), observation],
+      );
+      return ok({
+        observation,
+        recordedForDelivery: false,
+        outstandingCriterionIds: gate.value.gate.criteria
+          .filter((entry) => entry.criterionId !== command.criterionId)
+          .map((entry) => entry.criterionId),
+      });
+    },
+
+    listOwnerObservations: async (query: {
+      readonly jobId: JobId;
+      readonly candidateFingerprint: string;
+    }): Promise<Result<readonly OwnerObservationView[], DomainError>> => {
+      const gate = this.gateOf(query.jobId);
+      if (!gate.ok) return gate;
+      return ok([
+        ...(this.ownerObservations.get(`${gate.value.candidateId}|${query.candidateFingerprint}`) ?? []),
+      ]);
     },
   };
 
@@ -2061,6 +2173,7 @@ test('the loaded controller module is validated before it can serve a request', 
     attention: { collectAttention() {}, acknowledge() {} },
     reviewCards: { buildReviewCard() {} },
     acceptance: { requestChanges() {}, recordAcceptance() {}, currentAcceptance() {}, acceptanceGate() {} },
+    ownerTests: { recordOwnerObservation() {}, listOwnerObservations() {} },
     planning: {
       draftPlan() {},
       getPlan() {},
@@ -2079,6 +2192,15 @@ test('the loaded controller module is validated before it can serve a request', 
     generation: new InMemoryController(() => new Date("2026-10-02T10:00:00.000Z"), ADAPTER_CAPABILITIES, true).generation,
   };
   assert.equal(isControllerSurface(complete), true);
+  const missingOwnerTestMethod = {
+    ...complete,
+    ownerTests: { ...complete.ownerTests, recordOwnerObservation: undefined },
+  };
+  assert.equal(
+    isControllerSurface(missingOwnerTestMethod),
+    false,
+    'a surface without the owner-test recording path must not pass the guard: recording an observation has to be a declared method (F25-AC4)',
+  );
   const missingPlanningMethod = {
     ...complete,
     planning: { ...complete.planning, publishPlan: undefined },
@@ -3190,6 +3312,307 @@ test('F01-AC1: an acceptance decision needs a session and a forgery token', asyn
 
   const anonymousRead = await h.app.inject({ method: 'GET', url: `/api/runs/${job.jobId}/acceptance` });
   assert.equal(anonymousRead.statusCode, 401, anonymousRead.body);
+});
+
+/* Manual owner test recording (F23, F24-AC4, F25-AC1, F25-AC4, F01)             */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * A manual criterion observation the transport accepts.
+ *
+ * One deployment target, one evidence reference and one note, so a case can vary exactly one
+ * of them. Every field here is something the owner chose; the observer, the instant and the
+ * candidate are not in this object and cannot be added to it (F25-AC4).
+ */
+function ownerObservationBody(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    criterionId: 'AC2',
+    expectedCandidateFingerprint: 'fp_candidate_1',
+    observation: 'BehaviorConfirmed',
+    observedAgainst: {
+      kind: 'Deployment',
+      component: 'web',
+      deploymentId: 'dep_octopus_1',
+      environment: 'preview',
+    },
+    evidence: { kind: 'Screenshot', reference: 'screenshots/review-card.png' },
+    note: 'The wording reads as the owner expects.',
+    ...overrides,
+  };
+}
+
+// F23-AC1, F23-AC3, F25-AC1: the write records the criterion, the exact fingerprint, the deployment
+// it was made against, the authenticated owner, the instant and the retained evidence reference.
+test('F23-AC3: a recorded observation names the fingerprint, the deployment, the owner and the evidence', async (t) => {
+  const h = await harness();
+  t.after(() => h.close());
+  const session = await signIn(h.app);
+  const job = queuedRun({ jobId: 'job_owner_test', state: 'Completed' });
+  h.controller.seedRun(job);
+  h.controller.seedAcceptanceGate(WORK_ITEM, acceptanceGate(['AC2']), 'cand_octopus_owner_test');
+
+  const response = await h.app.inject({
+    method: 'POST',
+    url: `/api/runs/${job.jobId}/owner-observations`,
+    headers: { cookie: session.cookie, 'x-shiploop-csrf': session.csrfToken },
+    payload: ownerObservationBody(),
+  });
+  assert.equal(response.statusCode, 200, response.body);
+  const report = parse<{ report: OwnerObservationReportView }>(response).report;
+  const observation = report.observation;
+  assert.equal(observation.criterionId, 'AC2');
+  assert.equal(observation.candidateFingerprint, 'fp_candidate_1', 'bound to the exact fingerprint the owner acted on (F23-AC3)');
+  assert.equal(observation.methodKind, 'OwnerTest', 'it is never read as an automated check (F23-AC5)');
+  assert.equal(observation.status, 'Verified');
+  assert.equal(observation.failureKind, null);
+  assert.equal(observation.deploymentId, 'dep_octopus_1', 'the deployment it was made against travels with it (F23-AC3)');
+  assert.equal(observation.component, 'web');
+  assert.equal(observation.environment, 'Preview');
+  assert.equal(observation.evidenceRef, 'screenshots/review-card.png', 'the retained evidence reference is reported (F23-AC2)');
+  assert.equal(observation.evidenceKind, 'Screenshot');
+  assert.equal(observation.observedBy, OWNER_ID, 'the observer is the session this request proved, never the body (F25-AC4)');
+  assert.equal(observation.observedAt, START, 'the instant is this process\'s, so it cannot be backdated (F23-AC3)');
+  assert.equal(
+    report.recordedForDelivery,
+    false,
+    'recording one observation is not accepting the work (F25-AC1, F24-AC3)',
+  );
+
+  const read = await h.app.inject({
+    method: 'GET',
+    url: `/api/runs/${job.jobId}/owner-observations?candidateFingerprint=fp_candidate_1`,
+    headers: { cookie: session.cookie },
+  });
+  assert.equal(read.statusCode, 200, read.body);
+  const listed = parse<{ observations: readonly OwnerObservationView[] }>(read).observations;
+  assert.equal(listed.length, 1, 'what was recorded reads back under the same identity (F20-AC3)');
+  assert.equal(listed[0]?.evidenceRef, 'screenshots/review-card.png');
+});
+
+// F24-AC4, F20-AC3: a submission prepared against a candidate that is no longer current is refused
+// with both identities, and nothing is recorded against the candidate that replaced it.
+test('F24-AC4: a submission against a superseded candidate is refused with a Conflict and records nothing', async (t) => {
+  const h = await harness();
+  t.after(() => h.close());
+  const session = await signIn(h.app);
+  const job = queuedRun({ jobId: 'job_stale_owner_test', state: 'Completed' });
+  h.controller.seedRun(job);
+  h.controller.seedAcceptanceGate(WORK_ITEM, acceptanceGate(['AC2']), 'cand_octopus_stale');
+
+  const stale = await h.app.inject({
+    method: 'POST',
+    url: `/api/runs/${job.jobId}/owner-observations`,
+    headers: { cookie: session.cookie, 'x-shiploop-csrf': session.csrfToken },
+    payload: ownerObservationBody({ expectedCandidateFingerprint: 'fp_the_previous_build' }),
+  });
+  assert.equal(stale.statusCode, 409, stale.body);
+  const problem = parse<ErrorPayload>(stale);
+  assert.equal(problem.error.code, 'Conflict');
+  assert.equal(problem.error.expected, 'fp_the_previous_build', 'the conflict names what the owner acted on (F24-AC4)');
+  assert.equal(problem.error.actual, 'fp_candidate_1', 'and the candidate that is current, so the owner can re-read (F24-AC4)');
+
+  const recorded = await h.app.inject({
+    method: 'GET',
+    url: `/api/runs/${job.jobId}/owner-observations?candidateFingerprint=fp_candidate_1`,
+    headers: { cookie: session.cookie },
+  });
+  assert.deepEqual(
+    parse<{ observations: readonly OwnerObservationView[] }>(recorded).observations,
+    [],
+    'the refusal recorded nothing against the candidate that replaced it (F24-AC4, F20-AC3)',
+  );
+});
+
+// F23-AC5: a capture failure, a behaviour failure and a confirmation are three distinguishable
+// answers, and the failed one is still not an automated check result.
+test('F23-AC5: a capture failure and a behaviour failure are reported as different outcomes', async (t) => {
+  const h = await harness();
+  t.after(() => h.close());
+  const session = await signIn(h.app);
+  const job = queuedRun({ jobId: 'job_capture_failure', state: 'Completed' });
+  h.controller.seedRun(job);
+  h.controller.seedAcceptanceGate(WORK_ITEM, acceptanceGate(['AC2']), 'cand_octopus_capture');
+
+  const post = (payload: Record<string, unknown>) =>
+    h.app.inject({
+      method: 'POST',
+      url: `/api/runs/${job.jobId}/owner-observations`,
+      headers: { cookie: session.cookie, 'x-shiploop-csrf': session.csrfToken },
+      payload,
+    });
+
+  const captured = await post(
+    ownerObservationBody({ observation: 'CaptureFailed', note: 'The recording tool never started.' }),
+  );
+  assert.equal(captured.statusCode, 200, captured.body);
+  const captureFailure = parse<{ report: OwnerObservationReportView }>(captured).report.observation;
+  assert.equal(captureFailure.status, 'Missing', 'a capture failure observed no behaviour (F23-AC5)');
+  assert.equal(captureFailure.failureKind, 'CaptureFailure');
+
+  const failed = await post(
+    ownerObservationBody({ observation: 'BehaviorFailed', note: 'The card omitted the failing check.' }),
+  );
+  assert.equal(failed.statusCode, 200, failed.body);
+  const behaviourFailure = parse<{ report: OwnerObservationReportView }>(failed).report.observation;
+  assert.equal(behaviourFailure.status, 'Failed');
+  assert.equal(behaviourFailure.failureKind, 'BehaviorFailure');
+  assert.equal(behaviourFailure.methodKind, 'OwnerTest', 'a failed owner test is not a failed automated check (F23-AC5)');
+  assert.notEqual(behaviourFailure.status, captureFailure.status, 'the two stay distinguishable (F23-AC5)');
+});
+
+// F25-AC4, F01-AC1, F02-AC4: the body cannot name the observer, the instant or the candidate, and
+// each attempt is refused by field name rather than silently ignored.
+test('F25-AC4: a body cannot claim the observer, the instant or the candidate', async (t) => {
+  const h = await harness();
+  t.after(() => h.close());
+  const session = await signIn(h.app);
+  const job = queuedRun({ jobId: 'job_no_actor', state: 'Completed' });
+  h.controller.seedRun(job);
+  h.controller.seedAcceptanceGate(WORK_ITEM, acceptanceGate(['AC2']), 'cand_octopus_actor');
+
+  const forged = await h.app.inject({
+    method: 'POST',
+    url: `/api/runs/${job.jobId}/owner-observations`,
+    headers: { cookie: session.cookie, 'x-shiploop-csrf': session.csrfToken },
+    payload: ownerObservationBody({ actor: 'own_somebody_else', observedBy: 'own_somebody_else' }),
+  });
+  assert.equal(forged.statusCode, 400, forged.body);
+  const fields = (parse<ErrorPayload>(forged).error.fields ?? []).map((field) => field.path);
+  assert.deepEqual(fields, ['actor', 'observedBy'], 'a request naming its own observer is refused by field name (F25-AC4)');
+
+  const backdated = await h.app.inject({
+    method: 'POST',
+    url: `/api/runs/${job.jobId}/owner-observations`,
+    headers: { cookie: session.cookie, 'x-shiploop-csrf': session.csrfToken },
+    payload: ownerObservationBody({ observedAt: '2020-01-01T00:00:00.000Z' }),
+  });
+  assert.equal(backdated.statusCode, 400, backdated.body);
+  assert.deepEqual(
+    (parse<ErrorPayload>(backdated).error.fields ?? []).map((field) => field.path),
+    ['observedAt'],
+    'an observation cannot be backdated (F23-AC3)',
+  );
+
+  const named = await h.app.inject({
+    method: 'POST',
+    url: `/api/runs/${job.jobId}/owner-observations`,
+    headers: { cookie: session.cookie, 'x-shiploop-csrf': session.csrfToken },
+    payload: ownerObservationBody({ candidateId: 'cand_somewhere_else' }),
+  });
+  assert.equal(named.statusCode, 400, named.body);
+  assert.deepEqual(
+    (parse<ErrorPayload>(named).error.fields ?? []).map((field) => field.path),
+    ['candidateId'],
+    'a request cannot choose the candidate; the run and the fingerprint decide it (F24-AC4)',
+  );
+});
+
+// F23-AC3, F23-AC4: the deployment is a required union, so neither "which deployment did you
+// observe" nor "which candidate" can be left blank for the server to guess.
+test('F23-AC4: the deployment must be named or explicitly ruled out', async (t) => {
+  const h = await harness();
+  t.after(() => h.close());
+  const session = await signIn(h.app);
+  const job = queuedRun({ jobId: 'job_target', state: 'Completed' });
+  h.controller.seedRun(job);
+  h.controller.seedAcceptanceGate(WORK_ITEM, acceptanceGate(['AC2']), 'cand_octopus_target');
+
+  const post = (payload: Record<string, unknown>) =>
+    h.app.inject({
+      method: 'POST',
+      url: `/api/runs/${job.jobId}/owner-observations`,
+      headers: { cookie: session.cookie, 'x-shiploop-csrf': session.csrfToken },
+      payload,
+    });
+
+  const blank = await post(ownerObservationBody({ observedAgainst: null }));
+  assert.equal(blank.statusCode, 400, blank.body);
+  assert.deepEqual(
+    (parse<ErrorPayload>(blank).error.fields ?? []).map((field) => field.path),
+    ['observedAgainst'],
+    'leaving the deployment blank is refused rather than guessed (F23-AC4)',
+  );
+
+  const unexplained = await post(ownerObservationBody({ observedAgainst: { kind: 'NoDeployment', reason: '  ' } }));
+  assert.equal(unexplained.statusCode, 400, unexplained.body);
+  assert.deepEqual(
+    (parse<ErrorPayload>(unexplained).error.fields ?? []).map((field) => field.path),
+    ['observedAgainst.reason'],
+    'ruling out every deployment needs a reason, so the record is not an unexplained absence (F23-AC3)',
+  );
+
+  const noDeployment = await post(
+    ownerObservationBody({ observedAgainst: { kind: 'NoDeployment', reason: 'This project deploys nothing.' } }),
+  );
+  assert.equal(noDeployment.statusCode, 200, noDeployment.body);
+  assert.equal(
+    parse<{ report: OwnerObservationReportView }>(noDeployment).report.observation.environment,
+    'Local',
+    'the environment label follows the target the owner stated (F23-AC4)',
+  );
+
+  const noEvidence = await post(ownerObservationBody({ evidence: { kind: 'Screenshot', reference: '' } }));
+  assert.equal(noEvidence.statusCode, 400, noEvidence.body);
+  assert.deepEqual(
+    (parse<ErrorPayload>(noEvidence).error.fields ?? []).map((field) => field.path),
+    ['evidence.reference'],
+    'an observation without a retained reference is refused (F23-AC2)',
+  );
+
+  const unknownObservation = await post(ownerObservationBody({ observation: 'ProbablyFine' }));
+  assert.equal(unknownObservation.statusCode, 400, unknownObservation.body);
+  assert.deepEqual(
+    (parse<ErrorPayload>(unknownObservation).error.fields ?? []).map((field) => field.path),
+    ['observation'],
+    'the three reportable outcomes are named rather than accepting a claim of confidence (F23-AC5)',
+  );
+});
+
+// F01-AC1, F01-AC4: recording is a write, so it needs a session and a forgery token, and the read
+// refuses an anonymous caller.
+test('F01-AC4: recording an observation needs a session and a forgery token', async (t) => {
+  const h = await harness();
+  t.after(() => h.close());
+  const session = await signIn(h.app);
+  const job = queuedRun({ jobId: 'job_owner_guard', state: 'Completed' });
+  h.controller.seedRun(job);
+  h.controller.seedAcceptanceGate(WORK_ITEM, acceptanceGate(['AC2']), 'cand_octopus_guard');
+
+  const anonymous = await h.app.inject({
+    method: 'POST',
+    url: `/api/runs/${job.jobId}/owner-observations`,
+    payload: ownerObservationBody(),
+  });
+  assert.equal(anonymous.statusCode, 401, anonymous.body);
+  assert.equal(parse<ErrorPayload>(anonymous).signInRequired, true);
+  assert.ok(!anonymous.body.includes(OWNER_ID), 'the refusal discloses no owner (F01-AC1)');
+
+  const sessionless = await h.app.inject({
+    method: 'POST',
+    url: `/api/runs/${job.jobId}/owner-observations`,
+    headers: { cookie: session.cookie },
+    payload: ownerObservationBody(),
+  });
+  assert.equal(sessionless.statusCode, 403, sessionless.body);
+  assert.equal(parse<ErrorPayload>(sessionless).error.code, 'Forbidden');
+
+  const anonymousRead = await h.app.inject({
+    method: 'GET',
+    url: `/api/runs/${job.jobId}/owner-observations?candidateFingerprint=fp_candidate_1`,
+  });
+  assert.equal(anonymousRead.statusCode, 401, anonymousRead.body);
+
+  const unsignedRead = await h.app.inject({
+    method: 'GET',
+    url: `/api/runs/${job.jobId}/owner-observations`,
+    headers: { cookie: session.cookie },
+  });
+  assert.equal(unsignedRead.statusCode, 400, unsignedRead.body);
+  assert.deepEqual(
+    (parse<ErrorPayload>(unsignedRead).error.fields ?? []).map((field) => field.path),
+    ['candidateFingerprint'],
+    'a read names the identity it is asking about, because an answer spanning every identity would read as one build inheriting another\'s (F20-AC3)',
+  );
 });
 
 /* Planning, readiness, publication and adoption (F08, F09, F10, F11)          */
