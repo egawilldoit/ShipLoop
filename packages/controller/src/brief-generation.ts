@@ -79,7 +79,7 @@ import type {
   ProviderId,
   ReadOnlyCapability,
   ReadOnlyCapabilityProfile,
-  RequestedOutcome,
+
   Result,
   ValidatedBriefProposal,
 } from '@shiploop/domain';
@@ -1045,22 +1045,6 @@ export function createBriefGenerationUseCases(deps: BriefGenerationDeps) {
 
 export type BriefGenerationUseCases = ReturnType<typeof createBriefGenerationUseCases>;
 
-/**
- * The requested outcomes a brief hands to planning (F08-AC1).
- *
- * One outcome per acceptance criterion, in brief order and carrying the criterion's id,
- * so `coverageCheck` can name which outcome a plan task delivers and which it declines
- * (F08-AC5). The criterion's own `verification` is not read here: how a criterion will be
- * checked is the verification layer's business, and reading it here would give this module
- * a field it has no use for.
- */
-export function requestedOutcomesFor(brief: Brief): readonly RequestedOutcome[] {
-  return Object.freeze(
-    brief.sections.acceptanceCriteria.map((criterion) =>
-      Object.freeze({ id: criterion.id, statement: criterion.text }),
-    ),
-  );
-}
 
 /** The questions a brief still carries, which planning must not resolve by guessing. */
 export function unresolvedQuestionsFor(brief: Brief): readonly string[] {

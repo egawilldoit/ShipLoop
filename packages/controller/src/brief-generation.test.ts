@@ -71,9 +71,9 @@ import {
   assertReadOnlyClarification,
   createBriefGenerationUseCases,
   createEngineClarifier,
-  requestedOutcomesFor,
   unresolvedQuestionsFor,
 } from './brief-generation.ts';
+import { requestedOutcomesFor } from './plan-generation.ts';
 import type {
   BriefGenerationBounds,
   BriefGenerationUseCases,
@@ -515,11 +515,12 @@ test('a generated brief carries exactly the seven sections F07-AC1 names, and no
     assert.equal(stored_row.value.version, 1);
     assert.equal(stored_row.value.sections.acceptanceCriteria[0]?.text, CRITERION_TEXT, 'the criterion reached the row intact');
 
-    // What planning reads next: one requested outcome per criterion, plus the brief's own
-    // unresolved questions (F08-AC1).
+    // What planning reads next: the requested outcomes. The list carries the brief's own
+    // desired outcome as well as one per criterion, because coverage must hold for the goal
+    // and not only for the things written down as checkable (F08-AC1, F08-AC5).
     assert.deepEqual(
-      requestedOutcomesFor(stored_row.value).map((outcome) => outcome.id),
-      ['AC1'],
+      requestedOutcomesFor(stored_row.value).map((outcome: { id: string }) => outcome.id),
+      ['brief.desiredOutcome', 'AC1'],
     );
     assert.deepEqual(
       [...unresolvedQuestionsFor(stored_row.value)],
