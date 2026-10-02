@@ -53,7 +53,6 @@ import type {
   AreaObservation,
   AttemptLimits,
   AttemptState,
-  CapabilityDeclaration,
   CapabilityKind,
   CandidateId,
   ChangeShape,
@@ -98,7 +97,7 @@ import { createCompositionRoot, taskWorkItemId } from './composition.ts';
 import type { IdeaDraft } from '@shiploop/domain';
 import type { ControllerClock, OwnerActor } from './profiles.ts';
 import type { StoredSessionRecord } from './sessions.ts';
-import type { AdapterRegistry, ConnectorProbe } from './connectors.ts';
+import { createProviderRegistry, readProviderConfiguration } from './providers.ts';
 import type { AttentionBoard } from './attention.ts';
 import type {
   CancelledRun,
@@ -3083,24 +3082,6 @@ export const SESSION_IDLE_TIMEOUT_ENV = 'SHIPLOOP_SESSION_IDLE_SECONDS';
  */
 export const ARTIFACT_ROOT_ENV = 'SHIPLOOP_ARTIFACT_ROOT';
 
-/**
- * No provider adapter is configured in this slice.
- *
- * Declaring no capabilities is the honest state: `saveProfile` then refuses any
- * profile needing one, naming the missing adapter, instead of accepting a profile
- * whose delivery would later fail against a provider nobody has implemented
- * (F03-AC2, N05-AC1). Wiring a test double here would make the product claim a
- * capability it does not have.
- */
-const NO_ADAPTERS: AdapterRegistry = {
-  declarationsFor(): readonly CapabilityDeclaration[] {
-    return [];
-  },
-  probeFor(): ConnectorProbe | null {
-    return null;
-  },
-};
-
 const SYSTEM_CLOCK: ControllerClock = { now: () => new Date().toISOString() };
 
 /** The same clock the root records writes with, so one process has one time source. */
@@ -3124,10 +3105,14 @@ export function resolveSurfaceRoot(env: NodeJS.ProcessEnv): Result<CompositionRo
       reason: `${DATABASE_PATH_ENV} must name the SQLite file this process serves; there is no default store to fall back on (F01-AC1).`,
     });
   }
+  const providers = readProviderConfiguration(env);
+  if (!providers.ok) return providers;
+  const registry = createProviderRegistry(providers.value);
+  if (!registry.ok) return registry;
   return createCompositionRoot({
     databasePath,
     clock: SYSTEM_CLOCK,
-    adapters: NO_ADAPTERS,
+    adapters: registry.value.adapters,
     sessionIdleTimeoutSeconds: readPositiveInteger(env[SESSION_IDLE_TIMEOUT_ENV]),
     artifactRoot: env[ARTIFACT_ROOT_ENV] === undefined || env[ARTIFACT_ROOT_ENV] === '' ? null : env[ARTIFACT_ROOT_ENV],
   });

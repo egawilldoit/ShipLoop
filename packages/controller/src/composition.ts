@@ -86,10 +86,10 @@ import type {
   SqlRow,
   StorageConnection,
 } from '@shiploop/storage';
-import type { GitAdapter, TicketAdapter } from '@shiploop/adapters';
 import { validateRecipe, type PreflightDeps, type RecipeVersion, type RequiredCheckPolicy } from '@shiploop/verification';
 import type { AdapterRegistry, ConnectorUseCases } from './connectors.ts';
 import { createConnectorUseCases } from './connectors.ts';
+import type { ProviderRegistry } from './providers.ts';
 import type { AcceptanceUseCases } from './acceptance.ts';
 import { createAcceptanceUseCases } from './acceptance.ts';
 import type { AttentionUseCases } from './attention.ts';
@@ -156,18 +156,19 @@ export interface CompositionRootConfig {
    */
   readonly artifactRoot?: IntakeArtifactRoot;
   /**
-   * The working providers, when the process has any.
+   * The providers this process was configured with (F03-AC1).
    *
-   * Absent rather than empty-by-default because publication and adoption both read or
-   * write a provider, and a use case built over a provider that refuses every call
-   * would present as a configured capability that cannot be used. A process with no
-   * `providers` gets `null` for both groups, and the transport says so by name
-   * (F03-AC2, F10-AC1, F11-AC1, N05-AC1).
+   * Absent rather than empty-by-default because publication and adoption read or write a
+   * provider, and a use case built over a provider that refuses every call would present
+   * as a configured capability that cannot be used (F03-AC2, N05-AC1). `ticket` and `git`
+   * are separately null because the two are configured independently: publishing needs a
+   * ticket provider alone, while adopting a branch needs both (F10-AC1, F11-AC2).
+   *
+   * This is the registry, not a pair of adapters, so the transport can also ask whether a
+   * stored credential reference resolves before it lets an operation reach a provider
+   * (F03-AC1, F03-AC3).
    */
-  readonly providers?: {
-    readonly ticket: TicketAdapter;
-    readonly git: GitAdapter;
-  };
+  readonly providers?: ProviderRegistry;
   /** Redaction applied to provider text before it reaches a stored row (N02-AC2). */
   readonly redactProviderText?: (text: string) => string;
 }
@@ -213,9 +214,11 @@ export interface CompositionRoot {
   /** Owner acceptance and retained change feedback (F25). */
   readonly acceptanceUseCases: AcceptanceUseCases;
   readonly planningUseCases: PlanningUseCases;
+  /** The providers this process registered, or null when it configured none (F03-AC2). */
+  readonly providers: ProviderRegistry | null;
   /** Null when the process was configured with no ticket provider (F03-AC2). */
   readonly publicationUseCases: PublicationUseCases | null;
-  /** Null for the same reason: adoption reads providers, so it cannot exist without one. */
+  /** Also null without a git provider: linking a branch reads one (F11-AC2). */
   readonly adoptionUseCases: AdoptionUseCases | null;
   /** Closes only the database handle this root opened. */
   close(): Result<true, DomainError>;
@@ -1126,31 +1129,34 @@ export function createCompositionRoot(config: CompositionRootConfig): Result<Com
     connectors,
   });
 
-  // Publication and adoption need a ticket provider and a git provider. Neither is
-  // constructed here: `config.providers` carries whatever the process was configured
-  // with, and a process configured with none gets `null` for both groups rather than a
-  // use case that would refuse every call with a fabricated reason (F03-AC2, N05-AC1).
+  // Publication needs a ticket provider and adoption needs one plus a git provider.
+  // Neither is constructed here: `config.providers` carries whatever the process was
+  // configured with, and each group is absent unless the provider it reads was configured,
+  // rather than built over a provider that would refuse every call with a fabricated
+  // reason (F03-AC2, F10-AC1, F11-AC2, N05-AC1).
   const providers = config.providers ?? null;
+  const ticketProvider = providers?.ticket ?? null;
+  const gitProvider = providers?.git ?? null;
   const publications = new PublicationRepository(database);
   const publicationUseCases =
-    providers === null
+    ticketProvider === null
       ? null
       : createPublicationUseCases({
           clock: config.clock,
           publications,
-          ticket: providers.ticket,
+          ticket: ticketProvider,
           ...(config.redactProviderText === undefined ? {} : { redactProviderText: config.redactProviderText }),
         });
   const adoptionUseCases =
-    providers === null
+    ticketProvider === null || gitProvider === null
       ? null
       : createAdoptionUseCases({
           clock: config.clock,
           publications,
           scope,
           profiles,
-          ticket: providers.ticket,
-          git: providers.git,
+          ticket: ticketProvider,
+          git: gitProvider,
           ...(config.redactProviderText === undefined ? {} : { redactProviderText: config.redactProviderText }),
         });
 
@@ -1181,6 +1187,7 @@ export function createCompositionRoot(config: CompositionRootConfig): Result<Com
     verificationUseCases,
     acceptanceUseCases,
     planningUseCases,
+    providers,
     publicationUseCases,
     adoptionUseCases,
     close(): Result<true, DomainError> {
