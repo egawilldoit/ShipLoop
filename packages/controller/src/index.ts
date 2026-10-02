@@ -28,6 +28,8 @@ export * from './profiles.ts';
 export * from './publication.ts';
 export * from './jobs.ts';
 export * from './attention.ts';
+export * from './plan-generation.ts';
+export * from './procedures.ts';
 export * from './verification.ts';
 export * from './sessions.ts';
 export * from './web-surface.ts';
