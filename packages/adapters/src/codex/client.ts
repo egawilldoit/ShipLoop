@@ -59,17 +59,58 @@
  * tokens, `LINEAR_API_KEY`, `DATABASE_URL`, netrc and askpass pointers — and what the ShipLoop
  * `HOME` removes is the ambient *directory*. Same-uid isolation is a separate change, recorded
  * in `docs/evidence/2026-10-01-credential-separation.md`.
+ *
+ * **A structured result rides its own channel, never a widened summary.** `MAX_SUMMARY_CHARS`
+ * in `events.ts` is a bound on what a human reads in a progress line, and a plan proposal is
+ * thousands of characters, so it cannot go there. Codex 0.160.0 supports two flags for this and
+ * both were used together on this host on 2 October 2026 against a live `codex exec
+ * --sandbox read-only`:
+ *
+ *   - `--output-schema <FILE>` — a JSON Schema describing the shape of the model's **final
+ *     response**. The observed run answered with exactly the requested object and no prose, so
+ *     the engine's own channel is constrained rather than merely requested.
+ *   - `-o/--output-last-message <FILE>` — writes that final message to a file. The observed run
+ *     wrote 2250 bytes where the last `agent_message` on stdout carried the identical text, and
+ *     the file appeared **even under `read-only`**, because the CLI process itself writes it
+ *     rather than a sandboxed command. That matters because a plan session runs read-only.
+ *
+ * The two are only useful together: `--output-schema` alone would leave the payload on stdout,
+ * where the summary cap truncates it, and `-o` alone would capture whatever prose the model
+ * chose. Both live in this file because argv construction and the result artifact are the same
+ * transport decision.
+ *
+ * **The result artifact is confined to the attempt's own directory, and confinement is verified
+ * rather than assumed.** It lands under `<stateRoot>/home/<attemptKey>/.shiploop/results/`, which
+ * is created mode 0700 by {@link prepareEngineState} for this workspace and is handed to the
+ * engine as `HOME`, so it is the one directory both sides already agree on. Four things are
+ * checked, and each is checked *after* resolving symlinks, because a containment test on the
+ * unresolved path passes for a link that points outside:
+ *
+ *   1. the results directory is resolved and must still be inside the resolved attempt home, so
+ *      a planted `.shiploop` symlink cannot move the channel out;
+ *   2. the result path is resolved against its resolved parent and must be inside it, which is
+ *      what rejects `..` traversal;
+ *   3. the path must not already exist, so a file a previous attempt on the same worktree left
+ *      behind can never be read as this attempt's answer — the token is per launch and the
+ *      existence check is the guarantee, not the token;
+ *   4. at read time the artifact must be a regular file and its resolved path must still be
+ *      inside the attempt home, which is what rejects a symlink swapped in during the run.
+ *
+ * The alternative — writing the result into the workspace — was rejected: an untracked file in
+ * the attempt's own worktree appears in its change inventory, which is exactly the marker
+ * `apps/worker/src/isolation.ts` deletes after its probe so a no-code run cannot look like a
+ * change (F14-AC4, F19-AC5).
  */
 
 import { spawn, type ChildProcessByStdio } from 'node:child_process';
-import { createHash } from 'node:crypto';
-import { chmodSync, copyFileSync, existsSync, mkdirSync, statSync } from 'node:fs';
+import { createHash, randomUUID } from 'node:crypto';
+import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import type { Readable } from 'node:stream';
 
-import { err, ok, type Result } from '@shiploop/domain';
-import type { AdapterContext } from '../contracts/index.ts';
+import { conflict, err, invalid, ok, type DomainError, type Result } from '@shiploop/domain';
+import type { AdapterContext, EngineResultRequest, EngineResultSchema } from '../contracts/index.ts';
 import { mapCodexVersionProbeFailure } from './errors.ts';
 
 /**
@@ -85,6 +126,20 @@ import { mapCodexVersionProbeFailure } from './errors.ts';
  */
 export const CODEX_VERIFIED_VERSION = '0.159.1';
 export const MINIMUM_CODEX_VERSION = '0.159.1';
+
+/**
+ * The Codex version the structured-result channel was measured on.
+ *
+ * A second constant rather than a wider claim on {@link CODEX_VERIFIED_VERSION}, because the two
+ * facts were established on different binaries and one number cannot honestly carry both. The
+ * `--json` event schema, the flag set and the thread-id shape were read off 0.159.1 on 1 October
+ * 2026. The `--output-schema` / `--output-last-message` behaviour — including that the artifact is
+ * written by a read-only turn, and that the provider requires `additionalProperties: false` on
+ * every object node of the schema — was read off **0.160.0** on 2 October 2026, which is what this
+ * host runs. Overloading one constant would have made a report name an engine that was never asked
+ * these questions (F04-AC2).
+ */
+export const CODEX_RESULT_CHANNEL_VERSION = '0.160.0';
 
 /** The sandbox modes a ShipLoop coding session may be granted. */
 export const CODEX_SANDBOX_MODES = ['read-only', 'workspace-write'] as const;
@@ -127,6 +182,22 @@ export interface CodexSpawnRequest {
   /** The recorded Codex thread to continue. Required for `Resume`, refused without it. */
   readonly priorSessionId?: string;
   readonly signal: AbortSignal;
+  /**
+   * The structured result this session must produce, or null when its text is enough.
+   *
+   * The channel is prepared *before* the process exists, so a schema that cannot be written or a
+   * result path that cannot be confined is a refusal with no engine run behind it rather than a
+   * session that starts and then cannot be read.
+   */
+  readonly result?: EngineResultRequest | null;
+  /**
+   * Identifies one launch's result files inside the attempt's results directory.
+   *
+   * Injected rather than generated here so the adapter — the layer that owns randomness —
+   * decides it, and so a test can pin it and prove that a second launch on the same worktree
+   * refuses a leftover file instead of reading it.
+   */
+  readonly resultToken?: string;
 }
 
 const DEFAULT_GRACEFUL_STOP_MS = 10_000;
@@ -231,6 +302,11 @@ export function resolveSandboxMode(requested: string, redact: (text: string) => 
  * The prompt is the final positional argument and never a flag, so an instruction beginning with
  * `-` cannot be read as an option. Nothing here is shell-quoted because nothing here is ever
  * handed to a shell. `--` ends flag parsing so a prompt starting with a dash is still a prompt.
+ *
+ * `--output-schema` and `-o` are added for **both** invocations and only when a result was
+ * requested, because `codex exec --help` and `codex exec resume --help` on 0.160.0 list both
+ * under each. They precede `--`, so neither the schema path nor the result path can be read as
+ * the prompt, and neither is ever interpolated into a command line.
  */
 export function buildArgv(request: {
   readonly sandbox: CodexSandboxMode;
@@ -240,6 +316,7 @@ export function buildArgv(request: {
   readonly model: string | null;
   readonly skipGitRepoCheck: boolean;
   readonly configOverrides: readonly string[];
+  readonly resultChannel: Pick<CodexResultChannel, 'schemaPath' | 'resultPath'> | null;
   readonly priorSessionId?: string;
 }): readonly string[] {
   const argv: string[] = ['exec'];
@@ -257,6 +334,10 @@ export function buildArgv(request: {
   argv.push('--json');
   if (request.model !== null) argv.push('-m', request.model);
   if (request.skipGitRepoCheck) argv.push('--skip-git-repo-check');
+  if (request.resultChannel !== null) {
+    argv.push('--output-schema', request.resultChannel.schemaPath);
+    argv.push('-o', request.resultChannel.resultPath);
+  }
   for (const override of request.configOverrides) argv.push('-c', override);
   argv.push('--');
   if (request.priorSessionId !== undefined) argv.push(request.priorSessionId);
@@ -271,6 +352,14 @@ export interface CodexProcess {
   readonly processGroupId: number;
   readonly argv: readonly string[];
   readonly cwd: string;
+  /**
+   * The structured-result channel this session was given, or null when it was not asked for one.
+   *
+   * It is part of the process record rather than a separate return value because the answer has to
+   * be read from *this* launch's artifact: a channel returned beside the process could be paired
+   * with a different one by a caller, and a stale result would then be read as this session's.
+   */
+  readonly resultChannel: CodexResultChannel | null;
   /** Lines from stdout, in order. Ends when the process closes its stdout. */
   lines(): AsyncIterable<string>;
   /** Bounded tail of stderr. Codex writes its startup banner and warnings there. */
@@ -330,7 +419,9 @@ export class CodexClient {
    *
    * The ShipLoop-owned state is created first, because the engine's environment cannot be
    * assembled without it and because a failure to create it must be a refusal rather than a
-   * fallback onto the operator's `~/.codex`.
+   * fallback onto the operator's `~/.codex`. The structured-result channel is prepared after
+   * that and before the process exists, so a schema that cannot be written or a result path that
+   * cannot be confined leaves no running engine behind.
    */
   start(request: CodexSpawnRequest): Result<CodexProcess> {
     if (request.invocation === 'Resume' && request.priorSessionId === undefined) {
@@ -347,6 +438,17 @@ export class CodexClient {
       attempt: request.cwd,
     });
     if (!state.ok) return err(state.error);
+
+    const resultChannel =
+      request.result === undefined || request.result === null
+        ? null
+        : prepareEngineResultChannel({
+            layout: state.value,
+            schema: request.result.schema,
+            token: request.resultToken ?? randomUUID(),
+          });
+    if (resultChannel !== null && !resultChannel.ok) return err(resultChannel.error);
+
     const argv = buildArgv({
       sandbox: request.sandbox,
       invocation: request.invocation,
@@ -355,6 +457,7 @@ export class CodexClient {
       model: this.options.model ?? null,
       skipGitRepoCheck: this.options.skipGitRepoCheck ?? false,
       configOverrides: this.options.configOverrides ?? [],
+      resultChannel: resultChannel === null || !resultChannel.ok ? null : resultChannel.value,
       ...(request.priorSessionId === undefined ? {} : { priorSessionId: request.priorSessionId }),
     });
 
@@ -362,6 +465,7 @@ export class CodexClient {
       [this.options.binary, ...argv],
       request.cwd,
       engineEnvironment(process.env, state.value),
+      resultChannel === null || !resultChannel.ok ? null : resultChannel.value,
     );
     if (tracked.ok) return tracked;
     return err(
@@ -639,6 +743,285 @@ export function engineEnvironment(
   return environment;
 }
 
+/* -------------------------------------------------------------------------- */
+/* The structured result channel                                                 */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Where one attempt's result artifacts live, relative to its ShipLoop-owned home.
+ *
+ * Inside `HOME` because that directory is already created 0700 for this workspace by
+ * {@link prepareEngineState} and is already what both sides agree the attempt owns. It is not
+ * inside the workspace: an untracked file in the attempt's own worktree shows up in its change
+ * inventory, which is what would make a read-only planning run look like a change (F14-AC4).
+ */
+export const ENGINE_RESULT_DIRECTORY = join('.shiploop', 'results');
+
+/** The schema file name inside the results directory. One per attempt, rewritten each launch. */
+export const ENGINE_RESULT_SCHEMA_FILE = 'schema.json';
+
+/**
+ * Upper bound on the bytes one result artifact may hold.
+ *
+ * A bound and not a truncation: a payload that reaches it was cut off somewhere, and this
+ * adapter cannot tell whether it lost a field, so it refuses rather than reporting half a result
+ * (F15-AC2). 256 KiB is far above a plan proposal — the live run measured on 2 October 2026
+ * produced 2250 bytes for a full `PlanProposal` — and low enough that a runaway engine cannot
+ * fill the attempt's state root.
+ */
+export const MAX_RESULT_BYTES = 256 * 1024;
+
+/** One launch's structured-result channel: where the schema went and where the answer must appear. */
+export interface CodexResultChannel {
+  /** The attempt-owned directory the channel is confined to, already resolved through symlinks. */
+  readonly root: string;
+  /** The schema written for `--output-schema`. */
+  readonly schemaPath: string;
+  /** Where `--output-last-message` must write, confined to `root`. */
+  readonly resultPath: string;
+  /** `resultPath` relative to `root`, which is what an event reports instead of a host path. */
+  readonly resultRelativePath: string;
+  /** Upper bound on the bytes the engine may write. */
+  readonly maxBytes: number;
+}
+
+/** What one result artifact actually held, read whole. */
+export interface CodexResultRead {
+  /** The engine's text exactly as stored. Not truncated, not yet redacted. */
+  readonly text: string;
+  /** Bytes the artifact held on disk. */
+  readonly byteLength: number;
+  /** The artifact's path relative to the attempt directory it was confined to. */
+  readonly sourcePath: string;
+}
+
+/**
+ * Prepares the channel for one launch: creates the directory, writes the schema, and refuses a
+ * path that is not confined or already occupied.
+ *
+ * Nothing here is best-effort. A result channel that cannot be established is a refusal before a
+ * process exists, because a session that started without one would end with no payload and no way
+ * to say why (F15-AC2).
+ */
+export function prepareEngineResultChannel(options: {
+  readonly layout: EngineStateLayout;
+  readonly schema: EngineResultSchema;
+  readonly token: string;
+  readonly maxBytes?: number;
+}): Result<CodexResultChannel, DomainError> {
+  const maxBytes = options.maxBytes ?? MAX_RESULT_BYTES;
+  if (!Number.isInteger(maxBytes) || maxBytes < 1 || maxBytes > MAX_RESULT_BYTES) {
+    return err(
+      invalid(
+        `A structured result may not be bounded by ${String(maxBytes)} bytes; the bound must be an integer from 1 to ${String(MAX_RESULT_BYTES)}. A bound this adapter does not honour is a bound that would truncate a result silently (F15-AC2).`,
+        [{ path: 'maxBytes', message: `Expected an integer from 1 to ${String(MAX_RESULT_BYTES)}.` }],
+      ),
+    );
+  }
+
+  const root = realDirectory(options.layout.home);
+  if (root === null) {
+    return err({
+      code: 'Unavailable',
+      reason: `The ShipLoop-owned attempt home ${options.layout.home} is not a readable directory, so a structured result could not be confined to it (F15-AC2).`,
+    });
+  }
+
+  // The results directory is created and then *resolved*, and the resolution must still be inside
+  // the attempt home. That order is the whole point: a `.shiploop` symlink planted in the home
+  // would pass a check on the unresolved path and put the channel somewhere else entirely.
+  const wanted = join(root, ENGINE_RESULT_DIRECTORY);
+  try {
+    mkdirSync(wanted, { recursive: true, mode: 0o700 });
+  } catch (cause) {
+    return err({
+      code: 'Unavailable',
+      reason: `The result directory ${wanted} could not be created (${describe(cause)}), so a structured result could not be confined to the attempt directory (F15-AC2).`,
+    });
+  }
+  const directory = realDirectory(wanted);
+  if (directory === null || !isInside(root, directory)) {
+    return err({
+      code: 'Forbidden',
+      reason: `The result directory ${wanted} does not resolve to a location inside the attempt directory ${root}. Reading a structured result through it could return a file this attempt does not own, so the session is refused rather than run (F15-AC2).`,
+    });
+  }
+
+  const schemaPath = join(directory, ENGINE_RESULT_SCHEMA_FILE);
+  try {
+    writeFileSync(schemaPath, JSON.stringify(options.schema), { encoding: 'utf8', mode: 0o600 });
+    chmodSync(schemaPath, 0o600);
+  } catch (cause) {
+    return err({
+      code: 'Unavailable',
+      reason: `The result schema could not be written to ${schemaPath} (${describe(cause)}). Codex would be asked for a structured answer with no schema to constrain it, so the session is refused rather than run unconstrained (F15-AC2).`,
+    });
+  }
+
+  const confined = confineResultPath(root, join(directory, `${options.token}.json`));
+  if (!confined.ok) return err(confined.error);
+  const resultPath = confined.value;
+
+  // The stale check. `token` makes a collision improbable; this makes it impossible, and it is
+  // also what refuses a previous attempt's file when the caller pins a token deliberately.
+  if (existsSync(resultPath)) {
+    return err(
+      conflict(
+        `A result artifact already exists at ${resultPath}. It may belong to an earlier attempt on this workspace, and a result is only ever read as the current attempt's own, so this session is refused rather than started (F15-AC2).`,
+        'no result artifact at this path',
+        `a leftover file from an earlier launch`,
+      ),
+    );
+  }
+
+  return ok({
+    root,
+    schemaPath,
+    resultPath,
+    resultRelativePath: relative(root, resultPath),
+    maxBytes,
+  });
+}
+
+/**
+ * Resolves a candidate result path and refuses it unless it lands inside the attempt directory.
+ *
+ * Containment is checked against the **resolved** parent directory, so `..` traversal and a
+ * symlinked parent are both caught by the same comparison, and the returned path is the resolved
+ * one rather than the requested one. A path equal to the root itself is refused too: the artifact
+ * is a file, and a "path" that names the directory would have no basename to confine.
+ */
+export function confineResultPath(root: string, candidate: string): Result<string, DomainError> {
+  if (!isAbsolute(candidate)) {
+    return err(
+      invalid(
+        `A structured result path must be absolute; received "${candidate}". A relative path resolves against whatever the process happens to consider its working directory, which is not a boundary (F15-AC2).`,
+        [{ path: 'resultPath', message: 'Expected an absolute path inside the attempt directory.' }],
+      ),
+    );
+  }
+  const requested = resolve(candidate);
+  const name = basename(requested);
+  if (name.length === 0 || name === '.' || name === '..') {
+    return err(invalid(`The structured result path "${candidate}" does not name a file.`, [
+      { path: 'resultPath', message: 'Expected a path whose last segment names a file.' },
+    ]));
+  }
+  const parent = realDirectory(dirname(requested));
+  if (parent === null) {
+    return err({
+      code: 'Unavailable',
+      reason: `The directory ${dirname(requested)} does not exist, so the structured result path "${candidate}" cannot be resolved. Reading a result means resolving where it really is, before reading anything (F15-AC2).`,
+    });
+  }
+  if (!isInside(root, parent)) {
+    return err({
+      code: 'Forbidden',
+      reason: `The structured result path "${candidate}" resolves to ${join(parent, name)}, which is outside the attempt directory ${root}. A result confined to nothing is not a result this attempt produced, so the session is refused (F15-AC2).`,
+    });
+  }
+  return ok(join(parent, name));
+}
+
+/**
+ * Reads one attempt's result artifact whole, or says precisely why it could not be read.
+ *
+ * Four refusals, each naming its own fault, because "no result" and "a result from somewhere
+ * else" are different problems with different fixes:
+ *
+ *   - nothing was written — an engine that produced no structured answer;
+ *   - the artifact is not a regular file — a directory, or a symbolic link, which must never be
+ *     followed because the link is the escape;
+ *   - the artifact's **resolved** path left the attempt directory — a link swapped in after the
+ *     launch;
+ *   - the size is empty or past the bound — an engine that wrote nothing usable, or one whose
+ *     output was cut off somewhere this adapter cannot see.
+ *
+ * The decoded text's byte length is compared with the file's own size. A file truncated in the
+ * middle of a multi-byte character decodes to a replacement character and to fewer bytes than it
+ * held, which is the only encoding fault a byte-count check would otherwise miss.
+ */
+export function readCodexResult(channel: CodexResultChannel): Result<CodexResultRead, DomainError> {
+  let info: ReturnType<typeof lstatSync>;
+  try {
+    info = lstatSync(channel.resultPath);
+  } catch (cause) {
+    return err({
+      code: 'Unavailable',
+      reason: `No structured result was written to ${channel.resultRelativePath} inside the attempt directory (${describe(cause)}). The session asked for a result, so a turn that produced none is a failure to report and not an empty success (F15-AC2).`,
+    });
+  }
+  if (!info.isFile()) {
+    return err({
+      code: 'Forbidden',
+      reason: `The structured result at ${channel.resultRelativePath} is not a regular file. A symbolic link is never followed here, because following it is exactly how a result would arrive from outside the attempt directory (F15-AC2).`,
+    });
+  }
+  if (info.size === 0) {
+    return err({
+      code: 'Unavailable',
+      reason: `The structured result at ${channel.resultRelativePath} is empty. Codex reported a completed turn but wrote no answer, so the session's requested result does not exist (F15-AC2).`,
+    });
+  }
+  if (info.size > channel.maxBytes) {
+    return err({
+      code: 'Unavailable',
+      reason: `The structured result at ${channel.resultRelativePath} is ${String(info.size)} bytes, past the ${String(channel.maxBytes)}-byte bound this adapter reads. It is refused rather than truncated: a cut-off payload cannot be told apart from a whole one, and half a proposal is not a proposal (F15-AC2).`,
+    });
+  }
+
+  const resolved = realpathSync(channel.resultPath);
+  if (!isInside(channel.root, dirname(resolved)) || !isInside(channel.root, resolved)) {
+    return err({
+      code: 'Forbidden',
+      reason: `The structured result at ${channel.resultRelativePath} resolves to ${resolved}, outside the attempt directory ${channel.root}. The path was confined before the run and re-checked after it, so this means the artifact was replaced while the engine was writing (F15-AC2).`,
+    });
+  }
+
+  let text: string;
+  try {
+    text = readFileSync(channel.resultPath, 'utf8');
+  } catch (cause) {
+    return err({
+      code: 'Unavailable',
+      reason: `The structured result at ${channel.resultRelativePath} could not be read (${describe(cause)}) (F15-AC2).`,
+    });
+  }
+  if (Buffer.byteLength(text, 'utf8') !== info.size) {
+    return err({
+      code: 'Unavailable',
+      reason: `The structured result at ${channel.resultRelativePath} decoded to ${String(Buffer.byteLength(text, 'utf8'))} bytes from a ${String(info.size)}-byte file, so it was cut off mid-character. A result that did not survive the round trip whole is not a result (F15-AC2).`,
+    });
+  }
+
+  return ok({ text, byteLength: info.size, sourcePath: channel.resultRelativePath });
+}
+
+/**
+ * Whether `candidate` is `root` itself or something under it.
+ *
+ * `relative` rather than a string prefix, because `/a/bc` starts with `/a/b` and a prefix test
+ * would call it contained. Both sides are compared after resolution by the callers, so this only
+ * has to be correct about the paths it is given.
+ */
+function isInside(root: string, candidate: string): boolean {
+  const gap = relative(root, candidate);
+  return gap.length > 0 && !gap.startsWith(`..${sep}`) && gap !== '..' && !isAbsolute(gap);
+}
+
+/** A resolved existing directory, or null when there is none or it is not a directory. */
+function realDirectory(path: string): string | null {
+  try {
+    const resolved = realpathSync(path);
+    return statSync(resolved).isDirectory() ? resolved : null;
+  } catch {
+    return null;
+  }
+}
+
+/* -------------------------------------------------------------------------- */
+/* Tracked process groups                                                      */
+/* -------------------------------------------------------------------------- */
 /**
  * Spawns any argv as the leader of its own process group, with an environment the caller chose.
  *
@@ -650,11 +1033,16 @@ export function engineEnvironment(
  *
  * `environment` is required rather than defaulted. A default of `process.env` here would put
  * the inheritance this module exists to remove back in one line, and it would be invisible.
+ *
+ * `resultChannel` defaults to null so a process spawned with no structured result to read needs
+ * no extra argument, and is carried onto the returned record so the answer can only ever be read
+ * from the launch that asked for it.
  */
 export function spawnTrackedGroup(
   argv: readonly string[],
   cwd: string,
   environment: NodeJS.ProcessEnv,
+  resultChannel: CodexResultChannel | null = null,
 ): Result<CodexProcess> {
   let child: CodexChildProcess;
   try {
@@ -688,7 +1076,7 @@ export function spawnTrackedGroup(
       reason: `the binary ${argv[0] ?? ''} was not started, so no process id exists to track or stop. It is missing, is not executable, or is not on PATH.`,
     });
   }
-  return ok(wrapProcess(child, argv, cwd));
+  return ok(wrapProcess(child, argv, cwd, resultChannel));
 }
 
 /**
@@ -697,7 +1085,7 @@ export function spawnTrackedGroup(
  * `lines()` is an async queue rather than a polling loop, so a long silent turn costs nothing
  * and a closed stdout ends the iteration deterministically instead of after a fixed delay.
  */
-function wrapProcess(child: CodexChildProcess, argv: readonly string[], cwd: string): CodexProcess {
+function wrapProcess(child: CodexChildProcess, argv: readonly string[], cwd: string, resultChannel: CodexResultChannel | null): CodexProcess {
   const pid = child.pid as number;
   const queue: string[] = [];
   let buffer = '';
@@ -751,6 +1139,7 @@ function wrapProcess(child: CodexChildProcess, argv: readonly string[], cwd: str
     processGroupId: pid,
     argv,
     cwd,
+    resultChannel,
     async *lines(): AsyncIterable<string> {
       let index = 0;
       for (;;) {

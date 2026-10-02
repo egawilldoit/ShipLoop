@@ -17,12 +17,14 @@ import { redact } from '@shiploop/domain';
 
 import {
   CODEX_MODELLED_EVENT_TYPES,
+  checkCodexResultAgainstSchema,
   codexUsageOf,
   finalizeCodexStream,
   initialCodexStreamState,
   readCodexUsage,
   translateCodexLine,
   translateCodexStream,
+  type CodexFinalizeInput,
   type CodexStreamState,
   type CodexTranslationOptions,
 } from './events.ts';
@@ -70,6 +72,359 @@ const CAPTURED_MISSING_AUTHENTICATION: readonly string[] = [
 ];
 
 /* -------------------------------------------------------------------------- */
+/* The structured result channel, against a result captured from a live run  */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * A real `PlanProposal` written by `codex exec` on this host on 2 October 2026.
+ *
+ * Produced by `codex exec --sandbox read-only --cd <throwaway git worktree> --json
+ * --output-schema <schema.json> -o <result.json> -- "<prompt>"` against `codex-cli 0.160.0`,
+ * answering with two requested outcomes, one task and two acceptance criteria. The artifact held
+ * 2250 bytes; the same text also arrived as the turn's final `agent_message` on stdout. Both facts
+ * are the point: the payload is far larger than the 400-character summary cap, and the artifact
+ * was written by a read-only turn, because the CLI process writes it rather than a sandboxed
+ * command. Captured verbatim rather than retyped, so the completeness check below is exercised
+ * against the bytes the engine really produced.
+ */
+const CAPTURED_RESULT_JSON =
+  "{\"kind\":\"PlanProposal\",\"briefId\":\"brief_probe_001\",\"draftedAt\":\"2026-10-02T00:00:00.000Z\",\"requestedOutcomes\":[{\"id\":\"brief.desiredOutcome\",\"statement\":\"The reader can resume an interrupted attempt without re-reading the whole transcript.\"},{\"id\":\"AC-1\",\"statement\":\"A pause records a checkpoint within two seconds of the pause request.\"}],\"tasks\":[{\"taskId\":\"T-1\",\"coversOutcomeIds\":[\"brief.desiredOutcome\"],\"outcome\":\"Enable a reader returning to an interrupted attempt to identify the last recorded checkpoint, understand what work remains, and continue from that point using a compact, durable summary instead of rereading the full transcript.\",\"scope\":\"Define and implement a resumable checkpoint representation that captures the attempt's current state, completed work, pending work, and useful context, then make that representation available when a reader resumes an interrupted attempt.\",\"acceptanceCriteria\":[\"For an interrupted attempt with a saved checkpoint, a reader can identify the current state, completed work, and next pending action from the checkpoint without needing to reread the transcript.\",\"The checkpoint preserves enough task-specific context to let a reader continue the interrupted attempt coherently, including relevant decisions and unresolved questions, without relying on unstated details from earlier conversation.\"],\"verificationMethod\":\"Create a representative interrupted attempt with a recorded checkpoint, then have a fresh reader use only that checkpoint to state the current status and next action; confirm both are accurate against the full attempt record.\",\"dependencies\":[],\"relevantProjectContext\":[\"The supplied brief defines the desired outcome as resuming an interrupted attempt without rereading the whole transcript.\",\"The user requested a read-only plan and explicitly instructed that the repository must not be inspected.\"],\"implementationLocation\":{\"kind\":\"ProposedLocation\",\"candidates\":[\"Undetermined until repository inspection is permitted; locate the existing attempt state or checkpoint implementation.\"],\"basis\":\"No repository file was read; this proposal is based on the user-supplied AGENTS.md instructions and brief, so the implementation file remains undetermined.\"}}],\"exclusions\":[]}";
+
+/** The schema that run was asked for, in the shape `applyPlanProposal` needs from a plan. */
+const RESULT_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['kind', 'briefId', 'draftedAt', 'requestedOutcomes', 'tasks', 'exclusions'],
+  properties: {
+    kind: { type: 'string', enum: ['PlanProposal'] },
+    briefId: { type: 'string' },
+    draftedAt: { type: 'string' },
+    requestedOutcomes: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['id', 'statement'],
+        properties: { id: { type: 'string' }, statement: { type: 'string' } },
+      },
+    },
+    tasks: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: [
+          'taskId',
+          'coversOutcomeIds',
+          'outcome',
+          'scope',
+          'acceptanceCriteria',
+          'verificationMethod',
+          'dependencies',
+          'relevantProjectContext',
+          'implementationLocation',
+        ],
+        properties: {
+          taskId: { type: 'string' },
+          coversOutcomeIds: { type: 'array', items: { type: 'string' } },
+          outcome: { type: 'string' },
+          scope: { type: 'string' },
+          acceptanceCriteria: { type: 'array', items: { type: 'string' } },
+          verificationMethod: { type: 'string' },
+          dependencies: { type: 'array', items: { type: 'string' } },
+          relevantProjectContext: { type: 'array', items: { type: 'string' } },
+          implementationLocation: {
+            type: 'object',
+            additionalProperties: false,
+            required: ['kind', 'candidates', 'basis'],
+            properties: {
+              kind: { type: 'string', enum: ['ProposedLocation'] },
+              candidates: { type: 'array', items: { type: 'string' } },
+              basis: { type: 'string' },
+            },
+          },
+        },
+      },
+    },
+    exclusions: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['outcomeId', 'excluded', 'reason'],
+        properties: { outcomeId: { type: 'string' }, excluded: { type: 'string' }, reason: { type: 'string' } },
+      },
+    },
+  },
+} as const;
+
+/** One JSONL line carrying `text` as a completed `agent_message`, as Codex emits it. */
+function agentMessageLine(text: string): string {
+  return JSON.stringify({ type: 'item.completed', item: { id: 'item_0', type: 'agent_message', text } });
+}
+
+/** The captured turn that produced it, on stdout: the same JSON, in a completed agent message. */
+const CAPTURED_RESULT_TURN: readonly string[] = [
+  '{"type":"thread.started","thread_id":"01a0fd2d-02db-78d3-931e-061b2b3832f5"}',
+  '{"type":"turn.started"}',
+  agentMessageLine(CAPTURED_RESULT_JSON),
+  '{"type":"turn.completed","usage":{"input_tokens":14876,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":1530,"reasoning_output_tokens":1097}}',
+];
+
+/** The bytes a reader must be able to arrive on. */
+const CAPTURED_RESULT_BYTES = Buffer.byteLength(CAPTURED_RESULT_JSON, 'utf8');
+
+function readResult(text: string, sourcePath = '.shiploop/results/token.json') {
+  return { kind: 'Read', text, byteLength: Buffer.byteLength(text, 'utf8'), sourcePath } as const;
+}
+
+function succeeded(events: readonly EngineEvent[]): Extract<EngineOutcome, { kind: 'Succeeded' }> | null {
+  const outcome = results(events).find((candidate) => candidate.kind === 'Succeeded');
+  return outcome !== undefined && outcome.kind === 'Succeeded' ? outcome : null;
+}
+
+test('F15-AC2 the summary cap stays a cap: a 2250-byte result rides its own field, and every summary stays bounded', () => {
+  // This is the defect the channel exists for. The engine put a whole plan on stdout and in the
+  // artifact; the old behaviour kept only the truncated summary, so a real session arrived cut off
+  // and `applyPlanProposal` was asked to read half an object.
+  const events = run(CAPTURED_RESULT_TURN, null, readResult(CAPTURED_RESULT_JSON), RESULT_SCHEMA);
+
+  assert.ok(CAPTURED_RESULT_BYTES > 400, 'the captured result must be longer than the summary cap for this to mean anything');
+  const summaries = events
+    .filter((event) => event.kind === 'Progress')
+    .map((event) => (event.kind === 'Progress' ? event.summary : ''));
+  assert.ok(summaries.length > 0, 'the captured turn produced no progress summary to bound');
+  for (const summary of summaries) {
+    assert.ok(summary.length <= 412, `a progress summary grew past the 400-character cap: ${String(summary.length)}`);
+  }
+  // A progress summary never carries the payload at all: Codex's own `agent_message` text becomes a
+  // bounded stage line, so there is nothing there for a reader to mistake for an answer.
+  assert.ok(
+    !summaries.some((summary) => summary.includes('acceptanceCriteria')),
+    'a progress summary carried the payload rather than a bounded stage line',
+  );
+
+  const outcome = succeeded(events);
+  assert.ok(outcome !== null, 'a complete result did not produce a Succeeded outcome');
+  assert.ok(outcome.summary.length <= 412, `the terminal summary grew past the cap: ${String(outcome.summary.length)}`);
+  // The terminal summary is where the old channel lost the payload, so it is the one that has to
+  // show the cut: bounded, marked truncated, and visibly not the answer.
+  assert.match(outcome.summary, /\[truncated\]$/);
+  assert.equal(outcome.summary, `${CAPTURED_RESULT_JSON.slice(0, 400)} [truncated]`);
+
+  // The whole payload, byte for byte, on the field that is not a summary.
+  assert.ok(outcome.result !== undefined, 'the result did not arrive on its own field');
+  assert.equal(outcome.result.byteLength, CAPTURED_RESULT_BYTES);
+  assert.equal(outcome.result.json, CAPTURED_RESULT_JSON);
+  assert.ok(outcome.result.json.length > 400, 'the payload was truncated somewhere');
+  assert.deepEqual(JSON.parse(outcome.result.json), JSON.parse(CAPTURED_RESULT_JSON));
+});
+
+test('F15-AC2 a result that satisfies the schema is reported complete, and names how much was checked', () => {
+  const events = run(CAPTURED_RESULT_TURN, null, readResult(CAPTURED_RESULT_JSON), RESULT_SCHEMA);
+  const outcome = succeeded(events);
+  assert.ok(outcome?.result !== undefined);
+  assert.ok(
+    outcome.result.checkedProperties > 20,
+    `the completeness claim covered only ${String(outcome.result.checkedProperties)} properties`,
+  );
+  assert.equal(outcome.result.sourcePath, '.shiploop/results/token.json');
+  assert.equal(diagnostics(events).length, 0);
+});
+
+test('F15-AC2 a truncated result is a failure naming the fault, never a partial success', () => {
+  // The exact payload the old channel produced: the first 400 characters of a real result. It is
+  // valid-looking text and it is not JSON, which is why a length check alone would have passed it.
+  const truncated = CAPTURED_RESULT_JSON.slice(0, 400);
+  const events = run(CAPTURED_RESULT_TURN, null, readResult(truncated), RESULT_SCHEMA);
+
+  assert.equal(results(events).length, 0, 'a truncated result still produced a terminal Result');
+  const seen = diagnostics(events);
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0]?.category, 'MalformedOutput');
+  assert.equal(seen[0]?.retry, 'Terminal');
+  assert.match(seen[0]?.detail ?? '', /not readable JSON/);
+  assert.match(seen[0]?.detail ?? '', /refused rather than reported as a result/);
+  assert.match(seen[0]?.detail ?? '', /token\.json/);
+  // Usage stays whatever the stream actually reported; a bad result is not a usage fault.
+  assert.equal(usageOf(events)?.kind, 'Reported');
+});
+
+test('F15-AC2 a payload missing a schema-declared property is refused by name', () => {
+  const decoded = JSON.parse(CAPTURED_RESULT_JSON) as Record<string, unknown>;
+  delete decoded['exclusions'];
+  const events = run(CAPTURED_RESULT_TURN, null, readResult(JSON.stringify(decoded)), RESULT_SCHEMA);
+
+  assert.equal(results(events).length, 0);
+  const detail = diagnostics(events)[0]?.detail ?? '';
+  assert.match(detail, /does not satisfy the schema/);
+  assert.match(detail, /schema-required property "exclusions"/);
+  assert.match(detail, /F15-AC2/);
+});
+
+test('F15-AC2 an incomplete task inside the payload is refused with the path that is missing it', () => {
+  // The shape a cut-off or lazily written payload has: a real proposal whose task lost two of the
+  // seven content fields F08-AC1 names. Top-level completeness passes; the nested check is what
+  // catches this, which is why the walk recurses rather than reading only the root.
+  const payload = JSON.stringify({
+    kind: 'PlanProposal',
+    briefId: 'brief_probe_001',
+    draftedAt: '2026-10-02T00:00:00.000Z',
+    requestedOutcomes: [{ id: 'brief.desiredOutcome', statement: 'Resume an interrupted attempt.' }],
+    tasks: [
+      {
+        taskId: 'T-1',
+        coversOutcomeIds: ['brief.desiredOutcome'],
+        outcome: 'An outcome.',
+        scope: 'A scope.',
+        acceptanceCriteria: ['A criterion.'],
+        dependencies: [],
+        relevantProjectContext: [],
+        implementationLocation: { kind: 'ProposedLocation', candidates: ['a.ts'], basis: 'Read from the brief.' },
+      },
+    ],
+    exclusions: [],
+  });
+  const events = run(CAPTURED_RESULT_TURN, null, readResult(payload), RESULT_SCHEMA);
+
+  assert.equal(results(events).length, 0);
+  const detail = diagnostics(events)[0]?.detail ?? '';
+  assert.match(detail, /tasks\[0\] is missing the schema-required property "verificationMethod"/);
+  assert.match(detail, /schema-declared property "tasks\[0\]\.verificationMethod"/);
+});
+
+test('F15-AC2 a declared enum the payload violates is refused with the values it allows', () => {
+  const payload = CAPTURED_RESULT_JSON.replace('"kind":"PlanProposal"', '"kind":"NotAPlanProposal"');
+  const events = run(CAPTURED_RESULT_TURN, null, readResult(payload), RESULT_SCHEMA);
+
+  assert.equal(results(events).length, 0);
+  const detail = diagnostics(events)[0]?.detail ?? '';
+  assert.match(detail, /kind is "NotAPlanProposal"/);
+  assert.match(detail, /PlanProposal/);
+});
+
+test('F15-AC2 a result artifact the engine never wrote is a failure naming the path, not an empty success', () => {
+  const events = run(
+    CAPTURED_RESULT_TURN,
+    null,
+    { kind: 'Unreadable', detail: 'No structured result was written to .shiploop/results/token.json inside the attempt directory.' },
+    RESULT_SCHEMA,
+  );
+
+  assert.equal(results(events).length, 0);
+  assert.equal(diagnostics(events)[0]?.category, 'MalformedOutput');
+  assert.match(diagnostics(events)[0]?.detail ?? '', /No structured result was written to \.shiploop\/results\/token\.json/);
+});
+
+test('F15-AC2 a session that asked for a result and got none is refused rather than reported empty', () => {
+  const events = run(CAPTURED_RESULT_TURN, null, null, RESULT_SCHEMA);
+  assert.equal(results(events).length, 0);
+  assert.match(diagnostics(events)[0]?.detail ?? '', /asked for a structured result and none was read/);
+});
+
+test('F15-AC2 a session that asked for no result is unaffected by the channel', () => {
+  const events = run(CAPTURED_RESULT_TURN);
+  const outcome = succeeded(events);
+  assert.ok(outcome !== null);
+  // No `result` key at all, rather than an empty one: "nothing was asked for" and "nothing was
+  // produced" have to stay distinguishable, and an always-present field could not tell them apart.
+  assert.equal(outcome.result, undefined);
+  assert.equal('result' in outcome, false);
+  assert.match(outcome.summary, /PlanProposal/);
+  assert.ok(outcome.summary.length <= 412);
+});
+
+test('F15-AC2 a malformed stream still outranks a valid result, so a bad result cannot repair a bad stream', () => {
+  const events = run(
+    [...CAPTURED_RESULT_TURN.slice(0, 3), '{"type":"turn.completed","usage":{"input_tok'],
+    null,
+    readResult(CAPTURED_RESULT_JSON),
+    RESULT_SCHEMA,
+  );
+  assert.equal(results(events).length, 0);
+  assert.match(diagnostics(events)[0]?.detail ?? '', /could not be parsed at line/);
+  assert.equal(usageOf(events)?.kind, 'Unknown');
+});
+
+test('F15-AC2 a result schema nested past the depth bound is refused rather than partly checked', () => {
+  // Fail-closed: a check that stopped early has not established completeness, so reporting it as
+  // one would be the same defect as reading a truncated summary as a whole answer.
+  let nested: Record<string, unknown> = { type: 'string' };
+  let value: unknown = 'leaf';
+  for (let depth = 0; depth < 20; depth += 1) {
+    nested = { type: 'object', properties: { child: nested } };
+    value = { child: value };
+  }
+  // The value nests as deep as the schema, so the walk really descends rather than stopping at the
+  // first absent property and calling it complete.
+  const check = checkCodexResultAgainstSchema(value, nested);
+  assert.equal(check.boundReached, 'DepthBudget');
+  assert.ok(check.totalFailures > 0);
+
+  const events = run(CAPTURED_RESULT_TURN, null, readResult(JSON.stringify(value)), nested);
+  assert.equal(results(events).length, 0);
+  assert.match(diagnostics(events)[0]?.detail ?? '', /nests deeper than/);
+});
+
+test('F15-AC2 a schema declaring more properties than the budget allows is refused, not silently partly checked', () => {
+  const wide: Record<string, unknown> = { type: 'object', required: [] };
+  const required: string[] = [];
+  for (let index = 0; index < 5_000; index += 1) required.push(`field_${String(index)}`);
+  wide['required'] = required;
+  const check = checkCodexResultAgainstSchema(JSON.parse(CAPTURED_RESULT_JSON), wide);
+  assert.equal(check.boundReached, 'PropertyBudget');
+  assert.ok(check.checkedProperties > 4_000);
+});
+
+test('F15-AC2 the completeness check passes on the captured payload and reads nothing it does not declare', () => {
+  const check = checkCodexResultAgainstSchema(JSON.parse(CAPTURED_RESULT_JSON), RESULT_SCHEMA);
+  assert.deepEqual([...check.failures], []);
+  assert.equal(check.totalFailures, 0);
+  assert.equal(check.boundReached, null);
+
+  // A schema that declares nothing checks nothing, and the count says so rather than the zero
+  // failures being read as a pass over the whole payload.
+  const declares = checkCodexResultAgainstSchema(JSON.parse(CAPTURED_RESULT_JSON), { type: 'string' });
+  assert.equal(declares.checkedProperties, 0);
+  assert.equal(declares.totalFailures, 0);
+
+  // A schema that declares exactly one property reports exactly one check.
+  const one = checkCodexResultAgainstSchema(JSON.parse(CAPTURED_RESULT_JSON), {
+    properties: { briefId: { type: 'string' } },
+  });
+  assert.equal(one.checkedProperties, 1);
+  assert.equal(one.totalFailures, 0);
+  assert.equal(checkCodexResultAgainstSchema(JSON.parse(CAPTURED_RESULT_JSON), { properties: { absent: {} } }).totalFailures, 1);
+});
+
+test('N02-AC2 a credential inside the payload is redacted before it reaches the caller', () => {
+  const canary = REDACTION_CANARIES[0] ?? '';
+  const payload = CAPTURED_RESULT_JSON.replace('The reader can resume', `upstream rejected ${canary} and the reader can resume`);
+  const events = run(CAPTURED_RESULT_TURN, null, readResult(payload), RESULT_SCHEMA);
+
+  const outcome = succeeded(events);
+  assert.ok(outcome?.result !== undefined, 'the payload was refused instead of redacted, so nothing reached the caller to leak');
+  assert.ok(!outcome.result.json.includes(canary), 'a credential-shaped string survived into the result payload');
+  assert.match(outcome.result.json, /\[redacted:/);
+  // The measurement is of what the engine wrote, not of what survived redaction.
+  assert.equal(outcome.result.byteLength, Buffer.byteLength(payload, 'utf8'));
+});
+
+test('N02-AC2 a refusal carrying engine text is redacted too', () => {
+  const canary = REDACTION_CANARIES[1] ?? '';
+  const events = run(
+    CAPTURED_RESULT_TURN,
+    null,
+    { kind: 'Unreadable', detail: `the artifact at ${canary} could not be parsed` },
+    RESULT_SCHEMA,
+  );
+  assert.equal(results(events).length, 0);
+  const detail = diagnostics(events)[0]?.detail ?? '';
+  assert.ok(!detail.includes(canary), 'a credential-shaped string survived into a refusal');
+  assert.match(detail, /\[redacted:/);
+});
+
+/* -------------------------------------------------------------------------- */
 /* Harness                                                                     */
 /* -------------------------------------------------------------------------- */
 
@@ -94,9 +449,23 @@ const OPTIONS: CodexTranslationOptions = {
   redact: (text: string): string => redact(text).text,
 };
 
-function run(lines: readonly string[], interruption: 'Stopped' | 'BudgetExhausted' | null = null): readonly EngineEvent[] {
+function run(
+  lines: readonly string[],
+  interruption: 'Stopped' | 'BudgetExhausted' | null = null,
+  result: CodexFinalizeInput['result'] = null,
+  schema: CodexFinalizeInput['schema'] = null,
+): readonly EngineEvent[] {
   return translateCodexStream(lines, OPTIONS, (state: CodexStreamState) =>
-    finalizeCodexStream({ state, options: OPTIONS, startedAt: '2026-10-01T08:34:00.000Z', interruption, exitCode: 0 }),
+    finalizeCodexStream({
+      state,
+      options: OPTIONS,
+      startedAt: '2026-10-01T08:34:00.000Z',
+      interruption,
+      exitCode: 0,
+      resultExpected: result !== null || schema !== null,
+      result,
+      schema,
+    }),
   );
 }
 
@@ -346,7 +715,16 @@ test('F18-AC4 absent usage is Unknown with a reason, never a zero', () => {
 test('F15-AC2 exactly one Usage event is emitted per session', () => {
   for (const lines of [CAPTURED_SUCCESS, CAPTURED_MISSING_AUTHENTICATION, []]) {
     const events = translateCodexStream(lines, OPTIONS, (state: CodexStreamState) =>
-      finalizeCodexStream({ state, options: OPTIONS, startedAt: '2026-10-01T08:34:00.000Z', interruption: null, exitCode: 0 }),
+      finalizeCodexStream({
+        state,
+        options: OPTIONS,
+        startedAt: '2026-10-01T08:34:00.000Z',
+        interruption: null,
+        exitCode: 0,
+        resultExpected: false,
+        result: null,
+        schema: null,
+      }),
     );
     assert.equal(events.filter((event) => event.kind === 'Usage').length, 1);
   }
