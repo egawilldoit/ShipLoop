@@ -1750,7 +1750,7 @@ test('N01-AC1: a SIGTERM mid-run leaves durable state consistent, and a restart 
     );
     assert.equal(claimed, true, `the shipped entrypoint must claim the job; child output: ${output.join('')}`);
 
-    const runningGroup = await processGroupsOf('engine-under-test.sh');
+    const runningGroup = await ownedProcessGroupsOf('engine-under-test.sh', directory);
     assert.equal(runningGroup.length, 1, `the real adapter spawned exactly one engine group: ${output.join('')}`);
 
     child.kill('SIGTERM');
@@ -1811,7 +1811,7 @@ test('N01-AC1: a SIGTERM mid-run leaves durable state consistent, and a restart 
     );
     afterSignal.value.close();
 
-    const leftOver = await processGroupsOf('engine-under-test.sh');
+    const leftOver = await ownedProcessGroupsOf('engine-under-test.sh', directory);
     assert.deepEqual(leftOver, [], 'the engine process group this worker spawned must be gone');
   } finally {
     if (child.pid !== undefined) {
@@ -1826,9 +1826,18 @@ test('N01-AC1: a SIGTERM mid-run leaves durable state consistent, and a restart 
 });
 
 /** Process-group ids whose command line mentions `marker`, used to prove nothing is left running. */
-async function processGroupsOf(marker: string): Promise<readonly number[]> {
+/**
+ * The process groups this TEST spawned, matched by marker and confined to this run's temp root.
+ *
+ * The previous version counted every process on the host whose arguments contained the marker.
+ * That made the assertion hostage to unrelated processes: an orphan left by an earlier failed
+ * run of this same test made it report extra groups and fail a candidate that was correct. The
+ * property under test is that THIS run's worker launched exactly one engine group and cleaned it
+ * up, so the scan is scoped to the run's own directory (F17-AC1, F17-AC5).
+ */
+async function ownedProcessGroupsOf(marker: string, root: string): Promise<readonly number[]> {
   const listing = await new Promise<string>((resolve, reject) => {
-    const ps = spawn('ps', ['-eo', 'pid=,args='], { stdio: ['ignore', 'pipe', 'ignore'] });
+    const ps = spawn('ps', ['-eo', 'pid=,pgid=,args='], { stdio: ['ignore', 'pipe', 'ignore'] });
     let output = '';
     ps.stdout.on('data', (chunk: Buffer) => {
       output += chunk.toString();
@@ -1838,10 +1847,12 @@ async function processGroupsOf(marker: string): Promise<readonly number[]> {
   });
   const groups: number[] = [];
   for (const line of listing.split('\n')) {
-    const match = /^\s*(\d+)\s+(.*)$/.exec(line);
+    const match = /^\s*(\d+)\s+(\d+)\s+(.*)$/.exec(line);
     if (match === null) continue;
-    const args = match[2] ?? '';
-    if (args.includes(marker)) groups.push(Number(match[1]));
+    const args = match[3] ?? '';
+    if (!args.includes(marker) || !args.includes(root)) continue;
+    const pgid = Number(match[2]);
+    if (!groups.includes(pgid)) groups.push(pgid);
   }
   return groups;
 }
