@@ -47,6 +47,37 @@ const API_ERROR_CODES: ReadonlySet<string> = new Set<ApiErrorCode>([
   'Unauthorized',
 ]);
 
+/**
+ * The prefix every artifact is served under, and the only one this client links to.
+ *
+ * The server registers that prefix behind the session guard, so an artifact link is a request
+ * this browser's session authorizes and nothing else. A recorded artifact is private run
+ * detail, and a link that bypassed the guard would make the file public while still looking
+ * like every other link on the card (F01-AC1, N02-AC2).
+ */
+export const ARTIFACT_PREFIX = '/artifacts/';
+
+/**
+ * The session-guarded URL for one store-relative artifact reference, or null when it has none.
+ *
+ * A recorded `artifactRef` is a name inside the artifact store (`logs/exit-zero.log`), never a
+ * URL. Turning it into one is a boundary decision, so it is made once here and refuses
+ * anything that is not a plain relative path inside the store: an absolute path, a scheme, a
+ * backslash, a control character, or any `.`/`..`/empty segment. A null means the reference
+ * cannot be addressed, and the caller must say so rather than emit a link to something else —
+ * a link to a path the server does not serve would present unavailable content as if it were
+ * an artifact (F01-AC1, F24-AC5).
+ */
+export function artifactHref(reference: string): string | null {
+  const trimmed = reference.trim();
+  if (trimmed === '') return null;
+  if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(trimmed)) return null;
+  if (/[\u0000-\u001f\u007f\\]/.test(trimmed)) return null;
+  const segments = trimmed.split('/');
+  if (segments.some((segment) => segment === '' || segment === '.' || segment === '..')) return null;
+  return `${ARTIFACT_PREFIX}${segments.map((segment) => encodeURIComponent(segment)).join('/')}`;
+}
+
 /** One rejected field, carrying the form path the message belongs next to (F02-AC4). */
 export interface ApiFieldError {
   readonly path: string;
@@ -999,6 +1030,58 @@ export interface ChangeRequestReport {
   readonly outstandingCriterionIds: readonly string[];
 }
 
+/**
+ * What the owner says they observed, in the verification layer's own vocabulary.
+ *
+ * `CaptureFailed` is a member of the union rather than a flavour of failure because a capture
+ * that never happened observes nothing: it cannot confirm a criterion and it cannot report the
+ * behaviour as broken, and collapsing the two would let a broken test run read as a broken
+ * product (F23-AC5).
+ */
+export type OwnerTestObservation = 'BehaviorConfirmed' | 'BehaviorFailed' | 'CaptureFailed';
+
+/**
+ * Where the owner performed the step.
+ *
+ * `Preview` and `LiveSmoke` are distinct from `Local` because a criterion that requires
+ * deployed behaviour stays unmet while it is satisfied by local evidence alone (F23-AC4).
+ */
+export type OwnerTestEnvironment = 'Local' | 'Preview' | 'LiveSmoke';
+
+/**
+ * The build or deployment the owner observed, or an explicit statement that none applies
+ * (F23-AC3, F23-AC4). A discriminated union rather than optional fields, because "no
+ * deployment exists yet" and "the deployment field was left blank" must not read alike.
+ */
+export type OwnerTestObservationTarget =
+  | {
+      readonly kind: 'Deployment';
+      readonly component: string;
+      readonly environment: string;
+      readonly deploymentId: string | null;
+      readonly deploymentUrl: string | null;
+    }
+  | { readonly kind: 'NoDeploymentApplicable'; readonly reason: string };
+
+/** The retained thing the claim points at (F23-AC2). */
+export interface OwnerTestEvidenceReference {
+  readonly kind: 'Screenshot' | 'ApiExchange' | 'CheckOutput';
+  readonly reference: string;
+}
+
+/** What the owner recorded, and whether acceptance is now possible (F25-AC1). */
+export interface OwnerTestReport {
+  readonly criterionId: string;
+  readonly candidateFingerprint: string;
+  readonly criterion: {
+    readonly status: string;
+    readonly methodKind: string;
+    readonly observedAt: string | null;
+    readonly evidenceId: string | null;
+  };
+  readonly acceptance: { readonly ready: boolean; readonly reasons: readonly string[] };
+}
+
 /** Transport health, mirrored so the owner is told when the view has stopped being current. */
 export interface ConnectionState {
   readonly connected: boolean;
@@ -1586,6 +1669,42 @@ export function acceptCandidate(
     method: 'POST',
     csrf: true,
     body: note === null ? { decision: 'Accept' } : { decision: 'Accept', note },
+  });
+}
+
+/**
+ * Records the owner's own observation for one criterion (F23-AC1, F23-AC5, F25-AC1, F25-AC4).
+ *
+ * The only write in this client that creates evidence about a criterion, and it is the owner's
+ * alone: the session is the authority, no body field names an actor, and no result is asserted
+ * by the caller — the caller states an *observation* and the server decides what that makes the
+ * criterion. The client therefore has no way to send "this criterion passed" (F25-AC4).
+ *
+ * The outcome vocabulary is sent as the domain spells it rather than as a friendly label, so a
+ * client-side rename cannot quietly change what gets recorded (F23-AC5).
+ */
+export function recordOwnerTest(
+  jobId: string,
+  input: {
+    readonly criterionId: string;
+    readonly expectedCandidateFingerprint: string;
+    readonly observation: OwnerTestObservation;
+    readonly observedAgainst: OwnerTestObservationTarget;
+    readonly evidence: OwnerTestEvidenceReference;
+    readonly note: string | null;
+  },
+): Promise<ApiResult<{ readonly report: OwnerTestReport }>> {
+  return request<{ readonly report: OwnerTestReport }>(pathFor(RUNS_ROOT, jobId, '/owner-observations'), {
+    method: 'POST',
+    csrf: true,
+    body: {
+      criterionId: input.criterionId,
+      expectedCandidateFingerprint: input.expectedCandidateFingerprint,
+      observation: input.observation,
+      observedAgainst: input.observedAgainst,
+      evidence: input.evidence,
+      note: input.note,
+    },
   });
 }
 
