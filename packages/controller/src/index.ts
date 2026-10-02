@@ -19,6 +19,8 @@ export { default } from './web-surface.ts';
 export * from './acceptance.ts';
 export * from './adoption.ts';
 export * from './composition.ts';
+export * from './context-packet.ts';
+export * from './brief-generation.ts';
 export * from './connectors.ts';
 export * from './delivery.ts';
 export * from './intake.ts';
