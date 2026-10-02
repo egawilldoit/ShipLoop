@@ -110,6 +110,9 @@ import type {
   RunWriter,
 } from './jobs.ts';
 import type { ReviewCard } from './verification.ts';
+import type { OwnerObservationRecord, OwnerObservationTarget, OwnerObservationUseCases } from './owner-tests.ts';
+import { SqliteOwnerObservationJournal, createOwnerObservationUseCases } from './owner-tests.ts';
+import { SqliteObservationJournal } from './verification.ts';
 import { PLAN_TASK_CONTENT_FIELDS } from '@shiploop/domain';
 import { blocked } from '@shiploop/domain';
 import type { ReconciliationOutcome, TicketPublication, TicketToPublish } from './publication.ts';
@@ -858,6 +861,86 @@ export interface SurfaceAcceptanceUseCases {
   acceptanceGate(jobId: JobId): Promise<Result<SurfaceAcceptanceGate, DomainError>>;
 }
 
+/**
+ * The deployment an observation was made against, or the owner's statement that none applies
+ * (F23-AC3, F23-AC4).
+ *
+ * Translated rather than widened: the controller's own union is already the transport's shape,
+ * so this port adds no third possibility that the layer below could express.
+ */
+export type SurfaceOwnerObservationTarget =
+  | {
+      readonly kind: 'Deployment';
+      readonly component: string;
+      readonly deploymentId: string;
+      readonly environment: string;
+    }
+  | {
+      readonly kind: 'NoDeployment';
+      readonly reason: string;
+    };
+
+/** The kinds of retained reference an observation may point at (F23-AC2). */
+export type SurfaceOwnerEvidenceKind = 'Screenshot' | 'ApiExchange' | 'CheckOutput';
+
+/**
+ * One recorded owner observation, as the transport reads it (F23-AC5, F25-AC1).
+ *
+ * `failureKind` travels as its own field rather than being left inside the detail prose, so
+ * the transport can tell a behaviour failure from a capture failure without parsing a
+ * sentence, and a failed owner test can never be rendered as a failed automated check
+ * (F23-AC5).
+ */
+export interface SurfaceOwnerObservation {
+  readonly evidenceId: string;
+  readonly criterionId: string;
+  readonly methodKind: 'OwnerTest';
+  readonly status: string;
+  readonly failureKind: 'BehaviorFailure' | 'CaptureFailure' | null;
+  /** The authenticated owner, which the transport proved and never reads from a body (F25-AC4). */
+  readonly observedBy: string;
+  readonly observedAt: string;
+  readonly environment: string;
+  readonly component: string | null;
+  readonly deploymentId: string | null;
+  readonly evidenceKind: SurfaceOwnerEvidenceKind;
+  readonly evidenceRef: string;
+  readonly detail: string | null;
+  readonly candidateId: string;
+  readonly candidateFingerprint: string;
+  readonly scopeFingerprint: string;
+  readonly correlationId: string;
+}
+
+/**
+ * Manual owner test recording (F23-AC1, F23-AC5, F24-AC4, F25-AC1, F25-AC4).
+ *
+ * Keyed by run, like the acceptance group: the transport names what the owner clicked and the
+ * candidate is resolved here, so a request cannot record an observation against a candidate the
+ * run does not offer (F25-AC3). `expectedCandidateFingerprint` is required and separate, because
+ * comparing it against the resolved candidate is what turns an action taken from an outdated
+ * card into a typed `Conflict` instead of a write against whatever is current now (F24-AC4).
+ *
+ * The command carries no instant: the observation is stamped by the controller's clock, so a
+ * client cannot backdate a record or re-attribute it (F23-AC3, F25-AC4).
+ */
+export interface SurfaceOwnerTestUseCases {
+  recordOwnerObservation(command: {
+    readonly jobId: JobId;
+    readonly criterionId: string;
+    readonly expectedCandidateFingerprint: string;
+    readonly observation: 'BehaviorConfirmed' | 'BehaviorFailed' | 'CaptureFailed';
+    readonly observedAgainst: SurfaceOwnerObservationTarget;
+    readonly evidence: { readonly kind: SurfaceOwnerEvidenceKind; readonly reference: string };
+    readonly note: string | null;
+    readonly actor: OwnerId;
+  }): Promise<Result<{ readonly observation: SurfaceOwnerObservation; readonly recordedForDelivery: false; readonly outstandingCriterionIds: readonly string[] }, DomainError>>;
+  listOwnerObservations(query: {
+    readonly jobId: JobId;
+    readonly candidateFingerprint: string;
+  }): Promise<Result<readonly SurfaceOwnerObservation[], DomainError>>;
+}
+
 /* -------------------------------------------------------------------------- */
 /* Plans, readiness, publication and adoption                                 */
 /* -------------------------------------------------------------------------- */
@@ -1124,6 +1207,7 @@ export interface ControllerSurface {
   readonly attention: SurfaceAttentionUseCases;
   readonly reviewCards: SurfaceReviewCardUseCases;
   readonly acceptance: SurfaceAcceptanceUseCases;
+  readonly ownerTests: SurfaceOwnerTestUseCases;
   readonly planning: SurfacePlanningUseCases;
 }
 
@@ -2646,6 +2730,60 @@ export function createControllerSurface(resolve: SurfaceRootResolver): Controlle
         }),
     },
 
+    /**
+     * Manual owner test recording (F23-AC1, F24-AC4, F25-AC1, F25-AC4).
+     *
+     * Delegation plus a projection. The candidate is resolved from the run rather than taken
+     * from the request, the fingerprint the owner's page was rendered against is forwarded as
+     * the claim it is so the use case can refuse it, and the owner actor is built from the
+     * identity the transport proved. Nothing here decides anything, so the refusals an owner
+     * reads are the ones the owner-test use case wrote (F23-AC1, F25-AC4).
+     */
+    ownerTests: {
+      recordOwnerObservation: async (command) =>
+        use(async (root) => {
+          const candidate = await candidateForRun(root, command.jobId);
+          if (!candidate.ok) return err(candidate.error);
+          const recorded = ownerObservationUseCases(root).recordOwnerObservation({
+            candidateId: candidate.value.candidateId,
+            expectedCandidateFingerprint: command.expectedCandidateFingerprint as Fingerprint,
+            criterionId: command.criterionId,
+            actor: ownerActor(command.actor),
+            observation: command.observation,
+            observedAgainst: command.observedAgainst as OwnerObservationTarget,
+            evidence: command.evidence,
+            note: command.note,
+            correlationId: correlationOf(command.jobId),
+          });
+          if (!recorded.ok) return err(recorded.error);
+          const report = recorded.value;
+          return ok({
+            observation: toSurfaceOwnerObservation(report.observation),
+            recordedForDelivery: report.recordedForDelivery,
+            outstandingCriterionIds: [...report.outstandingCriterionIds],
+          });
+        }),
+
+      /**
+       * The observations bound to one exact candidate identity (F20-AC3, F23-AC1).
+       *
+       * The fingerprint is part of the query, and the candidate is the run's current one, so a
+       * replacement candidate reads as having inherited nothing from the build it replaced
+       * rather than as showing that build's results (F20-AC3).
+       */
+      listOwnerObservations: async (query) =>
+        use(async (root) => {
+          const candidate = await candidateForRun(root, query.jobId);
+          if (!candidate.ok) return err(candidate.error);
+          const listed = ownerObservationUseCases(root).listOwnerObservations({
+            candidateId: candidate.value.candidateId,
+            candidateFingerprint: query.candidateFingerprint as Fingerprint,
+          });
+          if (!listed.ok) return err(listed.error);
+          return ok(listed.value.map(toSurfaceOwnerObservation));
+        }),
+    },
+
     planning: {
       /**
        * Validates a structured proposal and drafts the plan it describes (F08-AC1).
@@ -2953,6 +3091,54 @@ async function candidateForRun(
   const run = await root.jobUseCases.getRun(jobId);
   if (!run.ok) return err(run.error);
   return currentCandidateFor(root, run.value.job.workItemId);
+}
+
+/**
+ * The owner-test use cases over this root (F23-AC1, F25-AC1).
+ *
+ * Built on demand rather than held on the root, because the journal that files the verdict and
+ * its attribution needs the root's own database handle, and the root is what the surface was
+ * resolved from. The composition root is not extended here: this is the one writer that needs a
+ * transaction spanning two tables, so it is assembled where the handle already exists.
+ */
+let ownerObservationCache: { readonly root: CompositionRoot; readonly useCases: OwnerObservationUseCases } | null = null;
+
+function ownerObservationUseCases(root: CompositionRoot): OwnerObservationUseCases {
+  if (ownerObservationCache?.root === root) return ownerObservationCache.useCases;
+  const evidence = new SqliteObservationJournal(root.database);
+  const useCases = createOwnerObservationUseCases({
+    clock: controllerClock(),
+    candidates: root.candidates,
+    workItems: { get: (id) => root.workItems.get(id) },
+    scope: { latestScopeSnapshot: (id) => root.workItems.latestScopeSnapshot(id) },
+    evidence,
+    observations: new SqliteOwnerObservationJournal(root.database, evidence),
+  });
+  ownerObservationCache = { root, useCases };
+  return useCases;
+}
+
+/** One recorded observation, renamed for the transport and narrowed to text (F23-AC5). */
+function toSurfaceOwnerObservation(record: OwnerObservationRecord): SurfaceOwnerObservation {
+  return {
+    evidenceId: String(record.evidenceId),
+    criterionId: record.criterionId,
+    methodKind: record.methodKind,
+    status: String(record.status),
+    failureKind: record.failureKind,
+    observedBy: String(record.observedBy),
+    observedAt: record.observedAt,
+    environment: String(record.environment),
+    component: record.component,
+    deploymentId: record.deploymentId,
+    evidenceKind: record.evidenceKind,
+    evidenceRef: record.evidenceRef,
+    detail: record.detail,
+    candidateId: String(record.candidateId),
+    candidateFingerprint: String(record.candidateFingerprint),
+    scopeFingerprint: String(record.scopeFingerprint),
+    correlationId: record.correlationId,
+  };
 }
 
 /**

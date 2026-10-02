@@ -97,6 +97,7 @@ const REQUIRED_METHODS = {
   attention: ['collectAttention', 'acknowledge'],
   reviewCards: ['buildReviewCard'],
   acceptance: ['requestChanges', 'recordAcceptance', 'currentAcceptance', 'acceptanceGate'],
+  ownerTests: ['recordOwnerObservation', 'listOwnerObservations'],
   planning: [
     'draftPlan',
     'getPlan',

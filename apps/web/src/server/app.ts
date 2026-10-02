@@ -43,6 +43,7 @@ import { registerConnectorRoutes } from './routes/connectors.ts';
 import { registerHealthRoutes } from './routes/health.ts';
 import { registerIntakeRoutes } from './routes/intake.ts';
 import { registerOwnerRoutes } from './routes/owner.ts';
+import { registerOwnerTestRoutes } from './routes/owner-tests.ts';
 import { registerPlanningRoutes } from './routes/planning.ts';
 import { registerProfileRoutes } from './routes/profiles.ts';
 import { registerRunRoutes } from './routes/runs.ts';
@@ -111,6 +112,7 @@ export async function buildApp(deps: AppDependencies): Promise<FastifyInstance> 
   registerRunRoutes(app, { controller, guard, now });
   registerAttentionRoutes(app, { controller, guard, now });
   registerPlanningRoutes(app, { controller, guard, now });
+  registerOwnerTestRoutes(app, { controller, guard });
 
   const staticRoot = config.staticRoot;
   if (staticRoot !== null) {
