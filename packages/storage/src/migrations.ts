@@ -2547,6 +2547,104 @@ const MIGRATION_11_PUBLISHED_PROVIDER_REVISION = `
 ALTER TABLE work_items ADD COLUMN provider_revision TEXT;
 `;
 
+/**
+ * Procedure versions are identified by subject and number, not by project alone
+ * (F05-AC1, F05-AC3).
+ *
+ * Migration 8 rebuilt this table and carried `UNIQUE (project_id, version)`
+ * across unchanged, "because nothing is relaxed here". That was the correct
+ * rule for the schema as it then stood and it is the wrong rule for the
+ * repository that writes it: `ProcedureRepository.appendVersion` numbers a
+ * version per *subject key*, and `currentVersion` reads per subject key, so a
+ * project holding two subjects produced `1` twice and the second write was
+ * refused by the constraint. One subject's first version therefore made every
+ * other subject of the same project unstorable, which is what left F05-AC3 -
+ * comparing a remembered scope note against a live recipe across two subjects
+ * of one project - unrepresentable rather than unimplemented.
+ *
+ * The replacement is `UNIQUE (project_id, subject_key, version)`: a version number
+ * means something within a subject, and two subjects may both start at 1. Every
+ * other invariant is carried across byte for byte, so nothing is weakened:
+ *
+ *   - the positive `version` CHECK, the `kind` and `source` vocabularies, the
+ *     `status` vocabulary and the approval invariant `status <> 'Accepted' OR
+ *     approved_at IS NOT NULL`;
+ *   - `UNIQUE (project_id, kind, content_fingerprint)`, which is a fact
+ *     identity and is unaffected by which subject holds it;
+ *   - `content_fingerprint`'s format CHECK, the NOT NULL columns and their empty
+ *     defaults, and the nullable ones left nullable.
+ *
+ * Nothing is renumbered and no row is dropped: the copy is column for column,
+ * so every existing `procedure_version_id` survives and every row that points at
+ * one - `evidence`, `scope_snapshots`, `jobs` and `candidates`, which
+ * `rebuildTables` stashes and restores around the swap - keeps pointing at the
+ * same version it pointed at before (F12-AC3). The old constraint was a
+ * *narrowing*, so every row that satisfied it satisfies this one; the rebuild
+ * cannot fail for that reason.
+ *
+ * A rebuild rather than a drop-and-recreate because SQLite cannot alter a
+ * constraint in place, and a rebuild is the only forward-only step this runner
+ * has proven: `rebuildTables` discovers the referencing tables, stashes them,
+ * swaps the parent and restores them in order, so `PRAGMA foreign_key_check`
+ * stays empty (N08-AC3, ADR 0003).
+ */
+const MIGRATION_12_PROCEDURE_VERSION_IDENTITY = `
+CREATE TABLE procedure_versions_subject_scoped (
+  procedure_version_id   TEXT PRIMARY KEY,
+  project_id             TEXT NOT NULL REFERENCES projects(project_id) ON DELETE RESTRICT,
+  subject_key            TEXT NOT NULL DEFAULT '',
+  version                INTEGER NOT NULL CHECK (version > 0),
+  kind                   TEXT NOT NULL CHECK (kind IN ('Procedure', 'Fact')),
+  scope                  TEXT NOT NULL DEFAULT '',
+  source                 TEXT NOT NULL CHECK (source IN ('Owner', 'Repository', 'Provider')),
+  source_revision        TEXT,
+  content_json           TEXT NOT NULL,
+  content_fingerprint    TEXT NOT NULL ${fingerprintCheck('content_fingerprint')},
+  status                 TEXT NOT NULL DEFAULT 'Proposed'
+                           CHECK (status IN ('Proposed', 'Accepted', 'Superseded', 'Retired')),
+  last_verified_revision TEXT,
+  last_verified_at       TEXT,
+  approved_at            TEXT,
+  created_at             TEXT NOT NULL DEFAULT ${NOW},
+  created_by             TEXT NOT NULL DEFAULT '',
+  note                   TEXT,
+  UNIQUE (project_id, subject_key, version),
+  UNIQUE (project_id, kind, content_fingerprint),
+  CHECK (status <> 'Accepted' OR approved_at IS NOT NULL)
+);
+`;
+
+/**
+ * Swaps `procedure_versions` for the subject-scoped definition and restores its indexes.
+ *
+ * The three indexes are recreated from the same statements migration 8 created, because
+ * SQLite drops an index with the table that owns it. They are not derived from the new
+ * definition: `procedure_versions_by_subject` is what `currentVersion` and `appendVersion`
+ * address, and `procedure_versions_proposed` is the partial index that makes `listProposed`
+ * read the owner's outstanding proposals rather than a project's whole history.
+ */
+function scopeProcedureVersionsBySubject(db: Database): void {
+  rebuildTables(db, [
+    {
+      table: 'procedure_versions',
+      replacement: 'procedure_versions_subject_scoped',
+      copy: identityCopy(db, 'procedure_versions'),
+      suspended: SCOPE_SNAPSHOT_IMMUTABILITY_TRIGGERS,
+    },
+  ]);
+
+  db.exec(
+    'CREATE INDEX procedure_versions_by_project ON procedure_versions(project_id, kind, version DESC)',
+  );
+  db.exec(
+    'CREATE INDEX procedure_versions_by_subject ON procedure_versions(project_id, subject_key, status, version DESC)',
+  );
+  db.exec(
+    `CREATE INDEX procedure_versions_proposed ON procedure_versions(project_id, created_at, version)
+     WHERE status = 'Proposed'`,
+  );
+}
+
 const MIGRATIONS: readonly Migration[] = [
   {
     version: 1,
@@ -2648,6 +2746,14 @@ const MIGRATIONS: readonly Migration[] = [
     name: 'published_provider_revision',
     up: (db) => {
       db.exec(MIGRATION_11_PUBLISHED_PROVIDER_REVISION);
+    },
+  },
+  {
+    version: 12,
+    name: 'procedure_version_subject_identity',
+    up: (db) => {
+      db.exec(MIGRATION_12_PROCEDURE_VERSION_IDENTITY);
+      scopeProcedureVersionsBySubject(db);
     },
   },
 ];

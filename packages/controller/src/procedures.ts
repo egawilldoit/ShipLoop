@@ -31,11 +31,11 @@
  * changed (F05-AC3, F05-AC1).
  *
  * Not implemented here, and named so it is not assumed: comparing a *remembered scope note*
- * against a *live recipe* across two subjects of one project. `procedure_versions` carries
- * `UNIQUE (project_id, version)` while `appendVersion` numbers versions per subject, so a
- * project can hold only one subject's first version and a second subject cannot be stored at
- * all. That comparison belongs in `@shiploop/storage` once the constraint and the numbering
- * agree; nothing here pretends to make it (F05-AC3).
+ * against a *live recipe* across two subjects of one project. The schema now identifies a
+ * version by its subject - `procedure_versions` carries `UNIQUE (project_id, subject_key,
+ * version)`, and `appendVersion` numbers per subject - so two subjects of one project can each
+ * hold a first version and advance independently, which is what that comparison needs. What is
+ * still absent is the comparison itself; nothing here pretends to make it (F05-AC3).
  */
 
 import { canonicalize, err, invalid, ok, redact } from '@shiploop/domain';

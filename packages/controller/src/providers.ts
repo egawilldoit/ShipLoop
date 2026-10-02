@@ -37,14 +37,21 @@ import {
   GITHUB_PROVIDER,
   GitHubGitAdapter,
   createGitTransport,
+  deniedCodingCapabilities,
 } from '@shiploop/adapters';
 import type {
   AdapterCapabilities,
   AdapterCompatibility,
   AdapterContext,
+  CodingSessionCapability,
   DeclareNoCodeOutcomeRequest,
   DescribeTransitionsRequest,
   DraftRef,
+  EngineAdapter,
+  EngineContinuation,
+  EngineEvent,
+  EngineSessionHandle,
+  EngineStopOutcome,
   FindDraftsRequest,
   GitAdapter,
   GitRepositoryRef,
@@ -65,6 +72,8 @@ import type {
   ReadTicketScopeRequest,
   RelatedIssue,
   RelatedIssueSearchRequest,
+  ResumeEngineSessionRequest,
+  StopEngineSessionRequest,
   TicketAdapter,
   TicketScopeRead,
   TicketTransitionDescriptor,
@@ -73,6 +82,7 @@ import type {
   UpsertDraftOutcome,
   UpsertDraftRequest,
 } from '@shiploop/adapters';
+import { readFileSync } from 'node:fs';
 // `@shiploop/adapters` publishes only its root entry point, which does not carry Linear, so the
 // shipped Linear adapter is reached by the same relative path `apps/worker/src/live-run.ts`
 // uses. Widening that package's exports is not part of this change.
@@ -81,9 +91,11 @@ import { blocked, err, invalid, ok, redact, secretFreeReason } from '@shiploop/d
 import type {
   BlockedError,
   CapabilityDeclaration,
+  CapabilityKind,
   ConnectorId,
   DomainError,
   OperationId,
+  ProviderId,
   Result,
 } from '@shiploop/domain';
 import type { ConnectorKind, ConnectorRecord } from '@shiploop/storage';
@@ -121,6 +133,8 @@ export const GIT_API_BASE_URL_ENV = 'SHIPLOOP_PROVIDER_GIT_API_BASE_URL';
 export const GIT_WORKTREE_ENV = 'SHIPLOOP_PROVIDER_GIT_WORKTREE';
 /** The coding engine binary this process serves; absent means no engine is registered. */
 export const ENGINE_BINARY_ENV = 'SHIPLOOP_PROVIDER_ENGINE_BINARY';
+/** The recorded answers this process replays instead of contacting a model. */
+export const ENGINE_TRANSCRIPT_ENV = 'SHIPLOOP_PROVIDER_ENGINE_TRANSCRIPT';
 
 /**
  * Reads the environment variable that holds a credential.
@@ -146,10 +160,33 @@ export interface ProviderBinding {
   readonly worktree: string | null;
 }
 
-/** The coding engine, which is configured by binary path and needs no credential. */
+/**
+ * How this process runs model work (F07-AC1, F08-AC1, F03-AC5).
+ *
+ * Two drivers, named rather than implied, because they are different claims and a record that
+ * cannot say which one produced it cannot be reviewed:
+ *
+ *   - `Executable` spawns the configured binary through the shipped `CodexEngineAdapter`.
+ *     This is the only driver that contacts a model, and it is what an operator means by
+ *     "configure the engine".
+ *   - `RecordedTranscript` replays an answer recorded ahead of time. No model is contacted, no
+ *     budget is spent, and the answer is a fixed document, so it exists for a deployment that
+ *     must exercise the generation path deterministically. Everything else about the pass is
+ *     unchanged: the domain validates the answer, the store records what it validated and the
+ *     owner reads it, which is why it is a driver rather than a bypass.
+ *
+ * A driver is never chosen by inference from the other's absence: one variable names an
+ * executable, the other names a transcript, and setting both is a configuration error rather
+ * than a silent preference (F03-AC1).
+ */
+export type EngineDriver = 'Executable' | 'RecordedTranscript';
+
+/** The coding engine, configured as an executable or as a recorded transcript. */
 export interface EngineBinding {
   readonly connectorId: ConnectorId;
-  readonly binary: string;
+  readonly driver: EngineDriver;
+  /** The executable for `Executable`; the transcript file for `RecordedTranscript`. */
+  readonly source: string;
 }
 
 /**
@@ -183,6 +220,16 @@ export interface ProviderRegistry {
   readonly ticket: TicketAdapter | null;
   /** Present only when a git provider is configured; adopting a branch needs one (F11-AC2). */
   readonly git: GitAdapter | null;
+  /**
+   * The coding engine this process registered, or null when it configured none.
+   *
+   * Published rather than kept inside this module because generation is the only caller that
+   * reaches an engine, and a caller that had to reach into the registry's own constructor to
+   * find one would either get nothing or get a second engine that is not the configured one
+   * (F07-AC1, F08-AC1, N05-AC2). Absent is reported as a named refusal at the operation rather
+   * than as a stub that refuses every call (F03-AC2).
+   */
+  readonly engine: EngineAdapter | null;
   /**
    * The blocker an operation must stop on, or null when its provider may act.
    *
@@ -259,9 +306,20 @@ export function readProviderConfiguration(env: NodeJS.ProcessEnv): Result<Provid
     }
   }
 
-  const engineBinary = trimmed(env[ENGINE_BINARY_ENV]);
+const engineBinary = trimmed(env[ENGINE_BINARY_ENV]);
+  const engineTranscript = trimmed(env[ENGINE_TRANSCRIPT_ENV]);
+  if (engineBinary !== null && engineTranscript !== null) {
+    problems.push({
+      path: ENGINE_TRANSCRIPT_ENV,
+      message: `${ENGINE_BINARY_ENV} and ${ENGINE_TRANSCRIPT_ENV} name two different engines. Configure exactly one: a process either runs a model or replays recorded answers (F03-AC1).`,
+    });
+  }
   const engine: EngineBinding | null =
-    engineBinary === null ? null : { connectorId: connectorIdFor('codex'), binary: engineBinary };
+    engineBinary !== null
+      ? { connectorId: connectorIdFor('codex'), driver: 'Executable', source: engineBinary }
+      : engineTranscript !== null
+        ? { connectorId: connectorIdFor('codex-recorded'), driver: 'RecordedTranscript', source: engineTranscript }
+        : null;
 
   if (problems.length > 0) return err(invalid('The provider configuration is not usable.', problems));
   return ok({ ticket, git, engine });
@@ -607,6 +665,244 @@ class CredentialScopedGitAdapter implements GitAdapter {
 }
 
 /* -------------------------------------------------------------------------- */
+/* The recorded engine driver                                                  */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * One recorded answer, and the session that produced it.
+ *
+ * The answer is the engine's own structured text, verbatim and unparsed: the recorded driver
+ * exists to hand the generation path a fixed document, and reading it here would move the
+ * validation the domain performs out of the path that performs it (F05-AC5).
+ */
+export interface RecordedEnginePass {
+  readonly sessionId: string;
+  readonly answer: string;
+}
+
+/**
+ * The whole recorded transcript, one answer per read-only pass.
+ *
+ * Keyed by pass rather than by a queue of answers because a queue would make the second
+ * generation of the same pass return a different document for no stated reason, and a
+ * recorded engine that changes its mind between two identical requests is a source of
+ * differences nobody can account for (F07-AC1).
+ */
+export interface RecordedEngineTranscript {
+  readonly engineVersion: string;
+  readonly clarification: RecordedEnginePass;
+  readonly plan: RecordedEnginePass;
+}
+
+/**
+ * Reads and validates a recorded transcript.
+ *
+ * Every problem is reported at once and names the member it is about, because a transcript is
+ * configuration an operator wrote by hand and a refusal that says only "malformed" costs a
+ * round trip to find one missing brace (F03-AC1).
+ */
+export function readRecordedEngineTranscript(raw: string): Result<RecordedEngineTranscript, DomainError> {
+  let decoded: unknown;
+  try {
+    decoded = JSON.parse(raw) as unknown;
+  } catch (error) {
+    return err(
+      invalid('The recorded engine transcript is not valid JSON.', [
+        { path: 'transcript', message: `${error instanceof Error ? error.message : String(error)}` },
+      ]),
+    );
+  }
+  const record = typeof decoded === 'object' && decoded !== null && !Array.isArray(decoded) ? (decoded as Record<string, unknown>) : null;
+  const problems: { readonly path: string; readonly message: string }[] = [];
+  if (record === null) {
+    return err(
+      invalid('The recorded engine transcript is not an object.', [
+        { path: 'transcript', message: 'Expected an object with "engineVersion", "clarification" and "plan".' },
+      ]),
+    );
+  }
+  const engineVersion = typeof record['engineVersion'] === 'string' ? record['engineVersion'].trim() : '';
+  if (engineVersion.length === 0) {
+    problems.push({ path: 'engineVersion', message: 'A recorded run reports which engine produced it.' });
+  }
+  const passes: RecordedEnginePass[] = [];
+  for (const key of ['clarification', 'plan'] as const) {
+    const member = typeof record[key] === 'object' && record[key] !== null ? (record[key] as Record<string, unknown>) : null;
+    const sessionId = member === null || typeof member['sessionId'] !== 'string' ? '' : member['sessionId'].trim();
+    const answer = member === null || typeof member['answer'] !== 'string' ? '' : member['answer'];
+    if (member === null) {
+      problems.push({ path: key, message: `The recorded transcript needs a "${key}" answer.` });
+      continue;
+    }
+    if (sessionId.length === 0) {
+      problems.push({ path: `${key}.sessionId`, message: 'A recorded answer names the session it came from.' });
+    }
+    if (answer.trim().length === 0) {
+      problems.push({ path: `${key}.answer`, message: 'A recorded answer may not be blank.' });
+    }
+    passes.push({ sessionId, answer });
+  }
+  if (problems.length > 0) {
+    return err(invalid('The recorded engine transcript is not usable.', problems));
+  }
+  const [clarification, plan] = passes;
+  if (clarification === undefined || plan === undefined) {
+    return err(
+      invalid('The recorded engine transcript is not usable.', [
+        { path: 'transcript', message: 'Both a clarification and a plan answer are required.' },
+      ]),
+    );
+  }
+  return ok({ engineVersion, clarification, plan });
+}
+
+/**
+ * Which recorded answer a session asks for.
+ *
+ * Structural rather than a substring of the prompt: a clarification pass is granted the
+ * read-only capabilities and a plan pass is granted none, and `PLAN_ENGINE_CAPABILITIES` is
+ * frozen empty precisely so that absence is a fact about the pass. A grant that is neither
+ * empty nor wholly read-only is refused, because answering it from a generation transcript
+ * would be answering a different request with this document (F07-AC5, F08-AC1).
+ */
+function recordedPassFor(granted: readonly CodingSessionCapability[], transcript: RecordedEngineTranscript): Result<RecordedEnginePass, DomainError> {
+  if (granted.length === 0) return ok(transcript.plan);
+  if (deniedCodingCapabilities(granted).length > 0) {
+    return err({
+      code: 'Forbidden',
+      reason: `A recorded engine serves the read-only generation passes only; a session holding ${deniedCodingCapabilities(granted).join(', ')} is not one of them (F03-AC5).`,
+    });
+  }
+  return ok(transcript.clarification);
+}
+
+/**
+ * An `EngineAdapter` that replays recorded answers instead of contacting a model.
+ *
+ * It implements the same contract as the shipped `CodexEngineAdapter` and is registered
+ * through the same configuration boundary, so the composition root reaches an engine rather
+ * than a test double handed to it (N05-AC2). Three things are deliberately structural:
+ *
+ *   - **The answer is emitted twice, structurally.** Once as a `Progress` summary and once as
+ *     the terminal `Succeeded` summary, because the two generation paths read different
+ *     channels: the clarification pass reads the terminal outcome and the plan pass reads the
+ *     engine's progress text. A driver that filled only one of them would make one of the two
+ *     passes unreachable for a reason that has nothing to do with the pass (F07-AC1, F08-AC1).
+ *   - **The answer is never parsed here.** Validation is the domain's, and a driver that
+ *     accepted an answer the domain would refuse would make the refusal unreachable
+ *     (F05-AC5).
+ *   - **Nothing is resumed and nothing is stopped.** There is no process to signal and no
+ *     rollout to restore, so both are named refusals rather than a fabricated `Stopped` or a
+ *     session that pretends to have continued (F15-AC4).
+ */
+class RecordedEngineAdapter implements EngineAdapter {
+  readonly kind = 'Engine' as const;
+  readonly connectorId: ConnectorId;
+  private readonly transcript: RecordedEngineTranscript;
+
+  constructor(connectorId: ConnectorId, transcript: RecordedEngineTranscript) {
+    this.connectorId = connectorId;
+    this.transcript = transcript;
+  }
+
+  capabilities(): AdapterCapabilities {
+    const read = (kind: CapabilityKind): CapabilityDeclaration => ({
+      kind,
+      supported: kind !== 'Engine:ResumeSession',
+      limitation:
+        kind === 'Engine:ResumeSession'
+          ? 'A recorded answer is a fixed document with no rollout to continue, so a resume is refused rather than answered from the recording (F15-AC4).'
+          : null,
+      privileged: false,
+      supportsPrecondition: false,
+    });
+    return {
+      kind: 'Engine',
+      contractVersion: ADAPTER_CONTRACT_VERSION,
+      declarations: [read('Engine:VersionCheck'), read('Engine:StartScoped'), read('Engine:StopGraceful')],
+    };
+  }
+
+  /** States plainly that no model was contacted, because a compatibility answer implies one. */
+  async checkCompatibility(context: AdapterContext): Promise<Result<AdapterCompatibility>> {
+    return ok({
+      kind: 'Engine',
+      contractVersion: ADAPTER_CONTRACT_VERSION,
+      runtimeVersion: this.transcript.engineVersion,
+      compatible: true,
+      detail: `This deployment replays recorded answers from ${this.transcript.engineVersion}; no model is contacted, so nothing here proves a model can be reached (F03-AC1).`,
+      observedAt: context.clock.now(),
+    });
+  }
+
+  async startSession(context: AdapterContext, request: Parameters<EngineAdapter['startSession']>[1]): Promise<Result<EngineSessionHandle>> {
+    const pass = recordedPassFor(request.grantedCapabilities, this.transcript);
+    if (!pass.ok) return pass;
+    const startedAt = context.clock.now();
+    const sessionId = pass.value.sessionId as ProviderId;
+    const events: readonly EngineEvent[] = [
+      {
+        kind: 'SessionStarted',
+        at: startedAt,
+        sessionId,
+        engineVersion: this.transcript.engineVersion,
+        mode: request.mode,
+        startedFrom: request.start.kind,
+      },
+      {
+        kind: 'Progress',
+        at: context.clock.now(),
+        stage: 'SummingUp',
+        milestoneKey: null,
+        summary: pass.value.answer,
+        detail: null,
+      },
+      {
+        kind: 'Result',
+        at: context.clock.now(),
+        outcome: { kind: 'Succeeded', summary: pass.value.answer },
+      },
+    ];
+    return ok({
+      sessionId,
+      engineVersion: this.transcript.engineVersion,
+      mode: request.mode,
+      workspace: request.workspace,
+      grantedCapabilities: request.grantedCapabilities,
+      startedAt,
+      events: {
+        async *[Symbol.asyncIterator](): AsyncIterator<EngineEvent> {
+          for (const event of events) yield event;
+        },
+      },
+    });
+  }
+
+  async resumeSession(
+    _context: AdapterContext,
+    request: ResumeEngineSessionRequest,
+  ): Promise<Result<EngineContinuation>> {
+    return ok({
+      kind: 'ContinuationUnsupported',
+      checkpoint: request.checkpoint,
+      limitation: `A recorded answer is a fixed document with no rollout to continue, so session ${request.priorSession.sessionId} cannot be resumed (F15-AC4).`,
+      requiresFreshSessionFromCheckpoint: true,
+    });
+  }
+
+  async stopSession(
+    context: AdapterContext,
+    _request: StopEngineSessionRequest,
+  ): Promise<Result<EngineStopOutcome>> {
+    return ok({
+      kind: 'Stopped',
+      stoppedAt: context.clock.now(),
+      checkpoint: null,
+    });
+  }
+}
+
+/* -------------------------------------------------------------------------- */
 /* Registration                                                                */
 /* -------------------------------------------------------------------------- */
 
@@ -649,18 +945,14 @@ export function createProviderRegistry(
     gitBinding === null || gitTransport === null
       ? null
       : buildGitAdapter(gitBinding, fetchImpl, gitTransport, readSecret);
-  const engineAdapter =
-    engineBinding === null
-      ? null
-      : new CodexEngineAdapter({
-          connectorId: engineBinding.connectorId,
-          client: { binary: engineBinding.binary },
-        });
+  const engineAdapter = buildEngineAdapter(engineBinding);
+  if (!engineAdapter.ok) return err(engineAdapter.error);
+  const engine = engineAdapter.value;
 
   const declarationsFor = (kind: ConnectorKind): readonly CapabilityDeclaration[] => {
     if (kind === 'Ticket') return ticketAdapter?.capabilities().declarations ?? [];
     if (kind === 'Git') return gitAdapter?.capabilities().declarations ?? [];
-    if (kind === 'Engine') return engineAdapter?.capabilities().declarations ?? [];
+    if (kind === 'Engine') return engine?.capabilities().declarations ?? [];
     return [];
   };
 
@@ -683,9 +975,44 @@ export function createProviderRegistry(
     adapters,
     ticket: ticketAdapter,
     git: gitAdapter,
+    engine,
     credentialBlocker: (kind, operation, storedReference) =>
       credentialBlockerFor(bindingFor(kind), operation, storedReference, readSecret),
   });
+}
+
+/**
+ * The engine this process registered, from the configured driver.
+ *
+ * An executable driver is the shipped `CodexEngineAdapter`, so a deployment that configures a
+ * binary gets the same spawn, sandbox, bounds and event translation a coding run gets; a
+ * transcript driver is the recorded adapter above. A transcript that cannot be read or parsed
+ * is refused here, at registration, rather than at the first generation the owner asked for:
+ * a deployment that cannot answer a model turn should say so while it is still starting
+ * (F03-AC1, F03-AC2).
+ */
+function buildEngineAdapter(binding: EngineBinding | null): Result<EngineAdapter | null, DomainError> {
+  if (binding === null) return ok(null);
+  if (binding.driver === 'Executable') {
+    return ok(new CodexEngineAdapter({ connectorId: binding.connectorId, client: { binary: binding.source } }));
+  }
+
+  let raw: string;
+  try {
+    raw = readFileSync(binding.source, 'utf8');
+  } catch (error) {
+    return err(
+      invalid('The recorded engine transcript could not be read.', [
+        {
+          path: ENGINE_TRANSCRIPT_ENV,
+          message: `${binding.source} could not be read: ${error instanceof Error ? error.message : String(error)}`,
+        },
+      ]),
+    );
+  }
+  const transcript = readRecordedEngineTranscript(raw);
+  if (!transcript.ok) return err(transcript.error);
+  return ok(new RecordedEngineAdapter(binding.connectorId, transcript.value));
 }
 
 /** This process's own environment, read only where a credential is actually resolved. */

@@ -337,6 +337,15 @@ async function withDatabaseAtVersion(
  */
 const PROCEDURE_ALIGNMENT_FROM = 7;
 
+/**
+ * The version that still carried the project-wide uniqueness constraint.
+ *
+ * Everything before this rebuilt `procedure_versions` with
+ * `UNIQUE (project_id, version)`, so a database at this version is the one shape the
+ * subject-scoped rebuild has to accept (F05-AC3).
+ */
+const PROCEDURE_SUBJECT_IDENTITY_FROM = 11;
+
 test('a database at version 7 upgrades to 8 without losing a row (N08-AC3)', async () => {
   await withDatabaseAtVersion(PROCEDURE_ALIGNMENT_FROM, (db) => {
     db.prepare('INSERT INTO projects (project_id, name) VALUES (?, ?)').run(PROJECT, 'Migration project');
@@ -525,6 +534,175 @@ test('a database at version 7 upgrades to 8 without losing a row (N08-AC3)', asy
     for (const removed of ['approval_state', 'content', 'provider_revision', 'version_number']) {
       assert.equal(columns.includes(removed), false, `${removed} should no longer exist`);
     }
+  });
+});
+
+test('a procedure version is identified by its subject, so two subjects may both start at 1 (F05-AC1, F05-AC3)', async () => {
+  await withMigratedDatabase((db) => {
+    db.prepare('INSERT INTO owners (owner_id, display_name) VALUES (?, ?)').run(OWNER, 'Solo owner');
+    db.prepare('INSERT INTO projects (project_id, name) VALUES (?, ?)').run(PROJECT, 'Migration project');
+    const insert = db.prepare(
+      `INSERT INTO procedure_versions
+         (procedure_version_id, project_id, subject_key, version, kind, scope, source, content_json,
+          content_fingerprint, status, approved_at, created_at, created_by)
+       VALUES (?, ?, ?, ?, 'Procedure', 'project', 'Owner', ?, ?, 'Accepted', ?, ?, ?)`,
+    );
+    insert.run('subject-a-1', PROJECT, 'release.web', 1, '{"step":"merge"}', fingerprint({ a: 1 }), T0, T0, OWNER);
+
+    // The constraint this migration changed: under the project-wide uniqueness the
+    // second subject's first version was refused, which is what made comparing two
+    // subjects of one project unstorable (F05-AC3).
+    insert.run('subject-b-1', PROJECT, 'environment.recipe', 1, '{"step":"build"}', fingerprint({ b: 1 }), T0, T0, OWNER);
+    insert.run('subject-b-2', PROJECT, 'environment.recipe', 2, '{"step":"verify"}', fingerprint({ b: 2 }), T0, T0, OWNER);
+
+    const rows = db
+      .prepare('SELECT procedure_version_id, subject_key, version FROM procedure_versions ORDER BY subject_key, version')
+      .all();
+    assert.deepEqual(
+      plain(rows).map((row) => [row['procedure_version_id'], row['subject_key'], row['version']]),
+      [
+        ['subject-b-1', 'environment.recipe', 1],
+        ['subject-b-2', 'environment.recipe', 2],
+        ['subject-a-1', 'release.web', 1],
+      ],
+    );
+
+    // The numbering is still per subject, so re-using a number within one subject is
+    // refused while the same number under another subject is not. Nothing was weakened
+    // to make the second subject storable.
+    assert.throws(
+      () =>
+        insert.run(
+          'subject-a-duplicate',
+          PROJECT,
+          'release.web',
+          1,
+          '{"step":"other"}',
+          fingerprint({ a: 2 }),
+          T0,
+          T0,
+          OWNER,
+        ),
+      /UNIQUE constraint failed: procedure_versions.project_id, procedure_versions.subject_key, procedure_versions.version/,
+    );
+  });
+});
+
+test('the subject-scoped rebuild keeps every procedure version and every reference to one (F05-AC3, F12-AC3, N08-AC3)', async () => {
+  await withDatabaseAtVersion(PROCEDURE_SUBJECT_IDENTITY_FROM, (db) => {
+    db.prepare('INSERT INTO owners (owner_id, display_name) VALUES (?, ?)').run(OWNER, 'Solo owner');
+    db.prepare('INSERT INTO projects (project_id, name) VALUES (?, ?)').run(PROJECT, 'Migration project');
+    db
+      .prepare(
+        `INSERT INTO project_profile_versions (profile_version_id, project_id, version, content_json, content_fingerprint, created_by, created_at)
+         VALUES (?, ?, 1, '{}', ?, ?, ?)`,
+      )
+      .run(PROFILE_VERSION, PROJECT, fingerprint({ profile: 'subject-identity' }), OWNER, T0);
+    db
+      .prepare(
+        `INSERT INTO procedure_versions
+           (procedure_version_id, project_id, subject_key, version, kind, scope, source, source_revision, content_json,
+            content_fingerprint, status, approved_at, created_at, created_by, note)
+         VALUES ('procedure-subject-1', ?, 'environment.recipe', 1, 'Procedure', 'Environment', 'Owner', 'rev-1', '{"step":"build"}', ?,
+                 'Accepted', ?, ?, ?, 'the owner note')`,
+      )
+      .run(PROJECT, fingerprint({ procedure: 'subject-identity' }), T0, T0, OWNER);
+
+    // Three different kinds of reference, because `rebuildTables` stashes whatever the
+    // live schema reports and a reference it did not carry across would be a lost fact
+    // about work that already happened (F12-AC3).
+    db
+      .prepare(
+        `INSERT INTO work_items (work_item_id, project_id, issue_id, publication_intent, origin, profile_version_id, created_at)
+         VALUES (?, ?, 'issue-subject-identity', 'PublishWhenAgreed', 'Proposed', ?, ?)`,
+      )
+      .run(WORK_ITEM, PROJECT, PROFILE_VERSION, T0);
+    db
+      .prepare(
+        `INSERT INTO scope_snapshots
+           (scope_snapshot_id, work_item_id, project_id, issue_id, description, scope_fingerprint, retrieved_at,
+            profile_version_id, procedure_version_id, created_at)
+         VALUES (?, ?, ?, 'issue-subject-identity', 'Subject scope', ?, ?, ?, 'procedure-subject-1', ?)`,
+      )
+      .run(SCOPE_SNAPSHOT, WORK_ITEM, PROJECT, fingerprint({ scope: 'subject-identity' }), T0, PROFILE_VERSION, T0);
+    db
+      .prepare(
+        `INSERT INTO jobs (job_id, work_item_id, project_id, scope_snapshot_id, profile_version_id, procedure_version_id,
+           mode, operation_id, correlation_id, queued_at, created_at)
+         VALUES ('job-subject-1', ?, ?, ?, ?, 'procedure-subject-1', 'Build', 'op-subject-1', 'corr-subject-1', ?, ?)`,
+      )
+      .run(WORK_ITEM, PROJECT, SCOPE_SNAPSHOT, PROFILE_VERSION, T0, T0);
+
+    const report = expectOk(migrate(db));
+    assert.equal(report.fromVersion, PROCEDURE_SUBJECT_IDENTITY_FROM);
+    assert.ok(
+      report.applied.some((step) => step.name === 'procedure_version_subject_identity'),
+      'the subject-scoped rebuild ran against these rows',
+    );
+
+    const row = db.prepare('SELECT * FROM procedure_versions WHERE procedure_version_id = ?').get('procedure-subject-1');
+    assert.ok(row !== undefined, 'the version keeps its identity across the rebuild');
+    assert.equal(row['subject_key'], 'environment.recipe');
+    assert.equal(row['version'], 1);
+    assert.equal(row['content_json'], '{"step":"build"}');
+    assert.equal(row['source_revision'], 'rev-1');
+    assert.equal(row['status'], 'Accepted');
+    assert.equal(row['approved_at'], T0);
+    assert.equal(row['created_by'], OWNER);
+    assert.equal(row['note'], 'the owner note');
+    assert.equal(
+      row['content_fingerprint'],
+      fingerprint({ procedure: 'subject-identity' }),
+      'the fact identity is carried across unchanged',
+    );
+
+    assert.equal(
+      db.prepare('SELECT procedure_version_id FROM jobs WHERE job_id = ?').get('job-subject-1')?.['procedure_version_id'],
+      'procedure-subject-1',
+    );
+    assert.equal(
+      db.prepare('SELECT procedure_version_id FROM scope_snapshots WHERE scope_snapshot_id = ?').get(SCOPE_SNAPSHOT)?.[
+        'procedure_version_id'
+      ],
+      'procedure-subject-1',
+    );
+    assert.deepEqual(plain(db.prepare('PRAGMA foreign_key_check').all()), []);
+
+    // The row the rebuild produced is the one the repository's per-subject numbering now
+    // accepts: a second version of the same subject follows it, and a different subject
+    // may hold its own version 1 (F05-AC1).
+    db
+      .prepare(
+        `INSERT INTO procedure_versions
+           (procedure_version_id, project_id, subject_key, version, kind, scope, source, content_json,
+            content_fingerprint, status, created_at, created_by)
+         VALUES ('procedure-subject-2', ?, 'environment.recipe', 2, 'Procedure', 'Environment', 'Owner', '{"step":"verify"}', ?,
+                 'Proposed', ?, ?)`,
+      )
+      .run(PROJECT, fingerprint({ procedure: 'subject-identity-2' }), T0, OWNER);
+    db
+      .prepare(
+        `INSERT INTO procedure_versions
+           (procedure_version_id, project_id, subject_key, version, kind, scope, source, content_json,
+            content_fingerprint, status, created_at, created_by)
+         VALUES ('procedure-other-subject-1', ?, 'release.web', 1, 'Procedure', 'project', 'Owner', '{"step":"merge"}', ?,
+                 'Proposed', ?, ?)`,
+      )
+      .run(PROJECT, fingerprint({ procedure: 'subject-identity-3' }), T0, OWNER);
+    assert.deepEqual(
+      plain(
+        db
+          .prepare(
+            `SELECT subject_key, version FROM procedure_versions ORDER BY subject_key, version`,
+          )
+          .all(),
+      ).map((row) => [row['subject_key'], row['version']]),
+      [
+        ['environment.recipe', 1],
+        ['environment.recipe', 2],
+        ['release.web', 1],
+      ],
+    );
   });
 });
 

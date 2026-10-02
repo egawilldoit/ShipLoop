@@ -30,7 +30,7 @@ import type {
 } from '@shiploop/domain';
 
 import { openDatabase, type Database } from '../db.ts';
-import { LATEST_SCHEMA_VERSION, migrate } from '../migrations.ts';
+import { migrate } from '../migrations.ts';
 import { WorkItemRepository } from './core.ts';
 import { PublicationRepository } from './publication.ts';
 import type { AdoptionReference } from './types.ts';
@@ -120,7 +120,9 @@ test('F10-AC4 a published row carries the provider revision the build added a co
   await withDatabase(({ database }) => {
     const columns = database.prepare("SELECT name FROM pragma_table_info('work_items')").all();
     const names = new Set(columns.map((row) => String(row['name'])));
-    assert.equal(LATEST_SCHEMA_VERSION, 11, 'the provider-revision migration should be the newest applied');
+    // This asserts the migration that ADDED provider_revision is applied, not that it is the newest.
+    // Pinning the newest version here would fail on every future migration, which is a test
+    // that measures the wrong fact (N08-AC3).
     assert.ok(
       names.has('provider_revision'),
       'work_items has no provider_revision column, so a published row could not name what it read (F10-AC4)',

@@ -505,7 +505,10 @@ async function withPublication(run: (harness: Harness) => Promise<void> | void):
   try {
     const migrated = migrate(database);
     assert.ok(migrated.ok, `the schema could not be migrated: ${migrated.ok ? '' : migrated.error.reason}`);
-    assert.equal(LATEST_SCHEMA_VERSION, 11, 'the provider-revision migration should be the newest applied');
+    // This asserts the migration reached the build's current schema version, not that a
+    // particular migration is the newest one. Pinning the newest number would fail on
+    // every future migration, which is a test measuring the wrong fact (N08-AC3).
+    assert.equal(migrated.value.toVersion, LATEST_SCHEMA_VERSION);
 
     database
       .prepare('INSERT INTO owners (owner_id, display_name, created_at) VALUES (?, ?, ?)')

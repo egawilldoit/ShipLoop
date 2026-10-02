@@ -98,6 +98,7 @@ import {
   type ChangeRequestReportView,
   type RunCheckpointView,
   type RunJobView,
+  type GenerationRunView,
   type RunStartView,
   type RunView,
   type RunWriterView,
@@ -1004,6 +1005,72 @@ class InMemoryController implements ControllerSurface {
    * acceptance is refused while a criterion is outstanding. A double that answered both
    * from a fixed map would pass without either (F25-AC1, F25-AC2).
    */
+  /**
+   * The generation group. The double records a tracked run rather than a result, because a model
+   * turn is asynchronous: the owner action returns an identity and a later read returns the
+   * outcome. A double that answered inline would not exercise the property this group exists for.
+   */
+  readonly generation = {
+    startBriefGeneration: async (command: { readonly ideaId: string; readonly actor: string }): Promise<Result<GenerationRunView, DomainError>> =>
+      ({ ok: true, value: this.recordGeneration(command.ideaId, 'Brief') }),
+    startPlanGeneration: async (command: { readonly ideaId: string; readonly actor: string }): Promise<Result<GenerationRunView, DomainError>> =>
+      ({ ok: true, value: this.recordGeneration(command.ideaId, 'Plan') }),
+    getGeneration: async (generationId: string): Promise<Result<GenerationRunView, DomainError>> => {
+      const found = this.generationRuns.get(generationId);
+      return found === undefined
+        ? { ok: false, error: { code: 'NotFound', reason: `no generation run ${generationId}` } }
+        : { ok: true, value: found };
+    },
+    listGenerations: async (ideaId: string): Promise<Result<readonly GenerationRunView[], DomainError>> =>
+      ({ ok: true, value: [...this.generationRuns.values()].filter((run) => run.ideaId === ideaId) }),
+  };
+
+  private readonly generationRuns = new Map<string, GenerationRunView>();
+
+  private recordGeneration(ideaId: string, pass: GenerationRunView['pass']): GenerationRunView {
+    const run: GenerationRunView = {
+      generationId: `gen-${String(this.generationRuns.size + 1)}`,
+      pass,
+      ideaId,
+      state: 'Succeeded',
+      startedAt: '2026-10-02T10:00:00.000Z',
+      finishedAt: '2026-10-02T10:00:04.000Z',
+      connectorId: 'engine_fixture',
+      engineVersion: '0.159.1',
+      sessionId: 'fixture-session',
+      brief: pass === 'Brief'
+        ? {
+            briefId: `brief-${String(this.generationRuns.size + 1)}`,
+            version: 1,
+            state: 'Proposed',
+            authoredBy: 'ClarificationModel',
+            questionCount: 1,
+            rejectedCandidateCount: 0,
+          }
+        : null,
+      plan: pass === 'Plan'
+        ? {
+            planId: `plan-${String(this.generationRuns.size + 1)}`,
+            revision: 1,
+            taskCount: 2,
+            coveredOutcomeIds: ['brief.desiredOutcome', 'AC1'],
+            splitJustifications: ['two independently reviewable surfaces'],
+          }
+        : null,
+      failure: null,
+      capability: {
+        name: 'read-only',
+        mayChangeApplicationCode: false,
+        mayPublishTickets: false,
+        mayDeploy: false,
+        mayStartCodingRun: false,
+        forbiddenSideEffects: ['publication', 'deployment', 'delivery'],
+      },
+    };
+    this.generationRuns.set(run.generationId, run);
+    return run;
+  }
+
   readonly acceptance = {
     requestChanges: async (command: {
       readonly jobId: JobId;
@@ -2006,12 +2073,22 @@ test('the loaded controller module is validated before it can serve a request', 
       linkExistingChange() {},
       requestAdoptedEvaluation() {},
     },
+    // The generation group must be declared on the surface, not merely present at runtime.
+    // Its absence is exactly the state this product was in: generation implemented and
+    // unreachable from any shipped path (F07-AC1, F08-AC1).
+    generation: new InMemoryController(() => new Date("2026-10-02T10:00:00.000Z"), ADAPTER_CAPABILITIES, true).generation,
   };
   assert.equal(isControllerSurface(complete), true);
   const missingPlanningMethod = {
     ...complete,
     planning: { ...complete.planning, publishPlan: undefined },
   };
+  const missingGeneration = { ...complete, generation: undefined };
+  assert.equal(
+    isControllerSurface(missingGeneration),
+    false,
+    'a surface without generation must not pass the guard: the use cases would be unreachable',
+  );
   assert.equal(
     isControllerSurface(missingPlanningMethod),
     false,

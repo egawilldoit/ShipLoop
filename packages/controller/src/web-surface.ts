@@ -43,7 +43,19 @@
  * the authority, and this file is what has to satisfy it.
  */
 
-import { DEFAULT_IDLE_TIMEOUT_SECONDS, capabilitiesFor, err, invalid, ok, orderedAreas, planReadiness, publishableTickets } from '@shiploop/domain';
+import {
+  DEFAULT_IDLE_TIMEOUT_SECONDS,
+  capabilitiesFor,
+  err,
+  fingerprint,
+  invalid,
+  isCommitSha,
+  ok,
+  orderedAreas,
+  planReadiness,
+  publishableTickets,
+  redact,
+} from '@shiploop/domain';
 import type {
   AttentionBucket,
   AttentionItem,
@@ -57,6 +69,7 @@ import type {
   CandidateId,
   ChangeShape,
   ChangeSurface,
+  CommitSha,
   ConnectorId,
   DomainError,
   Fingerprint,
@@ -92,7 +105,8 @@ import type {
   JobQuery,
 } from '@shiploop/storage';
 import type { GitRepositoryRef, TicketState } from '@shiploop/adapters';
-import type { CompositionRoot } from './composition.ts';
+import { createGitTransport } from '@shiploop/adapters';
+import type { CompositionRoot, GenerationRunView, GenerationWorkspaceReader } from './composition.ts';
 import { createCompositionRoot, taskWorkItemId } from './composition.ts';
 import type { IdeaDraft } from '@shiploop/domain';
 import type { ControllerClock, OwnerActor } from './profiles.ts';
@@ -1113,6 +1127,76 @@ export interface SurfacePlanningUseCases {
   }): Promise<Result<SurfaceAdoptedEvaluationRequest, DomainError>>;
 }
 
+/**
+ * One generation run as the transport carries it (F07-AC1, F08-AC1, N04-AC3).
+ *
+ * The whole point of this group is that the answer is a tracked identity rather than a wait:
+ * `state` travels with the run so a client can show where it is, and the result and the refusal
+ * travel as data so the client never has to infer either from the absence of one. The capability
+ * profile is carried whole because "what could this pass do" is part of what the owner is shown
+ * (F07-AC5).
+ */
+export interface SurfaceGenerationRun {
+  readonly generationId: string;
+  readonly pass: 'Brief' | 'Plan';
+  readonly ideaId: string;
+  readonly state: 'Queued' | 'Running' | 'Succeeded' | 'Failed';
+  readonly startedAt: string;
+  readonly finishedAt: string | null;
+  readonly connectorId: string | null;
+  readonly engineVersion: string | null;
+  readonly sessionId: string | null;
+  readonly brief: {
+    readonly briefId: string;
+    readonly version: number;
+    readonly state: string;
+    readonly authoredBy: string;
+    readonly questionCount: number;
+    readonly rejectedCandidateCount: number;
+  } | null;
+  readonly plan: {
+    readonly planId: string;
+    readonly revision: number;
+    readonly taskCount: number;
+    readonly coveredOutcomeIds: readonly string[];
+    readonly splitJustifications: readonly string[];
+  } | null;
+  readonly failure: {
+    readonly code: string;
+    readonly reason: string;
+    readonly fields: readonly { readonly path: string; readonly message: string }[];
+  } | null;
+  readonly capability: {
+    readonly name: string;
+    readonly mayChangeApplicationCode: false;
+    readonly mayPublishTickets: false;
+    readonly mayDeploy: false;
+    readonly mayStartCodingRun: false;
+    readonly forbiddenSideEffects: readonly string[];
+  };
+}
+
+/**
+ * Starting and reading a generation run (N04-AC3).
+ *
+ * A start is the only write and it returns the tracked identity immediately: the run itself
+ * happens after the request has been answered, so an owner action never holds a connection open
+ * for a model turn. Reads carry no caller because a read cannot be authorized by a request body
+ * (F01-AC1).
+ */
+export interface SurfaceGenerationUseCases {
+  startBriefGeneration(command: {
+    readonly ideaId: IdeaId;
+    readonly actor: OwnerId;
+  }): Promise<Result<SurfaceGenerationRun, DomainError>>;
+  startPlanGeneration(command: {
+    readonly ideaId: IdeaId;
+    readonly actor: OwnerId;
+  }): Promise<Result<SurfaceGenerationRun, DomainError>>;
+  getGeneration(generationId: string): Promise<Result<SurfaceGenerationRun, DomainError>>;
+  listGenerations(ideaId: IdeaId): Promise<Result<readonly SurfaceGenerationRun[], DomainError>>;
+}
+
 /** The whole injected surface. One argument, so a missing use case is a type error. */
 export interface ControllerSurface {
   readonly owners: SurfaceOwnerUseCases;
@@ -1125,6 +1209,7 @@ export interface ControllerSurface {
   readonly reviewCards: SurfaceReviewCardUseCases;
   readonly acceptance: SurfaceAcceptanceUseCases;
   readonly planning: SurfacePlanningUseCases;
+  readonly generation: SurfaceGenerationUseCases;
 }
 
 /**
@@ -2935,6 +3020,110 @@ export function createControllerSurface(resolve: SurfaceRootResolver): Controlle
           });
         }),
     },
+
+    /**
+     * Generation: the owner's two "do it for me" actions, and the reads that follow them.
+     *
+     * A start delegates and returns whatever the composition recorded, including the case where
+     * nothing was scheduled because the deployment configured no engine. That refusal is the use
+     * case's own and reaches the owner unchanged: a client that answered "started" here and
+     * discovered the absence later would report a run that does not exist (F03-AC2, N04-AC3).
+     */
+    generation: {
+      startBriefGeneration: async (command) =>
+        use((root) => {
+          const started = root.generationUseCases.startBriefGeneration({
+            ideaId: command.ideaId,
+            actor: ownerActor(command.actor),
+          });
+          return started.ok ? ok(toSurfaceGeneration(started.value)) : err(started.error);
+        }),
+
+      startPlanGeneration: async (command) =>
+        use((root) => {
+          const started = root.generationUseCases.startPlanGeneration({
+            ideaId: command.ideaId,
+            actor: ownerActor(command.actor),
+          });
+          return started.ok ? ok(toSurfaceGeneration(started.value)) : err(started.error);
+        }),
+
+      /** Reads carry no caller, so the owner is resolved rather than taken from the request. */
+      getGeneration: async (generationId) =>
+        use((root) => {
+          const actor = root.useCases.resolveOwnerActor();
+          if (!actor.ok) return err(actor.error);
+          const found = root.generationUseCases.getGeneration(generationId);
+          return found.ok ? ok(toSurfaceGeneration(found.value)) : err(found.error);
+        }),
+
+      listGenerations: async (ideaId) =>
+        use((root) => {
+          const actor = root.useCases.resolveOwnerActor();
+          if (!actor.ok) return err(actor.error);
+          const listed = root.generationUseCases.listGenerations(ideaId);
+          return listed.ok ? ok(listed.value.map(toSurfaceGeneration)) : err(listed.error);
+        }),
+    },
+  };
+}
+
+/**
+ * One generation run, renamed for the transport (F07-AC5, N04-AC3).
+ *
+ * A projection: the recorded run's own fields travel, with the capability profile carried
+ * whole. The four `may*` flags are typed as literal `false` in the port, so a client that read
+ * them as anything else would not compile - which is the point, because "this pass could publish
+ * a ticket" is a statement about the run and not something a renderer should decide.
+ */
+function toSurfaceGeneration(run: GenerationRunView): SurfaceGenerationRun {
+  return {
+    generationId: run.generationId,
+    pass: run.pass,
+    ideaId: run.ideaId,
+    state: run.state,
+    startedAt: run.startedAt,
+    finishedAt: run.finishedAt,
+    connectorId: run.connectorId,
+    engineVersion: run.engineVersion,
+    sessionId: run.sessionId,
+    brief:
+      run.brief === null
+        ? null
+        : {
+            briefId: run.brief.briefId,
+            version: run.brief.version,
+            state: run.brief.state,
+            authoredBy: run.brief.authoredBy,
+            questionCount: run.brief.questionCount,
+            rejectedCandidateCount: run.brief.rejectedCandidateCount,
+          },
+    plan:
+      run.plan === null
+        ? null
+        : {
+            planId: run.plan.planId,
+            revision: run.plan.revision,
+            taskCount: run.plan.taskCount,
+            coveredOutcomeIds: [...run.plan.coveredOutcomeIds],
+            splitJustifications: [...run.plan.splitJustifications],
+          },
+    failure:
+      run.failure === null
+        ? null
+        : {
+            code: run.failure.code,
+            reason: run.failure.reason,
+            fields: run.failure.fields.map((field) => ({ path: field.path, message: field.message })),
+          },
+    capability: {
+      name: run.capability.name,
+      mayChangeApplicationCode: false,
+      mayPublishTickets: false,
+      mayDeploy: false,
+      mayStartCodingRun: false,
+      forbiddenSideEffects: [...run.capability.forbiddenSideEffects],
+    },
   };
 }
 
@@ -3082,6 +3271,85 @@ export const SESSION_IDLE_TIMEOUT_ENV = 'SHIPLOOP_SESSION_IDLE_SECONDS';
  */
 export const ARTIFACT_ROOT_ENV = 'SHIPLOOP_ARTIFACT_ROOT';
 
+/**
+ * The environment variable naming the read-only checkout brief and plan generation run in.
+ *
+ * Required by a generation and absent from a process that does no generation, for the same reason
+ * `SHIPLOOP_ARTIFACT_ROOT` is: the directory is a fact about the deployment, and a pass that ran
+ * somewhere this configuration did not name would put an uninspected path into the prompt and into
+ * the record (F07-AC4).
+ */
+export const GENERATION_WORKSPACE_ENV = 'SHIPLOOP_GENERATION_WORKSPACE';
+
+/**
+ * Reads the head of the configured checkout, through the shipped `git` transport.
+ *
+ * The SHAs are read rather than assumed, because the two fields this produces are the engine's
+ * whole claim about which code it may read, and a generated constant would be a fabricated commit
+ * in every generation record (F07-AC4). `base` equals `head` and that is stated rather than
+ * hidden: a read-only pass branches from nothing, so the commit it read at is also the base it
+ * started from.
+ */
+async function readCheckoutHead(
+  directory: string,
+  at: string,
+): Promise<Result<{ readonly headSha: string; readonly baseSha: string }, DomainError>> {
+  const transport = createGitTransport(directory);
+  const outcome = await transport.run(
+    {
+      correlationId: 'generation-workspace',
+      operationId: 'generation-workspace' as OperationId,
+      clock: { now: (): string => at, elapsedMs: (): number => 0 },
+      logger: { emit: () => undefined },
+      signal: new AbortController().signal,
+      redact: (text: string): string => redact(text).text,
+    },
+    ['rev-parse', 'HEAD'],
+  );
+  if (!outcome.ok) return err(outcome.error);
+  const head = outcome.value.stdout.trim();
+  if (outcome.value.exitCode !== 0 || !isCommitSha(head)) {
+    return err(
+      blocked(
+        `${GENERATION_WORKSPACE_ENV} does not name a checkout ShipLoop can read: "git rev-parse HEAD" did not report a commit (F07-AC4).`,
+        [
+          {
+            name: 'generation workspace',
+            detail: 'A read-only pass records the commit it read at, so the configured directory must be a git checkout at a full commit.',
+            remedy: `Point ${GENERATION_WORKSPACE_ENV} at a git checkout with one commit in it, then ask again (F03-AC1).`,
+          },
+        ],
+      ),
+    );
+  }
+  return ok({ headSha: head, baseSha: head });
+}
+
+/**
+ * The workspace reader this process serves, or null when it configured none.
+ *
+ * `fingerprint` records what the pass was scoped to, from the run's own identity, so two runs
+ * never claim the same scope even when they read the same checkout (F02-AC2).
+ */
+export function generationWorkspaceReader(directory: string | null): GenerationWorkspaceReader | null {
+  if (directory === null) return null;
+  return async (input) => {
+    const head = await readCheckoutHead(directory, input.at);
+    if (!head.ok) return err(head.error);
+    return ok({
+      workspaceId: `ws_generation_${input.generationId}`,
+      absolutePath: directory,
+      headSha: head.value.headSha as CommitSha,
+      baseSha: head.value.baseSha as CommitSha,
+      environmentFingerprint: fingerprint({ generation: input.pass, at: input.at }),
+      scopeFingerprint: fingerprint({ generation: input.generationId }),
+      isolatedPorts: {},
+      serviceEndpoints: [],
+      testAccess: { kind: 'None' },
+    });
+  };
+}
+
 const SYSTEM_CLOCK: ControllerClock = { now: () => new Date().toISOString() };
 
 /** The same clock the root records writes with, so one process has one time source. */
@@ -3109,12 +3377,23 @@ export function resolveSurfaceRoot(env: NodeJS.ProcessEnv): Result<CompositionRo
   if (!providers.ok) return providers;
   const registry = createProviderRegistry(providers.value);
   if (!registry.ok) return registry;
+  const workspace = generationWorkspaceReader(
+    env[GENERATION_WORKSPACE_ENV] === undefined || env[GENERATION_WORKSPACE_ENV] === ''
+      ? null
+      : env[GENERATION_WORKSPACE_ENV],
+  );
   return createCompositionRoot({
     databasePath,
     clock: SYSTEM_CLOCK,
     adapters: registry.value.adapters,
+    // The whole registry, not just its declarations: generation reaches the configured engine
+    // through it, and publication and adoption reach the configured providers. Passing only
+    // `adapters` would leave a process whose configuration parsed a registry the composition
+    // could not see, which is how a configured capability ends up unreachable (F03-AC1).
+    providers: registry.value,
     sessionIdleTimeoutSeconds: readPositiveInteger(env[SESSION_IDLE_TIMEOUT_ENV]),
     artifactRoot: env[ARTIFACT_ROOT_ENV] === undefined || env[ARTIFACT_ROOT_ENV] === '' ? null : env[ARTIFACT_ROOT_ENV],
+    ...(workspace === null ? {} : { generationWorkspace: workspace }),
   });
 }
 

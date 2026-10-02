@@ -39,7 +39,7 @@ import {
   sendProblem,
   signInRequiredProblem,
 } from '../http-error.ts';
-import { asProjectId, type ControllerSurface } from '../contracts.ts';
+import { asIdeaId, asProjectId, type ControllerSurface } from '../contracts.ts';
 import type { SessionGuard } from '../auth-guard.ts';
 
 const MAXIMUM_TEXT = 20_000;
@@ -464,6 +464,32 @@ export function registerPlanningRoutes(app: FastifyInstance, options: PlanningRo
     });
     if (!reconciled.ok) return sendProblem(reply, problemFor(reconciled.error));
     return reply.status(200).send({ reconciliation: reconciled.value });
+  });
+
+  /**
+   * Starts a plan proposal for one captured request (F08-AC1, N04-AC3).
+   *
+   * 202 with the tracked identity, because the model turn has not happened when this answers.
+   * No body is read: the change a plan is generated against is read from the agreed brief the
+   * controller holds, so there is nothing here for a client to influence except whether to ask
+   * (F08-AC5, F01-AC1).
+   */
+  app.post('/api/ideas/:ideaId/plans/propose', { preHandler: options.guard }, async (request, reply) => {
+    const session = request.session;
+    if (session === null) return sendProblem(reply, signInRequiredProblem());
+    const params = parseBody(
+      z.strictObject({ ideaId: z.string().trim().min(1, 'An idea id is required.').max(200) }),
+      request.params,
+    );
+    if (!params.ok) return sendProblem(reply, fieldsProblem(fieldErrorsOf(params.problem)));
+    const body = parseBody(z.strictObject({}), request.body ?? {});
+    if (!body.ok) return sendProblem(reply, fieldsProblem(fieldErrorsOf(body.problem)));
+    const started = await options.controller.generation.startPlanGeneration({
+      ideaId: asIdeaId(params.value.ideaId),
+      actor: session.ownerId,
+    });
+    if (!started.ok) return sendProblem(reply, problemFor(started.error));
+    return reply.status(202).send({ generation: started.value });
   });
 
   app.post('/api/adoption/issue', { preHandler: options.guard }, async (request, reply) => {

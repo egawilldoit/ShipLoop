@@ -205,6 +205,17 @@ export interface IntakeRouteOptions {
   readonly now: () => Date;
 }
 
+/**
+ * Where a generation pass runs.
+ *
+ * One concern of the file rather than a schema: neither generation route takes a body, because a
+ * generation is started by an authenticated owner acting on a request the path already names, and
+ * a body would be a place a client could put an identity, a prompt or a capability claim (F01-AC1,
+ * F07-AC5). An empty object is accepted and anything else is refused, so a client that sends a
+ * field finds out rather than having it silently dropped (F02-AC4).
+ */
+const emptyBody = z.strictObject({});
+
 export function registerIntakeRoutes(app: FastifyInstance, options: IntakeRouteOptions): void {
   app.post('/api/intake/ideas', { preHandler: options.guard }, async (request, reply) => {
     const session = request.session;
@@ -422,5 +433,59 @@ export function registerIntakeRoutes(app: FastifyInstance, options: IntakeRouteO
     });
     if (!applied.ok) return sendProblem(reply, problemFor(applied.error));
     return reply.status(201).send(applied.value);
+  });
+
+  /**
+   * Starts a clarification pass for one captured request (F07-AC1, N04-AC3).
+   *
+   * 202 and not 200: the request recorded a tracked identity and the model turn has not happened
+   * yet, so "accepted" would be a claim about work that is not finished. The run's state and its
+   * identity are in the body, which is what a client polls (N04-AC3).
+   */
+  app.post('/api/intake/ideas/:ideaId/generations/brief', { preHandler: options.guard }, async (request, reply) => {
+    const session = request.session;
+    if (session === null) return sendProblem(reply, signInRequiredProblem());
+    const params = parseBody(ideaParams, request.params);
+    if (!params.ok) return sendProblem(reply, fieldsProblem(fieldErrorsOf(params.problem)));
+    const body = parseBody(emptyBody, request.body ?? {});
+    if (!body.ok) return sendProblem(reply, fieldsProblem(fieldErrorsOf(body.problem)));
+    const started = await options.controller.generation.startBriefGeneration({
+      ideaId: asIdeaId(params.value.ideaId),
+      actor: session.ownerId,
+    });
+    if (!started.ok) return sendProblem(reply, problemFor(started.error));
+    return reply.status(202).send({ generation: started.value });
+  });
+
+  /** Every generation recorded against one request, newest first (N04-AC3). */
+  app.get('/api/intake/ideas/:ideaId/generations', { preHandler: options.guard }, async (request, reply) => {
+    const params = parseBody(ideaParams, request.params);
+    if (!params.ok) return sendProblem(reply, fieldsProblem(fieldErrorsOf(params.problem)));
+    const listed = await options.controller.generation.listGenerations(asIdeaId(params.value.ideaId));
+    if (!listed.ok) return sendProblem(reply, problemFor(listed.error));
+    return reply.status(200).send({ generations: listed.value });
+  });
+
+  /**
+   * One generation run, addressed by the identity the start returned (N04-AC3).
+   *
+   * A read rather than a wait: the owner polls this while the pass runs, which is what keeps an
+   * owner action from holding a request open for a model turn (N04-AC2, N04-AC3).
+   */
+  app.get('/api/intake/generations/:generationId', { preHandler: options.guard }, async (request, reply) => {
+    const params = parseBody(
+      z.strictObject({
+        generationId: z
+          .string()
+          .trim()
+          .min(1, 'A generation run is addressed by its identity.')
+          .max(200, 'A generation id may be at most 200 characters.'),
+      }),
+      request.params,
+    );
+    if (!params.ok) return sendProblem(reply, fieldsProblem(fieldErrorsOf(params.problem)));
+    const found = await options.controller.generation.getGeneration(params.value.generationId);
+    if (!found.ok) return sendProblem(reply, problemFor(found.error));
+    return reply.status(200).send({ generation: found.value });
   });
 }

@@ -1233,6 +1233,85 @@ test('listProposed returns a project\'s proposals oldest first and ignores anoth
   });
 });
 
+test('two subjects of one project each hold version 1 and advance independently (F05-AC1, F05-AC3)', async () => {
+  await withDatabase(async ({ connection }) => {
+    seedOwnerAndProject(connection);
+    const procedures = new ProcedureRepository(connection);
+
+    // `appendVersion` numbers per subject, so these two writes are each a subject's
+    // first version. Under the project-wide uniqueness the second was refused, which
+    // left one subject's first version able to make every other subject unstorable
+    // (F05-AC3).
+    const releaseFirst = expectOk(
+      procedures.appendVersion(
+        procedureInput({ content: 'Merge with squash, then promote the preview.' }),
+      ),
+    );
+    const environmentFirst = expectOk(
+      procedures.appendVersion(
+        procedureInput({
+          subjectKey: 'environment.recipe',
+          scope: 'Environment',
+          content: 'Run pnpm verify:app on node 24 before promoting.',
+        }),
+      ),
+    );
+    assert.equal(releaseFirst.versionNumber, 1);
+    assert.equal(environmentFirst.versionNumber, 1);
+    assert.notEqual(releaseFirst.procedureVersionId, environmentFirst.procedureVersionId);
+
+    // Each subject reads only its own current version, and the numbers move per subject:
+    // advancing one must not renumber the other, and must not make it unwritable.
+    const environmentSecond = expectOk(
+      procedures.appendVersion(
+        procedureInput({
+          subjectKey: 'environment.recipe',
+          scope: 'Environment',
+          content: 'Run pnpm verify:app and the browser suite on node 24.',
+        }),
+      ),
+    );
+    assert.equal(environmentSecond.versionNumber, 2);
+    assert.equal(expectOk(procedures.currentVersion(PROJECT, 'environment.recipe'))?.procedureVersionId, environmentSecond.procedureVersionId);
+    assert.equal(expectOk(procedures.currentVersion(PROJECT, 'release.web'))?.procedureVersionId, releaseFirst.procedureVersionId);
+
+    const releaseSecond = expectOk(
+      procedures.appendVersion(
+        procedureInput({ content: 'Merge with squash, promote the preview, then record the receipt.' }),
+      ),
+    );
+    assert.equal(releaseSecond.versionNumber, 2, 'the release subject advanced on its own numbering');
+
+    // Superseding one subject leaves the other exactly as it was.
+    assert.deepEqual(
+      expectOk(procedures.listVersions(PROJECT, 'environment.recipe')).map((version) => [
+        version.versionNumber,
+        version.status,
+      ]),
+      [
+        [1, 'Superseded'],
+        [2, 'Accepted'],
+      ],
+    );
+    assert.deepEqual(
+      expectOk(procedures.listVersions(PROJECT, 'release.web')).map((version) => version.versionNumber),
+      [1, 2],
+    );
+
+    // The optimistic check is per subject too: a write prepared against a version this
+    // subject has moved past is refused rather than appended over it.
+    expectError(
+      procedures.appendVersion(
+        procedureInput({
+          content: 'A rewrite prepared against a version this subject has moved past.',
+          expectedVersionNumber: 1,
+        }),
+      ),
+      'Conflict',
+    );
+  });
+});
+
 test('the migrated procedure_versions columns are exactly the ones the repository reads', async () => {
   await withDatabase(async ({ connection }) => {
     seedOwnerAndProject(connection);

@@ -109,6 +109,7 @@ const REQUIRED_METHODS = {
     'linkExistingChange',
     'requestAdoptedEvaluation',
   ],
+  generation: ['startBriefGeneration', 'startPlanGeneration', 'getGeneration', 'listGenerations'],
 } as const satisfies Record<keyof ControllerSurface, readonly string[]>;
 
 /**

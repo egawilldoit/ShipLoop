@@ -32,17 +32,23 @@ import {
   conflict,
   draftPlan as domainDraftPlan,
   editPlan as domainEditPlan,
+  blocked,
   err,
+  invalid,
   ok,
   planReadiness,
   publishableTickets,
+  readOnlyCapabilityProfile,
   redact,
   type AreaObservation,
+  type Brief,
   type ChangeShape,
   type DependencyStatus,
   type DomainError,
+  type IdeaDraft,
   type IdeaId,
   type OwnerId,
+  type ReadOnlyCapabilityProfile,
   type PasswordHash,
   type Plan,
   type PlanEdit,
@@ -98,7 +104,13 @@ import type { IntakeArtifactRoot, IntakeUseCases } from './intake.ts';
 import { createIntakeUseCases } from './intake.ts';
 import type { JobUseCases } from './jobs.ts';
 import { createJobUseCases } from './jobs.ts';
-import type { ControllerClock, OwnerCredentialRecord, OwnerCredentialStore, ProfileUseCases } from './profiles.ts';
+import type {
+  ControllerClock,
+  OwnerActor,
+  OwnerCredentialRecord,
+  OwnerCredentialStore,
+  ProfileUseCases,
+} from './profiles.ts';
 import { RECIPE_SUBJECT_KEY, createProfileUseCases } from './profiles.ts';
 import type { SessionUseCases } from './sessions.ts';
 import { createSessionUseCases } from './sessions.ts';
@@ -115,6 +127,19 @@ import type { AdoptionUseCases } from './adoption.ts';
 import { createAdoptionUseCases } from './adoption.ts';
 import type { PublicationUseCases } from './publication.ts';
 import { createPublicationUseCases } from './publication.ts';
+import type { ExecutionWorkspace } from '@shiploop/adapters';
+import type { CapturedFact, ContextPacket } from './context-packet.ts';
+import { assembleContextPacket } from './context-packet.ts';
+import type { BriefGenerationUseCases } from './brief-generation.ts';
+import { createBriefGenerationUseCases, createEngineClarifier } from './brief-generation.ts';
+import type { PlanContextRequest, PlanGenerationUseCases } from './plan-generation.ts';
+import {
+  createPlanContextReader,
+  createPlanGenerationUseCases,
+  planEngineFromAdapter,
+  requirePlanningOwner,
+} from './plan-generation.ts';
+import { requireIntakeOwner } from './intake.ts';
 
 export interface CompositionRootConfig {
   readonly databasePath: string;
@@ -171,6 +196,15 @@ export interface CompositionRootConfig {
   readonly providers?: ProviderRegistry;
   /** Redaction applied to provider text before it reaches a stored row (N02-AC2). */
   readonly redactProviderText?: (text: string) => string;
+  /**
+   * The read-only workspace brief and plan generation run in (F07-AC4, F03-AC2).
+   *
+   * Required to be absent rather than defaulted, for the same reason `artifactRoot` is: a
+   * generation pass confined to a directory this configuration did not name would put an
+   * uninspected path into the prompt and into the record. A root without one refuses the
+   * operation by name, and the engine being configured is not enough to change that (F07-AC4).
+   */
+  readonly generationWorkspace?: GenerationWorkspaceReader;
 }
 
 /**
@@ -214,6 +248,16 @@ export interface CompositionRoot {
   /** Owner acceptance and retained change feedback (F25). */
   readonly acceptanceUseCases: AcceptanceUseCases;
   readonly planningUseCases: PlanningUseCases;
+  /**
+   * Brief and plan generation, reached through the engine this process registered.
+   *
+   * Published rather than kept private because the owner's two actions - "write this brief for
+   * me" and "propose a plan" - are exactly this group, and a transport that had to reach the
+   * engine itself would be building a second composition (F07-AC1, F08-AC1, N05-AC2).
+   */
+  readonly generationUseCases: GenerationUseCases;
+  /** The durable ledger every generation run is recorded in (N04-AC3). */
+  readonly generationLedger: SqliteGenerationLedger;
   /** The providers this process registered, or null when it configured none (F03-AC2). */
   readonly providers: ProviderRegistry | null;
   /** Null when the process was configured with no ticket provider (F03-AC2). */
@@ -1160,6 +1204,49 @@ export function createCompositionRoot(config: CompositionRootConfig): Result<Com
           ...(config.redactProviderText === undefined ? {} : { redactProviderText: config.redactProviderText }),
         });
 
+  /**
+   * Generation, reached through the engine this process registered.
+   *
+   * The adapter comes from `config.providers`, which parsed the operator's configuration, so
+   * the engine generation runs against is the configured one rather than a second engine chosen
+   * here. Both passes are built over the same adapter, and neither is constructed at all when no
+   * engine was configured: the use cases below then refuse the operation by name, which is a
+   * different answer from a use case built over an engine that refuses every call (F03-AC2,
+   * N05-AC2, F07-AC1).
+   */
+  const generationLedger = new SqliteGenerationLedger(database);
+  const configuredEngine = providers?.engine ?? null;
+  const briefGenerationFor =
+    configuredEngine === null
+      ? null
+      : (workspace: ExecutionWorkspace): BriefGenerationUseCases =>
+          createBriefGenerationUseCases({
+            clock: config.clock,
+            engine: createEngineClarifier({ engine: configuredEngine, workspace, clock: config.clock }),
+            store: intake,
+            workspace,
+          });
+  const planGeneration =
+    configuredEngine === null
+      ? null
+      : createPlanGenerationUseCases({
+          clock: config.clock,
+          planning: planningUseCases,
+          engine: planEngineFromAdapter(configuredEngine),
+          readContextPacket: createPlanContextReader({ clock: config.clock, procedures, profiles }).read,
+        });
+  const generationUseCases = createGenerationUseCases({
+    clock: config.clock,
+    ledger: generationLedger,
+    intake,
+    profiles,
+    briefGenerationFor,
+    planGeneration,
+    readWorkspace: config.generationWorkspace ?? null,
+    engine: configuredEngine === null ? null : { connectorId: String(configuredEngine.connectorId) },
+  });
+
+
   let closed = false;
 
   return ok({
@@ -1187,6 +1274,8 @@ export function createCompositionRoot(config: CompositionRootConfig): Result<Com
     verificationUseCases,
     acceptanceUseCases,
     planningUseCases,
+    generationUseCases,
+    generationLedger,
     providers,
     publicationUseCases,
     adoptionUseCases,
@@ -1320,5 +1409,719 @@ function noProviderRead(): DomainError {
 function refuse(database: Database, error: DomainError): Result<never, DomainError> {
   closeDatabase(database);
   return err(error);
+}
+
+/* -------------------------------------------------------------------------- */
+/* Generation (F07-AC1, F08-AC1, N04-AC3)                                       */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Which read-only pass a generation run performs.
+ *
+ * Named on the record because the two passes have different inputs, different outputs and
+ * different refusals, and a record that could not say which one ran would answer questions
+ * about a brief with facts about a plan (F07-AC1, F08-AC1).
+ */
+export type GenerationPass = 'Brief' | 'Plan';
+
+/**
+ * Where a generation run is, as a tracked identity rather than a promise (N04-AC3).
+ *
+ * `Queued` and `Running` are the two states a caller has to poll, and both are durable before
+ * the first model call: an owner who closes the browser between the two still finds the run
+ * and its outcome when they come back, because the state was written to the store rather than
+ * held in the request (N04-AC3, F01-AC5).
+ */
+export type GenerationState = 'Queued' | 'Running' | 'Succeeded' | 'Failed';
+
+/** The brief a successful clarification pass produced, as the owner reads it. */
+export interface GeneratedBriefSummary {
+  readonly briefId: string;
+  readonly version: number;
+  readonly state: 'Proposed' | 'Agreed';
+  readonly authoredBy: string;
+  readonly questionCount: number;
+  readonly rejectedCandidateCount: number;
+}
+
+/** The plan a successful plan pass proposed, as the owner reads it. */
+export interface GeneratedPlanSummary {
+  readonly planId: string;
+  readonly revision: number;
+  readonly taskCount: number;
+  readonly coveredOutcomeIds: readonly string[];
+  readonly splitJustifications: readonly string[];
+}
+
+/** A refusal as the run record carries it: the code, the sentence and the fields to correct. */
+export interface GenerationFailure {
+  readonly code: string;
+  readonly reason: string;
+  readonly fields: readonly { readonly path: string; readonly message: string }[];
+}
+
+/**
+ * One generation run, read from the ledger.
+ *
+ * Every field is a fact the run recorded: the engine it reached and the session it was given,
+ * what the domain validated, and - when it refused - the refusal verbatim rather than a
+ * paraphrase, because the field paths are how the owner corrects the answer (F05-AC5, F07-AC1).
+ */
+export interface GenerationRunView {
+  readonly generationId: string;
+  readonly pass: GenerationPass;
+  readonly ideaId: string;
+  readonly state: GenerationState;
+  readonly startedAt: string;
+  readonly finishedAt: string | null;
+  /** The engine this process registered; null before the session started (F03-AC2). */
+  readonly connectorId: string | null;
+  readonly engineVersion: string | null;
+  readonly sessionId: string | null;
+  readonly brief: GeneratedBriefSummary | null;
+  readonly plan: GeneratedPlanSummary | null;
+  readonly failure: GenerationFailure | null;
+  /**
+   * The exact capability profile the engine was granted, so a record states what the pass
+   * could do rather than what it was asked to do (F07-AC5).
+   */
+  readonly capability: ReadOnlyCapabilityProfile;
+}
+
+/** The `audit_log` subject every generation run is recorded under. */
+const GENERATION_SUBJECT_KIND = 'GenerationRun';
+
+/**
+ * Generation runs as rows in the durable audit ledger.
+ *
+ * The store has no generation table, and adding one would mean a second schema authority
+ * beside `@shiploop/storage`. `audit_log` is the one append-only ledger this schema already
+ * owns, it is indexed on `(subject_kind, subject_id)` which is exactly how a run is read back,
+ * and nothing in the product reads it for any other purpose, so a run recorded here is a fact
+ * about an operation that happened rather than a repurposed row of something else.
+ *
+ * One row per transition, never an update: `Queued`, then `Running`, then a terminal row. A
+ * run's state is therefore the newest row for its identity, which means a reader that arrives
+ * late, after a restart, or from another process reads the same answer the writer recorded
+ * rather than a value that only ever lived in memory (N04-AC3, N01-AC3).
+ */
+export class SqliteGenerationLedger {
+  private readonly connection: StorageConnection;
+  private counter = 0;
+
+  constructor(connection: StorageConnection) {
+    this.connection = connection;
+  }
+
+  /** A run identity no other row can carry, minted from the injected clock and a counter. */
+  nextId(at: string): string {
+    this.counter += 1;
+    return `gen_${at.replace(/[^0-9]/g, '')}_${String(this.counter)}`;
+  }
+
+  /** Appends one transition. Redacted before it is written: the text came from an engine. */
+  append(input: {
+    readonly run: GenerationRunView;
+    readonly actor: string;
+    readonly projectId: string | null;
+    readonly at: string;
+  }): Result<true, DomainError> {
+    try {
+      this.connection
+        .prepare(
+          `INSERT INTO audit_log
+             (audit_id, project_id, actor, action, subject_kind, subject_id, correlation_id, occurred_at, detail_json)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          `${input.run.generationId}-${input.at}-${String(this.counter)}`,
+          input.projectId,
+          input.actor,
+          `Generation:${input.run.pass}:${input.run.state}`,
+          GENERATION_SUBJECT_KIND,
+          input.run.generationId,
+          input.run.generationId,
+          input.at,
+          redact(JSON.stringify(input.run)).text,
+        );
+      this.counter += 1;
+      return ok(true);
+    } catch (error) {
+      return err({
+        code: 'Unavailable',
+        reason: `The generation run could not be recorded: ${describe(error)}`,
+      });
+    }
+  }
+
+  /** One run, as its newest transition recorded it, or null when nothing recorded it. */
+  read(generationId: string): Result<GenerationRunView | null, DomainError> {
+    try {
+      const row = this.connection
+        .prepare(
+          `SELECT detail_json FROM audit_log
+           WHERE subject_kind = ? AND subject_id = ? ORDER BY occurred_at DESC, rowid DESC LIMIT 1`,
+        )
+        .get(GENERATION_SUBJECT_KIND, generationId);
+      if (row === undefined) return ok(null);
+      return ok(readRun(requiredText(row, 'detail_json')));
+    } catch (error) {
+      return err({ code: 'Unavailable', reason: `The generation run could not be read: ${describe(error)}` });
+    }
+  }
+
+  /**
+   * Every run recorded against one request, newest first.
+   *
+   * Filtered by the recorded document rather than by a column because the ledger's own columns
+   * name the run, not the request it was started for; the number of rows is bounded by the
+   * number of generations an owner has asked for, and each read is one indexed range.
+   */
+  listForIdea(ideaId: string): Result<readonly GenerationRunView[], DomainError> {
+    try {
+      const rows = this.connection
+        .prepare(
+          `SELECT detail_json FROM audit_log
+           WHERE subject_kind = ? ORDER BY occurred_at DESC, rowid DESC`,
+        )
+        .all(GENERATION_SUBJECT_KIND);
+      const seen = new Set<string>();
+      const runs: GenerationRunView[] = [];
+      for (const row of rows) {
+        const run = readRun(requiredText(row, 'detail_json'));
+        if (run.ideaId !== ideaId || seen.has(run.generationId)) continue;
+        seen.add(run.generationId);
+        runs.push(run);
+      }
+      return ok(runs);
+    } catch (error) {
+      return err({ code: 'Unavailable', reason: `The generation runs could not be read: ${describe(error)}` });
+    }
+  }
+}
+
+/**
+ * One recorded run, read back from its document.
+ *
+ * A document this version cannot interpret is an error rather than a record with blanks in it:
+ * a run reported as "queued" because its outcome could not be read is the failure N04-AC3
+ * exists to prevent, and a silently empty status is exactly how that happens.
+ */
+function readRun(body: string): GenerationRunView {
+  let decoded: unknown;
+  try {
+    decoded = JSON.parse(body) as unknown;
+  } catch {
+    throw new Error(`Generation run ${body.slice(0, 32)}... has a record that is not readable JSON`);
+  }
+  const record = decoded !== null && typeof decoded === 'object' ? (decoded as Record<string, unknown>) : null;
+  const generationId = record === null ? '' : String(record['generationId'] ?? '');
+  if (record === null || generationId === '') {
+    throw new Error('A generation record carries no identity');
+  }
+  const pass = String(record['pass']);
+  const state = String(record['state']);
+  const capability = record['capability'];
+  if ((pass !== 'Brief' && pass !== 'Plan') || !GENERATION_STATES.includes(state as GenerationState)) {
+    throw new Error(`Generation run ${generationId} is recorded in an unknown state: ${pass}/${state}`);
+  }
+  if (capability === null || typeof capability !== 'object') {
+    throw new Error(`Generation run ${generationId} records no capability profile`);
+  }
+  return {
+    generationId,
+    pass,
+    ideaId: String(record['ideaId'] ?? ''),
+    state: state as GenerationState,
+    startedAt: String(record['startedAt'] ?? ''),
+    finishedAt: record['finishedAt'] === null ? null : String(record['finishedAt']),
+    connectorId: record['connectorId'] === null ? null : String(record['connectorId']),
+    engineVersion: record['engineVersion'] === null ? null : String(record['engineVersion']),
+    sessionId: record['sessionId'] === null ? null : String(record['sessionId']),
+    brief: (record['brief'] ?? null) as GeneratedBriefSummary | null,
+    plan: (record['plan'] ?? null) as GeneratedPlanSummary | null,
+    failure: (record['failure'] ?? null) as GenerationFailure | null,
+    capability: capability as ReadOnlyCapabilityProfile,
+  };
+}
+
+const GENERATION_STATES: readonly GenerationState[] = ['Queued', 'Running', 'Succeeded', 'Failed'];
+
+/**
+ * The read-only workspace a generation pass runs in.
+ *
+ * Injected rather than invented here because it is a fact about the deployment, not about this
+ * process: a generation pass that claims a checkout nobody read would put an uninspected commit
+ * into the prompt and the record (F07-AC4). A process with none configured refuses by name at the
+ * operation rather than running against a directory it made up (F03-AC2).
+ */
+export type GenerationWorkspaceReader = (input: {
+  readonly generationId: string;
+  readonly pass: GenerationPass;
+  readonly at: string;
+}) => Promise<Result<ExecutionWorkspace, DomainError>>;
+
+export interface GenerationDeps {
+  readonly clock: ControllerClock;
+  readonly ledger: SqliteGenerationLedger;
+  readonly intake: IntakeRepository;
+  readonly profiles: ProjectProfileRepository;
+  /**
+   * The clarification use cases for one workspace, built per run.
+   *
+   * A factory rather than an instance because the workspace is read when the pass starts, and a
+   * use case built at boot would have to be given a workspace before one existed (F07-AC4).
+   */
+  readonly briefGenerationFor: ((workspace: ExecutionWorkspace) => BriefGenerationUseCases) | null;
+  readonly planGeneration: PlanGenerationUseCases | null;
+  /**
+   * The read-only workspace a pass runs in, or null when the deployment configured none.
+   *
+   * Null is a named refusal at the operation rather than a default directory: a pass that ran
+   * somewhere this configuration did not name would put an uninspected path into the prompt and
+   * the record (F07-AC4, F03-AC2).
+   */
+  readonly readWorkspace: GenerationWorkspaceReader | null;
+  /**
+   * The engine this process registered, or null when it configured none.
+   *
+   * Only its identity is read here. The adapter itself was already bound into the two use cases
+   * this root built, so a second reference could only be used to reach an engine the composition
+   * did not choose (F03-AC2, N05-AC2).
+   */
+  readonly engine: { readonly connectorId: string } | null;
+}
+
+/**
+ * Starting a generation and reading it back (N04-AC3).
+ *
+ * The two shapes are deliberately different: a start is synchronous and returns a tracked
+ * identity immediately, and everything after that is a read. Nothing here waits for a model
+ * turn, so an owner action never holds an HTTP request open while an engine reasons
+ * (N04-AC3, N04-AC2).
+ */
+export interface GenerationUseCases {
+  /** F07-AC1: draft this request's brief in one bounded read-only pass. */
+  readonly startBriefGeneration: (command: {
+    readonly ideaId: IdeaId;
+    readonly actor: OwnerActor;
+  }) => Result<GenerationRunView, DomainError>;
+  /** F08-AC1: propose a plan for this request's agreed brief in one read-only pass. */
+  readonly startPlanGeneration: (command: {
+    readonly ideaId: IdeaId;
+    readonly actor: OwnerActor;
+  }) => Result<GenerationRunView, DomainError>;
+  /** The run's current state and whatever it produced or refused (N04-AC3). */
+  readonly getGeneration: (generationId: string) => Result<GenerationRunView, DomainError>;
+  /** Every run recorded against one request, newest first. */
+  readonly listGenerations: (ideaId: IdeaId) => Result<readonly GenerationRunView[], DomainError>;
+  /**
+   * Resolves once nothing is in flight.
+   *
+   * Used by shutdown and by tests that assert an outcome without polling for it. It is a drain,
+   * not a cancel: a run in flight finishes and records its outcome.
+   */
+  readonly drained: () => Promise<true>;
+}
+
+/** How many passes one process runs at once. One, because a recorded run has no queue to wait in. */
+const MAXIMUM_CONCURRENT_GENERATIONS = 1;
+
+function noEngineConfigured(pass: GenerationPass): DomainError {
+  return blocked(
+    `This deployment configured no coding engine, so a ${pass.toLowerCase()} cannot be generated (F03-AC2).`,
+    [
+      {
+        name: 'coding engine',
+        detail:
+          'Brief and plan generation run a read-only session against the engine this process was configured with, and this process was started without one.',
+        remedy: 'Configure a coding engine for this deployment, restart it, then ask again (F03-AC1).',
+      },
+    ],
+  );
+}
+
+function noWorkspaceConfigured(pass: GenerationPass): DomainError {
+  return blocked(
+    `This deployment configured no read-only generation workspace, so a ${pass.toLowerCase()} pass has nowhere to run (F03-AC2).`,
+    [
+      {
+        name: 'generation workspace',
+        detail:
+          'A generation pass is confined to one named workspace, and this process was started without one. Running it anywhere else would put an uninspected path into the prompt and the record.',
+        remedy: 'Configure a read-only workspace for this deployment, restart it, then ask again (F07-AC4).',
+      },
+    ],
+  );
+}
+
+function generationFailure(error: DomainError): GenerationFailure {
+  const fields = error.code === 'Invalid' && Array.isArray((error as { readonly fields?: unknown }).fields)
+    ? ((error as { readonly fields: readonly { path: string; message: string }[] }).fields ?? [])
+    : [];
+  return { code: error.code, reason: error.reason, fields };
+}
+
+/**
+ * The context a clarification pass is given, assembled from what this process actually read.
+ *
+ * Every fact carries either the text that was read or why nothing was read, and the repository
+ * is always present as an explicit unknown: this process reads no checkout, so a packet that
+ * omitted it would let the model believe the repository had nothing to say about the request
+ * (F07-AC4). The saved profile is included only when there is one, and it says what it names
+ * rather than what it implies (F02-AC1).
+ */
+function contextPacketFor(
+  deps: GenerationDeps,
+  idea: IdeaDraft,
+  brief: Brief | null,
+  at: string,
+): Result<ContextPacket, DomainError> {
+  const facts: CapturedFact[] = [
+    {
+      factId: `conversation:${idea.ideaId}`,
+      kind: 'OwnerConversation',
+      subject: 'the request the owner captured',
+      reference: `idea:${String(idea.ideaId)}`,
+      observation: { observed: idea.rawRequest, inspectedRevision: null, observedAt: idea.capturedAt },
+      unknownReason: null,
+    },
+    {
+      factId: 'repository:uninspected',
+      kind: 'RepositoryState',
+      subject: 'the repository this request is about',
+      reference: 'the project profile',
+      observation: null,
+      unknownReason:
+        'No checkout was read for this clarification pass: this process reads no repository, so nothing is known about the code (F07-AC4).',
+    },
+  ];
+
+  const projectId = idea.projectId as ProjectId | null;
+  const profile = projectId === null ? null : deps.profiles.currentVersion(projectId);
+  if (idea.projectId !== null && profile !== null && profile.ok && profile.value !== null) {
+    const references = profile.value.content.references;
+    facts.push({
+      factId: `profile:${String(profile.value.profileVersionId)}`,
+      kind: 'ProjectProfile',
+      subject: 'the project profile',
+      reference: `profile:${String(profile.value.profileVersionId)}`,
+      observation: {
+        observed: `Repository ${references.repository}; delivery target ${references.targetBranch}.`,
+        inspectedRevision: null,
+        observedAt: profile.value.createdAt,
+      },
+      unknownReason: null,
+    });
+  }
+
+  if (brief !== null) {
+    facts.push({
+      factId: `brief:${String(brief.briefId)}`,
+      kind: 'OwnerConversation',
+      subject: 'the brief already agreed for this request',
+      reference: `brief:${String(brief.briefId)}`,
+      observation: {
+        observed: `Desired outcome: ${brief.sections.desiredOutcome}`,
+        inspectedRevision: null,
+        observedAt: brief.authoredAt,
+      },
+      unknownReason: null,
+    });
+  }
+
+  return assembleContextPacket({
+    packetId: `packet_${String(idea.ideaId)}_${at.replace(/[^0-9]/g, '')}`,
+    ideaId: idea.ideaId,
+    projectId: idea.projectId,
+    assembledAt: at,
+    facts,
+  });
+}
+
+/**
+ * The change a plan is generated against, read from the brief it delivers.
+ *
+ * No repository was inspected for this pass, so the change is the brief's own desired outcome
+ * as a single reviewable surface. Deriving it rather than inventing one is what keeps the split
+ * decision honest: `shouldSplit` sees one independently reviewable unit, so a proposal that
+ * asks for more than one task is refused by name instead of being split on the model's word
+ * (F08-AC2, F08-AC5).
+ */
+function changeShapeFor(brief: Brief): ChangeShape {
+  const observable = brief.sections.acceptanceCriteria.map((criterion) => criterion.text);
+  return {
+    summary: brief.sections.desiredOutcome,
+    surfaces: [
+      {
+        surfaceId: `brief:${brief.briefId}`,
+        description: brief.sections.desiredOutcome,
+        observableBehaviour: observable.length === 0 ? brief.sections.desiredOutcome : observable.join(' '),
+        independentlyReviewable: true,
+      },
+    ],
+    dependencyEdges: [],
+  };
+}
+
+/**
+ * Binds both generation paths to durable state, an engine and a workspace.
+ *
+ * The order inside one pass is the argument: the owner and the engine are checked before
+ * anything is scheduled, `Queued` is written before the engine is contacted so the identity
+ * exists even if the process dies mid-turn, and the terminal row carries the outcome verbatim
+ * (N04-AC3, F05-AC5).
+ */
+function createGenerationUseCases(deps: GenerationDeps): GenerationUseCases {
+  let active = 0;
+  const queue: (() => Promise<void>)[] = [];
+  let idle: (() => void) | null = null;
+
+  const drain = (): void => {
+    while (active < MAXIMUM_CONCURRENT_GENERATIONS && queue.length > 0) {
+      const next = queue.shift();
+      if (next === undefined) break;
+      active += 1;
+      void Promise.resolve()
+        .then(next)
+        .catch(() => undefined)
+        .then(() => {
+          active -= 1;
+          if (active === 0 && queue.length === 0 && idle !== null) {
+            const resolve = idle;
+            idle = null;
+            resolve();
+          } else {
+            drain();
+          }
+        });
+    }
+  };
+
+  const record = (run: GenerationRunView, actor: OwnerActor, projectId: string | null): Result<true, DomainError> =>
+    deps.ledger.append({ run, actor: actor.actorId, projectId, at: deps.clock.now() });
+
+  /** A refusal becomes the run's terminal state; nothing throws across the background task. */
+  const settleFailure = (run: GenerationRunView, error: DomainError, actor: OwnerActor, projectId: string | null): void => {
+    record({ ...run, state: 'Failed', finishedAt: deps.clock.now(), failure: generationFailure(error) }, actor, projectId);
+  };
+
+  const startBriefGeneration: GenerationUseCases['startBriefGeneration'] = (command) => {
+    const permitted = requireIntakeOwner(command.actor);
+    if (!permitted.ok) return err(permitted.error);
+    const readWorkspace = deps.readWorkspace;
+    const buildBriefGeneration = deps.briefGenerationFor;
+    if (deps.engine === null || buildBriefGeneration === null) return err(noEngineConfigured('Brief'));
+    if (readWorkspace === null) return err(noWorkspaceConfigured('Brief'));
+
+    const idea = deps.intake.read(command.ideaId);
+    if (!idea.ok) return err(idea.error);
+    const current = deps.intake.currentBrief(command.ideaId);
+    if (!current.ok) return err(current.error);
+    if (current.value !== null) {
+      return err(
+        conflict(
+          `This request already has a brief at version ${String(current.value.version)}.`,
+          'no brief yet',
+          `version ${String(current.value.version)}`,
+        ),
+      );
+    }
+
+    const at = deps.clock.now();
+    const queued: GenerationRunView = {
+      generationId: deps.ledger.nextId(at),
+      pass: 'Brief',
+      ideaId: String(command.ideaId),
+      state: 'Queued',
+      startedAt: at,
+      finishedAt: null,
+      connectorId: deps.engine?.connectorId ?? null,
+      engineVersion: null,
+      sessionId: null,
+      brief: null,
+      plan: null,
+      failure: null,
+      capability: readOnlyCapabilityProfile,
+    };
+    const recorded = record(queued, command.actor, idea.value.projectId);
+    if (!recorded.ok) return err(recorded.error);
+
+    queue.push(async () => {
+      const running = record({ ...queued, state: 'Running' }, command.actor, idea.value.projectId);
+      if (!running.ok) return;
+      const workspace = await readWorkspace({ generationId: queued.generationId, pass: 'Brief', at });
+      if (!workspace.ok) {
+        settleFailure(queued, workspace.error, command.actor, idea.value.projectId);
+        return;
+      }
+      const packet = contextPacketFor(deps, idea.value, null, deps.clock.now());
+      if (!packet.ok) {
+        settleFailure(queued, packet.error, command.actor, idea.value.projectId);
+        return;
+      }
+      const generated = await buildBriefGeneration(workspace.value).generateBrief({
+        briefId: `brief-${String(command.ideaId)}`,
+        idea: idea.value,
+        contextPacket: packet.value,
+        operationId: queued.generationId,
+      });
+      const at2 = deps.clock.now();
+      if (!generated.ok) {
+        settleFailure(queued, generated.error, command.actor, idea.value.projectId);
+        return;
+      }
+      record(
+        {
+          ...queued,
+          state: 'Succeeded',
+          finishedAt: at2,
+          engineVersion: generated.value.engineVersion,
+          sessionId: String(generated.value.sessionId),
+          brief: {
+            briefId: generated.value.brief.briefId,
+            version: generated.value.brief.version,
+            state: generated.value.brief.state,
+            authoredBy: generated.value.brief.authoredBy,
+            questionCount: generated.value.questions.length,
+            rejectedCandidateCount: generated.value.rejected.length,
+          },
+        },
+        command.actor,
+        idea.value.projectId,
+      );
+    });
+    drain();
+    return ok(queued);
+  };
+
+  const startPlanGeneration: GenerationUseCases['startPlanGeneration'] = (command) => {
+    const permitted = requirePlanningOwner(command.actor);
+    if (!permitted.ok) return err(permitted.error);
+    const readWorkspace = deps.readWorkspace;
+    const planGeneration = deps.planGeneration;
+    if (deps.engine === null || planGeneration === null) return err(noEngineConfigured('Plan'));
+    if (readWorkspace === null) return err(noWorkspaceConfigured('Plan'));
+
+    const idea = deps.intake.read(command.ideaId);
+    if (!idea.ok) return err(idea.error);
+    const briefs = deps.intake.listBriefs(command.ideaId);
+    if (!briefs.ok) return err(briefs.error);
+    const agreed = briefs.value.find((brief) => brief.state === 'Agreed');
+    if (agreed === undefined) {
+      return err(
+        invalid('A plan is generated from an agreed brief, and this request has none (F07-AC1, F08-AC1).', [
+          {
+            path: 'brief.state',
+            message:
+              briefs.value.length === 0
+                ? 'No brief has been drafted for this request. Generate or record one, then agree it.'
+                : `The newest brief is at version ${String(briefs.value[briefs.value.length - 1]?.version ?? 0)} and has not been agreed.`,
+          },
+        ]),
+      );
+    }
+
+    const at = deps.clock.now();
+    const queued: GenerationRunView = {
+      generationId: deps.ledger.nextId(at),
+      pass: 'Plan',
+      ideaId: String(command.ideaId),
+      state: 'Queued',
+      startedAt: at,
+      finishedAt: null,
+      connectorId: deps.engine?.connectorId ?? null,
+      engineVersion: null,
+      sessionId: null,
+      brief: null,
+      plan: null,
+      failure: null,
+      capability: readOnlyCapabilityProfile,
+    };
+    const recorded = record(queued, command.actor, idea.value.projectId);
+    if (!recorded.ok) return err(recorded.error);
+
+    queue.push(async () => {
+      const running = record({ ...queued, state: 'Running' }, command.actor, idea.value.projectId);
+      if (!running.ok) return;
+      const workspace = await readWorkspace({ generationId: queued.generationId, pass: 'Plan', at });
+      if (!workspace.ok) {
+        settleFailure(queued, workspace.error, command.actor, idea.value.projectId);
+        return;
+      }
+      const request: PlanContextRequest = {
+        packetId: `packet_${agreed.briefId}_v${String(agreed.version)}`,
+        briefId: agreed.briefId,
+        projectId: idea.value.projectId as ProjectId | null,
+        subjectKeys: [],
+        unrelatedSubjectKeys: [],
+        ticketSnapshot: ['No ticket provider is configured for this project, so no ticket was read (F05-AC2).'],
+        priorFeedback: [],
+      };
+      const packet = planGeneration.contextPacketFor(request);
+      if (!packet.ok) {
+        settleFailure(queued, packet.error, command.actor, idea.value.projectId);
+        return;
+      }
+      const generated = await planGeneration.generateAndStorePlanProposal({
+        brief: agreed,
+        contextPacket: packet.value,
+        ideaId: command.ideaId,
+        change: changeShapeFor(agreed),
+        workspace: workspace.value,
+        actor: command.actor,
+      });
+      const at2 = deps.clock.now();
+      if (!generated.ok) {
+        settleFailure(queued, generated.error, command.actor, idea.value.projectId);
+        return;
+      }
+      record(
+        {
+          ...queued,
+          state: 'Succeeded',
+          finishedAt: at2,
+          engineVersion: generated.value.run.engineVersion,
+          sessionId: String(generated.value.run.sessionId),
+          plan: {
+            planId: generated.value.planId,
+            revision: generated.value.plan.revision,
+            taskCount: generated.value.plan.tasks.length,
+            coveredOutcomeIds: generated.value.coverage.map((entry) => entry.outcomeId),
+            splitJustifications: generated.value.split.split ? [...generated.value.split.justifications] : [],
+          },
+        },
+        command.actor,
+        idea.value.projectId,
+      );
+    });
+    drain();
+    return ok(queued);
+  };
+
+  const getGeneration: GenerationUseCases['getGeneration'] = (generationId) => {
+    if (generationId.trim().length === 0) {
+      return err(invalid('A generation run is addressed by its identity.', [{ path: 'generationId', message: 'Must not be blank.' }]));
+    }
+    const found = deps.ledger.read(generationId);
+    if (!found.ok) return err(found.error);
+    if (found.value === null) {
+      return err({ code: 'NotFound', reason: `No generation run ${generationId} has been recorded.` });
+    }
+    return ok(found.value);
+  };
+
+  const listGenerations: GenerationUseCases['listGenerations'] = (ideaId) => deps.ledger.listForIdea(ideaId);
+
+  const drained: GenerationUseCases['drained'] = async () => {
+    if (active > 0 || queue.length > 0) {
+      await new Promise<void>((resolve) => {
+        idle = resolve;
+      });
+    }
+    return true;
+  };
+
+  return { startBriefGeneration, startPlanGeneration, getGeneration, listGenerations, drained };
 }
 

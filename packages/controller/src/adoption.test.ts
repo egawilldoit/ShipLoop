@@ -336,7 +336,9 @@ async function withAdoption(run: (harness: Harness) => Promise<void> | void): Pr
   try {
     const migrated = migrate(database);
     assert.ok(migrated.ok, `the schema could not be migrated: ${migrated.ok ? '' : migrated.error.reason}`);
-    assert.equal(LATEST_SCHEMA_VERSION, 11);
+    // The migration reached LATEST_SCHEMA_VERSION rather than any pinned number, so this
+    // fixture keeps working when a later migration is added (N08-AC3).
+    assert.equal(migrated.value.toVersion, LATEST_SCHEMA_VERSION);
 
     database
       .prepare('INSERT INTO owners (owner_id, display_name, created_at) VALUES (?, ?, ?)')

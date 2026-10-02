@@ -1325,6 +1325,68 @@ export interface PlanningUseCases {
   }): Promise<Result<AdoptedEvaluationView, DomainError>>;
 }
 
+/**
+ * One generation run, as this HTTP layer carries it (F07-AC1, F08-AC1, N04-AC3).
+ *
+ * Declared with the four `may*` flags as literal `false`, because the capability profile is what
+ * the run was granted and a renderer that could read one of them as `true` would be offering to
+ * publish or deploy work that generation has no path to (F07-AC5).
+ */
+export interface GenerationRunView {
+  readonly generationId: string;
+  readonly pass: 'Brief' | 'Plan';
+  readonly ideaId: string;
+  readonly state: 'Queued' | 'Running' | 'Succeeded' | 'Failed';
+  readonly startedAt: string;
+  readonly finishedAt: string | null;
+  readonly connectorId: string | null;
+  readonly engineVersion: string | null;
+  readonly sessionId: string | null;
+  readonly brief: {
+    readonly briefId: string;
+    readonly version: number;
+    readonly state: string;
+    readonly authoredBy: string;
+    readonly questionCount: number;
+    readonly rejectedCandidateCount: number;
+  } | null;
+  readonly plan: {
+    readonly planId: string;
+    readonly revision: number;
+    readonly taskCount: number;
+    readonly coveredOutcomeIds: readonly string[];
+    readonly splitJustifications: readonly string[];
+  } | null;
+  readonly failure: {
+    readonly code: string;
+    readonly reason: string;
+    readonly fields: readonly { readonly path: string; readonly message: string }[];
+  } | null;
+  readonly capability: {
+    readonly name: string;
+    readonly mayChangeApplicationCode: false;
+    readonly mayPublishTickets: false;
+    readonly mayDeploy: false;
+    readonly mayStartCodingRun: false;
+    readonly forbiddenSideEffects: readonly string[];
+  };
+}
+
+/**
+ * Starting and reading a generation run (N04-AC3).
+ *
+ * The start methods return the tracked identity rather than the answer, which is the whole point:
+ * a model turn is asynchronous, so an owner action records an intent and the owner reads the
+ * outcome from a later read. A write carries the owner the guard proved; reads carry none, because
+ * a read cannot be authorized by a request body (F01-AC1).
+ */
+export interface GenerationUseCases {
+  startBriefGeneration(command: { readonly ideaId: IdeaId; readonly actor: OwnerId }): Promise<Result<GenerationRunView, DomainError>>;
+  startPlanGeneration(command: { readonly ideaId: IdeaId; readonly actor: OwnerId }): Promise<Result<GenerationRunView, DomainError>>;
+  getGeneration(generationId: string): Promise<Result<GenerationRunView, DomainError>>;
+  listGenerations(ideaId: IdeaId): Promise<Result<readonly GenerationRunView[], DomainError>>;
+}
+
 /** The whole injected surface. One argument, so a missing use case is a type error. */
 export interface ControllerSurface {
   readonly owners: OwnerUseCases;
@@ -1337,6 +1399,7 @@ export interface ControllerSurface {
   readonly reviewCards: ReviewCardUseCases;
   readonly acceptance: AcceptanceUseCases;
   readonly planning: PlanningUseCases;
+  readonly generation: GenerationUseCases;
 }
 
 const REQUIRED_METHODS = {
@@ -1386,6 +1449,7 @@ const REQUIRED_METHODS = {
     'linkExistingChange',
     'requestAdoptedEvaluation',
   ],
+  generation: ['startBriefGeneration', 'startPlanGeneration', 'getGeneration', 'listGenerations'],
 } as const satisfies Record<keyof ControllerSurface, readonly string[]>;
 
 export type ControllerGroup = keyof typeof REQUIRED_METHODS;
