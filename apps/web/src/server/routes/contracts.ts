@@ -283,8 +283,14 @@ export function registerContractRoutes(app: FastifyInstance, options: ContractRo
 
   /* --------------------------------------------------------------- contracts */
 
-  /** Drafts revision 1 of this request's delivery contract (mvp-spec 3). */
-  app.post('/api/projects/:projectId/requests/:requestId/contract', { preHandler: options.guard }, async (request, reply) => {
+  /**
+   * Drafts revision 1 of this request's delivery contract (mvp-spec 3).
+   *
+   * `/contracts`, plural, the same sub-resource the listing beside it answers: a client
+   * that drafts revision 1 and then lists the revisions holds one path and one noun, and a
+   * singular twin would be a second shape for the same write.
+   */
+  app.post('/api/projects/:projectId/requests/:requestId/contracts', { preHandler: options.guard }, async (request, reply) => {
     const session = request.session;
     if (session === null) return sendProblem(reply, signInRequiredProblem());
     const params = parseBody(requestParams, request.params);

@@ -2046,7 +2046,7 @@ async function draftContract(
 ): Promise<ContractView> {
   const response = await h.app.inject({
     method: 'POST',
-    url: `/api/projects/${projectId}/requests/${requestId}/contract`,
+    url: `/api/projects/${projectId}/requests/${requestId}/contracts`,
     headers: { cookie: session.cookie, [CSRF_HEADER]: session.csrfToken },
     payload: CONTRACT_CONTENT,
   });
@@ -2510,7 +2510,7 @@ test('mvp-spec 3: a contract with no criterion, or an unknown verification type,
 
   const empty = await h.app.inject({
     method: 'POST',
-    url: `/api/projects/${PROJECT_ID}/requests/${request.requestId}/contract`,
+    url: `/api/projects/${PROJECT_ID}/requests/${request.requestId}/contracts`,
     headers: { cookie: session.cookie, [CSRF_HEADER]: session.csrfToken },
     payload: { ...CONTRACT_CONTENT, acceptanceCriteria: [] },
   });
@@ -2518,7 +2518,7 @@ test('mvp-spec 3: a contract with no criterion, or an unknown verification type,
 
   const invented = await h.app.inject({
     method: 'POST',
-    url: `/api/projects/${PROJECT_ID}/requests/${request.requestId}/contract`,
+    url: `/api/projects/${PROJECT_ID}/requests/${request.requestId}/contracts`,
     headers: { cookie: session.cookie, [CSRF_HEADER]: session.csrfToken },
     payload: {
       ...CONTRACT_CONTENT,
@@ -2763,7 +2763,7 @@ test('mvp-spec 3, F02-AC2: nothing here crosses a project boundary', async () =>
       label: 'draft against a request in another project',
       response: await h.app.inject({
         method: 'POST',
-        url: `/api/projects/${elsewhere}/requests/${request.requestId}/contract`,
+        url: `/api/projects/${elsewhere}/requests/${request.requestId}/contracts`,
         headers: { cookie: session.cookie, [CSRF_HEADER]: session.csrfToken },
         payload: CONTRACT_CONTENT,
       }),
@@ -2799,7 +2799,7 @@ test('F01-AC1: every request and contract route refuses an anonymous caller', as
     { method: 'POST', url: `/api/projects/${PROJECT_ID}/requests`, payload: { title: 'x', description: 'y' } },
     { method: 'GET', url: `/api/projects/${PROJECT_ID}/requests/req_1`, payload: null },
     { method: 'PATCH', url: `/api/projects/${PROJECT_ID}/requests/req_1`, payload: { title: 'x', expectedUpdatedAt: 'y' } },
-    { method: 'POST', url: `/api/projects/${PROJECT_ID}/requests/req_1/contract`, payload: CONTRACT_CONTENT },
+    { method: 'POST', url: `/api/projects/${PROJECT_ID}/requests/req_1/contracts`, payload: CONTRACT_CONTENT },
     { method: 'GET', url: `/api/projects/${PROJECT_ID}/requests/req_1/contracts`, payload: null },
     { method: 'GET', url: `/api/projects/${PROJECT_ID}/contracts/dc_1/1`, payload: null },
     { method: 'GET', url: `/api/projects/${PROJECT_ID}/contracts/dc_1/1/criteria`, payload: null },
