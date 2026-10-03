@@ -9,6 +9,13 @@
  * The rules below are not decoration. Each one exists because there is a specific wrong
  * answer it makes unreachable:
  *
+ *   - **A verdict rests on an observation that counts.** `recordedOutcome`, `currentOutcome`
+ *     and `countsForCurrentCandidate` say three different things, and a card that publishes
+ *     them without tying them to the verdicts above is a card that renders a stale pass in
+ *     green. So a criterion, an owner test or a check reading `passed` must name an
+ *     observation that describes the candidate on screen, and the card's staleness summary
+ *     must count exactly the rows that no longer do. `review.invariants.test.ts` builds a
+ *     card for each way this can be violated and each one is refused (F20-AC3, F24-AC3).
  *   - **The two evidence outcomes cannot be confused.** The domain read model carries both
  *     `outcome` (what the source said at the time, which stays `passed` after a push) and
  *     `currentOutcome` (`stale` once the binding no longer holds). A card that published
@@ -386,13 +393,26 @@ function checkedCard(
   // observation behind it describe the candidate on screen? Checks, criteria and owner tests
   // are walked in turn, because a green criterion panel over a stale table is the exact
   // failure the two-outcome evidence shape was introduced to prevent (F20-AC3, F24-AC3).
+  //
+  // The three lists are built before any of them is checked, so a `passed` sitting in the
+  // last criterion cannot be missed because an earlier one already failed - and the
+  // accumulated disagreement is reported as one refusal naming every offender rather than
+  // only the first. A card that is wrong in three places should read as wrong in three
+  // places, not as a sequence of one-at-a-time surprises.
   const verdicts: readonly { readonly what: string; readonly state: string; readonly evidenceId: string | null }[] = [
     ...card.checks.map((check) => ({ what: `Check "${check.checkId}"`, state: check.result, evidenceId: check.evidenceId })),
     ...card.criteria.map((criterion) => ({ what: `Criterion ${criterion.criterionId}`, state: criterion.state, evidenceId: criterion.evidenceId })),
     ...card.ownerTests.map((criterion) => ({ what: `Owner test ${criterion.criterionId}`, state: criterion.state, evidenceId: criterion.evidenceId })),
   ];
-  for (const verdict of verdicts) {
-    if (!verdictIsSupported(card, verdict, reply)) return null;
+  const unsupported = verdicts.filter((verdict) => !verdictIsSupported(card, verdict));
+  if (unsupported.length > 0) {
+    refuse(
+      reply,
+      `The card reports ${unsupported.length} verdict(s) that no observation of this candidate can stand behind: ${unsupported
+        .map((verdict) => `${verdict.what} reads ${verdict.state} on ${verdict.evidenceId ?? 'nothing at all'}`)
+        .join('; ')}. What the source said at the time is history; only an observation bound to ${card.candidate.headSha} can verify this candidate (F20-AC3, F24-AC3).`,
+    );
+    return null;
   }
 
   if (!stalenessSummaryAgrees(card, reply)) return null;
@@ -457,32 +477,25 @@ function checkedCard(
  *
  * A check reading `passed` with no observation at all is the sharpest case: there is nothing
  * behind the green at all, which is a fabricated pass rather than a stale one (F20-AC2).
+ *
+ * The loop this is called from walks every check, criterion and owner test on the card rather
+ * than stopping at the first disagreement, because the wrong answer is served if *any* one of
+ * them is a stale pass - one green panel is enough to make the card lie.
  */
 function verdictIsSupported(
   card: MvpReviewCardView,
   verdict: { readonly what: string; readonly state: string; readonly evidenceId: string | null },
-  reply: FastifyReply,
 ): boolean {
-  const row = verdict.evidenceId === null ? undefined : card.evidence.find((entry) => entry.evidenceId === verdict.evidenceId);
+  const row =
+    verdict.evidenceId === null ? undefined : card.evidence.find((entry) => entry.evidenceId === verdict.evidenceId);
   const counts = row !== undefined && row.countsForCurrentCandidate;
-  if (verdict.state === 'passed' && !counts) {
-    const behind =
-      row === undefined
-        ? 'no observation at all'
-        : `evidence ${row.evidenceId}, which no longer describes this candidate (${truncate(row.staleReasons.join('; '))})`;
-    refuse(
-      reply,
-      `${verdict.what} reads passed on ${behind}. What the source said at the time is history; only an observation bound to ${card.candidate.headSha} can stand behind a verdict on this candidate (F20-AC3, F24-AC3).`,
-    );
-    return false;
-  }
-  if (verdict.state === 'stale' && counts) {
-    refuse(
-      reply,
-      `${verdict.what} reads stale on evidence ${verdict.evidenceId ?? 'it names'}, which does describe this candidate. An observation cannot be discounted and counted at once (F20-AC3).`,
-    );
-    return false;
-  }
+  // `passed` needs an observation that counts; `stale` needs one that does not. Everything
+  // else - `pending`, `unverified`, `not_run`, `failed`, `capture_failed` - is a refusal of a
+  // claim rather than a claim of success, so it needs nothing behind it. That asymmetry is
+  // the rule: this check can only be too strict about a claim of success, never about a
+  // refusal to claim one.
+  if (verdict.state === 'passed') return counts;
+  if (verdict.state === 'stale') return !counts;
   return true;
 }
 

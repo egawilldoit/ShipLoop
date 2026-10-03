@@ -454,6 +454,26 @@ test('F20-AC3, F25-AC3: a card whose staleness summary hides a stale row is refu
   });
 });
 
+test('F20-AC3, F24-AC3: every offending verdict is named, not only the first one found', async () => {
+  const base = consistentCard();
+  // Three verdicts resting on one stale observation: the check, the criterion and the owner
+  // test all reading `passed` on a row that no longer describes this commit. A transport that
+  // refused on the first disagreement would name one of them and leave a reader unable to tell
+  // whether the other two were fine.
+  const card: MvpReviewCardView = {
+    ...base,
+    ownerTests: [{ ...base.ownerTests[0]!, state: 'passed', evidenceId: UNIT_EVIDENCE, observedAt: LATER }],
+    evidence: [staleEvidence()],
+    staleness: { stale: true, reasons: ['evidence no longer applies'], staleEvidenceIds: [UNIT_EVIDENCE], staleDecisionIds: [] },
+  };
+  await withCard(card, async (h) => {
+    const message = await refuses(h, 'three verdicts resting on stale evidence');
+    assert.match(message, new RegExp(`Check "${UNIT_CHECK}"`), `the check is named: ${message}`);
+    assert.match(message, new RegExp(`Criterion ${AUTOMATED_CRITERION_ID}`), `the criterion is named: ${message}`);
+    assert.match(message, new RegExp(`Owner test ${OWNER_CRITERION_ID}`), `the owner test is named: ${message}`);
+  });
+});
+
 test('F20-AC3: a row claiming to count while naming an older commit is refused', async () => {
   const base = consistentCard();
   const card: MvpReviewCardView = {

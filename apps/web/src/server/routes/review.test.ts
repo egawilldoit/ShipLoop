@@ -29,9 +29,18 @@
  *     acceptance. Nothing on this card can settle it (F23-AC1, F24-AC3).
  *   - **Accept is gated, Request Changes is not.** With the same card, one is refused with
  *     the outstanding requirements named and the other is recorded (F23-AC1, F25-AC2).
- *   - **the project boundary is server-side.** Another project's path finds nothing, an
- *     anonymous caller is refused before any fact is considered, and a state-changing request
- *     without the session's forgery token is refused too (F02-AC2, F01-AC1, F01-AC4).
+ *   - **the project boundary is server-side, in both directions.** The other project is a
+ *     real one with its own request, revision and candidate, so the only thing that can
+ *     refuse is the candidate's own project; the reason is asserted, not just the status,
+ *     because a project-keyed lookup would answer 404 for a different reason. An anonymous
+ *     caller is refused before any fact is considered, and a state-changing request without
+ *     the session's forgery token is refused too (F02-AC2, F01-AC1, F01-AC4).
+ *
+ * The two staleness checks are deliberately split across files. This one drives the real
+ * projection, so it proves the domain is right. `review.invariants.test.ts` answers the port
+ * with cards built to contradict themselves, so it proves the transport notices when a card is
+ * wrong. Neither file can establish the other's half, and a check that has only ever seen
+ * honest input has not been shown to work.
  *
  * The seed is the MVP's own journey over HTTP - a request, a contract drafted against it and
  * the owner's approval - and then one candidate row written directly through the delivery
