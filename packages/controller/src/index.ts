@@ -1,7 +1,7 @@
 /**
  * The controller's public surface: composition, owner and profile use cases,
- * connector use cases, intake use cases, session use cases, and the surface the HTTP
- * layer loads.
+ * connector use cases, intake use cases, session use cases, the external-execution
+ * handoff, and the surface the HTTP layer loads.
  *
  * `apps/web` and `apps/worker` import only from this root. Nothing here reaches a
  * provider SDK or restates a lifecycle rule; the use cases are the only supported
@@ -23,6 +23,7 @@ export * from './context-packet.ts';
 export * from './brief-generation.ts';
 export * from './connectors.ts';
 export * from './delivery.ts';
+export * from './handoff/index.ts';
 export * from './intake.ts';
 export * from './profiles.ts';
 export * from './publication.ts';
