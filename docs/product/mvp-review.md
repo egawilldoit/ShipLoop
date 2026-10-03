@@ -56,6 +56,31 @@ Derivation precedence is fixed and each step is a refusal to reach `passed` earl
 **An automated criterion names the check that verifies it.** `MvpContractCriterionView.verificationCheckId`
 is required for that link and may not be inferred from whichever check passed.
 
+### The binding is a check name, and it is required before approval
+
+`ContractCriterion.verificationCheckId` is the same field, carried on the stored revision and
+passed through unchanged. Its value is a **check name**, not a check run: the vocabulary the
+project profile's `policy.requiredChecks` uses and that a recipe's `CheckCommand.id` or a
+`GitHubCheckProjection.checkId` reports under. That is what makes the binding survive re-runs —
+a re-run on a new commit re-verifies the criterion instead of invalidating the link — and it is
+why there is no second registry of verification identities.
+
+| `verificationType` | `verificationCheckId` | Approval |
+| --- | --- | --- |
+| `automated` | a check name | required; `approveContract` refuses the revision otherwise |
+| `automated` | absent | a draft may carry it; approval is refused |
+| `owner_test` | must be absent | refused at draft, edit and revise |
+
+The approval gate is the reason this is load-bearing rather than advisory. Without it an owner
+could agree a contract containing a criterion nothing can ever verify; that criterion reads
+`unverified` for the life of the product, `readyForAcceptance` stays false, and every acceptance
+of that contract is refused with nothing the owner could act on. The binding is part of the
+frozen content: `contractContentFingerprint` includes it, so repointing a criterion at a
+different check moves the fingerprint rather than describing an already-approved agreement.
+
+A revision written before the binding existed reads as unbound, which is the truth about it, and
+the review card reports that as `unverified` rather than borrowing a green check.
+
 ## Evidence binding
 
 `packages/domain/src/review/evidence.ts`
@@ -213,13 +238,21 @@ observation a source could not attribute. An `owner_test` row requires `owner_id
 the domain constructors already accepted and rebuilds every read through those same
 constructors, so a row this build cannot reconstruct is reported rather than dropped.
 
+The criterion binding needs no migration of its own. Acceptance criteria are stored as one JSON
+document in `delivery_contracts.acceptance_criteria_json`, whose CHECK constrains the document
+to a valid JSON array and says nothing about its members, so the field round-trips through the
+existing column. A revision written before the field existed has no key for it and reads as
+unbound; a stored binding that is neither text nor null is reported as `Unavailable` rather
+than read as "nothing is bound".
+
 ## What an integrator must satisfy
 
 1. **Candidate identity.** Supply a full 40-character `headSha` for every candidate. A
    branch name or PR number is not identity and the domain will refuse it.
-2. **Contract criteria.** Every automated criterion needs `verificationCheckId` naming a
-   check that exists in the policy. An automated criterion without one stays `unverified`,
-   which is correct: nothing bound to it.
+2. **Contract criteria.** Every automated criterion needs `verificationCheckId` naming a check
+   by name, from the same vocabulary the profile's `policy.requiredChecks` uses. Approval is
+   refused without one; a stored revision that predates the field reads `unverified`, which is
+   correct: nothing is bound to it. An `owner_test` criterion carries no binding at all.
 3. **Policy.** `MvpVerificationPolicy.requiredAutomatedCheckIds` is the gate list.
    `ownerTestBlocksReview` defaults false and `ownerTestBlocksDelivery` true, which is
    F24-AC3 read as configuration.
