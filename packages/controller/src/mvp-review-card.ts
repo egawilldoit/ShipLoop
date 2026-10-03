@@ -953,12 +953,16 @@ export function createMvpReviewCardUseCases(deps: MvpReviewCardDeps): MvpReviewC
         headSha: candidate.headSha,
       };
       const observedAt = live.value.observedAt;
+      // The commit the provider read was made for. It is the candidate's own head in the ordinary
+      // case, and the two differ exactly when the pull request has been pushed on since the
+      // candidate was recorded (F24-AC4).
+      const liveHeadSha = live.value.live.headSha;
       const projection: GitHubCandidateProjection = {
         candidateId: command.candidateId,
         contractId: contract.id,
         contractRevision: contract.revision,
         headSha: candidate.headSha,
-        checks: live.value.checks.map((check) => providerCheckFor(check, candidate.headSha)),
+        checks: live.value.checks.map((check) => providerCheckFor(check, liveHeadSha, candidate.headSha)),
         observedAt,
       };
 
@@ -1038,7 +1042,7 @@ export function createMvpReviewCardUseCases(deps: MvpReviewCardDeps): MvpReviewC
           candidateHeadSha: candidate.headSha,
           // The commit the pull request holds right now, reported next to the bound head rather
           // than substituted for it: a difference is the finding, not a nuisance (F20-AC3).
-          providerHeadSha: live.value.live.headSha,
+          providerHeadSha: liveHeadSha,
           contractId: contract.id,
           contractRevision: contract.revision,
           method: 'github_checks',
@@ -1160,18 +1164,24 @@ function approvedRevisionOf(contract: DeliveryContract): Result<true, DomainErro
  * verification package maps to `missing`. A check that did not run therefore cannot be recorded as
  * one that passed, however this function is edited (F20-AC2).
  *
- * `headSha` is the commit the run belongs to, and this is where a run the provider attributed to a
- * *different* commit stops being about this candidate.
+ * `headSha` is the commit this observation is about, and this is where an observation stops being
+ * about this candidate. See `attributableTo` for what it is derived from and why.
  */
-function providerCheckFor(check: CandidateCheckStatus, candidateHeadSha: string): GitHubCheckProjection {
+function providerCheckFor(
+  check: CandidateCheckStatus,
+  liveHeadSha: string,
+  candidateHeadSha: string,
+): GitHubCheckProjection {
+  const attributable = attributableTo(check, liveHeadSha, candidateHeadSha);
   return {
     checkId: check.name,
     name: check.name,
     status: providerStatusOf(check.result),
-    // A run the provider attributed elsewhere keeps that other commit, so the verification package
-    // can compare and record it unbound. Replacing it with the candidate's head would make another
-    // commit's green run prove this one (F20-AC3).
-    headSha: attributableTo(check, candidateHeadSha) ? candidateHeadSha : check.observedHeadSha,
+    // The commit this observation is attributed to, and the one thing that decides whether
+    // `recordGitHubProjection` binds it. An observation that is not about this candidate must not
+    // name this candidate's head, or the binding would be asserted by the very field meant to
+    // carry it (F20-AC3).
+    headSha: attributable ? candidateHeadSha : unattributedHeadOf(check, liveHeadSha, candidateHeadSha),
     startedAt: check.startedAt,
     completedAt: check.endedAt,
     detailUrl: check.artifactUrl,
@@ -1180,24 +1190,57 @@ function providerCheckFor(check: CandidateCheckStatus, candidateHeadSha: string)
 }
 
 /**
+ * The commit an observation that is not about this candidate names, or null.
+ *
+ * `recordGitHubProjection` records a check unbound when its `headSha` is not the target's or is
+ * absent, so this returns anything other than the candidate's head. The candidate module's live
+ * head is used when it differs, because that names which build the read was actually made for and
+ * is the more useful thing for a reader to see. When the live head *is* the candidate's - the
+ * ordinary case for a `Stale` result, which exists precisely because the run belonged to some
+ * other commit - there is no other SHA available, so the observation names none and the
+ * verification package's own summary says why (F20-AC3).
+ */
+function unattributedHeadOf(
+  check: CandidateCheckStatus,
+  liveHeadSha: string,
+  candidateHeadSha: string,
+): string | null {
+  if (check.observedHeadSha !== null) return check.observedHeadSha;
+  return liveHeadSha === candidateHeadSha ? null : liveHeadSha;
+}
+
+/**
  * Whether an observation may be said to describe this candidate.
  *
- * Two cases and no third, because the difference between them is the difference between "we saw
- * this pass" and "we saw a pass, for something else":
+ * Derived from two facts and not from a third one that does not exist. The shipped
+ * `ProviderCheckObservation` carries no per-check commit - the git adapter resolves a check
+ * reported for another commit into `result: 'Stale'` and says which commit in its detail rather
+ * than in a field - so there is no SHA here to compare. What there *is* is the candidate module's
+ * own verdict, which this path is bound to respect rather than second-guess:
  *
- *   - **The provider named a commit.** It counts only when that commit is the candidate's.
- *   - **The provider named no commit, because it reported no run at all.** A check the project
- *     requires and the provider never ran, or declined under policy, *was* observed for this
- *     candidate: this read asked about this head and the answer was "nothing". Recording it bound
- *     is what makes the card say `missing` - a check that did not run - instead of `stale`, and
- *     neither state is a pass (F20-AC2).
+ *   - **`Stale` is never attributable.** That result exists for exactly one reason: the provider
+ *     ran the check for a different commit. A green base-branch result must not approve this
+ *     candidate, and the adapter already decided it does not (F20-AC3, F24-AC4).
+ *   - **The live head must be the candidate's head.** The provider read was made for the commit the
+ *     candidate module holds; if that is not the commit under review, every check it returned
+ *     belongs to a build this pass is not verifying, and attributing them would be the F20-AC3 bug
+ *     from the other direction.
+ *   - **`Missing` and `NotApplicable` are attributable on the same terms as a verdict.** A check
+ *     the project requires and the provider never ran *was* observed for this candidate: the read
+ *     asked about this head and the answer was "nothing". Binding it is what makes the card say
+ *     `missing` rather than `stale`, and neither state is a pass (F20-AC2).
  *
- * A reported verdict with no attribution is never attributable. "It was green, but the provider
- * would not say for what" proves nothing about this commit and is recorded unbound.
+ * A `Stale` result that also had an attributable SHA would still be refused here, because the
+ * adapter's staleness verdict and a comparison could only disagree if one of them were wrong, and
+ * the one that has read the provider is the adapter.
  */
-function attributableTo(check: CandidateCheckStatus, candidateHeadSha: string): boolean {
-  if (check.observedHeadSha !== null) return check.observedHeadSha === candidateHeadSha;
-  return check.result === 'Missing' || check.result === 'NotApplicable';
+function attributableTo(
+  check: CandidateCheckStatus,
+  liveHeadSha: string,
+  candidateHeadSha: string,
+): boolean {
+  if (liveHeadSha !== candidateHeadSha) return false;
+  return check.result !== 'Stale';
 }
 
 /**
