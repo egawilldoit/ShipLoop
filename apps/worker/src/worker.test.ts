@@ -1621,6 +1621,16 @@ test('defect 5: a SIGTERM-ignoring engine child still produces a bounded stop an
 const WORKER_ENTRYPOINT = new URL('./index.ts', import.meta.url).pathname;
 
 /**
+ * The credential the fixture provisions for its own engine, in the shape `codex login --with-api-key`
+ * writes.
+ *
+ * An `apikey` login, deliberately: it carries no refresh token, so there is nothing for the engine and
+ * an operator to rotate between them. Only its presence and its 0600 mode are load-bearing —
+ * `resolveEngineAuthentication` stats the file and refuses anything another account could read.
+ */
+const PROVISIONED_ENGINE_CREDENTIAL = ['{"auth_mode":"apikey","OPENAI_API_KEY":"sk-', 'provisioned-worker-test-key"}'].join('');
+
+/**
  * The workspace the interrupted child worker prepared, as it is left behind.
  *
  * The recovery port has to present this and not the fixture's default: a checkpoint written after
@@ -1644,6 +1654,22 @@ test('N01-AC1: a SIGTERM mid-run leaves durable state consistent, and a restart 
   const database = join(directory, 'worker.db');
   const engineBinary = join(directory, 'engine-under-test.sh');
   const workspaceModule = join(directory, 'workspace-port.mjs');
+  /**
+   * A hermetic engine state root for the child, carrying one credential this test provisioned.
+   *
+   * The shipped entrypoint refuses a run with no engine credential (F15-AC5), and it resolved its
+   * state root from the environment it inherited. Left alone it read the operator's real
+   * `~/.local/state`, so this proof passed only on a host that happened to have a Codex login
+   * provisioned — and the verification harness, which runs every command against an empty temporary
+   * home so no operator credential leaks into a check, refused the child before it claimed anything.
+   * A credential is not what this test is about, so it belongs to the fixture. `auth.json` sits under
+   * `shiploop/codex/codex` because the state root resolves to `<XDG_STATE_HOME>/shiploop/codex` and
+   * `codexHome` is that root's own `codex` child.
+   */
+  const engineStateRoot = join(directory, 'engine-state');
+  const engineCodexHome = join(engineStateRoot, 'shiploop', 'codex', 'codex');
+  await mkdir(engineCodexHome, { recursive: true, mode: 0o700 });
+  await writeFile(join(engineCodexHome, 'auth.json'), PROVISIONED_ENGINE_CREDENTIAL, { mode: 0o600 });
   await mkdir(worktree);
   await writeFile(
     engineBinary,
@@ -1717,6 +1743,7 @@ test('N01-AC1: a SIGTERM mid-run leaves durable state consistent, and a restart 
     stdio: ['ignore', 'pipe', 'pipe'],
     env: {
       ...process.env,
+      XDG_STATE_HOME: engineStateRoot,
       SHIPLOOP_WORKER_DATABASE: database,
       SHIPLOOP_WORKER_HOLDER: 'worker-signal-test',
       SHIPLOOP_WORKER_WORKSPACE_MODULE: workspaceModule,

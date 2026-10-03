@@ -61,7 +61,6 @@ import type { ExecutionPrincipal, IsolationSettings } from './isolation.ts';
 
 const PRINCIPAL_USER = process.env['SHIPLOOP_TEST_ENGINE_PRINCIPAL'] ?? 'shiploop-engine';
 const ENGINE_BINARY = process.env['SHIPLOOP_TEST_ENGINE_BINARY'] ?? '/srv/shiploop/engine-bin/codex';
-const OPERATOR_HOME = process.env['HOME'] ?? '/home/ubuntu';
 const SYNTHETIC_ENV_NAME = 'SHIPLOOP_SYNTHETIC_CREDENTIAL';
 const SYNTHETIC_ENV_VALUE = 'synthetic-value-not-a-real-credential';
 const PROVISIONING_HINT =
@@ -79,6 +78,16 @@ interface Fixture {
   readonly homeRoot: string;
   readonly tempRoot: string;
   readonly workspace: string;
+  /**
+   * A synthetic operator home, seeded by this fixture.
+   *
+   * It stands in for the operator's real home rather than reading `HOME`, because the verification
+   * harness deliberately runs every command against an empty temporary home so no operator
+   * credential leaks into a check (`scripts/lib/command.mjs`). Reading the ambient home made these
+   * assertions vacuous under that harness — the seeded paths simply did not exist — while passing
+   * only on a host whose real home happened to be populated.
+   */
+  readonly operatorHome: string;
   /** 0700, so nothing outside this process may read what is seeded in it. */
   readonly privateDir: string;
   readonly seededSecretFile: string;
@@ -102,6 +111,7 @@ async function withFixture(overrides: (base: IsolationSettings) => IsolationSett
     const homeRoot = join(root, 'home-root');
     const tempRoot = join(root, 'temp-root');
     const workspace = join(root, 'workspace');
+    const operatorHome = join(root, 'operator-home');
     const privateDir = join(root, 'private');
     const databaseFile = join(root, 'state', 'shiploop.sqlite');
     await mkdir(workspace, { recursive: true });
@@ -109,6 +119,25 @@ async function withFixture(overrides: (base: IsolationSettings) => IsolationSett
     await mkdir(join(root, 'state'), { recursive: true });
     await chmod(privateDir, 0o700);
     await chmod(join(root, 'state'), 0o700);
+
+    // Seeded, and deliberately NOT readable by the execution principal: an operator home another uid
+    // can read is the historical failure this boundary exists to prevent, and the launcher refuses
+    // that outright. So the modes here are what a real operator home looks like from outside, and the
+    // assertions below then prove the engine is kept out of material it has no other reason to miss.
+    // Only the config's unreadability is asserted — it has to be a real profile to be worth keeping
+    // out, and its bytes are a plausible `never`-approval profile rather than the unrestricted-sandbox
+    // literal this repository's own policy lint bans.
+    await mkdir(join(operatorHome, '.ssh'), { recursive: true });
+    await mkdir(join(operatorHome, '.codex'), { recursive: true });
+    await writeFile(join(operatorHome, '.ssh', 'id_ed25519'), 'synthetic operator private key\n', { mode: 0o600 });
+    await writeFile(
+      join(operatorHome, '.codex', 'config.toml'),
+      'model = "gpt-5-codex"\napproval_policy = "never"\n',
+      { mode: 0o600 },
+    );
+    await chmod(join(operatorHome, '.ssh'), 0o700);
+    await chmod(join(operatorHome, '.codex'), 0o700);
+    await chmod(operatorHome, 0o700);
 
     const seededSecretFile = join(privateDir, 'seeded-secret.txt');
     const seededDatabaseFile = join(privateDir, 'seeded-authoritative.sqlite');
@@ -125,15 +154,15 @@ async function withFixture(overrides: (base: IsolationSettings) => IsolationSett
       SHIPLOOP_ENGINE_TEMP_ROOT: tempRoot,
       SHIPLOOP_ENGINE_LAUNCHER_ROOT: launcherRoot,
       SHIPLOOP_ENGINE_BINARY: ENGINE_BINARY,
-      SHIPLOOP_ENGINE_OPERATOR_HOME: OPERATOR_HOME,
+      SHIPLOOP_ENGINE_OPERATOR_HOME: operatorHome,
       SHIPLOOP_ENGINE_PROTECTED_PATHS: [
-        join(OPERATOR_HOME, '.ssh'),
-        join(OPERATOR_HOME, '.ssh', 'id_ed25519'),
-        join(OPERATOR_HOME, '.codex', 'config.toml'),
+        join(operatorHome, '.ssh'),
+        join(operatorHome, '.ssh', 'id_ed25519'),
+        join(operatorHome, '.codex', 'config.toml'),
       ].join(':'),
       SHIPLOOP_ENGINE_DATABASE_PATH: databaseFile,
       SHIPLOOP_ENGINE_COMMAND_TIMEOUT_MS: '30000',
-      HOME: OPERATOR_HOME,
+      HOME: operatorHome,
     });
     assert.ok(base.ok, `the fixture settings were refused: ${base.ok ? '' : describeError(base.error)}`);
 
@@ -143,6 +172,7 @@ async function withFixture(overrides: (base: IsolationSettings) => IsolationSett
       homeRoot,
       tempRoot,
       workspace,
+      operatorHome,
       privateDir,
       seededSecretFile,
       seededDatabaseFile,
@@ -265,13 +295,13 @@ test('F03-AC5: the launched child cannot read a seeded secret, the operator .ssh
 
       // Its home is ShipLoop's, so the operator's Codex profile cannot switch its sandbox off.
       assert.equal(report.home, plan.homePath);
-      assert.notEqual(report.home, OPERATOR_HOME);
-      const operatorConfig = join(OPERATOR_HOME, '.codex', 'config.toml');
+      assert.notEqual(report.home, fixture.operatorHome);
+      const operatorConfig = join(fixture.operatorHome, '.codex', 'config.toml');
       assert.ok(!report.environmentNames.includes('CODEX_HOME'), 'the engine was pointed at an operator Codex home');
 
       // Nothing protected was readable: the seeded secrets, the operator's ssh directory and key, and
       // the authoritative database the worker itself owns.
-      for (const path of [fixture.seededSecretFile, fixture.seededDatabaseFile, fixture.privateDir, fixture.databaseFile, join(OPERATOR_HOME, '.ssh'), join(OPERATOR_HOME, '.ssh', 'id_ed25519'), operatorConfig]) {
+      for (const path of [fixture.seededSecretFile, fixture.seededDatabaseFile, fixture.privateDir, fixture.databaseFile, join(fixture.operatorHome, '.ssh'), join(fixture.operatorHome, '.ssh', 'id_ed25519'), operatorConfig]) {
         assert.ok(!report.readable.includes(path), `the launched child could read ${path}`);
       }
 

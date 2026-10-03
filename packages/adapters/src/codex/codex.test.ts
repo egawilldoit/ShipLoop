@@ -448,23 +448,32 @@ test('F03-AC5 an instruction that looks like a shell command stays one argument 
 });
 
 test('F04-AC2 a missing engine binary is reported, and does not take the process down', async () => {
-  const adapter = new CodexEngineAdapter({ connectorId: connectorId('connector_codex_missing'), client: { binary: '/nonexistent/codex-binary' } });
-  const context: AdapterContext = { ...adapterContext('op_codex_missing'), signal: AbortSignal.timeout(20_000) };
-  const started = await adapter.startSession(context, {
-    operationId: operationId('op_codex_missing'),
-    workspace: FIXTURE_WORKSPACE,
-    start: { kind: 'Fresh', instruction: 'do a thing' },
-    mode: 'Headless',
-    grantedCapabilities: ['Git:ReadRepository'],
-    bounds: { activeWallClockMs: 5_000, retryBudget: 1, eventCountLimit: 16 },
-  });
-  // A missing binary surfaces as a Blocked prerequisite, not as an unhandled `error` event that
-  // would abort the worker.
-  assert.equal(started.ok, false);
-  assert.equal(started.ok === false ? started.error.code : null, 'Blocked');
-  const prerequisites = started.ok === false && started.error.code === 'Blocked' ? started.error.prerequisites : [];
-  assert.equal(prerequisites[0]?.name, 'CodexRuntime');
-  await new Promise((resolve) => setTimeout(resolve, 200));
+  // A provisioned credential in a state root of this test's own making, so the prerequisite this
+  // asserts is the missing binary rather than a credential the host happens to carry (F15-AC5).
+  const workspace = tempDir();
+  const stateRoot = join(workspace, 'state');
+  provisionTestCredential(stateRoot, workspace);
+  try {
+    const adapter = new CodexEngineAdapter({ connectorId: connectorId('connector_codex_missing'), client: { binary: '/nonexistent/codex-binary', stateRoot } });
+    const context: AdapterContext = { ...adapterContext('op_codex_missing'), signal: AbortSignal.timeout(20_000) };
+    const started = await adapter.startSession(context, {
+      operationId: operationId('op_codex_missing'),
+      workspace: { ...FIXTURE_WORKSPACE, absolutePath: workspace },
+      start: { kind: 'Fresh', instruction: 'do a thing' },
+      mode: 'Headless',
+      grantedCapabilities: ['Git:ReadRepository'],
+      bounds: { activeWallClockMs: 5_000, retryBudget: 1, eventCountLimit: 16 },
+    });
+    // A missing binary surfaces as a Blocked prerequisite, not as an unhandled `error` event that
+    // would abort the worker.
+    assert.equal(started.ok, false);
+    assert.equal(started.ok === false ? started.error.code : null, 'Blocked');
+    const prerequisites = started.ok === false && started.error.code === 'Blocked' ? started.error.prerequisites : [];
+    assert.equal(prerequisites[0]?.name, 'CodexRuntime');
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  } finally {
+    rmSync(workspace, { recursive: true, force: true });
+  }
 });
 
 test('F15-AC4 a resume without a thread id is refused rather than falling back to --last', async () => {
@@ -1272,10 +1281,12 @@ const SCRIPTED_SUCCESS_BODY = [
 test('F15-AC1, F15-AC2 a scripted turn yields the real thread id, a Succeeded result and reported usage', async () => {
   const engine = scriptedEngine(SCRIPTED_SUCCESS_BODY);
   const workspace = tempDir();
+  const stateRoot = join(workspace, 'state');
+  provisionTestCredential(stateRoot, workspace);
   try {
     const adapter = new CodexEngineAdapter({
       connectorId: connectorId('connector_codex_scripted'),
-      client: { binary: engine.binary },
+      client: { binary: engine.binary, stateRoot },
       sessionStartTimeoutMs: 15_000,
     });
     const context: AdapterContext = { ...adapterContext('op_codex_scripted'), signal: AbortSignal.timeout(30_000) };
@@ -1315,10 +1326,12 @@ test('F15-AC2 a malformed line in a live stream suppresses the completion it pre
     ].join('\n'),
   );
   const workspace = tempDir();
+  const stateRoot = join(workspace, 'state');
+  provisionTestCredential(stateRoot, workspace);
   try {
     const adapter = new CodexEngineAdapter({
       connectorId: connectorId('connector_codex_malformed'),
-      client: { binary: engine.binary },
+      client: { binary: engine.binary, stateRoot },
       sessionStartTimeoutMs: 15_000,
     });
     const context: AdapterContext = { ...adapterContext('op_codex_malformed'), signal: AbortSignal.timeout(30_000) };
@@ -1358,11 +1371,13 @@ test('F15-AC3 a scripted authentication failure arrives as a Blocked result, and
     ].join('\n'),
   );
   const workspace = tempDir();
+  const stateRoot = join(workspace, 'state');
+  provisionTestCredential(stateRoot, workspace);
   try {
     writeFileSync(join(workspace, 'kept.txt'), 'intact', 'utf8');
     const adapter = new CodexEngineAdapter({
       connectorId: connectorId('connector_codex_blocked'),
-      client: { binary: engine.binary },
+      client: { binary: engine.binary, stateRoot },
       sessionStartTimeoutMs: 15_000,
     });
     const context: AdapterContext = { ...adapterContext('op_codex_blocked'), signal: AbortSignal.timeout(30_000) };
@@ -1397,10 +1412,12 @@ test('F15-AC2 a stream that stops without a turn outcome is reported, not comple
     [`printf '%s\\n' '{"type":"thread.started","thread_id":"01a0f699-7149-7d20-831e-98f7b7b43a71"}'`, `printf '%s\\n' '{"type":"turn.started"}'`].join('\n'),
   );
   const workspace = tempDir();
+  const stateRoot = join(workspace, 'state');
+  provisionTestCredential(stateRoot, workspace);
   try {
     const adapter = new CodexEngineAdapter({
       connectorId: connectorId('connector_codex_truncated'),
-      client: { binary: engine.binary },
+      client: { binary: engine.binary, stateRoot },
       sessionStartTimeoutMs: 15_000,
     });
     const context: AdapterContext = { ...adapterContext('op_codex_truncated'), signal: AbortSignal.timeout(30_000) };
@@ -1430,10 +1447,12 @@ test('F18-AC2 the wall-clock bound ends the run as Incomplete rather than waitin
     [`printf '%s\\n' '{"type":"thread.started","thread_id":"01a0f699-7149-7d20-831e-98f7b7b43a71"}'`, `printf '%s\\n' '{"type":"turn.started"}'`, 'sleep 60'].join('\n'),
   );
   const workspace = tempDir();
+  const stateRoot = join(workspace, 'state');
+  provisionTestCredential(stateRoot, workspace);
   try {
     const adapter = new CodexEngineAdapter({
       connectorId: connectorId('connector_codex_budget'),
-      client: { binary: engine.binary, gracefulStopMs: 2_000, killWaitMs: 2_000 },
+      client: { binary: engine.binary, stateRoot, gracefulStopMs: 2_000, killWaitMs: 2_000 },
       sessionStartTimeoutMs: 15_000,
     });
     const context: AdapterContext = { ...adapterContext('op_codex_budget'), signal: AbortSignal.timeout(30_000) };
@@ -1475,10 +1494,11 @@ test('F17-AC1, F17-AC5 a stop reaps the whole spawned process group, SIGTERM-ign
     ].join('\n'),
   );
   const workspace = tempDir();
+  provisionTestCredential(join(workspace, 'state'), workspace);
   try {
     const adapter = new CodexEngineAdapter({
       connectorId: connectorId('connector_codex_stop'),
-      client: { binary: engine.binary, gracefulStopMs: 700, killWaitMs: 5_000 },
+      client: { binary: engine.binary, stateRoot: join(workspace, 'state'), gracefulStopMs: 700, killWaitMs: 5_000 },
       sessionStartTimeoutMs: 15_000,
     });
     const context: AdapterContext = { ...adapterContext('op_codex_stop'), signal: AbortSignal.timeout(40_000) };
@@ -2215,9 +2235,17 @@ test('F03-AC5 CODEX_HOME is a ShipLoop directory, so the operator\'s config.toml
   assert.notEqual(run.childEnvironment['CODEX_HOME'], operatorCodexHome, 'the child inherited the operator CODEX_HOME');
   assert.equal(run.childEnvironment['CODEX_HOME_IS'], run.layout.codexHome);
   assert.equal(run.layout.codexHome, join(run.layout.stateRoot, 'codex'));
-  // The state root is never a temporary directory: Codex refuses to create its PATH-alias helper
-  // binaries there and warns on every run, so a default under TMPDIR would be a broken default.
-  assert.ok(!defaultEngineStateRoot({}).startsWith(tmpdir()), `the default state root is a temporary directory: ${defaultEngineStateRoot({})}`);
+  // The default is ShipLoop's own state directory under XDG state, resolved from an explicit
+  // environment rather than from whatever HOME the runner happens to carry. Codex refuses to create
+  // its PATH-alias helper binaries under a temporary directory, so the rule being proved is that the
+  // root is derived from the state directory — not that some particular host's home is not /tmp.
+  assert.equal(
+    defaultEngineStateRoot({ XDG_STATE_HOME: '/home/operator/.local/state' }),
+    '/home/operator/.local/state/shiploop/codex',
+  );
+  // And it follows XDG when that is set, so the root is the state directory's and never the
+  // operator's own Codex home, which is where an unrestricted sandbox_mode would live.
+  assert.equal(defaultEngineStateRoot({ XDG_STATE_HOME: '/srv/state' }), '/srv/state/shiploop/codex');
 });
 
 test('F15-AC5 the operator\'s rotating login is never copied, re-copied or even read', () => {

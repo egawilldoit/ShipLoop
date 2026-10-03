@@ -93,6 +93,16 @@ test('the fixture greets', () => {
 `;
 
 /**
+ * The credential the fixture provisions for its own engine, in the shape `codex login
+ * --with-api-key` writes.
+ *
+ * An `apikey` login, deliberately: it carries no refresh token, so there is nothing for the engine
+ * and an operator to rotate between them. Only its presence and its 0600 mode are load-bearing —
+ * `resolveEngineAuthentication` stats the file and refuses anything another account could read.
+ */
+const PROVISIONED_ENGINE_CREDENTIAL = ['{"auth_mode":"apikey","OPENAI_API_KEY":"sk-', 'provisioned-runtime-test-key"}'].join('');
+
+/**
  * A real engine process: real Codex JSONL on stdout, a real file written into the workspace it was
  * started in, and a real clean exit (F15-AC1).
  */
@@ -526,6 +536,28 @@ async function withHarness(
     provider,
   };
 
+  /**
+   * A hermetic engine state root holding one credential this fixture provisioned.
+   *
+   * `resolveEngineAuthentication` refuses any run that holds no engine credential (F15-AC5), and the
+   * adapter resolves its state root from `XDG_STATE_HOME`. Left pointing at the ambient environment it
+   * read the operator's real `~/.local/state`, so these delivery proofs passed only on a host that
+   * happened to have a Codex login provisioned, and the verification harness — which runs every command
+   * against an empty temporary home, so that no operator credential leaks into a check — refused them
+   * before any engine ran. The delivery path under test is not the credential, so the credential
+   * belongs to the fixture.
+   *
+   * The path is the one the adapter derives, stated rather than recomputed: the state root resolves to
+   * `<XDG_STATE_HOME>/shiploop/codex`, and `codexHome` is that root's own `codex` child, so
+   * `auth.json` lands under `shiploop/codex/codex`.
+   */
+  const engineStateRoot = join(root, 'engine-state');
+  const engineCodexHome = join(engineStateRoot, 'shiploop', 'codex', 'codex');
+  await mkdir(engineCodexHome, { recursive: true, mode: 0o700 });
+  await writeFile(join(engineCodexHome, 'auth.json'), PROVISIONED_ENGINE_CREDENTIAL, { mode: 0o600 });
+  const previousStateHome = process.env['XDG_STATE_HOME'];
+  process.env['XDG_STATE_HOME'] = engineStateRoot;
+
   const seeded = openDatabase(databasePath);
   assert.ok(seeded.ok, 'the store could not be opened for seeding');
   assert.ok(migrate(seeded.value).ok, 'the store could not be migrated');
@@ -567,6 +599,8 @@ async function withHarness(
   } finally {
     seededRun.close();
     await provider.close();
+    if (previousStateHome === undefined) delete process.env['XDG_STATE_HOME'];
+    else process.env['XDG_STATE_HOME'] = previousStateHome;
     await rm(root, { recursive: true, force: true });
   }
 }

@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
-import { mkdir, mkdtemp, readFile, lstat, readlink, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, lstat, readlink, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { offlineEnv, runCommand, validateCommand } from './command.mjs';
@@ -68,6 +68,18 @@ export async function verify({ cwd, profileName, signal }) {
   const reportDir = join(cwd, '.shiploop-artifacts', 'verify', runId);
   await mkdir(reportDir, { recursive: true, mode: 0o700 });
   const home = await mkdtemp(join(tmpdir(), 'shiploop-check-'));
+  /**
+   * Traversable, unlike the 0700 `mkdtemp` gives.
+   *
+   * This directory is also the command's `TMPDIR`, so a test that builds a fixture under it and then
+   * spawns a child as a *different* uid — the execution-isolation proofs do exactly that — could not
+   * traverse into its own fixture. The probe reported a failure that had nothing to do with the code
+   * under test: it was refused because it could not write into a tree this harness had made
+   * unreachable. Nothing sensitive lives here (it is a fresh empty home for an offline check, and the
+   * report is written 0600 beside it), so the isolation this directory provides is "new every run",
+   * not "unreadable by another uid".
+   */
+  await chmod(home, 0o755);
   const env = offlineEnv({ PATH: process.env.PATH, HOME: home, TMPDIR: home,
     XDG_CONFIG_HOME: join(home, 'config'), XDG_CACHE_HOME: join(home, 'cache'),
     XDG_DATA_HOME: join(home, 'data') });

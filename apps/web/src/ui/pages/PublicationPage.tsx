@@ -217,18 +217,24 @@ export function PublicationPage({ planId, ideaId, projectId, onBackToPlan, epoch
 
   const adopt = async (): Promise<void> => {
     if (adoptState === 'working') return;
+    // Field-level first, then the broader precondition.
+    //
+    // An unnamed issue is the more specific thing the owner can fix in this form, and a refusal has to
+    // name the field it is about (F02-AC4, N03-AC3). Reporting the missing project first would answer
+    // a different question than the one the owner just acted on, and would hide the per-field error
+    // behind a message about somewhere else entirely.
+    if (issueId.trim() === '') {
+      setAdoptErrors({ issueId: 'Name the issue by its provider identity, never by a title (F11-AC3).' });
+      setAdoptMessage('Nothing was adopted because no issue was named (F11-AC1).');
+      setAdoptState('refused');
+      return;
+    }
     if (projectId === null) {
       // Adoption binds a work item to a project, so with none selected there is no identity to
       // address. Refusing here names the fix; sending the empty string would have asked the
       // provider to adopt an issue into a project named "" (F11-AC1, F02-AC1).
       setAdoptErrors({});
       setAdoptMessage('Nothing was adopted: choose a project in the header first. Adoption binds an issue to one project.');
-      setAdoptState('refused');
-      return;
-    }
-    if (issueId.trim() === '') {
-      setAdoptErrors({ issueId: 'Name the issue by its provider identity, never by a title (F11-AC3).' });
-      setAdoptMessage('Nothing was adopted because no issue was named (F11-AC1).');
       setAdoptState('refused');
       return;
     }
