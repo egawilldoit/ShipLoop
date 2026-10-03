@@ -317,11 +317,24 @@ function staleCard(
  *     about another project cannot be read through this project's path (F02-AC2);
  *   - `candidate.headSha` is a full commit SHA, because that is the only acceptable
  *     identity for what is under review (mvp-spec 3);
- *   - every criterion the contract declares appears on the card, and every evidence row
- *     agrees with itself about staleness (F24-AC2);
+ *   - every evidence row agrees with itself about staleness (F24-AC2);
+ *   - **every verdict rests on an observation that counts for this candidate**, which is
+ *     the rule the recorded/current split exists to make enforceable: a criterion, an
+ *     owner test or a check reading `passed` on evidence that no longer describes the
+ *     commit on screen is the stale pass rendered green, and it is refused rather than
+ *     shipped (F20-AC3, F24-AC3);
+ *   - the card's own staleness summary counts exactly the rows that no longer count, so a
+ *     client reading the headline rather than every row is not told a stale candidate is
+ *     current (F20-AC3, F25-AC3);
  *   - an owner test nobody ran reads `pending`: a card claiming `passed` without the
  *     evidence of an owner observation is refused, because no automated result and no
- *     agent may settle the owner's own step (F23-AC1, F25-AC4).
+ *     agent may settle the owner's own step (F23-AC1, F25-AC4);
+ *   - only an acceptance that names this commit and this revision authorises anything
+ *     (F25-AC3, F27-AC3).
+ *
+ * Every one of these is measured rather than assumed, and `review.invariants.test.ts`
+ * answers the port with cards built to fail each one, because a check that has only ever
+ * run against an honest projection has not been shown to work.
  *
  * Returns null after answering the reply, so a caller cannot send a partial body by
  * accident.
@@ -364,6 +377,21 @@ function checkedCard(
     }
   }
 
+  // Every verdict on the card is measured against the one question that matters: does the
+  // observation behind it describe the candidate on screen? Checks, criteria and owner tests
+  // are walked in turn, because a green criterion panel over a stale table is the exact
+  // failure the two-outcome evidence shape was introduced to prevent (F20-AC3, F24-AC3).
+  const verdicts: readonly { readonly what: string; readonly state: string; readonly evidenceId: string | null }[] = [
+    ...card.checks.map((check) => ({ what: `Check "${check.checkId}"`, state: check.result, evidenceId: check.evidenceId })),
+    ...card.criteria.map((criterion) => ({ what: `Criterion ${criterion.criterionId}`, state: criterion.state, evidenceId: criterion.evidenceId })),
+    ...card.ownerTests.map((criterion) => ({ what: `Owner test ${criterion.criterionId}`, state: criterion.state, evidenceId: criterion.evidenceId })),
+  ];
+  for (const verdict of verdicts) {
+    if (!verdictIsSupported(card, verdict, reply)) return null;
+  }
+
+  if (!stalenessSummaryAgrees(card, reply)) return null;
+
   for (const criterion of card.ownerTests) {
     if (criterion.state !== 'pending') continue;
     if (criterion.evidenceId !== null) {
@@ -386,22 +414,104 @@ function checkedCard(
     }
   }
 
+  if (card.decision.outcome !== 'none' && card.decision.decision === null) {
+    refuse(
+      reply,
+      `The card reports the outcome "${card.decision.outcome}" while carrying no decision behind it. A decision the owner cannot read is not a decision they made, and nothing is returned that would let it read as one (F25-AC2).`,
+    );
+    return null;
+  }
   if (card.decision.authorizesCurrentCandidate) {
     const governing = card.decision.decision;
     if (
       governing === null ||
+      governing.kind !== 'accepted' ||
+      card.decision.outcome !== 'accepted' ||
       governing.candidateHeadSha !== card.candidate.headSha ||
       governing.contractRevision !== card.contract.revision
     ) {
       refuse(
         reply,
-        'The card reports a decision that authorises the candidate on screen while naming no decision for this commit and contract revision. An acceptance of an earlier commit authorises nothing (F25-AC3, F27-AC3).',
+        `The card reports a decision that authorises the candidate on screen while naming no acceptance of this commit and contract revision (it names ${governing === null ? 'no decision' : `a ${governing.kind} of ${governing.candidateHeadSha}`}). Only an acceptance authorises anything, and an acceptance of an earlier commit authorises nothing (F25-AC3, F27-AC3).`,
       );
       return null;
     }
   }
 
   return { value: card };
+}
+
+/**
+ * Whether one verdict on the card is standing on an observation that counts.
+ *
+ * The rule, in one place because checks, criteria and owner tests all break the same way:
+ * `passed` requires a named observation that counts for this candidate, and `stale` requires
+ * one that does not. A row that no longer describes the candidate may say `passed` - that is
+ * what `recordedOutcome` is for - but nothing on the card may read `passed` because of it,
+ * and a row that does count cannot be reported as stale either (F20-AC3, F24-AC3).
+ *
+ * A check reading `passed` with no observation at all is the sharpest case: there is nothing
+ * behind the green at all, which is a fabricated pass rather than a stale one (F20-AC2).
+ */
+function verdictIsSupported(
+  card: MvpReviewCardView,
+  verdict: { readonly what: string; readonly state: string; readonly evidenceId: string | null },
+  reply: FastifyReply,
+): boolean {
+  const row = verdict.evidenceId === null ? undefined : card.evidence.find((entry) => entry.evidenceId === verdict.evidenceId);
+  const counts = row !== undefined && row.countsForCurrentCandidate;
+  if (verdict.state === 'passed' && !counts) {
+    const behind =
+      row === undefined
+        ? 'no observation at all'
+        : `evidence ${row.evidenceId}, which no longer describes this candidate (${truncate(row.staleReasons.join('; '))})`;
+    refuse(
+      reply,
+      `${verdict.what} reads passed on ${behind}. What the source said at the time is history; only an observation bound to ${card.candidate.headSha} can stand behind a verdict on this candidate (F20-AC3, F24-AC3).`,
+    );
+    return false;
+  }
+  if (verdict.state === 'stale' && counts) {
+    refuse(
+      reply,
+      `${verdict.what} reads stale on evidence ${verdict.evidenceId ?? 'it names'}, which does describe this candidate. An observation cannot be discounted and counted at once (F20-AC3).`,
+    );
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Whether the card's staleness summary tells the same story as its rows.
+ *
+ * `staleness` is what a client puts at the top of the page, so it has to be derivable from
+ * the rows below it rather than maintained beside them: a card whose rows include a stale
+ * observation while its summary reports nothing stale is a card whose headline contradicts
+ * its table, and the owner would be told a stale candidate is current (F20-AC3, F25-AC3).
+ * Compared as sets, because the summary is a list of identities and their order is not a
+ * claim.
+ */
+function stalenessSummaryAgrees(card: MvpReviewCardView, reply: FastifyReply): boolean {
+  const notCounting = new Set(card.evidence.filter((row) => !row.countsForCurrentCandidate).map((row) => row.evidenceId));
+  const listed = new Set(card.staleness.staleEvidenceIds);
+  const missing = [...notCounting].filter((id) => !listed.has(id));
+  const extra = [...listed].filter((id) => !notCounting.has(id));
+  if (missing.length > 0 || extra.length > 0) {
+    refuse(
+      reply,
+      `The card's staleness summary does not match its evidence. Not counted for this candidate and not listed: ${missing.join(', ') || 'none'}. Listed as stale but counted: ${extra.join(', ') || 'none'}. A client reading the summary rather than every row would be told something the rows contradict (F20-AC3, F25-AC3).`,
+    );
+    return false;
+  }
+  const expected = notCounting.size > 0 || card.staleness.staleDecisionIds.length > 0;
+  if (card.staleness.stale !== expected || (card.staleness.stale && card.staleness.reasons.length === 0)) {
+    refuse(
+      reply,
+      `The card reports staleness=${String(card.staleness.stale)} with ${card.staleness.staleDecisionIds.length} stale decision(s) and ${notCounting.size} stale observation(s), which cannot both be true. A card that is stale says why (F20-AC3).`,
+    );
+    return false;
+  }
+  return true;
 }
 
 /**
