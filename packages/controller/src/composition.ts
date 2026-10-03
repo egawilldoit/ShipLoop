@@ -79,6 +79,7 @@ import {
   ProcedureRepository,
   ProjectProfileRepository,
   ProjectRepository,
+  ProjectSettingsRepository,
   PublicationRepository,
   RequestRepository,
   ScopeRepository,
@@ -145,6 +146,7 @@ import {
 } from './plan-generation.ts';
 import { requireIntakeOwner } from './intake.ts';
 import { createContractUseCases, type ContractUseCases } from './contracts.ts';
+import { createSettingsUseCases, type SettingsUseCases } from './settings.ts';
 
 export interface CompositionRootConfig {
   readonly databasePath: string;
@@ -264,6 +266,14 @@ export interface CompositionRoot {
    */
   readonly contractUseCases: ContractUseCases;
   readonly sessionUseCases: SessionUseCases;
+  /**
+   * Project settings: the optional T3 launch target and a read-only view of the
+   * repository and provider configuration a project already has (mvp-spec 3, L02-AC2).
+   *
+   * Published because the owner's settings screen is exactly this group, and because the
+   * handoff packet's launch button needs the same answer the settings screen shows.
+   */
+  readonly settingsUseCases: SettingsUseCases;
   /** Run start, lifecycle transitions and owner limit decisions (F13, F17, F18). */
   readonly jobUseCases: JobUseCases;
   /** The attention dashboard and acknowledgement (F31). */
@@ -326,6 +336,11 @@ const REQUIRED_TABLES: readonly string[] = [
   // without it, a session read on a database that predates the table fails with an opaque
   // driver error rather than a named startup refusal (F02-AC1).
   'owner_active_project',
+  // The optional per-project settings, including the T3 launch URL. Checked here for the
+  // same reason as the tables above: without it, the settings screen fails with an opaque
+  // driver error on a database that predates the table rather than with a named startup
+  // refusal (mvp-spec 3, L02-AC2).
+  'project_settings',
   // A request and its delivery-contract revisions. Checked here because
   // `RequestRepository` and `ContractRepository` would otherwise fail at the first call
   // rather than at startup, which is the difference between an operator reading a
@@ -1145,6 +1160,21 @@ export function createCompositionRoot(config: CompositionRootConfig): Result<Com
   });
   const connectorUseCases = createConnectorUseCases({ clock: config.clock, connectors, adapters: config.adapters });
   const sessionUseCases = createSessionUseCases({ clock: config.clock, owners });
+  /**
+   * Settings, over the same repositories the profile and connector use cases read.
+   *
+   * Built with no provider, no adapter and no engine: the T3 launch URL is optional and the
+   * MVP journey has to work on a deployment that configured none of them, so a settings save
+   * must not be gated on a capability (L02-AC3).
+   */
+  const settingsUseCases = createSettingsUseCases({
+    clock: config.clock,
+    settings: new ProjectSettingsRepository(database),
+    projects,
+    profiles,
+    connectors,
+    resolveOwner: () => profileUseCases.resolveOwnerActor(),
+  });
   const intakeUseCases = createIntakeUseCases({
     clock: config.clock,
     intake,
@@ -1329,6 +1359,7 @@ export function createCompositionRoot(config: CompositionRootConfig): Result<Com
     intakeUseCases,
     contractUseCases,
     sessionUseCases,
+    settingsUseCases,
     jobUseCases,
     attentionUseCases,
     verificationUseCases,

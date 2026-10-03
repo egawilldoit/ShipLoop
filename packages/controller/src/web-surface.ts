@@ -116,6 +116,7 @@ import type { IdeaDraft } from '@shiploop/domain';
 import type { ControllerClock, OwnerActor } from './profiles.ts';
 import type { StoredSessionRecord } from './sessions.ts';
 import { createProviderRegistry, readProviderConfiguration } from './providers.ts';
+import type { ProjectSettingsView } from './settings.ts';
 import type { AttentionBoard } from './attention.ts';
 import type {
   CancelledRun,
@@ -412,6 +413,71 @@ export interface SurfaceConnectorUseCases {
     readonly reason: string;
     readonly actor: OwnerId;
   }): Promise<Result<SurfaceConnector, DomainError>>;
+}
+
+/**
+ * Project settings as this adapter projects them (mvp-spec 3, L02-AC2, L02-AC3).
+ *
+ * Structurally the controller's own `ProjectSettingsView`, renamed only where the transport
+ * speaks in strings. The projection is a copy of an immutable value rather than a second
+ * place a rule could live: the launch-URL rules, the ownership gate and the credential
+ * omission all happen in `settings.ts`, and this file only translates the result (F03-AC3).
+ */
+export interface SurfaceT3LaunchSetting {
+  readonly configured: boolean;
+  readonly url: string | null;
+}
+
+export interface SurfaceRepositorySetting {
+  readonly configured: boolean;
+  readonly profileVersionId: ProfileVersionId | null;
+  readonly versionNumber: number | null;
+  readonly repository: string | null;
+  readonly baseBranch: string | null;
+  readonly targetBranch: string | null;
+  readonly ticketProvider: string | null;
+  readonly deploymentProvider: string | null;
+  readonly engine: string | null;
+}
+
+/**
+ * One configured provider, without its credential reference (F03-AC3, F32-AC2).
+ *
+ * The contrast with `SurfaceConnector` is deliberate and load-bearing: that view carries the
+ * reference because the connector route is where an owner registered it, and this one cannot,
+ * because a settings response is read by a page that has no business holding a pointer into
+ * the credential store.
+ */
+export interface SurfaceProviderSetting {
+  readonly connectorId: ConnectorId;
+  readonly kind: SurfaceConnectorKind;
+  readonly provider: string;
+  readonly resourceScope: string;
+  readonly credentialReferenceDigest: string;
+  readonly state: SurfaceConnectorState;
+  readonly lastCheckedAt: string | null;
+  readonly lastSuccessAt: string | null;
+}
+
+export interface SurfaceProjectSettings {
+  readonly projectId: string;
+  readonly t3: SurfaceT3LaunchSetting;
+  readonly repository: SurfaceRepositorySetting;
+  readonly providers: readonly SurfaceProviderSetting[];
+  readonly updatedAt: string | null;
+}
+
+export interface SurfaceSettingsUseCases {
+  readSettings(command: {
+    readonly projectId: ProjectId;
+    readonly actor: OwnerId;
+  }): Promise<Result<SurfaceProjectSettings, DomainError>>;
+  updateSettings(command: {
+    readonly projectId: ProjectId;
+    readonly t3Url?: string | null;
+    readonly at: string;
+    readonly actor: OwnerId;
+  }): Promise<Result<SurfaceProjectSettings, DomainError>>;
 }
 
 
@@ -1583,6 +1649,7 @@ export interface ControllerSurface {
   readonly sessions: SurfaceSessionUseCases;
   readonly profiles: SurfaceProfileUseCases;
   readonly connectors: SurfaceConnectorUseCases;
+  readonly settings: SurfaceSettingsUseCases;
   readonly intake: SurfaceIntakeUseCases;
   readonly runs: SurfaceRunUseCases;
   readonly attention: SurfaceAttentionUseCases;
@@ -1945,6 +2012,25 @@ function toSurfaceProfile(version: {
   readonly createdBy: string;
 }): SurfaceProfileVersion {
   return { ...version };
+}
+
+/**
+ * The settings view, projected for the transport (L02-AC2, F03-AC3).
+ *
+ * A copy of an immutable value: the controller has already validated the URL, dropped the
+ * credential references and gated the project, so there is nothing left to decide here. The
+ * identifiers keep their branded types rather than being widened to strings, which is what
+ * lets this surface satisfy the transport's declared port without a cast - the same reason
+ * `SurfaceProfileVersion` carries a `ProfileVersionId`.
+ */
+function toSurfaceSettings(view: ProjectSettingsView): SurfaceProjectSettings {
+  return {
+    projectId: view.projectId,
+    t3: { ...view.t3 },
+    repository: { ...view.repository },
+    providers: view.providers.map((provider) => ({ ...provider })),
+    updatedAt: view.updatedAt,
+  };
 }
 
 /**
@@ -3089,6 +3175,49 @@ export function createControllerSurface(resolve: SurfaceRootResolver): Controlle
           const stored = root.useCases.ownerConnector(command.connectorId, actor);
           if (!stored.ok) return err(stored.error);
           return ok(toSurfaceConnector(stored.value));
+        }),
+    },
+
+    /**
+     * Project settings: the optional T3 launch target, and a read of the configuration
+     * this project already has (mvp-spec 3, L02-AC2, L02-AC3).
+     *
+     * Both commands carry the identity the transport proved, converted once here as every
+     * other group does, and the project from the path. The rules - what a usable T3 URL is,
+     * that a project this deployment does not hold is invisible, that no credential
+     * reference travels - live in `settings.ts`; nothing is restated here.
+     */
+    settings: {
+      readSettings: async (command) =>
+        use((root) => {
+          const actor = ownerActorFor(command.actor);
+          if (!actor.ok) return err(actor.error);
+          const read = root.settingsUseCases.readSettings({ projectId: command.projectId, actor: actor.value });
+          if (!read.ok) return err(read.error);
+          return ok(toSurfaceSettings(read.value));
+        }),
+
+      /**
+       * `t3Url` is passed through as the caller stated it, including `null` for a clear and
+       * absence for "nothing to change". Collapsing those three states here would decide at
+       * the transport what a save means, and the distinction is the use case's (L02-AC3).
+       *
+       * `at` is the transport's instant and is not used for the row: the settings use cases
+       * record writes with the controller's own injected clock, which is the same clock in
+       * one process and keeps one time source in the use case rather than one per caller
+       * (mvp-spec 7).
+       */
+      updateSettings: async (command) =>
+        use((root) => {
+          const actor = ownerActorFor(command.actor);
+          if (!actor.ok) return err(actor.error);
+          const updated = root.settingsUseCases.updateSettings({
+            projectId: command.projectId,
+            ...(command.t3Url === undefined ? {} : { t3Url: command.t3Url }),
+            actor: actor.value,
+          });
+          if (!updated.ok) return err(updated.error);
+          return ok(toSurfaceSettings(updated.value));
         }),
     },
 

@@ -15,6 +15,7 @@ export * from './repositories/scope.ts';
 export * from './repositories/intake.ts';
 export * from './repositories/publication.ts';
 export * from './repositories/candidate-link.ts';
+export * from './repositories/settings.ts';
 export * from './events/inbox.ts';
 export * from './events/outbox.ts';
 export * from './events/operations.ts';

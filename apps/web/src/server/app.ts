@@ -50,6 +50,7 @@ import { registerProjectRoutes } from './routes/projects.ts';
 import { registerPlanningRoutes } from './routes/planning.ts';
 import { registerProfileRoutes } from './routes/profiles.ts';
 import { registerRunRoutes } from './routes/runs.ts';
+import { registerSettingsRoutes } from './routes/settings.ts';
 
 const CONTENT_SECURITY_POLICY = [
   "default-src 'self'",
@@ -122,6 +123,9 @@ export async function buildApp(deps: AppDependencies): Promise<FastifyInstance> 
   registerAttentionRoutes(app, { controller, guard, now });
   registerPlanningRoutes(app, { controller, guard, now });
   registerOwnerTestRoutes(app, { controller, guard });
+  // Last of the project-scoped group, and for the same reason as the rest: the project
+  // identity is part of the path, so settings cannot be addressed without one (mvp-spec 3).
+  registerSettingsRoutes(app, { controller, guard, now });
 
   const staticRoot = config.staticRoot;
   if (staticRoot !== null) {
