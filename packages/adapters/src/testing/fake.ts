@@ -34,6 +34,7 @@ import {
   deriveReadiness,
   err,
   fingerprint,
+  isCommitSha,
   ok,
   outcomeUnknown,
   type CapabilityDeclaration,
@@ -67,6 +68,7 @@ import {
   type ArtifactReference,
   type BrowserFlowSpec,
   type BrowserOutcome,
+  type CandidateGitPort,
   type CheckCompletion,
   type CheckExecutionRecord,
   type CheckExecutionRequest,
@@ -100,6 +102,8 @@ import {
   type GitAdapter,
   type GitRepositoryRef,
   type GitStateRead,
+  type LinkedPullRequestFacts,
+  type ReadLinkedPullRequestRequest,
   type ManagedProgressOutcome,
   type ManagedProgressUpdateRequest,
   type MapCriteriaRequest,
@@ -831,6 +835,26 @@ function requirementFor(name: string, requiredCheckNames: readonly string[]): Pr
   return requiredCheckNames.includes(name) ? 'ProfileRequired' : 'ProviderExtra';
 }
 
+/**
+ * What a scripted `readLinkedPullRequest` reports for one pull request.
+ *
+ * Both commit SHAs are `CommitSha`, so an abbreviation cannot be scripted by accident; the
+ * adapter re-checks at the read anyway, because the point of a fake is to be able to hand a
+ * caller a payload the real adapter would refuse.
+ */
+export interface FakeLinkedPullRequest {
+  readonly number: number;
+  readonly state: 'Open' | 'Closed' | 'Merged';
+  readonly headSha: CommitSha;
+  readonly baseSha: CommitSha;
+  readonly headBranch: string;
+  readonly baseBranch: string;
+  readonly draft: boolean;
+  /** Absent means "the head is in this repository", which is the common case. */
+  readonly headRepository?: string | null;
+  readonly mergedSha?: CommitSha | null;
+}
+
 export class FakeGitAdapter extends FakeAdapterBase implements GitAdapter {
   override readonly kind = 'Git';
 
@@ -1112,6 +1136,79 @@ export class FakeGitAdapter extends FakeAdapterBase implements GitAdapter {
 
   private refuseRepository(repository: GitRepositoryRef): ForbiddenError | null {
     return this.refuseForeignProvider('Git', repository.fullName, repository.provider);
+  }
+
+  /**
+   * The facts a manual candidate link reads, scripted per pull-request number.
+   *
+   * A test scripts these because the interesting transitions — a force push, a close, a
+   * retargeted base — are the *change* between two reads, and a fake that can only report one
+   * fixed state cannot express "the head moved". Scripting is therefore by number, so a case can
+   * replace one entry and read again.
+   */
+  private readonly linkedPullRequests = new Map<number, FakeLinkedPullRequest>();
+
+  /** Replaces what the next read of one pull request reports. */
+  scriptLinkedPullRequest(pullRequest: FakeLinkedPullRequest): void {
+    this.linkedPullRequests.set(pullRequest.number, pullRequest);
+  }
+
+  /**
+   * Reads one pull request by number, as the MVP candidate journey does.
+   *
+   * Distinct from `readState`, which answers a different question: it takes a *branch* and
+   * reports the latest pull request for it. Manual linking names a *number*, so a fake that
+   * only supported the branch form would make the MVP journey untestable.
+   *
+   * With nothing scripted the pull request does not exist, and the read says so. The fake
+   * refuses to invent a resource here: a default that answered for any number would make "the
+   * PR does not exist" unrepresentable, and that is one of the refusals the MVP journey has to
+   * be able to test. `headSha` is validated as a full commit before it is returned, because an
+   * abbreviated identity reaching a candidate is the failure this read exists to prevent
+   * (F20-AC3).
+   */
+  async readLinkedPullRequest(
+    context: AdapterContext,
+    request: ReadLinkedPullRequestRequest,
+  ): Promise<Result<LinkedPullRequestFacts>> {
+    return this.gated<LinkedPullRequestFacts>('Git:ReadRepository', 'readLinkedPullRequest', () => {
+      const foreign = this.refuseRepository(request.repository);
+      if (foreign !== null) return err(foreign);
+      if (request.repository.fullName !== this.repository.fullName) {
+        return err(absent(`${this.provider} has no repository ${request.repository.fullName}.`));
+      }
+      const scripted = this.linkedPullRequests.get(request.pullRequestNumber);
+      if (scripted === undefined) {
+        return err(
+          absent(
+            `${this.provider} has no pull request ${request.pullRequestNumber} in ${this.repository.fullName}. Script one with scriptLinkedPullRequest before reading it.`,
+          ),
+        );
+      }
+      if (!isCommitSha(scripted.headSha) || !isCommitSha(scripted.baseSha)) {
+        return err(
+          unavailable(
+            `${this.provider} reported an abbreviated commit for pull request ${request.pullRequestNumber}, which cannot be candidate identity.`,
+          ),
+        );
+      }
+      return ok({
+        repository: this.repository,
+        providerPullRequestId: providerId(`pull_fixture_${request.pullRequestNumber}`),
+        number: scripted.number,
+        url: `https://fixture.invalid/${this.repository.fullName}/pull/${scripted.number}`,
+        state: scripted.state,
+        draft: scripted.draft,
+        headBranch: scripted.headBranch,
+        headSha: scripted.headSha,
+        baseBranch: scripted.baseBranch,
+        baseSha: scripted.baseSha,
+        headRepository: scripted.headRepository ?? this.repository.fullName,
+        mergedSha: scripted.state === 'Merged' ? (scripted.mergedSha ?? null) : null,
+        mergedAt: null,
+        observedAt: context.clock.now(),
+      });
+    });
   }
 
   private latestPullRequest(): GitStateRead['pullRequest'] {
@@ -2382,3 +2479,16 @@ export type AdapterContractSurface = {
 export type AssertFakesAreContracts = AdapterSet extends AdapterContractSurface
   ? true
   : 'the fakes no longer satisfy the adapter contracts';
+
+/**
+ * Fails to compile unless the fake git adapter also satisfies the MVP candidate port.
+ *
+ * Kept separate from the assertion above because `CandidateGitPort` is a *narrower* thing: the
+ * fake is allowed to keep its write methods for the slices that test them, but it must be able to
+ * stand in for the read-only port a candidate-linking controller is handed. Without this, an
+ * integrator wiring the candidate journey against `AdapterSet` would find only at runtime that
+ * the standard fake cannot answer a pull-request read.
+ */
+export type AssertFakeGitIsACandidatePort = FakeGitAdapter extends CandidateGitPort
+  ? true
+  : 'the fake git adapter can no longer stand in for the read-only candidate port';

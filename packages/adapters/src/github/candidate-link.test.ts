@@ -34,11 +34,15 @@ import {
   FIXED_INSTANT,
   FIXTURE_BASE_SHA,
   FIXTURE_CANDIDATE_FINGERPRINT,
+  FIXTURE_FOREIGN_REPOSITORY,
   FIXTURE_HEAD_SHA,
+  FIXTURE_REPOSITORY,
   FIXTURE_SUPERSEDED_HEAD_SHA,
   adapterContext,
   connectorId,
 } from '../testing/fixtures.ts';
+import { createFakeAdapterSet } from '../testing/fake.ts';
+import type { FakeLinkedPullRequest } from '../testing/fake.ts';
 import type { AdapterContext, GitRepositoryRef, ProviderCheckObservation } from '../contracts/index.ts';
 import { CANDIDATE_PORT_MEMBERS, readOnlyCandidateGit } from '../contracts/candidate-link.ts';
 import { GitHubGitAdapter } from './adapter.ts';
@@ -499,6 +503,91 @@ test('the read-only candidate port exposes exactly the declared reads and nothin
   assert.equal(port.kind, 'Git');
   assert.ok(port.capabilities().declarations.length > 0);
   assert.equal(typeof readOnlyCandidateGit(adapter).readChecks, 'function');
+});
+
+/* -------------------------------------------------------------------------- */
+/* The shared fake can stand in for the port                                   */
+/* -------------------------------------------------------------------------- */
+
+test('the shared fake git adapter answers a candidate read, so an integrator needs no new double', async () => {
+  const set = createFakeAdapterSet();
+  const port = readOnlyCandidateGit(set.git);
+  const repository = FIXTURE_REPOSITORY;
+
+  // A number nobody scripted does not exist. The fake refuses to invent a resource, because
+  // "the pull request does not exist" is one of the refusals the MVP journey must be able to
+  // test and a permissive default would make it unrepresentable.
+  const absent = await errorOf(
+    port.readLinkedPullRequest(adapterContext('op_fake_00'), { repository, pullRequestNumber: 7 }),
+  );
+  assert.equal(absent.code, 'NotFound');
+
+  const script = (overrides: Partial<FakeLinkedPullRequest> = {}): void => {
+    set.git.scriptLinkedPullRequest({
+      number: 7,
+      state: 'Open',
+      headSha: FIXTURE_HEAD_SHA,
+      baseSha: FIXTURE_BASE_SHA,
+      headBranch: 'fixture/head',
+      baseBranch: repository.defaultBranch,
+      draft: false,
+      ...overrides,
+    });
+  };
+
+  script();
+  const initial = await okOf(port.readLinkedPullRequest(adapterContext('op_fake_01'), { repository, pullRequestNumber: 7 }));
+  assert.equal(initial.headSha, FIXTURE_HEAD_SHA);
+  assert.equal(initial.baseSha, FIXTURE_BASE_SHA);
+  assert.equal(initial.state, 'Open');
+  assert.equal(initial.headRepository, repository.fullName);
+
+  // Scripting one entry is how a case expresses "the branch was force-pushed" between two
+  // reads, which is the transition the whole refresh path exists to detect.
+  script({ headSha: FIXTURE_SUPERSEDED_HEAD_SHA });
+  const moved = await okOf(port.readLinkedPullRequest(adapterContext('op_fake_02'), { repository, pullRequestNumber: 7 }));
+  assert.equal(moved.headSha, FIXTURE_SUPERSEDED_HEAD_SHA);
+  assert.notEqual(moved.headSha, initial.headSha);
+
+  // And a close, which an identity-keyed uniqueness rule would otherwise have swallowed.
+  script({ headSha: FIXTURE_SUPERSEDED_HEAD_SHA, state: 'Closed' });
+  const closed = await okOf(port.readLinkedPullRequest(adapterContext('op_fake_03'), { repository, pullRequestNumber: 7 }));
+  assert.equal(closed.state, 'Closed');
+  assert.equal(closed.mergedSha, null);
+
+  // A fork is reported as its own repository, so a controller can refuse it.
+  script({ headRepository: 'someone-else/repo' });
+  const forked = await okOf(port.readLinkedPullRequest(adapterContext('op_fake_06'), { repository, pullRequestNumber: 7 }));
+  assert.equal(forked.headRepository, 'someone-else/repo');
+
+  // A repository this provider does not own is refused before the pull request is addressed.
+  const foreign = await errorOf(
+    port.readLinkedPullRequest(adapterContext('op_fake_05'), { repository: FIXTURE_FOREIGN_REPOSITORY, pullRequestNumber: 7 }),
+  );
+  assert.equal(foreign.code, 'Forbidden');
+});
+
+test('the shared fake refuses to report an abbreviated commit as a candidate', async () => {
+  const set = createFakeAdapterSet();
+  // Scripted past the type with a cast on purpose: the point is that a fake can hand a caller
+  // the payload a real adapter refuses, and that the fake refuses it too.
+  set.git.scriptLinkedPullRequest({
+    number: 7,
+    state: 'Open',
+    headSha: FIXTURE_HEAD_SHA.slice(0, 12) as CommitSha,
+    baseSha: FIXTURE_BASE_SHA,
+    headBranch: 'fixture/head',
+    baseBranch: 'develop',
+    draft: false,
+  });
+  const error = await errorOf(
+    readOnlyCandidateGit(set.git).readLinkedPullRequest(adapterContext('op_fake_short'), {
+      repository: FIXTURE_REPOSITORY,
+      pullRequestNumber: 7,
+    }),
+  );
+  assert.equal(error.code, 'Unavailable');
+  assert.match(error.reason, /abbreviated commit/);
 });
 
 /* -------------------------------------------------------------------------- */
