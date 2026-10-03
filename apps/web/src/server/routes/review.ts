@@ -211,10 +211,19 @@ export function registerReviewRoutes(app: FastifyInstance, options: ReviewRouteO
     const body = parseBody(decisionBody, request.body);
     if (!body.ok) return sendProblem(reply, fieldsProblem(fieldErrorsOf(body.problem)));
 
-    // The card is read before the decision is offered, because the accept gate is the
+    // The card is read before an acceptance is offered, because the accept gate is the
     // card's own `readyForAcceptance` and nothing else may stand in for it. Refusing here
     // reaches no write at all, and the refusal carries the card's outstanding requirements
     // so the owner learns what to do rather than only that the door is shut (F23-AC1).
+    //
+    // The identity is compared *first*, before eligibility, and the order is load-bearing.
+    // A submission prepared against one commit cannot be answered with a report about
+    // another: reading the current card's blockers and returning them as the reason an
+    // acceptance of SHA A failed tells the owner to go and discharge requirements on a
+    // build they never looked at, and never mentions that a push moved the ground. The
+    // domain refuses in this order too - `staleSubmission` runs before the acceptance gate
+    // in `decide` - so the transport and the use case agree on what a stale submission is
+    // rather than answering the same command two different ways (F24-AC4, F25-AC3).
     if (body.value.decision === 'accepted') {
       const current = await options.controller.mvpReview.getReview({
         projectId: params.value.projectId,
@@ -224,6 +233,12 @@ export function registerReviewRoutes(app: FastifyInstance, options: ReviewRouteO
       if (!current.ok) return sendProblem(reply, problemFor(current.error));
       const card = checkedCard(current.value, params.value.projectId, params.value.candidateId, reply);
       if (card === null) return reply;
+      if (
+        card.value.candidate.headSha !== body.value.expectedHeadSha ||
+        card.value.contract.revision !== body.value.expectedContractRevision
+      ) {
+        return sendProblem(reply, problemFor(staleCard(body.value.expectedHeadSha, card.value)));
+      }
       if (!card.value.eligibility.readyForAcceptance) {
         return sendProblem(
           reply,
@@ -237,16 +252,6 @@ export function registerReviewRoutes(app: FastifyInstance, options: ReviewRouteO
             })),
           }),
         );
-      }
-      // A card rendered from a commit other than the one being decided on cannot be the
-      // basis for an acceptance. The use case refuses this too; refusing here means the
-      // stale card is never read as an eligibility statement about a different commit
-      // (F24-AC4, F25-AC3).
-      if (
-        card.value.candidate.headSha !== body.value.expectedHeadSha ||
-        card.value.contract.revision !== body.value.expectedContractRevision
-      ) {
-        return sendProblem(reply, problemFor(staleCard(body.value.expectedHeadSha, card.value)));
       }
     }
 

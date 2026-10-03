@@ -81,6 +81,8 @@ const CANDIDATE_ID = 'cand-checkout';
 const HEAD = 'a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2';
 /** The commit before the push, used for the stale cases. Also a full SHA. */
 const OLD_HEAD = 'f6e5d4c3b2a1f6e5d4c3b2a1f6e5d4c3b2a1f6e5';
+/** The commit a push moves the candidate to. A third full SHA, distinct from both above. */
+const PUSHED_HEAD = '0f1e2d3c4b5a0f1e2d3c4b5a0f1e2d3c4b5a0f1e';
 
 /** No provider is configured: the MVP journey must work with none (mvp-spec MVP). */
 const NO_ADAPTERS: AdapterRegistry = {
@@ -173,10 +175,21 @@ interface Harness {
    * module - is not part of this phase's transport.
    */
   readonly recordAcceptanceFor: (input: { decisionId: string; headSha: string; decidedAt?: string }) => void;
+  /**
+   * Records the candidate row a push produces: the same pull request at a new commit.
+   *
+   * The store mints a candidate identity per observation, so a push is a new row rather
+   * than a rewritten one - which is why it needs its own id, and why the card and decision
+   * helpers take one. Written directly because the GitHub adapter is not part of this
+   * phase's transport (F20-AC3).
+   */
+  readonly push: (input: { candidateId: string; headSha: string }) => void;
   /** Re-reads the card, so a test can prove a refused submission left nothing behind. */
   readonly review: () => Promise<{ readonly status: number; readonly card: MvpReviewCardView | null; readonly raw: string }>;
+  readonly reviewFor: (candidateId: string) => Promise<{ readonly status: number; readonly card: MvpReviewCardView | null; readonly raw: string }>;
   readonly decide: (payload: Record<string, unknown>) => Promise<{ readonly status: number; readonly body: string }>;
   readonly decideIn: (projectId: string, payload: Record<string, unknown>) => Promise<{ readonly status: number; readonly body: string }>;
+  readonly decideOn: (candidateId: string, payload: Record<string, unknown>) => Promise<{ readonly status: number; readonly body: string }>;
   readonly decideWithoutCsrf: (payload: Record<string, unknown>) => Promise<{ readonly status: number; readonly body: string }>;
   /** Moves the injected clock forward, so a later decision really is later. */
   readonly advance: (seconds: number) => void;
@@ -249,24 +262,24 @@ async function harness(options: { readonly content?: ContractContent } = {}): Pr
     'the candidate row the card is read against',
   );
 
-  const reviewUrl = (projectId: string): string =>
-    `/api/projects/${projectId}/candidates/${CANDIDATE_ID}/review`;
-  const decisionUrl = (projectId: string): string =>
-    `/api/projects/${projectId}/candidates/${CANDIDATE_ID}/decision`;
+  const reviewUrl = (projectId: string, candidateId = CANDIDATE_ID): string =>
+    `/api/projects/${projectId}/candidates/${candidateId}/review`;
+  const decisionUrl = (projectId: string, candidateId = CANDIDATE_ID): string =>
+    `/api/projects/${projectId}/candidates/${candidateId}/decision`;
 
-  const readReview = async (projectId: string) => {
+  const readReview = async (projectId: string, candidateId = CANDIDATE_ID) => {
     const response = await app.inject({
       method: 'GET',
-      url: reviewUrl(projectId),
+      url: reviewUrl(projectId, candidateId),
       headers: { cookie: session.cookie },
     });
     return { status: response.statusCode, body: response.body };
   };
 
-  const decideIn = async (projectId: string, payload: Record<string, unknown>) => {
+  const decideIn = async (projectId: string, payload: Record<string, unknown>, candidateId = CANDIDATE_ID) => {
     const response = await app.inject({
       method: 'POST',
-      url: decisionUrl(projectId),
+      url: decisionUrl(projectId, candidateId),
       headers: { cookie: session.cookie, [CSRF_HEADER]: session.csrfToken },
       payload,
     });
@@ -361,8 +374,42 @@ async function harness(options: { readonly content?: ContractContent } = {}): Pr
         raw: response.body,
       };
     },
+    reviewFor: async (candidateId) => {
+      const response = await readReview(PROJECT_ID, candidateId);
+      return {
+        status: response.status,
+        card: parse<{ review?: MvpReviewCardView }>({ body: response.body }).review ?? null,
+        raw: response.body,
+      };
+    },
     decide: (payload) => decideIn(PROJECT_ID, payload),
     decideIn,
+    decideOn: (candidateId, payload) => decideIn(PROJECT_ID, payload, candidateId),
+    push: (input) => {
+      expectOk(
+        new DeliveryCandidateRepository(root.database).record({
+          candidateId: input.candidateId as CandidateId,
+          projectId: PROJECT_ID as ProjectId,
+          requestId: seed.requestId,
+          contractId: seed.contractId,
+          contractRevision: seed.revision,
+          provider: 'github',
+          repository: 'octopus/shop',
+          pullRequestNumber: 42,
+          pullRequestUrl: 'https://example.invalid/octopus/shop/pull/42',
+          baseBranch: 'main',
+          baseSha: OLD_HEAD as CommitSha,
+          headBranch: 'feature/checkout-total',
+          headSha: input.headSha as CommitSha,
+          headRepository: 'octopus/shop',
+          pullRequestState: 'Open',
+          draft: false,
+          observedAt: LATER,
+          correlationId: `push-${input.candidateId}`,
+        }),
+        'the candidate row a push leaves behind',
+      );
+    },
     decideWithoutCsrf,
     advance: (seconds) => {
       instant += seconds * 1000;
@@ -795,6 +842,123 @@ test('F24-AC4, F25-AC3: a decision prepared against an earlier commit is refused
   }
 });
 
+test('F24-AC4, F25-AC3: a changed SHA rejects an acceptance, and the rejection is the conflict rather than a report about the new head', async (t) => {
+  const h = await harness({ content: OWNER_ONLY_CONTENT });
+  t.after(() => h.close());
+
+  // The card the owner rendered and accepted was eligible: the owner test ran against HEAD.
+  h.recordOwnerTest({ evidenceId: 'evid-owner-pass', headSha: HEAD });
+  const ready = await h.review();
+  assert.equal(ready.card?.eligibility.readyForAcceptance, true, 'the card the owner looked at was eligible');
+
+  // Submitting that acceptance a second time, still naming HEAD, is recorded: this is the
+  // baseline, so what follows can only be about staleness.
+  const accepted = await h.decide(decisionBody({ decision: 'accepted', feedback: null }));
+  assert.equal(accepted.status, 200, accepted.body);
+
+  // An acceptance naming the commit before it is a conflict, and it names both identities.
+  const staleSha = await h.decide(
+    decisionBody({ decision: 'accepted', expectedHeadSha: OLD_HEAD, feedback: null }),
+  );
+  assert.equal(staleSha.status, 409, `an acceptance of another commit must conflict: ${staleSha.body}`);
+  const problem = problemOf(staleSha.body);
+  assert.equal(problem.error.code, 'Conflict');
+  assert.equal(problem.error.expected, OLD_HEAD, 'the refusal names the commit that was submitted');
+  assert.equal(problem.error.actual, HEAD, 'and the commit the candidate is actually on');
+
+  // The refusal must not have become a decision about the head on screen. The acceptance
+  // already recorded for HEAD is the governing one, and nothing was added to it.
+  const afterStale = await h.review();
+  assert.equal(afterStale.card?.decision.outcome, 'accepted');
+  assert.equal(afterStale.card?.decision.decision?.candidateHeadSha, HEAD);
+  assert.deepEqual(afterStale.card?.decision.staleDecisions, [], 'no decision was made for another commit');
+
+  // A revision that is not the current one is the same refusal, so a moved revision cannot
+  // ride through the accept gate either.
+  const staleRevision = await h.decide(
+    decisionBody({ decision: 'accepted', expectedContractRevision: 2, feedback: null }),
+  );
+  assert.equal(staleRevision.status, 409, staleRevision.body);
+  assert.equal(problemOf(staleRevision.body).error.code, 'Conflict');
+});
+
+test('F24-AC4: a push moves the ground under an acceptance, and the owner must look again', async (t) => {
+  const h = await harness({ content: OWNER_ONLY_CONTENT });
+  t.after(() => h.close());
+
+  // The owner runs their test and accepts, against HEAD.
+  h.recordOwnerTest({ evidenceId: 'evid-owner-pass', headSha: HEAD });
+  const accepted = await h.decide(decisionBody({ decision: 'accepted', feedback: null }));
+  assert.equal(accepted.status, 200, accepted.body);
+  assert.equal(
+    parse<{ review: MvpReviewCardView }>({ body: accepted.body }).review.decision.authorizesCurrentCandidate,
+    true,
+    'the acceptance authorises the commit it was made against',
+  );
+
+  // A push lands: the same pull request at a new commit, which the store records as a new
+  // candidate identity.
+  h.push({ candidateId: 'cand-checkout-pushed', headSha: PUSHED_HEAD });
+
+  const pushed = await h.reviewFor('cand-checkout-pushed');
+  assert.equal(pushed.status, 200, pushed.raw);
+  assert.equal(pushed.card?.candidate.headSha, PUSHED_HEAD);
+  assert.equal(
+    pushed.card?.decision.outcome,
+    'none',
+    'the acceptance of the earlier commit governs nothing here (F25-AC3)',
+  );
+  assert.equal(
+    pushed.card?.decision.authorizesCurrentCandidate,
+    false,
+    'and it authorises nothing, so no delivery gate may read it as permission (F27-AC3)',
+  );
+  assert.equal(
+    pushed.card?.ownerTests[0]?.state,
+    'pending',
+    'the owner test run against the earlier commit does not settle this one (F25-AC1)',
+  );
+  assert.equal(
+    pushed.card?.eligibility.readyForAcceptance,
+    false,
+    'and the new commit has nothing verified against it yet',
+  );
+
+  // The old page's acceptance is refused against the new commit, and the refusal names both.
+  const stale = await h.decideOn(
+    'cand-checkout-pushed',
+    decisionBody({ decision: 'accepted', expectedHeadSha: HEAD, feedback: null }),
+  );
+  assert.equal(stale.status, 409, `an acceptance of the earlier commit must conflict: ${stale.body}`);
+  const conflict = problemOf(stale.body);
+  assert.equal(conflict.error.code, 'Conflict');
+  assert.equal(conflict.error.expected, HEAD);
+  assert.equal(conflict.error.actual, PUSHED_HEAD, 'the refusal names the commit now on screen');
+
+  // Nothing was recorded against the new commit, and an acceptance naming the new commit
+  // is still refused on its own merits rather than quietly accepted off the old evidence.
+  const stillNone = await h.reviewFor('cand-checkout-pushed');
+  assert.equal(stillNone.card?.decision.outcome, 'none');
+  assert.equal(stillNone.card?.decision.decision, null);
+  const onTheNewCommit = await h.decideOn(
+    'cand-checkout-pushed',
+    decisionBody({ decision: 'accepted', expectedHeadSha: PUSHED_HEAD, feedback: null }),
+  );
+  assert.equal(
+    onTheNewCommit.status,
+    422,
+    `the new commit still needs its own owner test: ${onTheNewCommit.body}`,
+  );
+  assert.equal(problemOf(onTheNewCommit.body).error.code, 'Blocked');
+
+  // And the earlier acceptance is still visible on its own commit, rather than retracted by
+  // the push: history is history, and the owner can see both facts.
+  const original = await h.review();
+  assert.equal(original.card?.candidate.headSha, HEAD);
+  assert.equal(original.card?.decision.outcome, 'accepted');
+  assert.equal(original.card?.decision.authorizesCurrentCandidate, true);
+});
+
 test('F25-AC2: the recorded decision binds the exact commit, revision and kind that were submitted', async (t) => {
   const h = await harness();
   t.after(() => h.close());
@@ -873,6 +1037,23 @@ test('F23-AC1, F25-AC2: Accept is gated on the card\'s own eligibility, and Requ
   assert.ok(
     (problem.error.prerequisites ?? []).some((entry) => entry.detail.includes(OWNER_CRITERION_ID)),
     `the outstanding owner test is named: ${blocked.body}`,
+  );
+
+  // A stale submission is a conflict even while the card is ineligible. Answering it with
+  // this head's outstanding requirements would tell the owner to discharge them on a commit
+  // their submission is not about, and would never mention that the ground moved (F24-AC4).
+  const stale = await h.decide(
+    decisionBody({ decision: 'accepted', expectedHeadSha: OLD_HEAD, feedback: null }),
+  );
+  assert.equal(stale.status, 409, `a stale acceptance must conflict, not report eligibility: ${stale.body}`);
+  const staleProblem = problemOf(stale.body);
+  assert.equal(staleProblem.error.code, 'Conflict');
+  assert.equal(staleProblem.error.expected, OLD_HEAD);
+  assert.equal(staleProblem.error.actual, HEAD);
+  assert.deepEqual(
+    staleProblem.error.prerequisites ?? [],
+    [],
+    'and it carries no eligibility report, because eligibility is a question about the current head',
   );
 
   const afterBlocked = await h.review();
