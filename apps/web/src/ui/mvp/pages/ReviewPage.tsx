@@ -22,7 +22,7 @@
 import { useCallback, useEffect, useState, type ReactElement } from 'react';
 import { formatTimestamp } from '../../api-client.ts';
 import { StatusBadge } from '../../components/StatusBadge.tsx';
-import { fetchReview, fetchReviewQueue, recordDecision } from '../client.ts';
+import { fetchReview, fetchReviewQueue, recordDecision, recordOwnerObservation } from '../client.ts';
 import { Panel, Sha, StateLine, type ViewState } from '../components/StateLine.tsx';
 import { SHA_IDENTITY_NOTE } from '../sha.ts';
 import {
@@ -84,7 +84,7 @@ function Queue({ items, onOpen }: { readonly items: readonly ReviewQueueItem[]; 
   );
 }
 
-function DetailView({ detail }: { readonly detail: ReviewDetail }): ReactElement {
+function DetailView({ detail, onRecorded }: { readonly detail: ReviewDetail; readonly onRecorded: () => void }): ReactElement {
   const counts = reviewCounts(detail);
   const refusals = acceptRefusals(detail);
   const canAccept = refusals.length === 0;
@@ -213,7 +213,11 @@ function DetailView({ detail }: { readonly detail: ReviewDetail }): ReactElement
         )}
       </Panel>
 
-      <Panel id="review-owner-tests" title="Waiting on your own test">
+      <Panel
+        id="review-owner-tests"
+        title="Waiting on your own test"
+        note="A criterion you marked as your own test is judged by you and by nothing else. ShipLoop records what you observed; it never decides whether you were right."
+      >
         {counts.pendingOwnerTests === 0 ? (
           <StateLine
             view="empty"
@@ -224,15 +228,161 @@ function DetailView({ detail }: { readonly detail: ReviewDetail }): ReactElement
           <ul className="connector-list" data-testid="review-pending-owner-tests">
             {detail.pendingOwnerTestCriterionIds.map((id) => (
               <li className="connector__problem" key={id}>
-                {`${id} — you test this one. ShipLoop cannot decide it, and nothing counts it until you record what you observed.`}
+                {`${id} — you test this one. Nothing counts it until you record what you observed.`}
               </li>
             ))}
           </ul>
         )}
+        {/* Kept mounted even once nothing is pending, so the confirmation of a recording the owner
+            has just made is not removed by the very re-read that recorded it. A control that
+            disappears with its own success message tells the owner nothing about what landed. */}
+        <OwnerObservation detail={detail} onRecorded={onRecorded} />
       </Panel>
 
-      <DecisionPanel detail={detail} canAccept={canAccept} refusals={refusals} />
+      <DecisionPanel detail={detail} canAccept={canAccept} refusals={refusals} onRecorded={onRecorded} />
     </>
+  );
+}
+
+/**
+ * The control that lets the owner record what they observed for a criterion only they can judge.
+ *
+ * It sends an *observation*, never a verdict. There is deliberately no "this passed" button: the
+ * vocabulary is "I saw this work" and "I saw this not work", and the server decides what either
+ * one makes the criterion. A client able to assert that a criterion passed would be a client able
+ * to manufacture verification evidence, which is the one thing this product must not permit.
+ *
+ * Every observation carries the environment it was made in, because "it worked locally" and "it
+ * worked on the deployed environment" are different claims about the same criterion.
+ */
+function OwnerObservation({ detail, onRecorded }: { readonly detail: ReviewDetail; readonly onRecorded: () => void }): ReactElement {
+  const [criterionId, setCriterionId] = useState(detail.pendingOwnerTestCriterionIds[0] ?? '');
+  const [observation, setObservation] = useState<'BehaviorConfirmed' | 'BehaviorFailed'>('BehaviorConfirmed');
+  const [environment, setEnvironment] = useState<'Local' | 'Preview' | 'LiveSmoke'>('Local');
+  const [note, setNote] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [message, setMessage] = useState<string | null>(null);
+  const [failure, setFailure] = useState<string | null>(null);
+
+  const pending = detail.pendingOwnerTestCriterionIds;
+  const selected = criterionId === '' || !pending.includes(criterionId) ? (pending[0] ?? '') : criterionId;
+  const nothingPending = pending.length === 0;
+
+  const submit = async (): Promise<void> => {
+    if (busy || selected === '') return;
+    setBusy(true);
+    setMessage(null);
+    setFailure(null);
+    const result = await recordOwnerObservation(detail.candidateId, {
+      criterionId: selected,
+      expectedHeadSha: detail.headSha,
+      observation,
+      environment,
+      note: note.trim() === '' ? null : note.trim(),
+    });
+    setBusy(false);
+    if (!result.ok) {
+      setFailure(`Your observation was not recorded: ${result.error.reason}`);
+      return;
+    }
+    setNote('');
+    setMessage(
+      `Recorded "${observation === 'BehaviorConfirmed' ? 'behaviour confirmed' : 'behaviour not confirmed'}" against ${selected} on ${environment}, for commit ${detail.headSha}. The review has been re-read; the server decides what this makes the criterion.`,
+    );
+    // Last, so the confirmation above is already set when the re-read lands. Re-reading first would
+    // briefly unmount nothing but would leave the panel showing a state one read behind the write.
+    onRecorded();
+  };
+
+  return (
+    <div className="form" data-testid="owner-observation">
+      <div className="field">
+        <label className="field__label" htmlFor="owner-observation-criterion">
+          Which criterion you tested
+        </label>
+        <select
+          className="field__input"
+          id="owner-observation-criterion"
+          value={selected}
+          disabled={busy}
+          onChange={(event) => setCriterionId(event.target.value)}
+        >
+          {pending.map((id) => (
+            <option key={id} value={id}>
+              {id}
+            </option>
+          ))}
+        </select>
+      </div>
+      <div className="field">
+        <label className="field__label" htmlFor="owner-observation-result">
+          What you saw
+        </label>
+        <select
+          className="field__input"
+          id="owner-observation-result"
+          value={observation}
+          disabled={busy}
+          onChange={(event) => setObservation(event.target.value as 'BehaviorConfirmed' | 'BehaviorFailed')}
+        >
+          <option value="BehaviorConfirmed">It behaved as this criterion says</option>
+          <option value="BehaviorFailed">It did not behave as this criterion says</option>
+        </select>
+      </div>
+      <div className="field">
+        <label className="field__label" htmlFor="owner-observation-environment">
+          Where you tested it
+        </label>
+        <select
+          className="field__input"
+          id="owner-observation-environment"
+          value={environment}
+          disabled={busy}
+          aria-describedby="owner-observation-environment-hint"
+          onChange={(event) => setEnvironment(event.target.value as 'Local' | 'Preview' | 'LiveSmoke')}
+        >
+          <option value="Local">Locally</option>
+          <option value="Preview">On a preview</option>
+          <option value="LiveSmoke">On the live deployment</option>
+        </select>
+        <p className="field__hint" id="owner-observation-environment-hint">
+          Stored with the observation, so evidence gathered locally stays labelled local and cannot
+          satisfy a criterion that required deployed behaviour.
+        </p>
+      </div>
+      <div className="field">
+        <label className="field__label" htmlFor="owner-observation-note">
+          Anything to note (optional)
+        </label>
+        <textarea
+          className="field__input field__input--area"
+          id="owner-observation-note"
+          value={note}
+          disabled={busy}
+          onChange={(event) => setNote(event.target.value)}
+        />
+      </div>
+      {failure === null ? null : <StateLine view="error" message={failure} testId="owner-observation-failure" />}
+      {message === null ? null : <StateLine view="ready" message={message} testId="owner-observation-message" />}
+      {nothingPending ? (
+        <StateLine
+          view="empty"
+          message="Nothing is waiting on your own test for this candidate, so there is nothing to record."
+          testId="owner-observation-empty"
+        />
+      ) : null}
+      <div className="form__actions">
+        <button
+          className="button"
+          type="button"
+          disabled={busy || nothingPending}
+          data-testid="record-observation"
+          onClick={() => void submit()}
+        >
+          {busy ? 'Recording…' : 'Record what I observed'}
+        </button>
+      </div>
+    </div>
   );
 }
 
@@ -240,10 +390,19 @@ function DecisionPanel({
   detail,
   canAccept,
   refusals,
+  onRecorded,
 }: {
   readonly detail: ReviewDetail;
   readonly canAccept: boolean;
   readonly refusals: readonly string[];
+  /**
+   * Re-read the review once a decision is recorded.
+   *
+   * Not an optimistic local edit: the recorded state includes what the decision was made against,
+   * and a panel that showed a decision the server had not yet written back would be claiming an
+   * acceptance that nothing durable holds.
+   */
+  readonly onRecorded: () => void;
 }): ReactElement {
   const [feedback, setFeedback] = useState('');
   const [feedbackError, setFeedbackError] = useState<string | undefined>(undefined);
@@ -278,6 +437,10 @@ function DecisionPanel({
         ? `Accepted as ${result.value.decision.decisionId}, against commit ${result.value.decision.headSha} and contract revision ${String(result.value.decision.contractRevision)}. Nothing is merged or deployed: this product ends at your decision.`
         : `Changes requested as ${result.value.decision.decisionId}. The feedback is kept against the commit you tested, and ShipLoop will not accept this commit again on the same evidence.`,
     );
+    // Last, so the confirmation is already rendered when the re-read lands. The recorded decision
+    // itself is never shown from this local state: it comes from the re-read, because a panel
+    // reporting an acceptance the server has not written back would be claiming evidence.
+    onRecorded();
   };
 
   return (
@@ -388,8 +551,12 @@ export function ReviewPage({
 
   useEffect(() => {
     let current = true;
-    setView('loading');
+    // Loading is entered only when there is nothing to show yet. A re-read after the owner's own
+    // action — recording an observation, making a decision — must not blank the panel the action
+    // was made from: the panel holds the outcome being reported, and unmounting it would discard
+    // the confirmation and leave the owner unable to tell whether the write landed.
     if (candidateId !== null) {
+      if (detail === null) setView('loading');
       void fetchReview(candidateId).then((result) => {
         if (!current) return;
         if (!result.ok) {
@@ -407,6 +574,7 @@ export function ReviewPage({
       };
     }
     setDetail(null);
+    if (queue.length === 0) setView('loading');
     void fetchReviewQueue(projectId).then((result) => {
       if (!current) return;
       if (!result.ok) {
@@ -426,6 +594,9 @@ export function ReviewPage({
     return () => {
       current = false;
     };
+    // `detail` and `queue` are read to decide whether to show loading, and are deliberately not
+    // dependencies: adding them would make every re-read set the state this read is deciding.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [candidateId, projectId, epoch, reload]);
 
   return (
@@ -459,7 +630,7 @@ export function ReviewPage({
       ) : null}
 
       {view !== 'ready' ? null : detail !== null ? (
-        <DetailView detail={detail} />
+        <DetailView detail={detail} onRecorded={refresh} />
       ) : queue.length === 0 ? (
         <Panel
           id="review-nothing"

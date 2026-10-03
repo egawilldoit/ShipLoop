@@ -32,6 +32,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { join } from 'node:path';
 import type { Page } from '@playwright/test';
 import { SYNTHETIC_OWNER, SYNTHETIC_PASSWORD, expect, test as base } from './fixtures.ts';
+import { openLegacy } from './legacy-nav.ts';
 
 /** Tables a capture or an archive must never add a row to (F06-AC5). */
 const WORK_TABLES: readonly string[] = ['work_items', 'jobs', 'attempts', 'candidates'];
@@ -126,7 +127,7 @@ async function signInThroughTheForm(page: Page, serverUrl: string): Promise<void
 }
 
 async function openIntake(page: Page): Promise<void> {
-  await page.getByRole('button', { name: 'Intake' }).click();
+  await openLegacy(page, 'intake');
   await expect(page.getByRole('heading', { name: 'Intake', level: 2 })).toBeVisible();
 }
 

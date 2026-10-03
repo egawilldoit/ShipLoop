@@ -145,6 +145,36 @@ export function fetchReview(candidateId: string): Promise<ApiResult<{ readonly r
 }
 
 /**
+ * `POST /api/review/:candidateId/observations` — what the owner observed for one criterion.
+ *
+ * Not a decision and not a check result. It is the only way a criterion whose `verificationType`
+ * is `owner_test` can ever be verified, because the person who can judge it is the owner and
+ * nothing else observed anything. The body carries an *observation*, never a verdict: the server
+ * decides what that observation makes the criterion, so the client has no way to assert that a
+ * criterion passed.
+ *
+ * `observedAgainst` is required rather than optional, because "I tested this locally" and "I
+ * tested this on the deployed environment" are different claims and a criterion that requires
+ * deployed behaviour must not be satisfied by local evidence.
+ */
+export function recordOwnerObservation(
+  candidateId: string,
+  input: {
+    readonly criterionId: string;
+    readonly expectedHeadSha: string;
+    readonly observation: 'BehaviorConfirmed' | 'BehaviorFailed';
+    readonly environment: 'Local' | 'Preview' | 'LiveSmoke';
+    readonly note: string | null;
+  },
+): Promise<ApiResult<{ readonly criterion: { readonly id: string; readonly status: string } }>> {
+  return sendJson(`/api/review/${encodeURIComponent(candidateId)}/observations`, {
+    method: 'POST',
+    csrf: true,
+    body: input,
+  });
+}
+
+/**
  * `POST /api/review/:candidateId/decision` — the owner's decision.
  *
  * `accepted` and `changes_requested` are the only two values the MVP allows, and the server

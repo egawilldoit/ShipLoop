@@ -55,6 +55,7 @@ import { join } from 'node:path';
 import { canonicalize, fingerprint } from '@shiploop/domain';
 import type { Locator, Page } from '@playwright/test';
 import { SYNTHETIC_OWNER, SYNTHETIC_PASSWORD, expect, test as base } from './fixtures.ts';
+import { openLegacy } from './legacy-nav.ts';
 
 const VIEWS = [
   { name: 'phone', width: 375, height: 812 },
@@ -643,9 +644,9 @@ async function startRunThroughTheForm(page: Page, store: ReviewCardStore, workIt
  * prove it renders what it fetched rather than what the store holds (N03-AC3).
  */
 async function openReviewCard(page: Page, workItemId: string): Promise<void> {
-  await page.getByRole('button', { name: 'Needs you', exact: true }).click();
+  await openLegacy(page, 'dashboard');
   await expect(page.getByRole('heading', { name: 'Needs you', level: 2 })).toBeVisible();
-  await page.getByRole('button', { name: 'Runs', exact: true }).click();
+  await openLegacy(page, 'runs');
   await expect(page.getByRole('heading', { name: 'Runs', level: 2 })).toBeVisible();
   await page.locator('li').filter({ hasText: workItemId }).first().getByRole('button').first().click();
   await expect(page.getByTestId('run-job-id')).toBeVisible();
@@ -684,7 +685,7 @@ async function subjectWithCandidate(
   const workItemId = store.seedWorkItem({ projectId: PROJECT, profileVersionId: profile.profileVersionId, now });
 
   await signInThroughTheForm(page, serverUrl);
-  await page.getByRole('button', { name: 'Runs', exact: true }).click();
+  await openLegacy(page, 'runs');
   await expect(page.getByRole('heading', { name: 'Runs', level: 2 })).toBeVisible();
 
   await fillStartForm(page, { workItemId, operationId: uniqueOperationId() });
@@ -1056,7 +1057,7 @@ test.describe('the owner test control', () => {
     const workItemId = store.seedWorkItem({ projectId: PROJECT, profileVersionId: profile.profileVersionId, now });
 
     await signInThroughTheForm(page, serverUrl);
-    await page.getByRole('button', { name: 'Runs', exact: true }).click();
+    await openLegacy(page, 'runs');
     await expect(page.getByRole('heading', { name: 'Runs', level: 2 })).toBeVisible();
     await fillStartForm(page, { workItemId, operationId: uniqueOperationId() });
     await startRunThroughTheForm(page, store, workItemId);

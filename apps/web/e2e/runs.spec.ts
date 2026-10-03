@@ -43,6 +43,7 @@ import { join } from 'node:path';
 import { canonicalize, fingerprint } from '@shiploop/domain';
 import type { Page } from '@playwright/test';
 import { SYNTHETIC_OWNER, SYNTHETIC_PASSWORD, expect, test as base } from './fixtures.ts';
+import { openLegacy } from './legacy-nav.ts';
 
 const VIEWS = [
   { name: 'phone', width: 375, height: 812 },
@@ -596,7 +597,7 @@ async function signInThroughTheForm(page: Page, serverUrl: string): Promise<void
 }
 
 async function openRuns(page: Page): Promise<void> {
-  await page.getByRole('button', { name: 'Runs', exact: true }).click();
+  await openLegacy(page, 'runs');
   await expect(page.getByRole('heading', { name: 'Runs', level: 2 })).toBeVisible();
 }
 
@@ -666,7 +667,7 @@ async function startRunThroughTheForm(page: Page, store: RunStore, workItemId: s
  * it fetched, not what the store holds.
  */
 async function reopenRun(page: Page, workItemId: string): Promise<void> {
-  await page.getByRole('button', { name: 'Needs you', exact: true }).click();
+  await openLegacy(page, 'dashboard');
   await expect(page.getByRole('heading', { name: 'Needs you', level: 2 })).toBeVisible();
   await openRuns(page);
   await page.locator('li').filter({ hasText: workItemId }).first().getByRole('button').first().click();
@@ -1152,7 +1153,7 @@ test.describe('attention dashboard', () => {
 
     // A run in flight is a Working item, derived from the queue rather than supplied by a
     // caller, which is the whole claim F31-AC1 makes (F31-AC1).
-    await page.getByRole('button', { name: 'Needs you', exact: true }).click();
+    await openLegacy(page, 'dashboard');
     await expect(page.getByRole('heading', { name: 'Needs you', level: 2 })).toBeVisible();
 
     // All four buckets are present whatever they hold, so "nothing is waiting on you here" is an
@@ -1182,9 +1183,9 @@ test.describe('attention dashboard', () => {
       now,
     });
     moveToBlocked(store, job.job_id, now, 'the e2e engine binary is not installed');
-    await page.getByRole('button', { name: 'Runs', exact: true }).click();
+    await openLegacy(page, 'runs');
     await openRuns(page);
-    await page.getByRole('button', { name: 'Needs you', exact: true }).click();
+    await openLegacy(page, 'dashboard');
 
     const needsInput = page.getByRole('region', { name: 'Needs your input' });
     await expect(needsInput).toContainText('is blocked');
@@ -1223,7 +1224,7 @@ test.describe('attention dashboard', () => {
     await expect(page.getByTestId('run-start-state')).not.toHaveAttribute('data-state', 'refused');
     moveToRunning(store, started.job_id, now);
 
-    await page.getByRole('button', { name: 'Needs you', exact: true }).click();
+    await openLegacy(page, 'dashboard');
     const working = page.getByRole('region', { name: 'Working' });
     await expect(working).toContainText('is Running');
     await expect(working.getByRole('button', { name: 'Acknowledge this item' })).toHaveCount(0);
@@ -1546,7 +1547,7 @@ test.describe('responsive layout', () => {
       expect(measurement.scrollWidth, 'a full commit SHA must not widen the layout').toBe(measurement.clientWidth);
 
       // The board is measured too, because its items carry the longest text on the page.
-      await page.getByRole('button', { name: 'Needs you', exact: true }).click();
+      await openLegacy(page, 'dashboard');
       await expect(page.getByRole('heading', { name: 'Needs you', level: 2 })).toBeVisible();
       await page.waitForLoadState('networkidle');
       const board = await page.evaluate(() => ({
@@ -1683,7 +1684,7 @@ test.describe('accessibility', () => {
       await route.continue();
     });
     await page.reload();
-    await page.getByRole('button', { name: 'Runs', exact: true }).click();
+    await openLegacy(page, 'runs');
     const loading = page.locator('#run-list-title ~ .state-line').first();
     await expect(loading).toHaveText('Loading runs…');
     await expect(loading).toHaveAttribute('data-state', 'loading');

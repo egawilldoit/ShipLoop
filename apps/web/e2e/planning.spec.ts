@@ -34,6 +34,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { join } from 'node:path';
 import type { Page } from '@playwright/test';
 import { SESSION_COOKIE_NAME, SYNTHETIC_OWNER, SYNTHETIC_PASSWORD, expect, test as base } from './fixtures.ts';
+import { openLegacy } from './legacy-nav.ts';
 
 const VIEWS = [
   { name: 'phone', width: 375, height: 812 },
@@ -83,7 +84,7 @@ async function signInThroughTheForm(page: Page, serverUrl: string): Promise<void
 }
 
 async function openPlanTab(page: Page): Promise<void> {
-  await page.getByRole('button', { name: 'Plan', exact: true }).click();
+  await openLegacy(page, 'plan');
   await expect(page.getByRole('heading', { name: 'Plan and readiness', level: 2 })).toBeVisible();
 }
 
@@ -108,6 +109,12 @@ interface Session {
 async function captureThroughForm(page: Page, rawRequest: string): Promise<{ readonly ideaId: string; readonly session: Session }> {
   const origin = new URL(page.url()).origin;
   const session = await sessionFromBrowser(page, origin);
+  // Reaching the capture form is part of capturing through it. The shell used to open on Intake,
+  // so a signed-in page was already showing this field; the MVP's default surface is Home, and
+  // relying on a default that the product now states differently would make every test below
+  // depend on which surface happens to be first.
+  await openLegacy(page, 'intake');
+  await expect(page.getByRole('heading', { name: 'Intake', level: 2 })).toBeVisible();
   await page.getByLabel('The request, in your own words').fill(rawRequest);
   await page.getByRole('button', { name: 'Capture this request' }).click();
   await expect(page.locator('[data-testid="raw-request"]')).toHaveText(rawRequest);
@@ -137,7 +144,7 @@ async function captureThroughForm(page: Page, rawRequest: string): Promise<{ rea
  * address (F08-AC1).
  */
 async function openPlanForRequest(page: Page, requestFragment: string): Promise<void> {
-  await page.getByRole('button', { name: 'Intake', exact: true }).click();
+  await openLegacy(page, 'intake');
   await expect(page.getByRole('heading', { name: 'Intake', level: 2 })).toBeVisible();
   await page
     .locator('li')
@@ -353,7 +360,7 @@ test.describe('the proposed plan', () => {
 
     // F08-AC3: publication is a separate screen and it is refused until something is
     // accepted, so the two screens read the same stored plan rather than separate state.
-    await page.getByRole('button', { name: 'Publication', exact: true }).click();
+    await openLegacy(page, 'publication');
     await expect(page.getByRole('heading', { name: 'Publication and adoption', level: 2 })).toBeVisible();
     await expect(page.locator('[data-testid="publishable-count"]')).toContainText('1 accepted');
     await expect(page.getByRole('button', { name: 'Publish the accepted proposals' })).toBeEnabled();
@@ -362,7 +369,7 @@ test.describe('the proposed plan', () => {
     await page.getByRole('button', { name: 'Remove "Every readiness area is on screen with its reason."' }).click();
     await expect(page.locator('[data-testid="plan-revision"]')).toContainText('3');
 
-    await page.getByRole('button', { name: 'Publication', exact: true }).click();
+    await openLegacy(page, 'publication');
     await expect(page.locator('[data-testid="publishable-count"]')).toContainText('No proposal on this plan is accepted');
     // F08-AC3: the control is not offered as available, because an unaccepted proposal
     // has no publishable representation at all.
@@ -480,7 +487,7 @@ test.describe('the readiness assessment', () => {
 test.describe('publication and adoption', () => {
   test('adoption reads existing work and offers no merge control (F11-AC1, F11-AC3)', async ({ page, serverUrl }) => {
     await signInThroughTheForm(page, serverUrl);
-    await page.getByRole('button', { name: 'Publication', exact: true }).click();
+    await openLegacy(page, 'publication');
     await expect(page.getByRole('heading', { name: 'Publication and adoption', level: 2 })).toBeVisible();
 
     const adoption = page.getByRole('region', { name: 'Adopt an issue that already exists' });
@@ -510,7 +517,7 @@ test.describe('publication and adoption', () => {
     serverUrl,
   }) => {
     await signInThroughTheForm(page, serverUrl);
-    await page.getByRole('button', { name: 'Publication', exact: true }).click();
+    await openLegacy(page, 'publication');
 
     await page.getByLabel('Issue identity').fill('   ');
     await page.getByRole('button', { name: 'Adopt this existing issue' }).click();
