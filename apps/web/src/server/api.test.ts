@@ -95,7 +95,9 @@ import {
   type DeclinedExtensionView,
   type GrantedExtensionView,
   type HandoffView,
+  type MvpOwnerTestReportView,
   type MvpReviewCardView,
+  type MvpVerificationReportView,
   type PausedRunView,
   type PlanTaskView,
   type PlanView,
@@ -1349,6 +1351,56 @@ class InMemoryController implements ControllerSurface {
       readonly feedback: string | null;
     }): Promise<Result<MvpReviewCardView, DomainError>> => {
       const scripted = this.takeScripted('decide');
+      if (scripted !== null) return { ok: false, error: scripted };
+      return {
+        ok: false,
+        error: {
+          code: 'NotFound',
+          reason: `This project holds no candidate ${command.candidateId} (F02-AC2).`,
+        },
+      };
+    },
+
+    /**
+     * Refuses by name rather than assembling a report.
+     *
+     * The same reason as the two methods above, and one more: a verification report is a set of
+     * verdicts derived from a provider read. A double that produced one would be inventing the
+     * very fact the endpoint exists to establish, so the scripted-refusal path is the only thing
+     * this surface can answer. What the server does with real provider facts is proven against the
+     * real controller in `routes/verification.test.ts` (F20-AC2, F23-AC1).
+     */
+    recordVerification: async (command: {
+      readonly projectId: string;
+      readonly candidateId: string;
+      readonly actor: string;
+      readonly correlationId: string;
+    }): Promise<Result<MvpVerificationReportView, DomainError>> => {
+      const scripted = this.takeScripted('recordVerification');
+      if (scripted !== null) return { ok: false, error: scripted };
+      return {
+        ok: false,
+        error: {
+          code: 'NotFound',
+          reason: `This project holds no candidate ${command.candidateId} (F02-AC2).`,
+        },
+      };
+    },
+
+    /**
+     * Refuses by name for the same reason, with the addition that an owner observation is the one
+     * thing a double must never appear to have produced: it would read as the owner's own hand
+     * (F25-AC4).
+     */
+    recordOwnerTest: async (command: {
+      readonly projectId: string;
+      readonly candidateId: string;
+      readonly actor: string;
+      readonly criterionId: string;
+      readonly outcome: 'passed' | 'failed';
+      readonly note: string | null;
+    }): Promise<Result<MvpOwnerTestReportView, DomainError>> => {
+      const scripted = this.takeScripted('recordOwnerTest');
       if (scripted !== null) return { ok: false, error: scripted };
       return {
         ok: false,
@@ -4397,7 +4449,10 @@ test('the loaded controller module is validated before it can serve a request', 
     // The review card and the owner decision, for the same reason: an MVP whose journey ends
     // at Accept or Request Changes needs both methods declared on the surface, or the step
     // that ends the journey is unreachable from any shipped path (F24-AC2, F25-AC2).
-    mvpReview: { getReview() {}, decide() {} },
+    // Both evidence paths are declared here too. A surface that omits them would pass every other
+    // assertion here while leaving a criterion with no shipped way to leave `unverified`, which is
+    // the invisibility this guard exists to prevent (F20-AC2, F23-AC1).
+    mvpReview: { getReview() {}, decide() {}, recordVerification() {}, recordOwnerTest() {} },
     sessions: { loadByToken() {}, create() {}, revoke() {}, touch() {} },
     profiles: { saveVersion() {}, currentVersion() {}, listVersions() {} },
     connectors: { register() {}, listForProject() {}, revoke() {} },
@@ -4501,6 +4556,18 @@ test('the loaded controller module is validated before it can serve a request', 
     isControllerSurface(missingReviewDecision),
     false,
     'a review group without the decision must not pass the guard: the step that ends the MVP journey would be unreachable (F25-AC2)',
+  );
+  const missingVerification = { ...complete, mvpReview: { getReview() {}, decide() {}, recordOwnerTest() {} } };
+  assert.equal(
+    isControllerSurface(missingVerification),
+    false,
+    'a review group without the automated verification path must not pass the guard: no criterion could ever leave `unverified` from a shipped path (F20-AC2)',
+  );
+  const missingOwnerTest = { ...complete, mvpReview: { getReview() {}, decide() {}, recordVerification() {} } };
+  assert.equal(
+    isControllerSurface(missingOwnerTest),
+    false,
+    'a review group without the owner-test path must not pass the guard: no owner test could ever leave `pending` (F23-AC1)',
   );
 });
 test('F01-AC1: a request over the body limit is refused with its own status', async (t) => {

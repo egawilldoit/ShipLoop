@@ -129,7 +129,12 @@ import type {
   RunWriter,
 } from './jobs.ts';
 import type { ReviewCard } from './verification.ts';
-import type { MvpReviewCard } from './mvp-review-card.ts';
+import type {
+  MvpOwnerTestReport,
+  MvpRecordedObservationReport,
+  MvpReviewCard,
+  MvpVerificationReport,
+} from './mvp-review-card.ts';
 import type { OwnerObservationRecord, OwnerObservationTarget, OwnerObservationUseCases } from './owner-tests.ts';
 import { SqliteOwnerObservationJournal, createOwnerObservationUseCases } from './owner-tests.ts';
 import { SqliteObservationJournal } from './verification.ts';
@@ -1737,6 +1742,18 @@ export interface SurfaceHandoffUseCases {
 export type SurfaceMvpReviewCard = MvpReviewCard;
 
 /**
+ * One automated observation, as the transport receives it.
+ *
+ * Aliases rather than a third transcription, for the reason `SurfaceMvpReviewCard` is: the card and
+ * the report have to agree field for field or a client can be handed a row whose two outcomes
+ * disagree about staleness. `web-surface.test.ts` asserts that agreement against both
+ * declarations (F20-AC3, F24-AC3).
+ */
+export type SurfaceMvpRecordedObservation = MvpRecordedObservationReport;
+export type SurfaceMvpVerificationReport = MvpVerificationReport;
+export type SurfaceMvpOwnerTestReport = MvpOwnerTestReport;
+
+/**
  * The MVP review card and the owner's Accept / Request Changes decision (F24, F25).
  *
  * Two methods, and no `merge`, `deploy` or provider write: the MVP ends at the owner
@@ -1759,6 +1776,36 @@ export interface SurfaceMvpReviewUseCases {
     readonly expectedContractRevision: number;
     readonly feedback: string | null;
   }): Promise<Result<SurfaceMvpReviewCard, DomainError>>;
+  /**
+   * Records the provider's check results for a candidate.
+   *
+   * `correlationId` is the only member about the call rather than about the candidate, and there is
+   * deliberately **no result, no outcome and no check id**: this adapter derives every verdict from
+   * the provider read the controller performs. A command member that carried a result would make
+   * "the browser says criterion X passed" expressible at the port, which is the one thing this
+   * method must never be (F20-AC2, F23-AC1).
+   */
+  recordVerification(command: {
+    readonly projectId: string;
+    readonly candidateId: string;
+    readonly actor: string;
+    readonly correlationId: string;
+  }): Promise<Result<SurfaceMvpVerificationReport, DomainError>>;
+  /**
+   * Records the owner's own test outcome.
+   *
+   * Two members from the caller and no more: the criterion and the outcome the owner reports. The
+   * owner is the identity the transport proved, and the instant is the controller's clock, so a
+   * body can neither attribute the observation to somebody else nor backdate it (F01-AC1, F25-AC4).
+   */
+  recordOwnerTest(command: {
+    readonly projectId: string;
+    readonly candidateId: string;
+    readonly actor: string;
+    readonly criterionId: string;
+    readonly outcome: 'passed' | 'failed';
+    readonly note: string | null;
+  }): Promise<Result<SurfaceMvpOwnerTestReport, DomainError>>;
 }
 
 /** The whole injected surface. One argument, so a missing use case is a type error. */
@@ -3230,6 +3277,57 @@ export function createControllerSurface(resolve: SurfaceRootResolver): Controlle
           });
           if (!decided.ok) return err(decided.error);
           return ok(decided.value);
+        }),
+
+      /**
+       * Reads the provider and records what it said (F20-AC2, F20-AC3, F23-AC1).
+       *
+       * The command carries no result and this adapter supplies none: the verdict comes from the
+       * controller's own provider read and from `recordGitHubProjection`'s mapping, both of which
+       * run inside `recordVerification`. The report is the controller's own object passed through,
+       * so the `recordedOutcome` / `currentOutcome` pair a client renders from is the pair the
+       * projection computed rather than a second opinion formed here (F24-AC3).
+       *
+       * The actor is the identity the transport proved, built here so a body cannot name one
+       * (F01-AC1).
+       */
+      recordVerification: async (command) =>
+        use(async (root) => {
+          const actor = ownerActorFor(command.actor);
+          if (!actor.ok) return err(actor.error);
+          const recorded = await root.mvpReviewCardUseCases.recordVerification({
+            projectId: command.projectId,
+            candidateId: command.candidateId,
+            actor: { role: 'owner', ownerId: command.actor as OwnerId },
+            correlationId: command.correlationId,
+          });
+          if (!recorded.ok) return err(recorded.error);
+          return ok(recorded.value);
+        }),
+
+      /**
+       * The owner's own test of one criterion (F23-AC1, F25-AC4).
+       *
+       * `outcome` is the owner's report and reaches the domain unchanged; `observedAt` is the
+       * controller's clock, stamped inside the use case, so the record cannot be backdated and no
+       * instant from the request survives into the evidence row. Whether the criterion is an owner
+       * test at all is the domain's refusal, with its text (F23-AC1).
+       */
+      recordOwnerTest: async (command) =>
+        use(async (root) => {
+          const actor = ownerActorFor(command.actor);
+          if (!actor.ok) return err(actor.error);
+          const recorded = await root.mvpReviewCardUseCases.recordOwnerTest({
+            projectId: command.projectId,
+            candidateId: command.candidateId,
+            actor: { role: 'owner', ownerId: command.actor as OwnerId },
+            criterionId: command.criterionId,
+            outcome: command.outcome,
+            note: command.note,
+            correlationId: `http-owner-test-${command.actor}`,
+          });
+          if (!recorded.ok) return err(recorded.error);
+          return ok(recorded.value);
         }),
     },
 

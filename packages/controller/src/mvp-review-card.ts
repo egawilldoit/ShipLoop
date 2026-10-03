@@ -32,17 +32,34 @@
  *     candidate. An acceptance of SHA A therefore refuses to become an acceptance of SHA B
  *     (F24-AC4, F25-AC3).
  *
- * The evidence a check or an owner test produces is *not* written here: no HTTP route in the
- * minimal MVP records one, so `recordEvidence` and `recordOwnerTest` are reachable only from the
- * use cases. That is a gap in the phase's transport contract rather than a choice, and the read
- * model answers honestly in the meantime - a criterion nobody observed reads `unverified` and an
- * owner test reads `pending`, so nothing on the card can look accepted (F24-AC3).
+ * ## The two evidence paths, and why they are two
+ *
+ * `recordVerification` and `recordOwnerTest` are the only things here that turn an observation
+ * into a stored `MvpRecordedEvidence` row reachable from the shipped transport, and they are
+ * deliberately not one function with a flag:
+ *
+ *   - **`recordVerification` derives its result.** It reads the provider live, hands the facts to
+ *     the verification package's `recordGitHubProjection`, and passes the outcome that function
+ *     produced to `recordEvidence`. No member of its command carries a result: the observation
+ *     vocabulary has no "claimed" member, so a caller that believes it chose the outcome is told
+ *     the outcome is not its to choose (F20-AC2, F23-AC1).
+ *   - **`recordOwnerTest` accepts one, because the owner's own test is not a measurement.** There
+ *     is no provider to read it from, so `outcome` is the owner's report and only the owner may
+ *     file it. The criterion must still be one the contract declares `owner_test`, so choosing the
+ *     weaker verification for one's own work is refused rather than accepted (F23-AC1, F25-AC4).
+ *
+ * Both bind the six facts the domain requires - project, request, contract revision, criterion or
+ * check, candidate and *full* candidate SHA - and both derive the commit from the stored candidate
+ * row rather than from the caller, because "which candidate is this evidence about" has exactly
+ * one answer and the caller is not the authority on it (F20-AC3, F24-AC4).
  */
 
-import { randomUUID } from 'node:crypto';
-import { requireMvpOwner } from '@shiploop/domain';
+import { createHash, randomUUID } from 'node:crypto';
+import { isCommitSha, requireMvpOwner } from '@shiploop/domain';
 import type {
+  CandidateCheckStatus,
   CandidateId,
+  CheckResult,
   ContractId,
   ContractStatus,
   CriterionVerificationMethod,
@@ -54,15 +71,25 @@ import type {
   MvpContractView,
   MvpCriterionResultView,
   MvpDecisionView,
+  MvpEvidenceObservation,
+  MvpRecordedEvidence,
   MvpReviewReadModel,
   MvpRequestView,
+  OwnerId,
   ProjectId,
   Request,
   RequestId,
   Result,
 } from '@shiploop/domain';
+import { recordGitHubProjection } from '@shiploop/verification';
+import type {
+  GitHubCandidateProjection,
+  GitHubCheckProjection,
+  GitHubProjectionTarget,
+} from '@shiploop/verification';
 import { createMvpReviewUseCases, type MvpReviewFacts, type MvpReviewUseCases } from './mvp-review.ts';
 import type { ControllerClock } from './profiles.ts';
+import type { CandidateView } from './candidate-linking.ts';
 import type {
   CandidateLinkStore,
   ContractStore,
@@ -322,9 +349,132 @@ export interface RecordMvpOwnerDecisionCommand extends ReadMvpReviewCommand {
   readonly feedback: string | null;
 }
 
+/**
+ * The live provider read the automated verification path derives its results from.
+ *
+ * Narrowed to what this module needs - an owner identity, the project and the request - rather
+ * than to the candidate module's own `readCandidate` input, so this seam does not drag the
+ * run-scoped `OwnerActor` vocabulary into a contract-revision review.
+ *
+ * `null` means this deployment composed no read-only git provider at all, which is a different
+ * fact from a provider that refused the read: the first is answered with a named `Unavailable` at
+ * the operation and records nothing, the second arrives as whatever the provider returned
+ * (F03-AC2, F20-AC2).
+ *
+ * The reader is expected to contact the provider rather than answer from a stored row. That is
+ * what makes what it returns an observation of the commit the candidate currently holds, and it is
+ * why `recordVerification` records nothing at all when it cannot be reached.
+ */
+export type MvpLiveCandidateReader = (input: {
+  readonly ownerId: OwnerId;
+  readonly projectId: ProjectId;
+  readonly requestId: string;
+  readonly correlationId: string;
+}) => Promise<Result<CandidateView, DomainError>>;
+
+/**
+ * Record the provider's check results for a candidate.
+ *
+ * There is deliberately **no result, no outcome and no check id on this command**. The server
+ * derives every one of them from the provider read below, so this schema cannot be widened into a
+ * way for a client to assert that something passed. `correlationId` is the only member about this
+ * call rather than about the candidate, and it is the transport's own trace identity (F20-AC2).
+ */
+export interface RecordMvpVerificationCommand {
+  readonly projectId: string;
+  readonly candidateId: string;
+  readonly actor: MvpActor;
+  readonly correlationId: string;
+}
+
+/**
+ * Record what the owner says they observed.
+ *
+ * `outcome` is the one member a caller supplies a verdict through, and it is here because the
+ * owner's own test is an observation rather than a measurement: there is no provider to read it
+ * from. Two members and no third - no owner, no commit, no instant and no way to name a
+ * criterion's verification type - so this command cannot attribute the observation to somebody
+ * else, backdate it, or discharge an automated criterion (F01-AC1, F23-AC1, F25-AC4).
+ */
+export interface RecordMvpOwnerTestCommand {
+  readonly projectId: string;
+  readonly candidateId: string;
+  readonly actor: MvpActor;
+  readonly criterionId: string;
+  readonly outcome: 'passed' | 'failed';
+  readonly note: string | null;
+  readonly correlationId: string;
+}
+
+/** One automated observation as recorded, and as it stands for the candidate on screen. */
+export interface MvpRecordedObservationReport {
+  readonly evidenceId: string;
+  readonly checkId: string;
+  /** What the provider said at the time. History, and never re-derived as a verdict (F20-AC3). */
+  readonly recordedOutcome: MvpEvidenceOutcomeProjection;
+  /** What that observation means for the candidate the card is about. */
+  readonly currentOutcome: MvpEvidenceOutcomeProjection | 'stale';
+  readonly countsForCurrentCandidate: boolean;
+  /** The commit the provider attributed the run to, or null when it attributed nothing. */
+  readonly observedHeadSha: string | null;
+  readonly observedContractRevision: number | null;
+  readonly observedAt: string | null;
+  readonly reason: string;
+}
+
+/**
+ * What one automated verification pass observed, and the card it produced.
+ *
+ * Both heads are carried and they are allowed to differ, because that difference *is* the answer:
+ * `candidateHeadSha` is the commit the evidence is bound to and `providerHeadSha` is the commit the
+ * pull request holds now. When they differ, every check the provider attributed to the newer commit
+ * lands unbound, reads `stale` and proves nothing about the candidate under review - which is the
+ * correct outcome, and the reason the two are reported side by side rather than collapsed
+ * (F20-AC3, F24-AC4).
+ */
+export interface MvpVerificationReport {
+  readonly projectId: string;
+  readonly candidateId: string;
+  readonly candidateHeadSha: string;
+  readonly providerHeadSha: string;
+  readonly contractId: string;
+  readonly contractRevision: number;
+  /** The source that produced every observation in this report. One, and named (F20-AC2). */
+  readonly method: 'github_checks';
+  readonly observedAt: string;
+  readonly recorded: readonly MvpRecordedObservationReport[];
+  readonly review: MvpReviewCard;
+}
+
+/** What the owner recorded, and the card it produced. */
+export interface MvpOwnerTestReport {
+  readonly projectId: string;
+  readonly candidateId: string;
+  /** The commit the owner's observation is bound to, read from the stored candidate. */
+  readonly candidateHeadSha: string;
+  readonly contractId: string;
+  readonly contractRevision: number;
+  readonly criterionId: string;
+  readonly outcome: 'passed' | 'failed';
+  readonly evidenceId: string;
+  readonly observedAt: string;
+  readonly note: string | null;
+  readonly review: MvpReviewCard;
+}
+
 export interface MvpReviewCardUseCases {
   readonly getReview: (command: ReadMvpReviewCommand) => Promise<Result<MvpReviewCard, DomainError>>;
   readonly decide: (command: RecordMvpOwnerDecisionCommand) => Promise<Result<MvpReviewCard, DomainError>>;
+  /**
+   * Reads the provider and records what it said, bound to the candidate's exact commit.
+   *
+   * Server-controlled by construction: the command carries no result (F20-AC2, F23-AC1).
+   */
+  readonly recordVerification: (
+    command: RecordMvpVerificationCommand,
+  ) => Promise<Result<MvpVerificationReport, DomainError>>;
+  /** The owner's own observation of one `owner_test` criterion (F23-AC1, F25-AC4). */
+  readonly recordOwnerTest: (command: RecordMvpOwnerTestCommand) => Promise<Result<MvpOwnerTestReport, DomainError>>;
 }
 
 /** The durable state the card is read from. Narrow reads, so nothing writes through this. */
@@ -337,6 +487,14 @@ export interface MvpReviewCardDeps {
   /** Injected so a recorded decision replays identically in a test. */
   readonly newDecisionId?: () => string;
   readonly newCorrelationId?: () => string;
+  /**
+   * The live candidate read the automated verification path derives its results from.
+   *
+   * Absent by default rather than defaulted to a stub that refuses every call, because a
+   * deployment with no git provider must be told so by name at the operation instead of being
+   * handed a use case that presents as a configured capability it cannot use (F03-AC2).
+   */
+  readonly readLiveCandidate?: MvpLiveCandidateReader | null;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -645,11 +803,12 @@ function toDecisionProjection(decision: MvpDecisionView): MvpDecisionProjection 
 /* -------------------------------------------------------------------------- */
 
 /**
- * The two review endpoints, over durable state.
+ * The four review endpoints, over durable state.
  *
- * `review` and `decide` are Builder 5's use cases, used unmodified. This module reads the facts
- * they need and projects what they return, and it refuses a non-owner before either fact read
- * so that a refused caller learns nothing about the candidate (F25-AC4).
+ * `review`, `decide`, `recordEvidence` and `recordOwnerTest` are Builder 5's use cases, used
+ * unmodified. This module reads the facts they need, projects what they return, and refuses a
+ * non-owner before any fact read so that a refused caller learns nothing about the candidate
+ * (F25-AC4).
  */
 export function createMvpReviewCardUseCases(deps: MvpReviewCardDeps): MvpReviewCardUseCases {
   const newDecisionId = deps.newDecisionId ?? (() => randomUUID());
@@ -720,5 +879,463 @@ export function createMvpReviewCardUseCases(deps: MvpReviewCardDeps): MvpReviewC
       if (!decided.ok) return decided;
       return { ok: true, value: toCard(decided.value, facts.value, deps.clock.now()) };
     },
+
+    /**
+     * Records the provider's check results for this candidate.
+     *
+     * The order of the steps is the argument:
+     *
+     *   1. refuse a non-owner, so an agent learns nothing about the candidate (F25-AC4);
+     *   2. read the facts, which refuses a candidate belonging to another project (F02-AC2);
+     *   3. refuse a revision that is not approved - see `approvedRevisionOf` for why that has to
+     *      happen here rather than at the projection;
+     *   4. refuse with a named reason when this deployment composed no git provider, rather than
+     *      answering an empty report that reads as "nothing failed" (F03-AC2);
+     *   5. read the provider live, and return its failure unchanged - a provider that stopped
+     *      answering must not be recorded as a clean run;
+     *   6. bind the results to the candidate's *stored* commit rather than to whatever the provider
+     *      just reported. That asymmetry is the whole of F20-AC3: a source may honestly not know
+     *      which commit it ran against, but the evidence it produces is always about one candidate.
+     */
+    recordVerification: async (
+      command: RecordMvpVerificationCommand,
+    ): Promise<Result<MvpVerificationReport, DomainError>> => {
+      const owner = requireMvpOwner(command.actor, 'Recording automated verification');
+      if (!owner.ok) return owner;
+
+      const facts = readFacts(deps, command);
+      if (!facts.ok) return facts;
+
+      const approved = approvedRevisionOf(facts.value.contract);
+      if (!approved.ok) return approved;
+
+      if (deps.readLiveCandidate === null || deps.readLiveCandidate === undefined) {
+        return {
+          ok: false,
+          error: {
+            code: 'Unavailable',
+            reason:
+              'This deployment composed no read-only git provider, so no check result could be read and no automated evidence was recorded. Nothing was verified and nothing is claimed to have been (F03-AC2, F20-AC2).',
+          },
+        };
+      }
+
+      const live = await deps.readLiveCandidate({
+        ownerId: owner.value.ownerId,
+        projectId: command.projectId as ProjectId,
+        requestId: facts.value.facts.request.id,
+        correlationId: command.correlationId,
+      });
+      if (!live.ok) return live;
+
+      const contract = facts.value.facts.contract;
+      const candidate = facts.value.facts.candidate;
+      if (!isCommitSha(candidate.headSha)) {
+        return {
+          ok: false,
+          error: {
+            code: 'Invalid',
+            reason: `Candidate ${candidate.id} records head "${truncate(candidate.headSha)}", which is not a full commit SHA. A branch name, an abbreviation and a pull request number are routing facts rather than identity, so no result can be bound to it (mvp-spec 3, F20-AC3).`,
+            fields: [
+              {
+                path: 'candidate.headSha',
+                message: 'A result can only be bound to the full 40-character commit SHA the candidate recorded.',
+              },
+            ],
+          },
+        };
+      }
+
+      const target: GitHubProjectionTarget = {
+        candidateId: command.candidateId,
+        contractId: contract.id,
+        contractRevision: contract.revision,
+        headSha: candidate.headSha,
+      };
+      const observedAt = live.value.observedAt;
+      // The commit the provider read was made for. It is the candidate's own head in the ordinary
+      // case, and the two differ exactly when the pull request has been pushed on since the
+      // candidate was recorded (F24-AC4).
+      const liveHeadSha = live.value.live.headSha;
+      const projection: GitHubCandidateProjection = {
+        candidateId: command.candidateId,
+        contractId: contract.id,
+        contractRevision: contract.revision,
+        headSha: candidate.headSha,
+        checks: live.value.checks.map((check) => providerCheckFor(check, liveHeadSha, candidate.headSha)),
+        observedAt,
+      };
+
+      // The verification package owns the provider vocabulary: which verdicts are not a pass, and
+      // what an unattributable run records. Reused rather than restated, so a `skipped` verdict
+      // cannot be recorded green here after being refused there (F20-AC2).
+      const derived = recordGitHubProjection({
+        projection,
+        target,
+        evidenceIdFor: (check) =>
+          observationEvidenceId('github-check', {
+            candidateId: command.candidateId,
+            contractId: contract.id,
+            contractRevision: String(contract.revision),
+            checkId: check.checkId,
+            status: check.status,
+            headSha: check.headSha ?? '',
+            observedAt: check.completedAt ?? check.startedAt ?? '',
+          }),
+      });
+      if (!derived.ok) return derived;
+
+      const recorded: MvpRecordedObservationReport[] = [];
+      for (const evidence of derived.value) {
+        const observation = providerObservationOf(evidence);
+        if (observation === null) {
+          return {
+            ok: false,
+            error: {
+              code: 'Unavailable',
+              reason: `Derived evidence ${evidence.evidenceId} came back from source "${evidence.source}", which this automated path cannot state. Nothing further was recorded, because a result whose source cannot be named cannot be reviewed (F20-AC2).`,
+            },
+          };
+        }
+        const written = await useCases.recordEvidence({
+          projectId: command.projectId,
+          requestId: facts.value.facts.request.id,
+          candidateId: command.candidateId,
+          expectedHeadSha: candidate.headSha,
+          expectedContractRevision: contract.revision,
+          facts: facts.value.facts,
+          evidenceId: evidence.evidenceId,
+          subject: evidence.subject,
+          method: evidence.method,
+          observation,
+          // An automated observation records no owner, so there is no owner identity for one to
+          // borrow (F25-AC4).
+          owner: null,
+          observedHeadSha: evidence.observedHeadSha,
+          observedContractRevision: evidence.observedContractRevision,
+          observedAt: evidence.observedAt,
+          detail: evidence.detail,
+          artifactRef: evidence.artifactRef,
+          correlationId: command.correlationId,
+        });
+        if (!written.ok) return written;
+        recorded.push(observationReport(evidence, written.value, evidence.subject));
+      }
+
+      // The card is projected once, after the last write, so what the caller receives describes
+      // every row this call produced rather than a state part way through them (F24-AC2).
+      const final = await useCases.review({
+        projectId: command.projectId,
+        requestId: facts.value.facts.request.id,
+        candidateId: command.candidateId,
+        expectedHeadSha: candidate.headSha,
+        expectedContractRevision: contract.revision,
+        facts: facts.value.facts,
+      });
+      if (!final.ok) return final;
+
+      return {
+        ok: true,
+        value: {
+          projectId: command.projectId,
+          candidateId: command.candidateId,
+          candidateHeadSha: candidate.headSha,
+          // The commit the pull request holds right now, reported next to the bound head rather
+          // than substituted for it: a difference is the finding, not a nuisance (F20-AC3).
+          providerHeadSha: liveHeadSha,
+          contractId: contract.id,
+          contractRevision: contract.revision,
+          method: 'github_checks',
+          observedAt,
+          recorded,
+          review: toCard(final.value, facts.value, deps.clock.now()),
+        },
+      };
+    },
+
+    /**
+     * Records the owner's own test outcome for one criterion.
+     *
+     * Owner-only, narrowed before the candidate is read so a refused caller learns nothing about
+     * it, and stamped with the controller's clock rather than a value from the request so it can
+     * be neither backdated nor attributed to somebody else (F01-AC1, F25-AC4).
+     *
+     * The criterion must be one the current revision declares `owner_test`; that check is the
+     * domain's rather than this module's, and the refusal names the criterion (F23-AC1). The commit
+     * is the stored candidate's, which is what makes an earlier observation history instead of a
+     * verdict on the candidate on screen (F24-AC4, F25-AC3).
+     */
+    recordOwnerTest: async (
+      command: RecordMvpOwnerTestCommand,
+    ): Promise<Result<MvpOwnerTestReport, DomainError>> => {
+      const owner = requireMvpOwner(command.actor, 'Recording an owner test outcome');
+      if (!owner.ok) return owner;
+
+      const facts = readFacts(deps, command);
+      if (!facts.ok) return facts;
+
+      const approved = approvedRevisionOf(facts.value.contract);
+      if (!approved.ok) return approved;
+
+      const contract = facts.value.facts.contract;
+      const candidate = facts.value.facts.candidate;
+      const observedAt = deps.clock.now();
+      const evidenceId = observationEvidenceId('owner-test', {
+        candidateId: command.candidateId,
+        contractId: contract.id,
+        contractRevision: String(contract.revision),
+        criterionId: command.criterionId,
+        outcome: command.outcome,
+        observedAt,
+      });
+
+      const recorded = await useCases.recordOwnerTest({
+        projectId: command.projectId,
+        requestId: facts.value.facts.request.id,
+        candidateId: command.candidateId,
+        expectedHeadSha: candidate.headSha,
+        expectedContractRevision: contract.revision,
+        facts: facts.value.facts,
+        actor: command.actor,
+        criterionId: command.criterionId,
+        outcome: command.outcome,
+        evidenceId,
+        observedAt,
+        detail: command.note,
+        artifactRef: null,
+        correlationId: command.correlationId,
+      });
+      if (!recorded.ok) return recorded;
+
+      return {
+        ok: true,
+        value: {
+          projectId: command.projectId,
+          candidateId: command.candidateId,
+          candidateHeadSha: candidate.headSha,
+          contractId: contract.id,
+          contractRevision: contract.revision,
+          criterionId: command.criterionId,
+          outcome: command.outcome,
+          evidenceId,
+          observedAt,
+          note: command.note,
+          review: toCard(recorded.value, facts.value, deps.clock.now()),
+        },
+      };
+    },
   };
+}
+
+/* -------------------------------------------------------------------------- */
+/* Evidence derivation                                                          */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The refusal an evidence write against a revision nobody approved earns.
+ *
+ * Checked here rather than left to the projection because the projection runs *after* the write:
+ * an evidence row recorded against a draft revision would be durable, and the refusal that
+ * followed would read as "this observation could not be read" rather than "this observation was
+ * never made" (F24-AC4, F25-AC1).
+ */
+function approvedRevisionOf(contract: DeliveryContract): Result<true, DomainError> {
+  if (contract.status === 'approved') return { ok: true, value: true };
+  return {
+    ok: false,
+    error: {
+      code: 'Invalid',
+      reason: `Contract ${contract.contractId} revision ${contract.revision} is ${contract.status}, so a candidate is neither verified nor tested against it. Approve the revision first (F24-AC4).`,
+      fields: [
+        {
+          path: 'contract.status',
+          message: 'A candidate is only verified against an approved contract revision.',
+        },
+      ],
+    },
+  };
+}
+
+/**
+ * One provider check, in the vocabulary `recordGitHubProjection` consumes.
+ *
+ * `status` is the provider's verdict translated, never normalised into a pass: `Missing` and
+ * `NotApplicable` become `skipped` and `Stale` becomes `neutral`, all three of which the
+ * verification package maps to `missing`. A check that did not run therefore cannot be recorded as
+ * one that passed, however this function is edited (F20-AC2).
+ *
+ * `headSha` is the commit this observation is about, and this is where an observation stops being
+ * about this candidate. See `attributableTo` for what it is derived from and why.
+ */
+function providerCheckFor(
+  check: CandidateCheckStatus,
+  liveHeadSha: string,
+  candidateHeadSha: string,
+): GitHubCheckProjection {
+  const attributable = attributableTo(check, liveHeadSha, candidateHeadSha);
+  return {
+    checkId: check.name,
+    name: check.name,
+    status: providerStatusOf(check.result),
+    // The commit this observation is attributed to, and the one thing that decides whether
+    // `recordGitHubProjection` binds it. An observation that is not about this candidate must not
+    // name this candidate's head, or the binding would be asserted by the very field meant to
+    // carry it (F20-AC3).
+    headSha: attributable ? candidateHeadSha : unattributedHeadOf(check, liveHeadSha, candidateHeadSha),
+    startedAt: check.startedAt,
+    completedAt: check.endedAt,
+    detailUrl: check.artifactUrl,
+    summary: check.detail,
+  };
+}
+
+/**
+ * The commit an observation that is not about this candidate names, or null.
+ *
+ * `recordGitHubProjection` records a check unbound when its `headSha` is not the target's or is
+ * absent, so this returns anything other than the candidate's head. The candidate module's live
+ * head is used when it differs, because that names which build the read was actually made for and
+ * is the more useful thing for a reader to see. When the live head *is* the candidate's - the
+ * ordinary case for a `Stale` result, which exists precisely because the run belonged to some
+ * other commit - there is no other SHA available, so the observation names none and the
+ * verification package's own summary says why (F20-AC3).
+ */
+function unattributedHeadOf(
+  check: CandidateCheckStatus,
+  liveHeadSha: string,
+  candidateHeadSha: string,
+): string | null {
+  if (check.observedHeadSha !== null) return check.observedHeadSha;
+  return liveHeadSha === candidateHeadSha ? null : liveHeadSha;
+}
+
+/**
+ * Whether an observation may be said to describe this candidate.
+ *
+ * Derived from two facts and not from a third one that does not exist. The shipped
+ * `ProviderCheckObservation` carries no per-check commit - the git adapter resolves a check
+ * reported for another commit into `result: 'Stale'` and says which commit in its detail rather
+ * than in a field - so there is no SHA here to compare. What there *is* is the candidate module's
+ * own verdict, which this path is bound to respect rather than second-guess:
+ *
+ *   - **`Stale` is never attributable.** That result exists for exactly one reason: the provider
+ *     ran the check for a different commit. A green base-branch result must not approve this
+ *     candidate, and the adapter already decided it does not (F20-AC3, F24-AC4).
+ *   - **The live head must be the candidate's head.** The provider read was made for the commit the
+ *     candidate module holds; if that is not the commit under review, every check it returned
+ *     belongs to a build this pass is not verifying, and attributing them would be the F20-AC3 bug
+ *     from the other direction.
+ *   - **`Missing` and `NotApplicable` are attributable on the same terms as a verdict.** A check
+ *     the project requires and the provider never ran *was* observed for this candidate: the read
+ *     asked about this head and the answer was "nothing". Binding it is what makes the card say
+ *     `missing` rather than `stale`, and neither state is a pass (F20-AC2).
+ *
+ * A `Stale` result that also had an attributable SHA would still be refused here, because the
+ * adapter's staleness verdict and a comparison could only disagree if one of them were wrong, and
+ * the one that has read the provider is the adapter.
+ */
+function attributableTo(
+  check: CandidateCheckStatus,
+  liveHeadSha: string,
+  candidateHeadSha: string,
+): boolean {
+  if (liveHeadSha !== candidateHeadSha) return false;
+  return check.result !== 'Stale';
+}
+
+/**
+ * A provider verdict in the five the projection accepts.
+ *
+ * Total over the domain's six states, so widening `CHECK_RESULTS` fails to compile here rather
+ * than defaulting a new state onto a pass (F20-AC2).
+ */
+function providerStatusOf(result: CheckResult): GitHubCheckProjection['status'] {
+  switch (result) {
+    case 'Passed':
+      return 'success';
+    case 'Failed':
+      return 'failure';
+    case 'Waiting':
+      return 'pending';
+    case 'Missing':
+    case 'NotApplicable':
+      return 'skipped';
+    case 'Stale':
+      return 'neutral';
+  }
+}
+
+/**
+ * The observation a derived provider row states, or null when its source is not this path's.
+ *
+ * Reconstructed from the row's own `source` rather than assumed, so a mapping that started
+ * producing another source is refused instead of being relabelled as a provider check. The
+ * `capture_failed` degradation mirrors the store's own read path: an automated row has no such
+ * outcome, so one can be neither a fabricated capture failure nor a fabricated behaviour failure
+ * (F23-AC5).
+ */
+function providerObservationOf(evidence: MvpRecordedEvidence): MvpEvidenceObservation | null {
+  if (evidence.source !== 'github_check') return null;
+  return {
+    kind: 'provider_check',
+    outcome: evidence.outcome === 'capture_failed' ? 'missing' : evidence.outcome,
+  };
+}
+
+/**
+ * One recorded observation, as the write and the projection together produced it.
+ *
+ * Both outcomes travel for the reason the card carries both: `recordedOutcome` is what the provider
+ * said and never changes, while `currentOutcome` and `countsForCurrentCandidate` answer "may this
+ * be shown as this candidate's result". A client handed only the first would render a stale pass in
+ * green (F20-AC3, F24-AC3).
+ */
+function observationReport(
+  evidence: MvpRecordedEvidence,
+  model: MvpReviewReadModel,
+  subject: MvpRecordedEvidence['subject'],
+): MvpRecordedObservationReport {
+  const row = model.evidence.find((entry) => entry.evidenceId === evidence.evidenceId);
+  return {
+    evidenceId: evidence.evidenceId,
+    // A provider result always speaks for a check, and this path records no other source. The
+    // fallback keeps the report total rather than reaching for an identifier that does not exist.
+    checkId: subject.kind === 'check' ? subject.checkId : '',
+    recordedOutcome: evidence.outcome,
+    currentOutcome: row?.currentOutcome ?? 'stale',
+    countsForCurrentCandidate: row?.appliesToCurrentCandidate ?? false,
+    observedHeadSha: evidence.observedHeadSha,
+    observedContractRevision: evidence.observedContractRevision,
+    observedAt: evidence.observedAt,
+    reason:
+      row?.reason ??
+      'The stored row could not be read back as an observation of this candidate, so it is reported as counting for nothing (F20-AC3).',
+  };
+}
+
+/**
+ * A stable identity for one observation.
+ *
+ * Content-addressed over the facts that make two observations the same observation, because the
+ * evidence table is append-only with a conflict-no-op primary key: an identity derived from the
+ * candidate alone would make a re-run *after CI finished* a no-op, and the card would keep
+ * reporting the earlier "still running" verdict forever. The read instant is deliberately absent
+ * from the provider variant and present in the owner variant - a check run reports its own
+ * timestamps, while an owner test has only the clock, so including it there is what tells two
+ * clicks apart from one (F20-AC3).
+ */
+function observationEvidenceId(prefix: string, parts: Readonly<Record<string, string>>): string {
+  // `JSON.stringify` over the sorted members rather than a joined string, so a value containing a
+  // delimiter cannot forge a different pair's identity by containing the delimiter itself.
+  const canonical = JSON.stringify(
+    Object.keys(parts)
+      .sort()
+      .map((key) => [key, parts[key] ?? '']),
+  );
+  return `mvp-${prefix}-${createHash('sha256').update(canonical).digest('hex').slice(0, 32)}`;
+}
+
+/** Bounds a value quoted in a refusal, so an unreadable stored string is not echoed whole. */
+function truncate(value: string): string {
+  return value.length > 80 ? `${value.slice(0, 80)}…` : value;
 }

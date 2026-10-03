@@ -54,6 +54,7 @@ import { registerProfileRoutes } from './routes/profiles.ts';
 import { registerReviewRoutes } from './routes/review.ts';
 import { registerRunRoutes } from './routes/runs.ts';
 import { registerSettingsRoutes } from './routes/settings.ts';
+import { registerVerificationRoutes } from './routes/verification.ts';
 
 const CONTENT_SECURITY_POLICY = [
   "default-src 'self'",
@@ -146,6 +147,11 @@ export async function buildApp(deps: AppDependencies): Promise<FastifyInstance> 
   // so a request cannot name a candidate without naming the project that holds it. The MVP
   // journey ends here — Accept or Request Changes, with nothing after them (mvp-spec 3).
   registerReviewRoutes(app, { controller, guard });
+  // The two evidence paths, registered with the review pair because they share its path prefix and
+  // its card: the automated `verify` and the owner `owner-test` are what let a criterion leave
+  // `unverified` and an owner test leave `pending`, so a journey that cannot record an observation
+  // cannot reach the owner decision this group exists to serve (F20-AC2, F23-AC1, F25-AC2).
+  registerVerificationRoutes(app, { controller, guard, now });
 
   const staticRoot = config.staticRoot;
   if (staticRoot !== null) {
