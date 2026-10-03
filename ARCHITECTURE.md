@@ -100,6 +100,45 @@ product behavior and authorize merge/release. A production-triggering merge requ
 authorization before merge. Coding credentials cannot deploy to production.
 After authorized delivery, record actual merge/deployment IDs and a live smoke result.
 
+## Request and delivery contract
+
+The journey is `Request → Delivery Contract → External execution → GitHub Candidate
+→ Verification → Owner Decision`. Execution is outside ShipLoop: the owner may implement
+in an external coding environment and link the resulting candidate. Creating or reading
+either record must therefore work with no coding engine configured.
+
+Two rules about these records are load-bearing rather than descriptive:
+
+- **A request is project-scoped by construction; an idea is not.** An idea is a pre-project
+  capture: it may be captured with no project, deferred or archived before anything is
+  built, and it carries attachments, a generated summary and a publication disposition. A
+  request belongs to exactly one project and exists to be answered by exactly one delivery
+  contract. Conflating them would give a contract a nullable project, or give an idea an
+  approval state neither can hold. Promotion is one-way provenance: an idea may become a
+  request, the request records which idea it came from, and neither reads the other to
+  answer for itself.
+- **An approved contract revision never mutates.** A material change is a new revision, and
+  writing it retires the previous approval in the same transaction, so a revision is never
+  approved while newer text is current. Approval is an owner action with a recorded identity:
+  nothing a model emits carries a status, an approver or an instant, and an unknown field on
+  structured output is refused by name rather than dropped. Invalidation is an explicit owner
+  action with a named reason, never inferred by a candidate, a check or a webhook -
+  demoting an agreement about scope is a decision about scope.
+
+A brief and a contract are different records, not two editable copies of one. A brief is an
+append-only proposal about a problem and is never approved; a contract is the owner-approved
+agreement for one request in one project. A brief may seed a draft revision once and the
+revision records which version did so, but the dependency is one-way - editing a contract
+never writes back to a brief, and re-reading a brief never changes a contract - so the two
+cannot disagree.
+
+A contract revision is identified by `(contractId, revision)` and carries both a content
+fingerprint and the fingerprint of the request text it answers. A candidate and its evidence
+bind to that revision; evidence for one revision never proves another. The request
+fingerprint is a *report*, not an automatic transition: whether a request edit is material to
+an agreement about that request is the owner's call, so a read exposes the comparison and
+leaving the decision open.
+
 ## Interfaces to establish with each slice
 
 - Commands validate input and return typed results, including Blocked and Outcome unknown.
