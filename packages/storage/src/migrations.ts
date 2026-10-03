@@ -2652,6 +2652,80 @@ CREATE INDEX delivery_candidates_by_binding ON delivery_candidates(binding_finge
 CREATE INDEX delivery_candidates_by_contract ON delivery_candidates(contract_id, contract_revision);
 `;
 
+/**
+ * The append-only guards on `delivery_candidates`, named once so migration 15 installs them and
+ * migration 18's rebuild suspends and restores the same two.
+ */
+const CANDIDATE_APPEND_ONLY_TRIGGERS = asSuspendedAppendOnly(
+  'delivery_candidates',
+  'delivery_candidates are retained: the head a piece of evidence was collected for is a fact about the past',
+);
+
+/**
+ * `delivery_candidates` with `Unknown` admitted as a pull-request state.
+ *
+ * Column-for-column identical to {@link MIGRATION_15_MVP_CANDIDATE_LINKING} except for that one
+ * CHECK, which is the whole point: a rebuild that quietly changed anything else would alter what a
+ * recorded observation means, and these rows are facts about one commit at one instant.
+ */
+const MIGRATION_18_CANDIDATE_STATE_UNKNOWN = `
+CREATE TABLE delivery_candidates_state_unknown (
+  candidate_id          TEXT PRIMARY KEY,
+  project_id            TEXT NOT NULL REFERENCES projects(project_id) ON DELETE RESTRICT,
+  request_id            TEXT NOT NULL CHECK (length(request_id) > 0),
+  contract_id           TEXT NOT NULL CHECK (length(contract_id) > 0),
+  contract_revision     INTEGER NOT NULL CHECK (contract_revision > 0),
+  observation_sequence  INTEGER NOT NULL CHECK (observation_sequence > 0),
+  provider              TEXT NOT NULL CHECK (provider = 'github'),
+  repository            TEXT NOT NULL CHECK (length(repository) > 0),
+  pull_request_number   INTEGER NOT NULL CHECK (pull_request_number > 0),
+  pull_request_url      TEXT NOT NULL CHECK (length(pull_request_url) > 0),
+  base_branch           TEXT NOT NULL CHECK (length(base_branch) > 0),
+  base_sha              TEXT NOT NULL ${commitShaCheck('base_sha')},
+  head_branch           TEXT NOT NULL CHECK (length(head_branch) > 0),
+  head_sha              TEXT NOT NULL ${commitShaCheck('head_sha')},
+  head_repository       TEXT,
+  -- 'Unknown' is a fact about this reading rather than about the pull request: it says the
+  -- provider reported a state this build cannot read, which is neither evidence that the work is
+  -- open nor evidence that it was withdrawn.
+  pull_request_state    TEXT NOT NULL CHECK (pull_request_state IN ('Open', 'Closed', 'Merged', 'Unknown')),
+  draft                 INTEGER NOT NULL DEFAULT 0 CHECK (draft IN (0, 1)),
+  binding_fingerprint   TEXT NOT NULL ${fingerprintCheck('binding_fingerprint')},
+  observed_at           TEXT NOT NULL,
+  linked_at             TEXT NOT NULL DEFAULT ${NOW},
+  correlation_id        TEXT,
+  UNIQUE (contract_id, contract_revision, head_sha, base_sha, base_branch, head_branch,
+          pull_request_state, draft),
+  UNIQUE (request_id, observation_sequence)
+);
+`;
+
+/**
+ * Swaps in the widened `delivery_candidates` and restores what SQLite drops with the table.
+ *
+ * The three indexes are recreated from the statements migration 15 created rather than derived from
+ * the new definition: `delivery_candidates_by_request` is what "the current candidate for this
+ * request" reads, `by_binding` is what an evidence row's binding resolves through, and
+ * `by_contract` is the contract-scoped history. The append-only triggers are re-created by
+ * `rebuildTables` itself, from the same list that migration 15 installed, because a rebuild drops
+ * them and a candidate row that could be edited would let a recorded identity stop meaning the
+ * commit it was recorded for.
+ */
+function widenCandidatePullRequestState(db: Database): void {
+  rebuildTables(db, [
+    {
+      table: 'delivery_candidates',
+      replacement: 'delivery_candidates_state_unknown',
+      copy: identityCopy(db, 'delivery_candidates'),
+      suspended: CANDIDATE_APPEND_ONLY_TRIGGERS,
+    },
+  ]);
+
+  db.exec('CREATE INDEX delivery_candidates_by_request ON delivery_candidates(request_id, observation_sequence DESC)');
+  db.exec('CREATE INDEX delivery_candidates_by_binding ON delivery_candidates(binding_fingerprint)');
+  db.exec('CREATE INDEX delivery_candidates_by_contract ON delivery_candidates(contract_id, contract_revision)');
+}
+
 const MIGRATION_12_PROCEDURE_VERSION_IDENTITY = `
 CREATE TABLE procedure_versions_subject_scoped (
   procedure_version_id   TEXT PRIMARY KEY,
@@ -2707,6 +2781,31 @@ function scopeProcedureVersionsBySubject(db: Database): void {
     `CREATE INDEX procedure_versions_proposed ON procedure_versions(project_id, created_at, version)
      WHERE status = 'Proposed'`,
   );
+}
+
+/**
+ * The append-only guards as {@link SuspendedTrigger}s, for a table rebuild that has to drop them.
+ *
+ * The names are derived from the same rule {@link appendOnlyTriggers} uses rather than written out
+ * again, so a rebuild cannot suspend a trigger under a name it never created — which would leave the
+ * rebuilt table quietly unguarded, the exact failure two copies of one definition invite.
+ */
+function asSuspendedAppendOnly(
+  table: string,
+  reason: string,
+): readonly SuspendedTrigger[] {
+  const created = appendOnlyTriggers(table, reason);
+  const update = created[0];
+  const remove = created[1];
+  if (update === undefined || remove === undefined) {
+    // `appendOnlyTriggers` returns exactly two statements. If that ever stops being true the
+    // rebuild would silently lose a guard, so this fails here rather than at the point of use.
+    throw new Error(`the append-only guards for ${table} were not the expected update and delete pair`);
+  }
+  return [
+    { name: `${table}_append_only_update`, create: update },
+    { name: `${table}_append_only_delete`, create: remove },
+  ];
 }
 
 /**
@@ -3195,11 +3294,8 @@ const MIGRATIONS: readonly Migration[] = [
       // Append-only by trigger, not by convention: a candidate row is a fact about one
       // commit at one instant, and editing it would let a recorded identity stop meaning
       // the commit it was recorded for.
-      for (const trigger of appendOnlyTriggers(
-        'delivery_candidates',
-        'delivery_candidates are retained: the head a piece of evidence was collected for is a fact about the past',
-      )) {
-        db.exec(trigger);
+      for (const trigger of CANDIDATE_APPEND_ONLY_TRIGGERS) {
+        db.exec(trigger.create);
       }
     },
   },
@@ -3236,6 +3332,22 @@ const MIGRATIONS: readonly Migration[] = [
     name: 'project_settings',
     up: (db) => {
       db.exec(MIGRATION_17_PROJECT_SETTINGS);
+    },
+  },
+  {
+    // Widens `delivery_candidates.pull_request_state` to admit `Unknown`.
+    //
+    // That column's CHECK was the third place an unrecognised provider state became a fact about
+    // the pull request rather than about the reading: the adapter mapped it to `Closed` (fixed in
+    // the same change), and the store then refused to keep anything else. SQLite cannot alter a
+    // CHECK, so this re-declares the table with the widened vocabulary and restores the rows
+    // column for column. `rebuildTables` handles what SQLite drops with the table — the indexes,
+    // the child tables and the append-only triggers.
+    version: 18,
+    name: 'candidate_state_unknown',
+    up: (db) => {
+      db.exec(MIGRATION_18_CANDIDATE_STATE_UNKNOWN);
+      widenCandidatePullRequestState(db);
     },
   },
 ];

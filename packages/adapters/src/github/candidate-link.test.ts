@@ -375,7 +375,10 @@ test('closed, merged and unrecognised pull request states are told apart', async
   const cases: readonly { readonly body: Record<string, unknown>; readonly expected: string }[] = [
     { body: pullRequestCapture({ state: 'closed' }), expected: 'Closed' },
     { body: pullRequestCapture({ state: 'closed', merged: true, mergedAt: '2026-10-01T09:00:00.000Z' }), expected: 'Merged' },
-    { body: pullRequestCapture({ state: 'whatever-new-state' }), expected: 'Closed' },
+    // Not 'Closed'. An unrecognised state used to land there, which told the owner their work had
+    // been withdrawn — a claim the provider never made, and indistinguishable from a real closure
+    // once it reached the review card. It is now reported as unreadable.
+    { body: pullRequestCapture({ state: 'whatever-new-state' }), expected: 'Unknown' },
   ];
   for (const entry of cases) {
     const { adapter } = adapterFor({
@@ -547,7 +550,9 @@ test('the state rule also holds on the pre-existing read paths, not only the new
     ]),
   );
   assert.equal(unknown.length, 1);
-  assert.equal(unknown[0]?.pullRequest.state, 'Closed', 'an unknown state is never reported as open');
+  // Never `Open`, and never `Closed` either. The shared read path reported this as `Closed` until
+  // the unknown-state fix; on that path an unreadable state was indistinguishable from a withdrawal.
+  assert.equal(unknown[0]?.pullRequest.state, 'Unknown', 'an unreadable state is reported as unreadable');
 
   const merged = await findOne(
     listed([

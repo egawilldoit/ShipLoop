@@ -298,8 +298,12 @@ test('every declared change kind has a phrase, so a difference can never render 
   assert.equal(reasons.size, CANDIDATE_CHANGE_KINDS.length);
 });
 
-test('the state vocabulary is the three GitHub states, not a fourth invented value', () => {
-  assert.deepEqual([...PULL_REQUEST_STATES], ['Open', 'Closed', 'Merged']);
+test('the state vocabulary is GitHub’s three states plus Unknown, and no others', () => {
+  // `Unknown` is the fourth value and it is not an invented provider state — it is the absence of
+  // a readable one. Without it this product had only two honest options for a `state` it could not
+  // read, and it took the wrong one: map it to `Closed`, which tells the owner their work was
+  // withdrawn. The assertion is the closed vocabulary, so a fifth value cannot be added by accident.
+  assert.deepEqual([...PULL_REQUEST_STATES], ['Open', 'Closed', 'Merged', 'Unknown']);
 });
 
 /* -------------------------------------------------------------------------- */

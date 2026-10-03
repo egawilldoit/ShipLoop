@@ -2694,20 +2694,26 @@ function pullRequestRefOf(pull: PullRequestShape): PullRequestRef {
 }
 
 /**
- * GitHub's `state` flag plus its `merged` flag mapped onto the three states an owner acts on.
+ * GitHub's `state` flag plus its `merged` flag mapped onto the states an owner acts on.
  *
  * `merged` is read first because GitHub reports a merged pull request as `state: "closed"`;
  * a merged candidate and a withdrawn one are different facts, and collapsing them would tell
  * the owner their change landed when it was abandoned.
  *
- * A `state` this adapter does not recognise becomes `Closed`, never `Open`. An unknown state
- * is no evidence that the pull request is still open, and defaulting it to open would present
- * withdrawn work as reviewable — the pull-request-side instance of the rule that a result the
- * adapter cannot read is never a pass (mvp-spec F20-AC2).
+ * Only GitHub's own two `state` values are mapped. Anything else becomes `Unknown`, and this
+ * used to be the single line `pull.state === 'open' ? 'Open' : 'Closed'`, which was the more
+ * conservative-looking choice and the wrong one: every unrecognised value fell into `Closed`,
+ * so a state this adapter could not read was reported to the owner as *their work was
+ * withdrawn*. That is a claim the provider never made, and it is indistinguishable from a real
+ * closure by the time it reaches the review card. `Unknown` is the pull-request-side instance
+ * of the rule that a result the adapter cannot read is never a pass (mvp-spec F20-AC2) — and
+ * never a fail either.
  */
 function pullRequestStateOf(pull: PullRequestShape): PullRequestState {
   if (pull.merged) return 'Merged';
-  return pull.state === 'open' ? 'Open' : 'Closed';
+  if (pull.state === 'open') return 'Open';
+  if (pull.state === 'closed') return 'Closed';
+  return 'Unknown';
 }
 
 function mapReview(review: ReviewShape): GitReviewState {

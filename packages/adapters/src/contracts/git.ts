@@ -5,6 +5,7 @@ import type {
   Fingerprint,
   OperationId,
   ProviderId,
+  PullRequestState,
   Result,
 } from '@shiploop/domain';
 import type { AdapterContext, AdapterIdentity, ArtifactReference, ManagedRegionTarget, TicketIssueRef } from './index.ts';
@@ -36,7 +37,17 @@ export interface PullRequestRef {
   readonly number: number | null;
   readonly url: string;
   readonly draft: boolean;
-  readonly state: 'Open' | 'Closed' | 'Merged';
+  /**
+   * The domain vocabulary, not a second copy of it.
+   *
+   * This was `'Open' | 'Closed' | 'Merged'` inline while the domain carried the same three, which
+   * is how an unreadable provider state ended up coerced rather than reported: the type had nowhere
+   * to put `Unknown`, so the only available answer for a state the adapter could not read was one of
+   * the other two. Readers here already compare against `'Open'` and `'Merged'` rather than
+   * exhaustively switching, so widening costs them nothing and `Unknown` correctly reads as "not
+   * open, not merged" instead of "withdrawn".
+   */
+  readonly state: PullRequestState;
 }
 
 export type GitReviewState =

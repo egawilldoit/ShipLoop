@@ -210,8 +210,15 @@ export function sameGitHubRepository(left: string, right: string): boolean {
  * `state` distinguishes `Closed` from `Merged` because they mean different things to an
  * owner: a closed pull request was withdrawn, a merged one landed. Both stop the
  * candidate from being new work, and neither is silently reported as open.
+ *
+ * `Unknown` is the fourth state because a value this product cannot read is a fact about
+ * the reading, not about the pull request. Without it the only honest options were to
+ * invent one of the other three or to refuse the candidate entirely, and both are worse:
+ * mapping an unrecognised provider state onto `Closed` tells the owner their work was
+ * withdrawn, which is a claim nobody made. A state the adapter could not read is the
+ * pull-request-side instance of the rule that an unreadable result is never a pass.
  */
-export const PULL_REQUEST_STATES = ['Open', 'Closed', 'Merged'] as const;
+export const PULL_REQUEST_STATES = ['Open', 'Closed', 'Merged', 'Unknown'] as const;
 export type PullRequestState = (typeof PULL_REQUEST_STATES)[number];
 
 /**
