@@ -157,6 +157,9 @@ interface Seed {
   readonly candidateId: string;
 }
 
+/** The same shape, for a project the first one has never heard of. */
+interface ProjectSeed extends Seed {}
+
 interface Harness {
   readonly app: FastifyInstance;
   readonly root: CompositionRoot;
@@ -184,6 +187,14 @@ interface Harness {
    * phase's transport (F20-AC3).
    */
   readonly push: (input: { candidateId: string; headSha: string }) => void;
+  /** A second project with its own approved revision, built the same way over HTTP. */
+  readonly seedProject: (projectId: string) => Promise<ProjectSeed>;
+  /** Writes one candidate row, so a test can give a second project a candidate of its own. */
+  readonly recordCandidate: (input: {
+    readonly candidateId: string;
+    readonly projectId: string;
+    readonly seed: ProjectSeed;
+  }) => void;
   /** Re-reads the card, so a test can prove a refused submission left nothing behind. */
   readonly review: () => Promise<{ readonly status: number; readonly card: MvpReviewCardView | null; readonly raw: string }>;
   readonly reviewFor: (candidateId: string) => Promise<{ readonly status: number; readonly card: MvpReviewCardView | null; readonly raw: string }>;
@@ -194,6 +205,7 @@ interface Harness {
   /** Moves the injected clock forward, so a later decision really is later. */
   readonly advance: (seconds: number) => void;
   readonly readReview: (projectId: string) => Promise<{ readonly status: number; readonly body: string }>;
+  readonly readReviewAs: (projectId: string, candidateId: string) => Promise<{ readonly status: number; readonly body: string }>;
   readonly readReviewAnonymously: () => Promise<{ readonly status: number; readonly body: string }>;
   readonly close: () => Promise<void>;
 }
@@ -261,6 +273,32 @@ async function harness(options: { readonly content?: ContractContent } = {}): Pr
     }),
     'the candidate row the card is read against',
   );
+
+  const recordCandidate = (input: { candidateId: string; projectId: string; seed: ProjectSeed }): void => {
+    expectOk(
+      new DeliveryCandidateRepository(root.database).record({
+        candidateId: input.candidateId as CandidateId,
+        projectId: input.projectId as ProjectId,
+        requestId: input.seed.requestId,
+        contractId: input.seed.contractId,
+        contractRevision: input.seed.revision,
+        provider: 'github',
+        repository: 'octopus/shop',
+        pullRequestNumber: 42,
+        pullRequestUrl: 'https://example.invalid/octopus/shop/pull/42',
+        baseBranch: 'main',
+        baseSha: OLD_HEAD as CommitSha,
+        headBranch: 'feature/checkout-total',
+        headSha: HEAD as CommitSha,
+        headRepository: 'octopus/shop',
+        pullRequestState: 'Open',
+        draft: false,
+        observedAt: NOW,
+        correlationId: `seed-${input.candidateId}`,
+      }),
+      `the candidate row for ${input.projectId}`,
+    );
+  };
 
   const reviewUrl = (projectId: string, candidateId = CANDIDATE_ID): string =>
     `/api/projects/${projectId}/candidates/${candidateId}/review`;
@@ -410,11 +448,20 @@ async function harness(options: { readonly content?: ContractContent } = {}): Pr
         'the candidate row a push leaves behind',
       );
     },
+    seedProject: async (projectId) => {
+      const other = await approvedContract(app, session, options.content ?? CONTRACT_CONTENT, projectId);
+      return { ...other, candidateId: `${projectId}-candidate` };
+    },
+    recordCandidate,
     decideWithoutCsrf,
     advance: (seconds) => {
       instant += seconds * 1000;
     },
     readReview,
+    readReviewAs: async (projectId, candidateId) => {
+      const response = await readReview(projectId, candidateId);
+      return { status: response.status, body: response.body };
+    },
     readReviewAnonymously: async () => {
       const response = await app.inject({ method: 'GET', url: reviewUrl(PROJECT_ID) });
       return { status: response.statusCode, body: response.body };
@@ -497,18 +544,19 @@ async function approvedContract(
   app: FastifyInstance,
   session: Session,
   content: ContractContent,
+  projectId: string = PROJECT_ID,
 ): Promise<Seed> {
   const created = await app.inject({
     method: 'POST',
     url: '/api/projects',
     headers: { cookie: session.cookie, [CSRF_HEADER]: session.csrfToken },
-    payload: { projectId: PROJECT_ID, name: 'Checkout' },
+    payload: { projectId, name: 'Checkout' },
   });
   assert.ok(created.statusCode === 200 || created.statusCode === 201, `project creation failed: ${created.body}`);
 
   const requested = await app.inject({
     method: 'POST',
-    url: `/api/projects/${PROJECT_ID}/requests`,
+    url: `/api/projects/${projectId}/requests`,
     headers: { cookie: session.cookie, [CSRF_HEADER]: session.csrfToken },
     payload: { title: REQUEST_TITLE, description: REQUEST_DESCRIPTION },
   });
@@ -517,7 +565,7 @@ async function approvedContract(
 
   const drafted = await app.inject({
     method: 'POST',
-    url: `/api/projects/${PROJECT_ID}/requests/${request.requestId}/contracts`,
+    url: `/api/projects/${projectId}/requests/${request.requestId}/contracts`,
     headers: { cookie: session.cookie, [CSRF_HEADER]: session.csrfToken },
     payload: content,
   });
@@ -526,13 +574,13 @@ async function approvedContract(
 
   const approved = await app.inject({
     method: 'POST',
-    url: `/api/projects/${PROJECT_ID}/contracts/${contract.contractId}/${contract.revision}/approve`,
+    url: `/api/projects/${projectId}/contracts/${contract.contractId}/${contract.revision}/approve`,
     headers: { cookie: session.cookie, [CSRF_HEADER]: session.csrfToken },
     payload: {},
   });
   assert.equal(approved.statusCode, 200, `approval failed: ${approved.body}`);
   return {
-    projectId: PROJECT_ID,
+    projectId,
     requestId: request.requestId,
     contractId: contract.contractId,
     revision: contract.revision,
@@ -1192,20 +1240,69 @@ test('F02-AC2: a candidate is addressed by its own project, never by id alone', 
   const h = await harness();
   t.after(() => h.close());
 
+  // The other project is not merely a string this one does not recognise: it is a project
+  // that genuinely exists, with its own request, its own approved revision and its own
+  // candidate. That is what makes this the isolation case rather than a 404-on-typo case -
+  // the id resolves, the facts are all there, and the candidate under review belongs to a
+  // different project than the path named (F02-AC2).
+  const other = await h.seedProject(OTHER_PROJECT_ID);
+  h.recordCandidate({ candidateId: other.candidateId, projectId: OTHER_PROJECT_ID, seed: other });
+
   const read = await h.readReview(OTHER_PROJECT_ID);
   assert.equal(read.status, 404, `another project's path must find nothing: ${read.body}`);
-  assert.equal(problemOf(read.body).error.code, 'NotFound');
+  const readProblem = problemOf(read.body);
+  assert.equal(readProblem.error.code, 'NotFound');
+  // The refusal is checked for the specific reason as well as the status: a project-keyed
+  // lookup answered by the request store also returns 404, so a status assertion alone would
+  // pass even if the candidate boundary were removed and the request read happened to fail
+  // first. Naming the candidate is what distinguishes the two.
+  assert.match(
+    readProblem.error.message,
+    /holds no candidate cand-checkout/,
+    `the refusal must come from the candidate's own project, not from a later read: ${readProblem.error.message}`,
+  );
+  assert.ok(
+    !readProblem.error.message.includes(HEAD),
+    `the refusal must not describe the candidate it hid: ${readProblem.error.message}`,
+  );
 
   // Request Changes reaches no eligibility gate, so this case proves the project scoping is in
   // the decision path and not only on the read.
   const decided = await h.decideIn(OTHER_PROJECT_ID, decisionBody());
   assert.equal(decided.status, 404, decided.body);
+  assert.equal(problemOf(decided.body).error.code, 'NotFound');
 
   const accepted = await h.decideIn(OTHER_PROJECT_ID, decisionBody({ decision: 'accepted', feedback: null }));
   assert.equal(accepted.status, 404, accepted.body);
 
+  // And a candidate id that exists under the *other* project is refused when reached through
+  // this project's path: the reverse direction of the same boundary, and the one a lookup by
+  // id alone would get wrong.
+  const across = await h.reviewFor(other.candidateId);
+  assert.equal(across.status, 404, `another project's candidate must not be read here: ${across.raw}`);
+  assert.equal(across.card, null, 'and no card comes back');
+  assert.match(
+    across.raw,
+    /holds no candidate checkout-other-candidate/,
+    `the same boundary, in the other direction: ${across.raw}`,
+  );
+
+  const decidedAcross = await h.decideOn(other.candidateId, decisionBody());
+  assert.equal(decidedAcross.status, 404, decidedAcross.body);
+
+  // Nothing was reached from across the boundary, in either direction.
   const unchanged = await h.review();
   assert.equal(unchanged.card?.decision.outcome, 'none', 'nothing was decided from across the boundary');
+  assert.deepEqual(unchanged.card?.decision.staleDecisions, []);
+  // Read through the other project's own path, which is the only way to see its card: the
+  // refusal above is what makes this the honest place to check that nothing was decided.
+  const otherCard = await h.readReviewAs(OTHER_PROJECT_ID, other.candidateId);
+  assert.equal(otherCard.status, 200, `the other project's own card must still read: ${otherCard.body}`);
+  assert.equal(
+    parse<{ review: MvpReviewCardView }>({ body: otherCard.body }).review.decision.outcome,
+    'none',
+    'and the other project was not decided from across the boundary',
+  );
 });
 
 test('mvp-spec 3, F03-AC5: this file registers the two review routes and nothing that merges or deploys', async (t) => {
