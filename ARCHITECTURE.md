@@ -121,9 +121,12 @@ Two rules about these records are load-bearing rather than descriptive:
   writing it retires the previous approval in the same transaction, so a revision is never
   approved while newer text is current. Approval is an owner action with a recorded identity:
   nothing a model emits carries a status, an approver or an instant, and an unknown field on
-  structured output is refused by name rather than dropped. Invalidation is an explicit owner
-  action with a named reason, never inferred by a candidate, a check or a webhook -
-  demoting an agreement about scope is a decision about scope.
+  structured output is refused by name rather than dropped. An approval also names the text it
+  approves - the content fingerprint the owner's read returned - and the store's compare-and-set
+  makes the fingerprint a condition of the statement that seals it, so two tabs on one draft
+  cannot both reach an approval and an agreement can never be sealed over text its approver did
+  not read. Invalidation is an explicit owner action with a named reason, never inferred by a
+  candidate, a check or a webhook - demoting an agreement about scope is a decision about scope.
 
 A brief and a contract are different records, not two editable copies of one. A brief is an
 append-only proposal about a problem and is never approved; a contract is the owner-approved

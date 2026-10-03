@@ -286,7 +286,8 @@ async function approvedContract(
     method: 'POST',
     url: `/api/projects/${projectId}/contracts/${contract.contractId}/${contract.revision}/approve`,
     headers: { cookie: session.cookie, [CSRF_HEADER]: session.csrfToken },
-    payload: {},
+    // The fingerprint the draft read returned: an approval names the text it seals.
+    payload: { expectedContentFingerprint: contract.contentFingerprint },
   });
   assert.equal(approved.statusCode, 200, `approval failed: ${approved.body}`);
   return { requestId: request.requestId, contractId: contract.contractId, revision: contract.revision };

@@ -1624,6 +1624,13 @@ export interface SurfaceContractUseCases {
     readonly projectId: string;
     readonly contractId: string;
     readonly revision: number;
+    /**
+     * The `contentFingerprint` of the revision as the owner read it, sent back by the
+     * client. Required, and checked against the stored text rather than trusted: an
+     * approval that could not name its text would seal the agreement over whatever a
+     * second tab had written since the page was rendered (mvp-spec 3, mvp-spec 7).
+     */
+    readonly expectedContentFingerprint: string;
     readonly actor: string;
   }): Promise<Result<SurfaceContract, DomainError>>;
   reviseContract(command: {
@@ -3074,6 +3081,11 @@ export function createControllerSurface(resolve: SurfaceRootResolver): Controlle
        * There is deliberately no approver parameter on this command: a body that could name
        * one would be a body that could record an approval attributed to somebody else, and
        * that is the one thing an approval may never be (mvp-spec 3).
+       *
+       * The reviewed text *is* on the command, because refusing an approval that cannot say
+       * what it approves matters more than keeping the body free of everything. It is one
+       * value the server itself derived on the read, so it is a reference and not an
+       * instruction, and the use case refuses it if it no longer describes the draft.
        */
       approveRevision: async (command) =>
         use((root) => {
@@ -3084,6 +3096,7 @@ export function createControllerSurface(resolve: SurfaceRootResolver): Controlle
               projectId: command.projectId as ProjectId,
               contractId: command.contractId as ContractId,
               revision: command.revision,
+              expectedContentFingerprint: command.expectedContentFingerprint,
             },
             actor.value,
           );

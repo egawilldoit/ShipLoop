@@ -18,6 +18,12 @@
  *   - **Revision identity.** The next contract id and revision number are minted here,
  *     from the stored history of that request, so revision numbering is one rule in one
  *     place and a caller cannot choose a number that skips or repeats.
+ *   - **Saying which draft an approval approves.** `approveContract` forwards the
+ *     fingerprint the caller read into the domain transition and into the store's
+ *     compare-and-set, so a caller's approval can only ever seal text it named. The
+ *     approver comes from the actor; the reviewed text comes from the read. Neither is
+ *     taken from the command's other members, which is what makes "an owner approved this
+ *     scope" a fact rather than a claim.
  *
  * What this module deliberately has no path for: creating a ticket, starting a run, or
  * setting a status from anything but an explicit owner action. Nothing here imports an
@@ -37,6 +43,7 @@ import {
   err,
   fingerprint,
   invalidateContract,
+  isFingerprint,
   nextRevisionNumber,
   ok,
   reviseContract,
@@ -178,6 +185,26 @@ export interface EditContractCommand {
   readonly revision: number;
   readonly content: ContractContentInput;
   readonly expectedUpdatedAt: string;
+}
+
+/**
+ * Approves a revision the caller read.
+ *
+ * `expectedContentFingerprint` is the fingerprint the read returned, sent back by the
+ * caller, and it is required: an approval is an owner's agreement to text, and an approval
+ * that cannot say which text would seal the agreement over whatever happened to be stored
+ * when the call landed. It arrives as text because it crossed a transport, and it is
+ * checked against the fingerprint the domain derives rather than trusted (mvp-spec 3,
+ * mvp-spec 7 "Reject stale requests").
+ *
+ * There is no approver field. The owner comes from the actor the guard proved, so a
+ * command cannot record an approval attributed to somebody else.
+ */
+export interface ApproveContractCommand {
+  readonly projectId: ProjectId;
+  readonly contractId: ContractId;
+  readonly revision: number;
+  readonly expectedContentFingerprint: string;
 }
 
 export interface ReviseContractCommand {
@@ -570,21 +597,51 @@ export function createContractUseCases(deps: ContractUseCaseDeps) {
    * The approver comes from the authenticated actor rather than the command, so no caller
    * - and no model behind a caller - can record an approval attributed to somebody else
    * (mvp-spec 3, MVP: "Never let agent or model output set approved directly").
+   *
+   * The command also has to say which text the owner reviewed, and that is checked twice
+   * on purpose. The domain refuses a fingerprint that does not describe the draft it holds,
+   * and the store's WHERE clause refuses to write when the row has moved since - so the
+   * two-tab case is refused whether the other tab's edit landed before this call was made
+   * or between the read and the write. Neither check reads text from the command: the
+   * command carries one value the server derived, and the server decides whether it still
+   * describes what is stored (mvp-spec 7, "Reject stale requests").
    */
   const approveContractUseCase = (
-    command: { readonly projectId: ProjectId; readonly contractId: ContractId; readonly revision: number },
+    command: ApproveContractCommand,
     actor: OwnerActor,
   ): Result<ContractView, DomainError> => {
     const owner = requireContractOwner(actor);
     if (!owner.ok) return err(owner.error);
 
+    if (!isFingerprint(command.expectedContentFingerprint)) {
+      return err({
+        code: 'Invalid',
+        reason: 'An approval must name the draft text it approves, so an owner approves what they read.',
+        fields: [
+          {
+            path: 'expectedContentFingerprint',
+            message:
+              'Send the contentFingerprint the revision carried when it was read. A value that is not a fingerprint describes no draft.',
+          },
+        ],
+      });
+    }
+    const reviewed = command.expectedContentFingerprint;
+
     const contract = requireContract(command.projectId, command.contractId, command.revision);
     if (!contract.ok) return err(contract.error);
 
-    const approvedValue = approveContract(contract.value, { approvedBy: owner.value, at: deps.clock.now() });
+    const approvedValue = approveContract(contract.value, {
+      approvedBy: owner.value,
+      at: deps.clock.now(),
+      expectedContentFingerprint: reviewed,
+    });
     if (!approvedValue.ok) return err(approvedValue.error);
 
-    const written = deps.contracts.approve(approvedValue.value, contract.value.updatedAt);
+    const written = deps.contracts.approve(approvedValue.value, {
+      updatedAt: contract.value.updatedAt,
+      contentFingerprint: reviewed,
+    });
     if (!written.ok) return err(written.error);
 
     const request = requireRequest(command.projectId, written.value.requestId);

@@ -238,7 +238,14 @@ test('the root binds one repository of each kind and exposes the use cases (F02-
       assert.equal(draft.value.status, 'draft');
 
       const approved = root.value.contractUseCases.approveContract(
-        { projectId: PROJECT_ID, contractId: draft.value.contractId as ContractId, revision: 1 },
+        {
+          projectId: PROJECT_ID,
+          contractId: draft.value.contractId as ContractId,
+          revision: 1,
+          // The fingerprint the draft carried when it was read, which is what a client sends
+          // back and the only thing an approval may be matched against.
+          expectedContentFingerprint: draft.value.contentFingerprint,
+        },
         actor,
       );
       assert.ok(approved.ok, `an approval recorded through the bound repositories: ${approved.ok ? '' : approved.error.reason}`);

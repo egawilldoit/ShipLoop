@@ -1779,7 +1779,9 @@ export type ContractStaleReason = (typeof CONTRACT_STALE_REASONS)[number];
  *
  * `approveRevision` takes no approver parameter at all. The approver is read from the session,
  * so a body cannot record an approval attributed to somebody else - the one thing an approval
- * may never be (mvp-spec 3).
+ * may never be (mvp-spec 3). It does take the fingerprint of the revision the owner read,
+ * because refusing an approval that cannot name its text matters more than keeping the body
+ * free of everything, and that value is one this server issued.
  *
  * Every command carries both a project and an identity, because neither alone addresses a row:
  * a request id from another project is a `NotFound` here, not a read of this one's data
@@ -1850,6 +1852,20 @@ export interface ContractUseCases {
     readonly projectId: string;
     readonly contractId: string;
     readonly revision: number;
+    /**
+     * The `contentFingerprint` the revision carried when it was read, sent back by the
+     * client, and required.
+     *
+     * An approval is an owner's agreement to text. Without this value the route could only
+     * name a *revision*, and two tabs on one draft both name revision 1 - so the call would
+     * succeed against whatever the second tab had written since the first tab's page was
+     * rendered, and the sealed agreement would describe a scope its owner never read. The
+     * fingerprint is a reference to a value this server derived, not an instruction, and the
+     * controller refuses a mismatch with the fingerprint now stored (mvp-spec 3, F24-AC4).
+     *
+     * There is still no owner field: the approver is read from the session (F01-AC1).
+     */
+    readonly expectedContentFingerprint: string;
     readonly actor: OwnerId;
   }): Promise<Result<ContractView, DomainError>>;
   reviseContract(command: {

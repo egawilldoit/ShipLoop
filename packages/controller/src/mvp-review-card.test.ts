@@ -169,8 +169,19 @@ function seed(
   );
   const contracts = new ContractRepository(db);
   expectOk(contracts.createDraft(draft));
-  const approved = expectOk(approveContract(draft, { approvedBy: OWNER_ID, at: T0 }));
-  expectOk(contracts.approve(approved, draft.updatedAt));
+  const approved = expectOk(
+    approveContract(draft, {
+      approvedBy: OWNER_ID,
+      at: T0,
+      expectedContentFingerprint: draft.contentFingerprint,
+    }),
+  );
+  expectOk(
+    contracts.approve(approved, {
+      updatedAt: draft.updatedAt,
+      contentFingerprint: draft.contentFingerprint,
+    }),
+  );
 
   const head = options.headSha ?? HEAD;
   expectOk(
