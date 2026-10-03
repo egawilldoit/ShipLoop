@@ -36,7 +36,6 @@ const HEAD = asCommitSha('a1b2c3d4'.repeat(5));
 const NEXT_HEAD = asCommitSha('f0e1d2c3'.repeat(5));
 const OWNER_ID = 'owner-0000-4000-8000-00000000000c' as MvpOwnerActor['ownerId'];
 const OWNER: MvpOwnerActor = { role: 'owner', ownerId: OWNER_ID };
-const T0 = '2026-10-03T09:00:00Z';
 const T1 = '2026-10-03T09:30:00Z';
 
 function expectOk<T>(result: Result<T, DomainError>): T {
@@ -199,7 +198,7 @@ test('the schema refuses an abbreviated candidate SHA on an evidence row', async
 });
 
 test('the schema refuses an abbreviated candidate SHA on a decision row', async () => {
-  await withStore((store, db) => {
+  await withStore((_store, db) => {
     assert.throws(() => {
       db.prepare(
         `INSERT INTO mvp_owner_decisions (decision_id, project_id, request_id, contract_id, contract_revision,
@@ -211,7 +210,7 @@ test('the schema refuses an abbreviated candidate SHA on a decision row', async 
 });
 
 test('a change request with no feedback is refused by the schema', async () => {
-  await withStore((store, db) => {
+  await withStore((_store, db) => {
     assert.throws(() => {
       db.prepare(
         `INSERT INTO mvp_owner_decisions (decision_id, project_id, request_id, contract_id, contract_revision,
