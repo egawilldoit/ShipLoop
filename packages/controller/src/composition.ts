@@ -176,6 +176,16 @@ export interface CompositionRootConfig {
   readonly openDatabaseOptions?: OpenDatabaseOptions;
   readonly migrateOptions?: MigrateOptions;
   /**
+   * The external T3 deployment the owner configured, unvalidated, or null (mvp-spec L02).
+   *
+   * Configuration rather than a capability: it decides where a browser *may* be sent, never
+   * what ShipLoop may do. It is read once here and published on the root as a plain value so
+   * `t3-launch.ts` stays the only implementation of what a usable URL is, and a deployment
+   * that does not use T3 leaves it absent - the handoff packet is complete without it
+   * (mvp-spec L02-AC3).
+   */
+  readonly t3Url?: string | null;
+  /**
    * Directory intake attachment bytes are written under (F06-AC1).
    *
    * Required rather than defaulted because the only honest default is none: writing
@@ -236,6 +246,13 @@ export interface CompositionRoot {
   /** Requests and the revisions of their delivery contracts (mvp-spec 3). */
   readonly requests: RequestRepository;
   readonly contracts: ContractRepository;
+  /**
+   * The operator's external deployment URL, or null (mvp-spec L02).
+   *
+   * Published as configuration rather than resolved here, so the handoff use case decides
+   * what a usable URL is and this root never interprets an operator's value.
+   */
+  readonly t3Url: string | null;
   /** Over the same handle, so a compare-and-set is meaningful within a process (F02-AC2). */
   readonly workItems: WorkItemRepository;
   readonly scope: ScopeRepository;
@@ -1316,6 +1333,7 @@ export function createCompositionRoot(config: CompositionRootConfig): Result<Com
     ideas,
     requests,
     contracts,
+    t3Url: config.t3Url ?? null,
     candidates,
     jobs,
     leases,
