@@ -92,16 +92,27 @@ const NO_ADAPTERS: AdapterRegistry = {
   },
 };
 
+/**
+ * The check AC1 is verified by.
+ *
+ * A check name, not a check run: the same string for every run, which is what lets a re-run on
+ * a new commit re-verify the criterion instead of invalidating the binding. It is the same
+ * vocabulary a project profile's `policy.requiredChecks` uses.
+ */
+const UNIT_CHECK = 'unit-tests';
+
 const AUTOMATED_CRITERION = {
   id: AUTOMATED_CRITERION_ID,
   description: 'The summary returns 200 and displays "Total: 12.00".',
   verificationType: 'automated',
+  verificationCheckId: UNIT_CHECK,
 } as const;
 
 const OWNER_CRITERION = {
   id: OWNER_CRITERION_ID,
   description: 'The owner confirms the total matches the invoice they were sent.',
   verificationType: 'owner_test',
+  verificationCheckId: null,
 } as const;
 
 const CONTRACT_CONTENT = {
@@ -114,13 +125,10 @@ const CONTRACT_CONTENT = {
 /**
  * A contract whose only criterion is the owner's own.
  *
- * Needed, and the reason is a property of the product rather than of this test: the MVP
- * contract records no assignment of a criterion to a check, so the card reports every
- * automated criterion as `unverified` and an acceptance over one can never become eligible.
- * That is the honest reading - nothing observed the criterion, so it is not verified - and
- * it means a contract made only of owner tests is the only shape in this phase where an
- * acceptance can succeed. See the report: it is a gap in the phase's contract shape, not a
- * defect this route can fix.
+ * Used by the cases about the owner-test gate, so that what they observe is the owner test and
+ * not an automated criterion nobody ran. It is not a workaround for anything: an automated
+ * criterion is settled by its bound check now, and a case that wants an automated criterion
+ * satisfied records a result for that check.
  */
 const OWNER_ONLY_CONTENT = {
   ...CONTRACT_CONTENT,
@@ -135,6 +143,8 @@ type ContractContent = {
     readonly id: string;
     readonly description: string;
     readonly verificationType: 'automated' | 'owner_test';
+    /** Omitted on purpose in the cases that draft an unbound criterion. */
+    readonly verificationCheckId?: string | null;
   }[];
 };
 
@@ -504,6 +514,129 @@ function decisionBody(overrides: Record<string, unknown> = {}): Record<string, u
   };
 }
 
+/**
+ * F23-AC1, F24-AC3: the approval gate over real HTTP, against the shipped composition.
+ *
+ * An automated criterion that names no check reaches the draft and stops at approval. This is
+ * the case that would otherwise block the journey forever: nothing could verify the criterion,
+ * so it would read `unverified` for the life of the product and every acceptance of that
+ * contract would be refused with nothing the owner could do about it.
+ *
+ * Driven through the same routes the product serves rather than through a surface double,
+ * because a double would approve whatever it was handed and prove nothing.
+ */
+test('F23-AC1, F24-AC3: an automated criterion that names no check is refused at approval, by name', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'shiploop-review-binding-'));
+  let instant = Date.parse(NOW);
+  const at = (): string => new Date(instant).toISOString();
+  const opened = createCompositionRoot({
+    databasePath: join(directory, 'shiploop.db'),
+    clock: { now: at },
+    adapters: NO_ADAPTERS,
+    passwordParameters: FAST_PASSWORD_COST,
+    sessionIdleTimeoutSeconds: IDLE_TIMEOUT_SECONDS,
+  });
+  assert.ok(opened.ok);
+  const root = opened.value;
+  const config = readServerConfig({
+    SHIPLOOP_CSRF_SECRET: CSRF_SECRET,
+    SHIPLOOP_NODE_ENV: 'test',
+    SHIPLOOP_COOKIE_SECURE: 'false',
+    SHIPLOOP_LOG_LEVEL: 'silent',
+  });
+  assert.ok(config.ok);
+  const app = await buildApp({
+    config: config.value,
+    controller: bindControllerSurface(root),
+    now: () => new Date(instant),
+  });
+  t.after(async () => {
+    await app.close();
+    root.close();
+    await rm(directory, { recursive: true, force: true });
+  });
+
+  const session = await signIn(app);
+  const project = await app.inject({
+    method: 'POST',
+    url: '/api/projects',
+    headers: { cookie: session.cookie, [CSRF_HEADER]: session.csrfToken },
+    payload: { projectId: PROJECT_ID, name: 'Checkout' },
+  });
+  assert.ok(project.statusCode === 200 || project.statusCode === 201, project.body);
+  const requested = await app.inject({
+    method: 'POST',
+    url: `/api/projects/${PROJECT_ID}/requests`,
+    headers: { cookie: session.cookie, [CSRF_HEADER]: session.csrfToken },
+    payload: { title: REQUEST_TITLE, description: REQUEST_DESCRIPTION },
+  });
+  assert.equal(requested.statusCode, 201, requested.body);
+  const requestId = parse<{ request: RequestView }>(requested).request.requestId;
+
+  // The body omits `verificationCheckId` on the automated criterion: the wire shape allows an
+  // omission, and the route states it as unbound rather than dropping it.
+  const drafted = await app.inject({
+    method: 'POST',
+    url: `/api/projects/${PROJECT_ID}/requests/${requestId}/contracts`,
+    headers: { cookie: session.cookie, [CSRF_HEADER]: session.csrfToken },
+    payload: {
+      ...CONTRACT_CONTENT,
+      acceptanceCriteria: [
+        { id: AUTOMATED_CRITERION_ID, description: AUTOMATED_CRITERION.description, verificationType: 'automated' },
+        { ...OWNER_CRITERION },
+      ],
+    },
+  });
+  assert.equal(drafted.statusCode, 201, drafted.body);
+  const contract = parse<{ contract: ContractView }>(drafted).contract;
+  assert.deepEqual(
+    contract.acceptanceCriteria.map((criterion) => criterion.verificationCheckId),
+    [null, null],
+    'the draft reads back as unbound, which is the state the gate refuses',
+  );
+
+  const refused = await app.inject({
+    method: 'POST',
+    url: `/api/projects/${PROJECT_ID}/contracts/${contract.contractId}/${contract.revision}/approve`,
+    headers: { cookie: session.cookie, [CSRF_HEADER]: session.csrfToken },
+    payload: {},
+  });
+  assert.equal(refused.statusCode, 400, refused.body);
+  assert.match(refused.body, /verificationCheckId/, 'the refusal names the field the owner has to fill');
+  assert.match(refused.body, /name the check that verifies it/);
+
+  const readBack = await app.inject({
+    method: 'GET',
+    url: `/api/projects/${PROJECT_ID}/contracts/${contract.contractId}/${contract.revision}`,
+    headers: { cookie: session.cookie },
+  });
+  assert.equal(parse<{ contract: ContractView }>(readBack).contract.status, 'draft');
+
+  // Binding it makes the same revision approvable, which is what tells the owner the refusal
+  // was about the missing statement rather than about the contract itself.
+  const bound = await app.inject({
+    method: 'PATCH',
+    url: `/api/projects/${PROJECT_ID}/contracts/${contract.contractId}/${contract.revision}`,
+    headers: { cookie: session.cookie, [CSRF_HEADER]: session.csrfToken },
+    payload: { ...CONTRACT_CONTENT, expectedUpdatedAt: contract.updatedAt },
+  });
+  assert.equal(bound.statusCode, 200, bound.body);
+  const approved = await app.inject({
+    method: 'POST',
+    url: `/api/projects/${PROJECT_ID}/contracts/${contract.contractId}/${contract.revision}/approve`,
+    headers: { cookie: session.cookie, [CSRF_HEADER]: session.csrfToken },
+    payload: {},
+  });
+  assert.equal(approved.statusCode, 200, approved.body);
+  assert.deepEqual(
+    parse<{ contract: ContractView }>(approved).contract.acceptanceCriteria.map(
+      (criterion) => criterion.verificationCheckId,
+    ),
+    [UNIT_CHECK, null],
+    'the approved revision names the check that settles each criterion',
+  );
+});
+
 /* -------------------------------------------------------------------------- */
 /* The card                                                                   */
 /* -------------------------------------------------------------------------- */
@@ -545,10 +678,10 @@ test('F24-AC2: the card carries every element, with the full commit SHA verbatim
   assert.ok(automated !== undefined);
   assert.equal(
     automated.verificationCheckId,
-    null,
-    'no automated criterion is bound to a check by inference, and an unbound one is unverified',
+    UNIT_CHECK,
+    'the criterion names the check its contract bound to it, not one inferred from a green result',
   );
-  assert.equal(automated.state, 'unverified', 'nothing observed it, so it is not a pass');
+  assert.equal(automated.state, 'unverified', 'nothing ran that check, so it is not a pass');
   assert.deepEqual(card.evidence, [], 'nothing observed this candidate yet, and that is said');
   assert.equal(card.ownerTests.length, 1);
   assert.deepEqual(card.staleness.staleEvidenceIds, []);
@@ -623,7 +756,7 @@ test('F23-AC1, F24-AC3: an owner test is pending until the owner acts, and only 
   assert.equal(
     after.card?.criteria.find((entry) => entry.criterionId === AUTOMATED_CRITERION_ID)?.state,
     'unverified',
-    'the automated criterion is still unverified, because nothing is bound to a check',
+    'the automated criterion is still unverified, because its bound check has not run',
   );
 });
 

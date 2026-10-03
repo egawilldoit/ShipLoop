@@ -2246,13 +2246,31 @@ const STALE_REASON_TEXT: Readonly<Record<ContractStaleReason, string>> = Object.
 });
 
 /** The contract content a request body sends, as the MVP's own example. */
+/**
+ * AC1 names `unit-tests`, a check name rather than a check run: the same binding for every
+ * run, which is what lets a re-run on a new commit re-verify the criterion. AC2 is the owner's
+ * own step and carries no binding, because naming a check for it would let that check
+ * discharge work only the owner can judge.
+ */
+const UNIT_CHECK = 'unit-tests';
+
 const CONTRACT_CONTENT = {
   outcome: 'The order summary shows the total including tax.',
   scope: ['Sum the line items before tax', 'Apply the configured tax rate'],
   outOfScope: ['Changing the tax rate'],
   acceptanceCriteria: [
-    { id: 'AC1', description: 'The summary returns 200 and displays "Total: 12.00".', verificationType: 'automated' },
-    { id: 'AC2', description: 'The owner confirms the total matches the invoice they were sent.', verificationType: 'owner_test' },
+    {
+      id: 'AC1',
+      description: 'The summary returns 200 and displays "Total: 12.00".',
+      verificationType: 'automated',
+      verificationCheckId: UNIT_CHECK,
+    },
+    {
+      id: 'AC2',
+      description: 'The owner confirms the total matches the invoice they were sent.',
+      verificationType: 'owner_test',
+      verificationCheckId: null,
+    },
   ],
 } as const;
 
@@ -2737,6 +2755,35 @@ test('mvp-spec 3: a draft revision carries its criteria and no approval', async 
       ['AC2', 'owner_test'],
     ],
     'the criteria are listed with the verification type that decides who may settle each',
+  );
+});
+
+test('mvp-spec 3: the verification binding crosses the wire with the criterion', async () => {
+  const h = await harness();
+  const session = await signIn(h.app);
+  const request = await createRequest(h, session);
+
+  // The binding travels out on every read, so a client can tell which check settles which
+  // criterion without recomputing it. The approval gate over real HTTP is proved in
+  // `routes/review.test.ts`, which drives the shipped composition rather than this file's
+  // in-memory surface double.
+  const bound = await draftContract(h, session, request.requestId);
+  assert.deepEqual(
+    bound.acceptanceCriteria.map((criterion) => criterion.verificationCheckId),
+    [UNIT_CHECK, null],
+    'a read states each binding explicitly, so an omitted one reads as unbound rather than as a missing field',
+  );
+  const criteria = parse<{ criteria: readonly ContractCriterionView[] }>(
+    await h.app.inject({
+      method: 'GET',
+      url: `/api/projects/${PROJECT_ID}/contracts/${bound.contractId}/1/criteria`,
+      headers: { cookie: session.cookie },
+    }),
+  );
+  assert.deepEqual(
+    criteria.criteria.map((criterion) => criterion.verificationCheckId),
+    [UNIT_CHECK, null],
+    'the criteria listing carries the same bindings',
   );
 });
 

@@ -112,6 +112,12 @@ const updateRequestBody = z.strictObject({
  *
  * `verificationType` is an enum rather than text: it decides who may settle the criterion, and
  * a value outside the vocabulary is refused here rather than defaulted (mvp-spec 3).
+ *
+ * `verificationCheckId` names the check that settles an `automated` criterion. It is a check
+ * name from the project's own verification configuration, so the same binding survives every
+ * re-run; it is nullable and optional because a draft may be mid-authoring, and an automated
+ * criterion that reaches approval unbound is refused there rather than here. Nothing about it is
+ * inferred from whichever check happens to be green (F23-AC1, F24-AC3).
  */
 const criterion = z.strictObject({
   id: z.string().trim().min(1, 'An acceptance criterion needs an id.').max(128, 'A criterion id may be at most 128 characters.'),
@@ -123,6 +129,13 @@ const criterion = z.strictObject({
   verificationType: z.enum(['automated', 'owner_test'], {
     error: 'A criterion is verified by an automated check or by an owner test (mvp-spec 3).',
   }),
+  verificationCheckId: z
+    .string()
+    .trim()
+    .min(1, 'An empty check name binds nothing. Name the check, or leave it unbound.')
+    .max(200, 'A check name may be at most 200 characters.')
+    .nullable()
+    .optional(),
 });
 
 const statementList = z
@@ -168,6 +181,31 @@ const editContractBody = contractContent.extend({
  * is the one thing this body must never carry (mvp-spec 3).
  */
 const approveBody = z.strictObject({});
+
+/**
+ * Parsed content, with every criterion's binding stated explicitly.
+ *
+ * The schema makes the binding optional - a draft may be mid-authoring - but nothing
+ * downstream should have to ask whether the key was absent, so the omission becomes `null`
+ * here rather than at three call sites. `null` is the honest reading of an omitted binding:
+ * nothing is bound to that criterion, which approval refuses for an automated one and the
+ * review card reports as `unverified` (F23-AC1).
+ */
+function explicitBindings(
+  content: z.infer<typeof contractContent>,
+): { readonly outcome: string; readonly scope: string[]; readonly outOfScope: string[]; readonly acceptanceCriteria: readonly { readonly id: string; readonly description: string; readonly verificationType: 'automated' | 'owner_test'; readonly verificationCheckId: string | null }[] } {
+  return {
+    outcome: content.outcome,
+    scope: content.scope,
+    outOfScope: content.outOfScope,
+    acceptanceCriteria: content.acceptanceCriteria.map((entry) => ({
+      id: entry.id,
+      description: entry.description,
+      verificationType: entry.verificationType,
+      verificationCheckId: entry.verificationCheckId ?? null,
+    })),
+  };
+}
 
 const invalidateBody = z.strictObject({
   reason: z.enum(CONTRACT_STALE_REASONS, {
@@ -311,7 +349,7 @@ export function registerContractRoutes(app: FastifyInstance, options: ContractRo
     const drafted = await options.controller.contracts.draftContract({
       projectId: params.value.projectId,
       requestId: params.value.requestId,
-      ...body.value,
+      ...explicitBindings(body.value),
       actor: session.ownerId,
     });
     if (!drafted.ok) return sendProblem(reply, problemFor(drafted.error));
@@ -393,10 +431,7 @@ export function registerContractRoutes(app: FastifyInstance, options: ContractRo
       projectId: params.value.projectId,
       contractId: params.value.contractId,
       revision: params.value.revision,
-      outcome: body.value.outcome,
-      scope: body.value.scope,
-      outOfScope: body.value.outOfScope,
-      acceptanceCriteria: body.value.acceptanceCriteria,
+      ...explicitBindings(body.value),
       expectedUpdatedAt: body.value.expectedUpdatedAt,
       actor: session.ownerId,
     });
@@ -449,10 +484,7 @@ export function registerContractRoutes(app: FastifyInstance, options: ContractRo
       projectId: params.value.projectId,
       contractId: params.value.contractId,
       revision: params.value.revision,
-      outcome: body.value.outcome,
-      scope: body.value.scope,
-      outOfScope: body.value.outOfScope,
-      acceptanceCriteria: body.value.acceptanceCriteria,
+      ...explicitBindings(body.value),
       actor: session.ownerId,
     });
     if (!revised.ok) return sendProblem(reply, problemFor(revised.error));

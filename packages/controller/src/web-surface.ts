@@ -1492,12 +1492,13 @@ export interface SurfaceContractCriterion {
   /**
    * The check that verifies an automated criterion, or null when none is bound.
    *
-   * Travels in both directions: a read always carries it, and a submit may omit it. Null
-   * is reported rather than inferred from whichever check is green, and an omitted binding
-   * on an automated criterion is refused at approval rather than accepted as "anything will
-   * do" (F23-AC1, F24-AC3).
+   * Required rather than optional in both directions. A read always carries it; a write is
+   * normalised at the transport boundary, which turns an omitted binding into this explicit
+   * `null` before it arrives. Nothing downstream then has to ask whether the key was absent,
+   * and `null` is reported rather than inferred from whichever check is green (F23-AC1,
+   * F24-AC3).
    */
-  readonly verificationCheckId?: string | null;
+  readonly verificationCheckId: string | null;
 }
 
 /**
