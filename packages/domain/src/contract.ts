@@ -17,8 +17,12 @@ import { err, invalid, ok } from './result.ts';
  *     cannot silently mutate, and a candidate bound to revision 3 can never be
  *     described by revision 4's text (mvp-spec 3, ARCHITECTURE "Candidate and
  *     decision rules").
- *   - **Approval is an owner action with a recorded identity.** `approveContract`
- *     takes an `OwnerId` and writes `approvedBy`. The shape a model may emit
+ *   - **Approval is an owner action with a recorded identity, over the exact text the
+ *     owner read.** `approveContract` takes an `OwnerId` and writes `approvedBy`, and it
+ *     takes the `contentFingerprint` of the draft the caller reviewed and refuses
+ *     anything else. Without that second argument an approval names a *revision* but not
+ *     a *state*: two tabs on one draft, the first tab approves, and the agreement is
+ *     sealed over text its approver never saw. The shape a model may emit
  *     (`ContractProposal`) has no status, no approval and no timestamp field, and
  *     `applyContractProposal` refuses an unknown key rather than dropping it, so
  *     structured output cannot assert agreement even by naming it. This is the same
@@ -161,6 +165,14 @@ export const MAXIMUM_CRITERION_DESCRIPTION_LENGTH = 2_000;
  * The single authority for "did this change": a draft edit, an approval and a later
  * staleness comparison all read this one function, so "material" cannot mean one thing
  * when writing and another when checking.
+ *
+ * It is also the optimistic lock `approveContract` compares against, and it is chosen
+ * over an edit counter for one reason: `editContract` already refuses a write whose
+ * fingerprint is unchanged, so this value moves on exactly the set of writes the domain
+ * calls material. A counter would be a second definition of the same fact, kept in step
+ * by hand, and the instant a step were missed the two would disagree about which text
+ * was on screen. `updatedAt` would be worse than either: two edits inside one clock
+ * tick produce two different texts under one timestamp.
  */
 export function contractContentFingerprint(content: ContractContent): Fingerprint {
   return fingerprint({
@@ -357,6 +369,10 @@ export function createContractDraft(input: CreateContractInput): Result<Delivery
  * function refuses - the way forward is `reviseContract`, which is what makes "an
  * approved contract never silently mutates" a property of the API rather than a rule
  * callers are trusted to follow.
+ *
+ * Every successful edit moves `contentFingerprint`, and a refused no-op does not, which
+ * is what makes that field usable as the lock `approveContract` requires: a caller
+ * holding an older fingerprint is holding text the store has since replaced.
  */
 export function editContract(
   contract: DeliveryContract,
@@ -426,14 +442,40 @@ function contractStatusRefusal(contract: DeliveryContract): string {
 /**
  * Records the owner's approval of a draft revision.
  *
- * The only function in this module that produces an approved revision, and it takes
- * the approver. Approval also re-derives the content fingerprint from the text being
- * approved rather than trusting the draft's stored one, so a fingerprint that drifted
- * from its content cannot be sealed into an agreement.
+ * The only function in this module that produces an approved revision, and it takes the
+ * approver. Approval also re-derives the content fingerprint from the text being approved
+ * rather than trusting the draft's stored one, so a fingerprint that drifted from its
+ * content cannot be sealed into an agreement.
+ *
+ * ## Why `expectedContentFingerprint` is required rather than optional
+ *
+ * An approval freezes a revision, and a revision's number outlives its text: two tabs
+ * editing one draft both address `contractId` + `revision 1`, and only one of them is
+ * looking at the text that is stored when the call lands. Without this argument the
+ * approval still succeeds in that case, and the agreement the whole product rests on is
+ * sealed over a scope its owner never read - the failure is invisible afterwards,
+ * because the frozen revision reports itself as approved and nobody can tell which text
+ * was approved.
+ *
+ * So the caller states which draft it reviewed, by the fingerprint the read gave it, and
+ * a mismatch is a `Conflict` rather than a warning. Text in a request body is a claim
+ * about what was reviewed, not evidence of it, so nothing here compares a re-sent copy
+ * of the contract; the caller's contribution is a single value the server derived and
+ * the server checks.
+ *
+ * Ordering is deliberate: an already-approved or stale revision is refused for what it
+ * is, before the fingerprint is consulted. "Revision 3 is already approved" is the more
+ * useful answer than "your fingerprint is stale", and it is the answer that stays true
+ * however the caller reached the call.
  */
 export function approveContract(
   contract: DeliveryContract,
-  input: { readonly approvedBy: OwnerId; readonly at: string },
+  input: {
+    readonly approvedBy: OwnerId;
+    readonly at: string;
+    /** The fingerprint of the draft text the approver actually reviewed. */
+    readonly expectedContentFingerprint: Fingerprint;
+  },
 ): Result<DeliveryContract, DomainError> {
   if (contract.status !== 'draft') {
     return err<DomainError>({
@@ -448,6 +490,21 @@ export function approveContract(
   }
 
   const content = normalizeContent(contract);
+  // Re-derived from the text rather than read off the record, for the same reason the seal
+  // below re-derives it: a stored fingerprint that does not describe the text beside it is
+  // not evidence of what anybody read, so it is not the thing an approval may be matched
+  // against either. Comparing against the text also means the lock cannot be satisfied by
+  // a row that was tampered with.
+  const currentFingerprint = contractContentFingerprint(content);
+  if (input.expectedContentFingerprint !== currentFingerprint) {
+    return err<DomainError>({
+      code: 'Conflict',
+      reason: `Revision ${contract.revision} changed after it was loaded, so approving it now would seal text you did not review. Read the revision again and approve what it says now.`,
+      expected: input.expectedContentFingerprint,
+      actual: currentFingerprint,
+    });
+  }
+
   return ok<DeliveryContract>(
     Object.freeze({
       ...content,

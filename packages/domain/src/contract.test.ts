@@ -54,7 +54,11 @@ function draftAt(overrides: Partial<Parameters<typeof createContractDraft>[0]> =
 
 function approved(content = BASE) {
   const draft = draftAt({ content });
-  const approvedValue = approveContract(draft, { approvedBy: OWNER, at: '2026-03-01T11:00:00.000Z' });
+  const approvedValue = approveContract(draft, {
+    approvedBy: OWNER,
+    at: '2026-03-01T11:00:00.000Z',
+    expectedContentFingerprint: draft.contentFingerprint,
+  });
   assert.ok(approvedValue.ok, approvedValue.ok ? '' : approvedValue.error.reason);
   return approvedValue.value;
 }
@@ -217,7 +221,11 @@ test('a stale revision cannot be edited either', () => {
 
 test('approving twice is a conflict naming the state it found', () => {
   const sealed = approved();
-  const again = approveContract(sealed, { approvedBy: OWNER, at: '2026-03-02T10:00:00.000Z' });
+  const again = approveContract(sealed, {
+    approvedBy: OWNER,
+    at: '2026-03-02T10:00:00.000Z',
+    expectedContentFingerprint: sealed.contentFingerprint,
+  });
   assert.ok(!again.ok);
   assert.equal(again.error.code, 'Conflict');
   if (again.error.code !== 'Conflict') return;
@@ -229,9 +237,120 @@ test('a stale revision cannot be approved', () => {
   const sealed = approved();
   const stale = invalidateContract(sealed, { reason: 'Scope moved.', at: '2026-03-02T10:00:00.000Z' });
   assert.ok(stale.ok);
-  const late = approveContract(stale.value, { approvedBy: OWNER, at: '2026-03-02T11:00:00.000Z' });
+  const late = approveContract(stale.value, {
+    approvedBy: OWNER,
+    at: '2026-03-02T11:00:00.000Z',
+    expectedContentFingerprint: stale.value.contentFingerprint,
+  });
   assert.ok(!late.ok);
   assert.equal(late.error.code, 'Conflict');
+});
+
+/* -------------------------------------------------------------------------- */
+/* The approval lock                                                           */
+/* -------------------------------------------------------------------------- */
+
+test('an approval naming text the caller did not review is refused, and nothing is sealed', () => {
+  const draft = draftAt();
+  // What the stale tab holds: the fingerprint of the text as it read before an edit.
+  const reviewed = draft.contentFingerprint;
+  const edited = editContract(draft, { ...BASE, outcome: 'The summary shows the total with shipping.' }, {
+    expectedUpdatedAt: draft.updatedAt,
+    at: '2026-03-01T10:30:00.000Z',
+    editedBy: OWNER,
+  });
+  assert.ok(edited.ok, edited.ok ? '' : edited.error.reason);
+  assert.notEqual(edited.value.contentFingerprint, reviewed, 'a material edit moves the lock');
+
+  const refused = approveContract(edited.value, {
+    approvedBy: OWNER,
+    at: '2026-03-01T11:00:00.000Z',
+    expectedContentFingerprint: reviewed,
+  });
+  assert.ok(!refused.ok);
+  assert.equal(refused.error.code, 'Conflict');
+  if (refused.error.code !== 'Conflict') return;
+  assert.equal(refused.error.expected, reviewed, 'the refusal names what the caller reviewed');
+  assert.equal(refused.error.actual, edited.value.contentFingerprint, 'and what the revision holds');
+  assert.match(refused.error.reason, /text you did not review/);
+
+  // Nothing about the draft moved, so the owner can read it again and approve it as it now
+  // reads. A refusal that mutated state would be a second defect, not a safe answer.
+  assert.equal(edited.value.status, 'draft');
+  assert.equal(edited.value.approvedBy, null);
+  assert.equal(edited.value.approvedAt, null);
+});
+
+test('the fingerprint of some other text is refused as firmly as an old one', () => {
+  const draft = draftAt();
+  const neverReviewed = fingerprint({ outcome: 'Something nobody ever showed this owner.' });
+  const refused = approveContract(draft, {
+    approvedBy: OWNER,
+    at: '2026-03-01T11:00:00.000Z',
+    expectedContentFingerprint: neverReviewed,
+  });
+  assert.ok(!refused.ok);
+  assert.equal(refused.error.code, 'Conflict');
+});
+
+test('an approval is accepted when the named fingerprint is the text now stored', () => {
+  const draft = draftAt();
+  const approvedValue = approveContract(draft, {
+    approvedBy: OWNER,
+    at: '2026-03-01T11:00:00.000Z',
+    expectedContentFingerprint: draft.contentFingerprint,
+  });
+  assert.ok(approvedValue.ok, approvedValue.ok ? '' : approvedValue.error.reason);
+  assert.equal(approvedValue.value.status, 'approved');
+});
+
+test('approval re-derives the fingerprint it seals, so a drifted draft cannot be approved', () => {
+  const draft = draftAt();
+  // A stored revision whose fingerprint does not describe its text: reachable only from a
+  // row written outside this function, and the reason the seal re-derives rather than
+  // copying.
+  const drifted = { ...draft, contentFingerprint: fingerprint({ nothing: 'like this text' }) };
+  const refused = approveContract(drifted, {
+    approvedBy: OWNER,
+    at: '2026-03-01T11:00:00.000Z',
+    expectedContentFingerprint: contractContentFingerprint(BASE),
+  });
+  assert.ok(refused.ok, 'the caller naming the real text is the one whose read was honest');
+  assert.equal(
+    refused.value.contentFingerprint,
+    contractContentFingerprint(BASE),
+    'and what is sealed is the fingerprint of the text, not the drifted one',
+  );
+});
+
+test('a no-op edit does not move the lock, so it cannot invalidate a page that read the draft', () => {
+  const draft = draftAt();
+  const noop = editContract(draft, { ...BASE }, {
+    expectedUpdatedAt: draft.updatedAt,
+    at: '2026-03-01T10:30:00.000Z',
+    editedBy: OWNER,
+  });
+  assert.ok(!noop.ok, 'a write that changes nothing is refused by the domain');
+  assert.equal(noop.error.code, 'Invalid');
+
+  // Nothing was written, so the fingerprint the owner's page holds is still current.
+  const sealed = approveContract(draft, {
+    approvedBy: OWNER,
+    at: '2026-03-01T11:00:00.000Z',
+    expectedContentFingerprint: draft.contentFingerprint,
+  });
+  assert.ok(sealed.ok, sealed.ok ? '' : sealed.error.reason);
+});
+
+test('a reordering of the same criteria is not material, and leaves the lock alone', () => {
+  const draft = draftAt();
+  const reordered = editContract(draft, { ...BASE, acceptanceCriteria: [...BASE.acceptanceCriteria].reverse() }, {
+    expectedUpdatedAt: draft.updatedAt,
+    at: '2026-03-01T10:30:00.000Z',
+    editedBy: OWNER,
+  });
+  assert.ok(!reordered.ok, 'criteria are a set keyed by identity, so a reorder changes nothing');
+  assert.equal(reordered.error.code, 'Invalid');
 });
 
 test('invalidation requires a reason, so a stale revision always explains itself', () => {
