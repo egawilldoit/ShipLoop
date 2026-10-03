@@ -44,6 +44,7 @@ import { registerConnectorRoutes } from './routes/connectors.ts';
 import { registerContractRoutes } from './routes/contracts.ts';
 import { registerHandoffRoutes } from './routes/handoff.ts';
 import { registerHealthRoutes } from './routes/health.ts';
+import { registerHomeRoutes, type HomeEvidenceSources } from './routes/home.ts';
 import { registerIntakeRoutes } from './routes/intake.ts';
 import { registerOwnerRoutes } from './routes/owner.ts';
 import { registerOwnerTestRoutes } from './routes/owner-tests.ts';
@@ -79,6 +80,16 @@ export interface AppDependencies {
   readonly config: ServerConfig;
   readonly controller: ControllerSurface;
   readonly now: () => Date;
+  /**
+   * The stored candidate and review projections the home route composes.
+   *
+   * Optional, and null by default, because the composition root does not expose
+   * `createCandidateLinkUseCases` or `createMvpReviewUseCases` yet. Until it does, the home
+   * route refuses with a 503 naming the missing dependency rather than answering with three
+   * empty groups — an empty board is a claim about the project, and a server that cannot read
+   * a candidate has no basis for one. Owned by the composition root, not by this route.
+   */
+  readonly homeSources?: HomeEvidenceSources | null;
 }
 
 /**
@@ -128,6 +139,7 @@ export async function buildApp(deps: AppDependencies): Promise<FastifyInstance> 
   // Last of the project-scoped group, and for the same reason as the rest: the project
   // identity is part of the path, so settings cannot be addressed without one (mvp-spec 3).
   registerSettingsRoutes(app, { controller, guard, now });
+  registerHomeRoutes(app, { controller, guard, now, sources: deps.homeSources ?? null });
 
   const staticRoot = config.staticRoot;
   if (staticRoot !== null) {
