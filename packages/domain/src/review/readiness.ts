@@ -230,6 +230,19 @@ interface CurrentCandidate {
 }
 
 /**
+ * Orders verdicts newest first, so "the observation that counts" is the latest one
+ * recorded rather than whichever entry a caller listed first. An observation with no time
+ * sorts oldest, which is the honest place for it: a result nobody can date cannot displace
+ * a dated one.
+ */
+function byNewest(left: MvpEvidenceVerdict, right: MvpEvidenceVerdict): number {
+  const leftAt = left.evidence.observedAt ?? '';
+  const rightAt = right.evidence.observedAt ?? '';
+  if (leftAt !== rightAt) return rightAt.localeCompare(leftAt);
+  return right.evidence.evidenceId.localeCompare(left.evidence.evidenceId);
+}
+
+/**
  * The projection every review surface reads.
  *
  * Pure, and total: given the same facts it returns the same model, and it never throws.
@@ -263,7 +276,13 @@ export function buildMvpReviewReadModel(input: MvpReviewInput): Result<MvpReview
     candidateHeadSha: candidate.headSha,
   };
 
-  const verdicts = evidence.map((record) => assessMvpEvidence(record, current));
+  // Newest first, ordered by the time the observation happened and then by identity so a
+  // same-instant pair is still deterministic. The projection sorts rather than trusting
+  // the caller's array order, because "which observation counts" must be a property of the
+  // recorded facts and not of how a repository happened to list them (F23-AC1).
+  const verdicts = [...evidence]
+    .map((record) => assessMvpEvidence(record, current))
+    .sort(byNewest);
 
   const evidenceViews: MvpEvidenceView[] = verdicts.map((verdict) => ({
     evidenceId: verdict.evidence.evidenceId,
@@ -299,10 +318,10 @@ export function buildMvpReviewReadModel(input: MvpReviewInput): Result<MvpReview
       }
       return verdict.evidence.subject.kind === 'criterion' && verdict.evidence.subject.criterionId === criterion.id;
     });
-    const applicable = related.filter((verdict) => verdict.match.applies);
-    // Newest applicable observation wins, so a re-run replaces rather than races, and
-    // an observation bound elsewhere still surfaces as `stale` rather than vanishing.
-    const chosen = applicable.at(-1) ?? related.at(-1) ?? null;
+    // Newest applicable observation wins, so a re-run replaces rather than races. An
+    // observation bound elsewhere is only consulted when nothing current exists, which is
+    // what makes it read `stale` on the card instead of silently vanishing (F20-AC3).
+    const chosen = related.find((verdict) => verdict.match.applies) ?? related[0] ?? null;
     const method = methodFor(criterion, chosen);
     const state = deriveCriterionState({
       verificationType: criterion.verificationType,
@@ -377,8 +396,7 @@ function policyView(
 
   return ids.map((checkId) => {
     const bucket = byCheck.get(checkId) ?? [];
-    const applicable = bucket.filter((verdict) => verdict.match.applies);
-    const chosen = applicable.at(-1) ?? bucket.at(-1) ?? null;
+    const chosen = bucket.find((verdict) => verdict.match.applies) ?? bucket[0] ?? null;
     const isRequired = policy.requiredAutomatedCheckIds.includes(checkId) ||
       policy.deliveryRequiredCheckIds.includes(checkId);
     if (chosen === null) {
