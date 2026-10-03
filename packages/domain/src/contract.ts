@@ -91,62 +91,58 @@ export interface ContractContent {
  * exist only on the variant that has them, so "approved, approved by nobody" is not
  * representable rather than merely discouraged.
  */
+interface ContractRecord {
+  readonly contractId: ContractId;
+  readonly projectId: ProjectId;
+  readonly requestId: RequestId;
+  readonly revision: number;
+  readonly sourceBriefId: string | null;
+  readonly sourceBriefVersion: number | null;
+  /** The content fingerprint, recomputed on every write and compared on every read. */
+  readonly contentFingerprint: Fingerprint;
+  /** The request text this revision was written against, so a later request edit is detectable. */
+  readonly requestFingerprint: Fingerprint;
+  /**
+   * The owner who wrote this revision.
+   *
+   * Distinct from `approvedBy`, and not derivable from it: an invalidated or superseded
+   * revision keeps the owner who approved it, and a revision may be superseded before it
+   * was ever approved. Carrying the writer separately is what stops the two facts from
+   * being collapsed into one column that answers both questions with whichever write
+   * happened last.
+   */
+  readonly createdBy: OwnerId;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+}
+
 export type DeliveryContract =
-  | (ContractContent & {
-      readonly contractId: ContractId;
-      readonly projectId: ProjectId;
-      readonly requestId: RequestId;
-      readonly revision: number;
-      readonly status: 'draft';
-      readonly approvedAt: null;
-      readonly approvedBy: null;
-      readonly staleReason: null;
-      readonly supersededByRevision: null;
-      readonly sourceBriefId: string | null;
-      readonly sourceBriefVersion: number | null;
-      /** The content fingerprint, recomputed on every write and compared on every read. */
-      readonly contentFingerprint: Fingerprint;
-      /** The request text this revision was written against, so a later request edit is detectable. */
-      readonly requestFingerprint: Fingerprint;
-      readonly createdAt: string;
-      readonly updatedAt: string;
-    })
-  | (ContractContent & {
-      readonly contractId: ContractId;
-      readonly projectId: ProjectId;
-      readonly requestId: RequestId;
-      readonly revision: number;
-      readonly status: 'approved';
-      readonly approvedAt: string;
-      readonly approvedBy: OwnerId;
-      readonly staleReason: null;
-      readonly supersededByRevision: null;
-      readonly sourceBriefId: string | null;
-      readonly sourceBriefVersion: number | null;
-      readonly contentFingerprint: Fingerprint;
-      readonly requestFingerprint: Fingerprint;
-      readonly createdAt: string;
-      readonly updatedAt: string;
-    })
-  | (ContractContent & {
-      readonly contractId: ContractId;
-      readonly projectId: ProjectId;
-      readonly requestId: RequestId;
-      readonly revision: number;
-      readonly status: 'stale';
-      /** null only when this revision was superseded by a newer one. */
-      readonly approvedAt: string | null;
-      /** null only when this revision was superseded before it was ever approved. */
-      readonly approvedBy: OwnerId | null;
-      readonly staleReason: string;
-      readonly supersededByRevision: number | null;
-      readonly sourceBriefId: string | null;
-      readonly sourceBriefVersion: number | null;
-      readonly contentFingerprint: Fingerprint;
-      readonly requestFingerprint: Fingerprint;
-      readonly createdAt: string;
-      readonly updatedAt: string;
-    });
+  | (ContractContent &
+      ContractRecord & {
+        readonly status: 'draft';
+        readonly approvedAt: null;
+        readonly approvedBy: null;
+        readonly staleReason: null;
+        readonly supersededByRevision: null;
+      })
+  | (ContractContent &
+      ContractRecord & {
+        readonly status: 'approved';
+        readonly approvedAt: string;
+        readonly approvedBy: OwnerId;
+        readonly staleReason: null;
+        readonly supersededByRevision: null;
+      })
+  | (ContractContent &
+      ContractRecord & {
+        readonly status: 'stale';
+        /** null only when this revision was invalidated before it was ever approved. */
+        readonly approvedAt: string | null;
+        /** null only when this revision was invalidated before it was ever approved. */
+        readonly approvedBy: OwnerId | null;
+        readonly staleReason: string;
+        readonly supersededByRevision: number | null;
+      });
 
 /** The longest outcome statement a revision may carry. */
 export const MAXIMUM_OUTCOME_LENGTH = 2_000;
@@ -346,6 +342,7 @@ export function createContractDraft(input: CreateContractInput): Result<Delivery
       sourceBriefVersion: input.sourceBriefVersion ?? null,
       contentFingerprint: contractContentFingerprint(content),
       requestFingerprint: input.requestFingerprint,
+      createdBy: input.createdBy,
       createdAt: input.at,
       updatedAt: input.at,
     }),
@@ -412,6 +409,7 @@ export function editContract(
       sourceBriefVersion: contract.sourceBriefVersion,
       contentFingerprint: contractContentFingerprint(normalized),
       requestFingerprint: contract.requestFingerprint,
+      createdBy: contract.createdBy,
       createdAt: contract.createdAt,
       updatedAt: options.at,
     }),
@@ -466,6 +464,7 @@ export function approveContract(
       sourceBriefVersion: contract.sourceBriefVersion,
       contentFingerprint: contractContentFingerprint(content),
       requestFingerprint: contract.requestFingerprint,
+      createdBy: contract.createdBy,
       createdAt: contract.createdAt,
       updatedAt: input.at,
     }),

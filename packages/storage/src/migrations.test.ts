@@ -27,7 +27,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import { fingerprint } from '@shiploop/domain';
+import { canonicalize, fingerprint } from '@shiploop/domain';
 import type { DomainError, InvalidError, Result } from '@shiploop/domain';
 import { openDatabase, type Database } from './db.ts';
 import {
@@ -804,6 +804,386 @@ test('a scope snapshot stays append-only (F12-AC1)', async () => {
   });
 });
 
+/* -------------------------------------------------------------------------- */
+/* Requests and delivery contracts (mvp-spec 3)                                */
+/* -------------------------------------------------------------------------- */
+
+const REQUEST = 'request-migration-01';
+const CONTRACT = 'contract-migration-01';
+const REQUEST_FINGERPRINT = fingerprint({ request: 'migration' });
+const CRITERIA = canonicalize([
+  { id: 'AC1', description: 'The endpoint returns 200.', verificationType: 'automated' },
+]);
+
+/** The parent rows a request and a contract reference. */
+function seedContractParents(db: Database): void {
+  db.prepare('INSERT INTO owners (owner_id, display_name) VALUES (?, ?)').run(OWNER, 'Solo owner');
+  db.prepare('INSERT INTO projects (project_id, name) VALUES (?, ?)').run(PROJECT, 'Migration project');
+  db.prepare('INSERT INTO projects (project_id, name) VALUES (?, ?)').run(OTHER_PROJECT, 'Other project');
+}
+
+function insertRequest(db: Database, requestId = REQUEST, projectId = PROJECT): void {
+  db.prepare(
+    'INSERT INTO requests (request_id, project_id, title, description, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)',
+  ).run(requestId, projectId, 'Checkout totals', 'The summary shows the pre-tax total.', T0, T0);
+}
+
+function insertContract(
+  db: Database,
+  overrides: {
+    readonly contractId?: string;
+    readonly requestId?: string;
+    readonly projectId?: string;
+    readonly revision?: number;
+    readonly status?: string;
+    readonly outcome?: string;
+    readonly scopeJson?: string;
+    readonly outOfScopeJson?: string;
+    readonly criteriaJson?: string;
+    readonly approvedBy?: string | null;
+    readonly approvedAt?: string | null;
+    readonly staleReason?: string | null;
+    readonly supersededByRevision?: number | null;
+    readonly sourceBriefId?: string | null;
+    readonly sourceBriefVersion?: number | null;
+    readonly contentFingerprint?: string;
+  } = {},
+): void {
+  db.prepare(
+    `INSERT INTO delivery_contracts
+       (contract_id, project_id, request_id, revision, outcome, scope_json, out_of_scope_json,
+        acceptance_criteria_json, status, content_fingerprint, request_fingerprint, approved_by_owner_id,
+        approved_at, stale_reason, superseded_by_revision, source_brief_id, source_brief_version,
+        created_by_owner_id, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    overrides.contractId ?? CONTRACT,
+    overrides.projectId ?? PROJECT,
+    overrides.requestId ?? REQUEST,
+    overrides.revision ?? 1,
+    overrides.outcome ?? 'The summary shows the total including tax.',
+    overrides.scopeJson ?? canonicalize(['Sum before tax']),
+    overrides.outOfScopeJson ?? canonicalize(['Changing the tax rate']),
+    overrides.criteriaJson ?? CRITERIA,
+    overrides.status ?? 'draft',
+    overrides.contentFingerprint ?? fingerprint({ contract: 'migration' }),
+    REQUEST_FINGERPRINT,
+    overrides.approvedBy === undefined ? null : overrides.approvedBy,
+    overrides.approvedAt === undefined ? null : overrides.approvedAt,
+    overrides.staleReason === undefined ? null : overrides.staleReason,
+    overrides.supersededByRevision === undefined ? null : overrides.supersededByRevision,
+    overrides.sourceBriefId === undefined ? null : overrides.sourceBriefId,
+    overrides.sourceBriefVersion === undefined ? null : overrides.sourceBriefVersion,
+    OWNER,
+    T0,
+    T0,
+  );
+}
+
+test('a request belongs to a project and needs a title and a description (mvp-spec 3)', async () => {
+  await withMigratedDatabase((db) => {
+    seedContractParents(db);
+    assert.throws(
+      () =>
+        db
+          .prepare('INSERT INTO requests (request_id, project_id, title, description, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)')
+          .run('req-blank', PROJECT, '   ', 'Something', T0, T0),
+      /CHECK constraint failed: length\(trim\(title\)\) > 0/,
+    );
+    assert.throws(
+      () =>
+        db
+          .prepare('INSERT INTO requests (request_id, project_id, title, description, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)')
+          .run('req-blank-desc', PROJECT, 'Title', '  ', T0, T0),
+      /CHECK constraint failed: length\(trim\(description\)\) > 0/,
+    );
+    // A request with no project is refused by the foreign key, so "which project is
+    // this for" can never be answered two ways.
+    assert.throws(
+      () =>
+        db
+          .prepare('INSERT INTO requests (request_id, project_id, title, description, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)')
+          .run('req-no-project', 'no-such-project', 'Title', 'Something', T0, T0),
+      /FOREIGN KEY constraint failed/,
+    );
+  });
+});
+
+test('a request title and description stay editable, because a request is a draft (mvp-spec 3)', async () => {
+  await withMigratedDatabase((db) => {
+    seedContractParents(db);
+    insertRequest(db);
+    db.prepare('UPDATE requests SET title = ?, description = ?, updated_at = ? WHERE request_id = ?').run(
+      'Checkout totals including tax',
+      'The summary shows the total including tax.',
+      '2026-02-02T00:00:00.000Z',
+      REQUEST,
+    );
+    const row = db.prepare('SELECT title, description, updated_at FROM requests WHERE request_id = ?').get(REQUEST);
+    assert.equal(row?.['title'], 'Checkout totals including tax');
+    assert.equal(row?.['updated_at'], '2026-02-02T00:00:00.000Z');
+  });
+});
+
+test('an approval is an owner decision with a recorded identity, or it is not an approval (mvp-spec 3)', async () => {
+  await withMigratedDatabase((db) => {
+    seedContractParents(db);
+    insertRequest(db);
+    // Approved by nobody.
+    assert.throws(
+      () => insertContract(db, { status: 'approved', approvedAt: T0 }),
+      /CHECK constraint failed/,
+    );
+    // Approved at no instant.
+    assert.throws(
+      () => insertContract(db, { status: 'approved', approvedBy: OWNER }),
+      /CHECK constraint failed/,
+    );
+    // Approved by a row that is not an owner.
+    assert.throws(
+      () => insertContract(db, { status: 'approved', approvedBy: 'own_not_real', approvedAt: T0 }),
+      /FOREIGN KEY constraint failed/,
+    );
+    // Both halves together is accepted.
+    insertContract(db, { status: 'approved', approvedBy: OWNER, approvedAt: T0 });
+    assert.equal(
+      db.prepare('SELECT status FROM delivery_contracts WHERE request_id = ?').get(REQUEST)?.['status'],
+      'approved',
+    );
+  });
+});
+
+test('an approved or stale revision is frozen by the schema, not only by the domain (mvp-spec 3)', async () => {
+  await withMigratedDatabase((db) => {
+    seedContractParents(db);
+    insertRequest(db);
+    insertContract(db, { status: 'approved', approvedBy: OWNER, approvedAt: T0 });
+
+    assert.throws(
+      () =>
+        db
+          .prepare('UPDATE delivery_contracts SET outcome = ? WHERE request_id = ?')
+          .run('A different outcome entirely', REQUEST),
+      /an approved or stale delivery contract revision is frozen/,
+    );
+    assert.throws(
+      () =>
+        db
+          .prepare('UPDATE delivery_contracts SET acceptance_criteria_json = ? WHERE request_id = ?')
+          .run(canonicalize([]), REQUEST),
+      /an approved or stale delivery contract revision is frozen/,
+    );
+    assert.throws(
+      () => db.prepare('DELETE FROM delivery_contracts WHERE request_id = ?').run(REQUEST),
+      /an approved or stale delivery contract revision is retained for history/,
+    );
+    assert.equal(
+      db.prepare('SELECT outcome FROM delivery_contracts WHERE request_id = ?').get(REQUEST)?.['outcome'],
+      'The summary shows the total including tax.',
+    );
+
+    // The transition out of approved is the one thing that is allowed, and it must name
+    // a reason: a stale revision always explains itself.
+    assert.throws(
+      () =>
+        db
+          .prepare("UPDATE delivery_contracts SET status = 'stale' WHERE request_id = ?")
+          .run(REQUEST),
+      /CHECK constraint failed/,
+    );
+    db.prepare("UPDATE delivery_contracts SET status = 'stale', stale_reason = ? WHERE request_id = ?").run(
+      'The owner changed the scope.',
+      REQUEST,
+    );
+    assert.equal(
+      db.prepare('SELECT stale_reason FROM delivery_contracts WHERE request_id = ?').get(REQUEST)?.['stale_reason'],
+      'The owner changed the scope.',
+    );
+  });
+});
+
+test('a draft revision keeps its own content editable while its identity stays fixed (mvp-spec 7)', async () => {
+  await withMigratedDatabase((db) => {
+    seedContractParents(db);
+    insertRequest(db);
+    insertContract(db);
+
+    db.prepare('UPDATE delivery_contracts SET outcome = ?, updated_at = ? WHERE request_id = ?').run(
+      'The summary shows the total including tax and shipping.',
+      '2026-02-02T00:00:00.000Z',
+      REQUEST,
+    );
+    assert.equal(
+      db.prepare('SELECT outcome FROM delivery_contracts WHERE request_id = ?').get(REQUEST)?.['outcome'],
+      'The summary shows the total including tax and shipping.',
+    );
+
+    for (const [column, value] of [
+      ['contract_id', 'contract-rewritten'],
+      ['revision', '9'],
+      ['request_id', 'request-rewritten'],
+      ['project_id', OTHER_PROJECT],
+      ['created_at', '2026-01-01T00:00:00.000Z'],
+      ['created_by_owner_id', 'own_rewritten'],
+    ] as const) {
+      assert.throws(
+        () =>
+          db.prepare(`UPDATE delivery_contracts SET ${column} = ? WHERE request_id = ?`).run(value, REQUEST),
+        /a delivery contract revision keeps its identity for its whole life/,
+        `${column} must not be rewritten`,
+      );
+    }
+  });
+});
+
+test('a request has at most one draft and one approved revision, so "the contract" is one thing (mvp-spec 3)', async () => {
+  await withMigratedDatabase((db) => {
+    seedContractParents(db);
+    insertRequest(db);
+    insertContract(db);
+    // A second draft for the same request: the constraint that stops two texts being
+    // editable at once, which is how a revision gets approved while another is on screen.
+    assert.throws(
+      () => insertContract(db, { contractId: 'contract-second-draft', revision: 2 }),
+      /UNIQUE constraint failed: delivery_contracts\.request_id/,
+    );
+
+    db.prepare('DELETE FROM delivery_contracts WHERE request_id = ?').run(REQUEST);
+    insertContract(db, { status: 'approved', approvedBy: OWNER, approvedAt: T0 });
+    assert.throws(
+      () =>
+        insertContract(db, {
+          contractId: 'contract-second-approved',
+          revision: 2,
+          status: 'approved',
+          approvedBy: OWNER,
+          approvedAt: T0,
+        }),
+      /UNIQUE constraint failed: delivery_contracts\.request_id/,
+    );
+    // A draft alongside the approved revision is fine: drafting a revision is how a
+    // material change is made, and the old approval stays current until it is superseded.
+    insertContract(db, { contractId: 'contract-next-draft', revision: 2 });
+  });
+});
+
+test('a request may hold many revisions, and each is addressed by its own number (mvp-spec 3)', async () => {
+  await withMigratedDatabase((db) => {
+    seedContractParents(db);
+    insertRequest(db);
+    insertContract(db, { status: 'approved', approvedBy: OWNER, approvedAt: T0 });
+    db.prepare('UPDATE delivery_contracts SET status = ?, stale_reason = ? WHERE request_id = ?').run(
+      'stale',
+      'Superseded by revision 2.',
+      REQUEST,
+    );
+    insertContract(db, { contractId: 'contract-second', revision: 2, status: 'draft' });
+
+    const rows = db
+      .prepare('SELECT contract_id, revision, status FROM delivery_contracts WHERE request_id = ? ORDER BY revision')
+      .all(REQUEST);
+    assert.deepEqual(
+      plain(rows).map((row) => [row['contract_id'], row['revision'], row['status']]),
+      [
+        [CONTRACT, 1, 'stale'],
+        ['contract-second', 2, 'draft'],
+      ],
+    );
+    // The same revision number cannot be reused for the same request.
+    assert.throws(
+      () => insertContract(db, { contractId: 'contract-duplicate-revision', revision: 2, status: 'draft' }),
+      /UNIQUE constraint failed/,
+    );
+  });
+});
+
+test('a revision is superseded only by a strictly later one, and a superseded one was approved (mvp-spec 3)', async () => {
+  await withMigratedDatabase((db) => {
+    seedContractParents(db);
+    insertRequest(db);
+    insertContract(db);
+    // Superseding itself: the reason names revision 1, which is what this row is.
+    assert.throws(
+      () =>
+        db
+          .prepare("UPDATE delivery_contracts SET status = 'stale', stale_reason = 'Superseded by revision 1.', superseded_by_revision = 1 WHERE request_id = ?")
+          .run(REQUEST),
+      /CHECK constraint failed/,
+    );
+    // Superseding by a later revision while the row is a draft: there is no approval to
+    // supersede, so the pairing is refused rather than recorded as one.
+    assert.throws(
+      () =>
+        db
+          .prepare("UPDATE delivery_contracts SET status = 'stale', stale_reason = 'Superseded by revision 4.', superseded_by_revision = 4 WHERE request_id = ?")
+          .run(REQUEST),
+      /CHECK constraint failed/,
+    );
+
+    // The real shape: an approved revision superseded by a later one.
+    db.prepare('DELETE FROM delivery_contracts WHERE request_id = ?').run(REQUEST);
+    insertContract(db, { status: 'approved', approvedBy: OWNER, approvedAt: T0 });
+    db.prepare("UPDATE delivery_contracts SET status = 'stale', stale_reason = ?, superseded_by_revision = 2 WHERE request_id = ?").run(
+      'Superseded by revision 2.',
+      REQUEST,
+    );
+    const row = db.prepare('SELECT status, stale_reason, superseded_by_revision, approved_by_owner_id FROM delivery_contracts WHERE request_id = ?').get(REQUEST);
+    assert.equal(row?.['status'], 'stale');
+    assert.equal(row?.['stale_reason'], 'Superseded by revision 2.');
+    assert.equal(row?.['superseded_by_revision'], 2);
+    // The approval survives, because a superseded revision is history rather than a deletion.
+    assert.equal(row?.['approved_by_owner_id'], OWNER);
+  });
+});
+
+test('brief provenance is all-or-nothing, so a revision never cites half a brief (F07-AC3)', async () => {
+  await withMigratedDatabase((db) => {
+    seedContractParents(db);
+    insertRequest(db);
+    assert.throws(
+      () => insertContract(db, { sourceBriefId: 'brief-1', sourceBriefVersion: null }),
+      /CHECK constraint failed/,
+    );
+    assert.throws(
+      () => insertContract(db, { sourceBriefId: null, sourceBriefVersion: 2 }),
+      /CHECK constraint failed/,
+    );
+    insertContract(db, { sourceBriefId: 'brief-1', sourceBriefVersion: 2 });
+    assert.equal(
+      db.prepare('SELECT source_brief_version FROM delivery_contracts WHERE request_id = ?').get(REQUEST)?.[
+        'source_brief_version'
+      ],
+      2,
+    );
+  });
+});
+
+test('a contract stores its content as canonical documents, not as opaque text (mvp-spec 7)', async () => {
+  await withMigratedDatabase((db) => {
+    seedContractParents(db);
+    insertRequest(db);
+    // Non-JSON, or JSON of the wrong shape, is refused at the column rather than read
+    // back as a contract whose scope is a string.
+    for (const [label, overrides] of [
+      ['scope_json', { scopeJson: 'not json' }],
+      ['out_of_scope_json', { outOfScopeJson: '"a string"' }],
+      ['acceptance_criteria_json', { criteriaJson: '{"AC1":"not an array"}' }],
+    ] as const) {
+      assert.throws(
+        () => insertContract(db, overrides),
+        /CHECK constraint failed/,
+        `${label} must hold a JSON array`,
+      );
+    }
+    // A malformed content fingerprint is refused too: a fingerprint of nothing cannot
+    // identify a revision.
+    assert.throws(
+      () => insertContract(db, { contentFingerprint: 'fp_short' }),
+      /CHECK constraint failed/,
+    );
+  });
+});
+
 test('the unique indexes the product relies on are present after migrating', async () => {
   await withMigratedDatabase((db) => {
     const unique = new Set(
@@ -823,6 +1203,10 @@ test('the unique indexes the product relies on are present after migrating', asy
       // One snapshot per sequence number for a work item, so a replayed append
       // returns the original snapshot (F12-AC1).
       'scope_snapshots_by_work_item_sequence',
+      // One draft and one approved revision per request, so "the current contract" is
+      // a single thing rather than two rows a client picks between (mvp-spec 3).
+      'delivery_contracts_one_draft_per_request',
+      'delivery_contracts_one_approved_per_request',
     ]) {
       assert.equal(unique.has(name), true, `${name} should be a unique index`);
     }

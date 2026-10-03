@@ -5,6 +5,7 @@ export * from './migrations.ts';
 export * from './tx.ts';
 export * from './repositories/types.ts';
 export * from './repositories/core.ts';
+export * from './repositories/contracts.ts';
 export * from './repositories/scope.ts';
 export * from './repositories/intake.ts';
 export * from './repositories/publication.ts';
