@@ -577,6 +577,24 @@ test('F24-AC2: the card carries every element, with the full commit SHA verbatim
   );
   assert.ok(card.contract.approval.approvedAt !== null, 'the approval is what the candidate was handed');
 
+  // Provider facts are carried, not inferred, and an unrecognised provider state keeps its
+  // own name rather than being folded into Open or Closed (mvp-spec 3).
+  assert.equal(card.candidate.pullRequestState, 'Open', "the provider's own state, verbatim");
+  assert.equal(card.candidate.pullRequestNumber, 42);
+  assert.equal(card.candidate.pullRequestUrl, 'https://example.invalid/octopus/shop/pull/42');
+  assert.equal(card.candidate.repository, 'octopus/shop');
+  assert.equal(card.candidate.baseBranch, 'main');
+  assert.equal(card.candidate.draft, false);
+  assert.equal(card.candidate.requestId, h.seed.requestId);
+  assert.equal(card.candidate.contractId, h.seed.contractId);
+
+  // The policy the eligibility was computed under travels with it, so a client can tell an
+  // empty required-check list from a missing policy.
+  assert.equal(card.policy.policyId, 'mvp-default');
+  assert.deepEqual(card.policy.requiredAutomatedCheckIds, [], 'the shipped policy requires no check');
+  assert.equal(card.policy.ownerTestBlocksReview, false);
+  assert.equal(card.policy.ownerTestBlocksDelivery, true);
+
   assert.equal(card.candidate.candidateId, CANDIDATE_ID);
   assert.equal(card.candidate.headSha, HEAD, 'the head is the full SHA the store recorded, verbatim');
   assert.equal(card.candidate.headSha.length, 40);
@@ -630,6 +648,90 @@ test('F24-AC2: the card carries every element, with the full commit SHA verbatim
     ],
     'the card carries these elements and nothing that would claim a merge, a deploy or a release',
   );
+
+  // Every criterion the contract declares appears exactly once in `criteria`, once in
+  // `ownerTests` if the owner owns it, and never in both lists under two names - a client
+  // counting requirements must not find the same criterion twice or none at all.
+  assert.deepEqual(
+    card.criteria.map((criterion) => criterion.criterionId).sort(),
+    [AUTOMATED_CRITERION_ID, OWNER_CRITERION_ID],
+    'every declared criterion is on the card, once',
+  );
+  assert.deepEqual(
+    card.ownerTests.map((criterion) => criterion.criterionId),
+    [OWNER_CRITERION_ID],
+    'the owner tests are the owner-owned criteria and no others',
+  );
+  for (const criterion of card.criteria) {
+    assert.ok(criterion.description.length > 0, `${criterion.criterionId} carries the text it was declared with`);
+    assert.ok(criterion.reason.length > 0, `${criterion.criterionId} says why it reads ${criterion.state}`);
+  }
+
+  // The three gates are separate answers rather than one flag, and the MVP reaches the first
+  // two: `verified != accepted` and `accepted != merged` are only visible if they are distinct
+  // (F24-AC3, F25-AC1).
+  assert.equal(card.eligibility.readyForOwnerReview, false);
+  assert.equal(card.eligibility.readyForAcceptance, false);
+  assert.equal(card.eligibility.readyForDelivery, false);
+  assert.ok(card.eligibility.deliveryBlockers.length > 0, 'delivery names what stands between this and delivered');
+  for (const reason of [...card.eligibility.blockingReasons, ...card.eligibility.acceptanceBlockers]) {
+    assert.ok(reason.length > 0, 'a blocker a client cannot read is not a blocker');
+  }
+
+  // Staleness is reported as a plain `false` rather than as an empty list a client has to
+  // interpret, and no reason is invented for a candidate that is current.
+  assert.equal(card.staleness.stale, false);
+  assert.deepEqual(card.staleness.reasons, []);
+});
+
+test('mvp-spec 3: the provider state reaches the card verbatim, never normalised into open or closed', async (t) => {
+  const h = await harness();
+  t.after(() => h.close());
+
+  // A second candidate at the same commit but a different provider state. GitHub owns this
+  // fact: a merged pull request is not a closed one and neither is an open one, and the card
+  // has to say which rather than collapsing the difference (mvp-spec 3).
+  expectOk(
+    new DeliveryCandidateRepository(h.root.database).record({
+      candidateId: 'cand-checkout-merged' as CandidateId,
+      projectId: PROJECT_ID as ProjectId,
+      requestId: h.seed.requestId,
+      contractId: h.seed.contractId,
+      contractRevision: h.seed.revision,
+      provider: 'github',
+      repository: 'octopus/shop',
+      pullRequestNumber: 43,
+      pullRequestUrl: 'https://example.invalid/octopus/shop/pull/43',
+      baseBranch: 'main',
+      baseSha: OLD_HEAD as CommitSha,
+      headBranch: 'feature/checkout-total',
+      headSha: HEAD as CommitSha,
+      headRepository: 'octopus/shop',
+      pullRequestState: 'Merged',
+      draft: false,
+      observedAt: NOW,
+      correlationId: 'seed-candidate-merged',
+    }),
+    'a candidate whose pull request is merged',
+  );
+
+  const response = await h.reviewFor('cand-checkout-merged');
+  assert.equal(response.status, 200, response.raw);
+  assert.equal(
+    response.card?.candidate.pullRequestState,
+    'Merged',
+    "the provider's own state, verbatim",
+  );
+  assert.notEqual(response.card?.candidate.pullRequestState, 'Open', 'a merged pull request is not open');
+  assert.notEqual(response.card?.candidate.pullRequestState, 'Closed', 'and not closed either');
+
+  // The card's state type is a plain string rather than the domain's closed vocabulary,
+  // which is what makes pass-through possible at all: a projection typed to the enum could
+  // only re-state a state it already knew. This is the type that allows the honest answer
+  // when the adapter reports something the product has no name for (mvp-spec 3).
+  const open = await h.review();
+  assert.equal(open.card?.candidate.pullRequestState, 'Open');
+  assert.equal(open.card?.candidate.headSha, HEAD, 'the two candidates are distinguished by their state alone');
 });
 
 test('F23-AC1, F24-AC3: an owner test is pending until the owner acts, and only the owner can settle it', async (t) => {

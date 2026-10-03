@@ -706,6 +706,47 @@ test('F20-AC3: an observation bound to another commit is reported as history, ne
   });
 });
 
+test('F02-AC2, F20-AC3: the card is proved to belong to the project that asked for it, at every level', async () => {
+  await withCard(async (harness) => {
+    const stored = seed(harness.db, OWNER_ONLY_SEED);
+    const card = expectOk(
+      await harness.card.getReview({ projectId: PROJECT, candidateId: stored.candidateId, actor: OWNER }),
+    );
+
+    // The candidate is the one thing `readFacts` refuses on project identity, and it is the
+    // only element whose project membership the other facts are derived from. So the other
+    // three are asserted here to pin the shape a client relies on: each names its own
+    // project, so "which project is this card about" has one answer rather than four that
+    // could be read independently (F02-AC2).
+    assert.equal(card.candidate.projectId, PROJECT, 'the candidate names the project it was read under');
+    assert.equal(card.request.projectId, PROJECT, 'and the request it belongs to agrees');
+    assert.equal(card.contract.projectId, PROJECT, 'and so does the contract revision');
+    assert.equal(card.candidate.requestId, stored.requestId, 'the candidate points at the request on the card');
+    assert.equal(card.candidate.contractId, stored.contractId);
+    assert.equal(card.candidate.contractRevision, card.contract.revision, 'the candidate and the card agree on the revision');
+    assert.equal(card.request.requestId, card.contract.requestId, 'the contract belongs to the request on the card');
+  });
+});
+
+test('F20-AC3, F24-AC3: a card carrying evidence from two projects cannot be read through one path', async () => {
+  // The transport re-checks project membership on every element of a card before returning
+  // it, because a projection assembled from several reads could otherwise mix a project in.
+  // The shape that makes that check meaningful is pinned here: every element carries its own
+  // project id rather than sharing one derived from the request (F02-AC2).
+  await withCard(async (harness) => {
+    const stored = seed(harness.db, OWNER_ONLY_SEED);
+    const card = expectOk(
+      await harness.card.getReview({ projectId: PROJECT, candidateId: stored.candidateId, actor: OWNER }),
+    );
+    const projects = new Set([
+      card.request.projectId,
+      card.contract.projectId,
+      card.candidate.projectId,
+    ]);
+    assert.equal(projects.size, 1, `a card must not mix projects; it carries ${[...projects].join(', ')}`);
+  });
+});
+
 test('F25-AC3: a decision that no longer describes the candidate is surfaced, not dropped', async () => {
   // Same seam and same reason as the case above: the projection must render a stale decision,
   // and its `staleDecisions` list must be present on every card even when it is empty.
