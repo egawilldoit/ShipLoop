@@ -1,4 +1,5 @@
-import { useState, type ReactElement } from 'react';
+import { useState, type FormEvent, type ReactElement } from 'react';
+import { createProject, type ProjectSummary } from './api-client.ts';
 import { ConnectionBanner } from './components/ConnectionBanner.tsx';
 import { BriefPage } from './pages/BriefPage.tsx';
 import { ConnectorsPage } from './pages/ConnectorsPage.tsx';
@@ -35,8 +36,161 @@ const SECTIONS: readonly { readonly id: Section; readonly label: string }[] = [
   { id: 'publication', label: 'Publication' },
 ];
 
+/**
+ * Which project every project-scoped screen addresses (F02-AC1).
+ *
+ * This component exists because project identity was previously absent rather than chosen.
+ * The session response carried no project, the pages took an empty string, and every request
+ * they built from it went to `/api/profiles/undefined` — a project literally named
+ * "undefined" — which answered 404 and was reported as "that project has no saved profile
+ * yet". A selector plus an explicit "no project selected" state means a page either has a
+ * project to ask about or says it has none, and neither case is a request for a name that
+ * does not exist (F02-AC1, F02-AC4).
+ *
+ * Creation is offered here because it is the only project write that needs no configured
+ * provider: a profile save, a connector registration and a procedure append all refuse by
+ * name when no adapter declares the capability they need, so an owner who has configured
+ * nothing would otherwise have no project to select at all (F03-AC2).
+ */
+function ProjectSelector({
+  projects,
+  selectedProjectId,
+  onSelect,
+  onCreated,
+}: {
+  readonly projects: readonly ProjectSummary[];
+  readonly selectedProjectId: string | null;
+  readonly onSelect: (projectId: string | null) => void;
+  readonly onCreated: () => void;
+}): ReactElement {
+  const [creating, setCreating] = useState(false);
+  const [projectId, setProjectId] = useState('');
+  const [name, setName] = useState('');
+  const [error, setError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+
+  const submit = (event: FormEvent<HTMLFormElement>): void => {
+    event.preventDefault();
+    if (saving) return;
+    if (projectId.trim() === '') {
+      setError('A project needs an id. It is the name every request for that project uses.');
+      return;
+    }
+    if (name.trim() === '') {
+      setError('A project needs a name, so the selector does not offer the owner a bare id.');
+      return;
+    }
+    setSaving(true);
+    setError(null);
+    void createProject({ projectId: projectId.trim(), name: name.trim() }).then((result) => {
+      setSaving(false);
+      if (!result.ok) {
+        setError(result.error.reason);
+        return;
+      }
+      setProjectId('');
+      setName('');
+      setCreating(false);
+      onCreated();
+      onSelect(result.value.project.projectId);
+    });
+  };
+
+  return (
+    <div className="project-selector">
+      <label className="project-selector__label" htmlFor="project-select">
+        Project
+      </label>
+      <select
+        id="project-select"
+        className="project-selector__select"
+        value={selectedProjectId ?? ''}
+        onChange={(event) => onSelect(event.target.value === '' ? null : event.target.value)}
+      >
+        {/* The empty option is a real state, not a placeholder: it is what "no project is
+            selected" means, and it is the state a signed-in owner with no project is in. */}
+        <option value="">No project selected</option>
+        {projects.map((project) => (
+          <option key={project.projectId} value={project.projectId}>
+            {project.name} ({project.projectId})
+          </option>
+        ))}
+      </select>
+      {creating ? (
+        <form className="project-selector__form" onSubmit={submit} noValidate>
+          <label className="project-selector__label" htmlFor="project-id">
+            Project id
+          </label>
+          <input
+            id="project-id"
+            className="project-selector__input"
+            value={projectId}
+            onChange={(event) => setProjectId(event.target.value)}
+            placeholder="one-word-id, no slashes"
+            disabled={saving}
+          />
+          <label className="project-selector__label" htmlFor="project-name">
+            Project name
+          </label>
+          <input
+            id="project-name"
+            className="project-selector__input"
+            value={name}
+            onChange={(event) => setName(event.target.value)}
+            placeholder="What this project is called"
+            disabled={saving}
+          />
+          {error !== null && (
+            <p className="state-line state-line--error" role="alert" data-state="failed">
+              {error}
+            </p>
+          )}
+          <div className="project-selector__actions">
+            <button className="button" type="submit" disabled={saving}>
+              {saving ? 'Creating…' : 'Create project'}
+            </button>
+            <button
+              className="button button--secondary"
+              type="button"
+              disabled={saving}
+              onClick={() => {
+                setCreating(false);
+                setError(null);
+              }}
+            >
+              Cancel
+            </button>
+          </div>
+        </form>
+      ) : (
+        <button
+          className="button button--secondary"
+          type="button"
+          onClick={() => {
+            setCreating(true);
+            setError(null);
+          }}
+        >
+          New project
+        </button>
+      )}
+    </div>
+  );
+}
+
 function Shell(): ReactElement {
-  const { status, owner, projectId, projectName, connection, connectionEpoch, signOut, retry } = useSession();
+  const {
+    status,
+    owner,
+    selectedProjectId,
+    selectProject,
+    projects,
+    reloadProjects,
+    connection,
+    connectionEpoch,
+    signOut,
+    retry,
+  } = useSession();
   const [section, setSection] = useState<Section>('intake');
   const [activeProfileId, setActiveProfileId] = useState('');
   const [activeProfileLabel, setActiveProfileLabel] = useState('');
@@ -82,10 +236,24 @@ function Shell(): ReactElement {
       <header className="app__header">
         <div className="app__identity">
           <h1 className="app__title">ShipLoop</h1>
+          {/*
+            The address is rendered from what the server sent, and its absence is stated
+            rather than rendered as an empty pair of parentheses. The header used to show
+            `Signed in as <name> () for ` because the session response carried no address and
+            this template interpolated one anyway, so a missing fact read as a rendering fault
+            in a field the owner had never filled in (F01-AC1).
+          */}
           <p className="app__owner">
-            Signed in as {owner.displayName} ({owner.email}) for {projectName}
+            Signed in as {owner.displayName}
+            {owner.email === null ? ' (this owner has no sign-in address)' : ` (${owner.email})`}
           </p>
         </div>
+        <ProjectSelector
+          projects={projects}
+          selectedProjectId={selectedProjectId}
+          onSelect={selectProject}
+          onCreated={reloadProjects}
+        />
         <button
           className="button button--secondary"
           type="button"
@@ -130,14 +298,14 @@ function Shell(): ReactElement {
       <main className="app__main" id="main">
         {section === 'profiles' ? (
           <ProfilesPage
-            projectId={projectId}
+            projectId={selectedProjectId}
             activeProfileId={activeProfileId}
             onSelectProfile={selectProfile}
             epoch={connectionEpoch}
           />
         ) : section === 'connectors' ? (
           <ConnectorsPage
-            projectId={projectId}
+            projectId={selectedProjectId}
             profileId={activeProfileId}
             profileName={activeProfileLabel}
             epoch={connectionEpoch}
@@ -145,6 +313,7 @@ function Shell(): ReactElement {
         ) : section === 'intake' ? (
           <IntakePage
             selectedIdeaId={activeIdeaId}
+            selectedProjectId={selectedProjectId}
             onSelectIdea={setActiveIdeaId}
             onOpenBrief={(ideaId) => {
               setActiveIdeaId(ideaId);
@@ -189,7 +358,7 @@ function Shell(): ReactElement {
           <PublicationPage
             planId={activePlanId}
             ideaId={activeIdeaId}
-            projectId={projectId}
+            projectId={selectedProjectId}
             onBackToPlan={() => setSection('plan')}
             epoch={connectionEpoch}
           />

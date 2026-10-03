@@ -23,6 +23,16 @@ import { StatusBadge, type StatusTone } from '../components/StatusBadge.tsx';
 
 export interface IntakePageProps {
   readonly selectedIdeaId: string;
+  /**
+   * The project a capture is recorded against, or null when none is selected (F02-AC1).
+   *
+   * This page used to send a hard-coded `projectId: null` on every capture, so every request a
+   * real owner made was stored against no project at all and the project-scoped screens had
+   * nothing that belonged to them. The owner's explicit selection is what a capture is now
+   * recorded against, and a capture with no project is still allowed because the specification
+   * does not require one — it is simply recorded honestly as unassigned (F06-AC1, F02-AC1).
+   */
+  readonly selectedProjectId: string | null;
   readonly onSelectIdea: (ideaId: string) => void;
   readonly onOpenBrief: (ideaId: string) => void;
   readonly epoch: number;
@@ -162,7 +172,13 @@ function TextArea({
  * data and an owner who cannot tell which is which will eventually act on a summary
  * as if it were what they asked for (F06-AC1).
  */
-export function IntakePage({ selectedIdeaId, onSelectIdea, onOpenBrief, epoch }: IntakePageProps): ReactElement {
+export function IntakePage({
+  selectedIdeaId,
+  selectedProjectId,
+  onSelectIdea,
+  onOpenBrief,
+  epoch,
+}: IntakePageProps): ReactElement {
   const [ideas, setIdeas] = useState<readonly IntakeIdea[] | null>(null);
   const [listError, setListError] = useState<string | null>(null);
   const [reload, setReload] = useState(0);
@@ -268,7 +284,10 @@ export function IntakePage({ selectedIdeaId, onSelectIdea, onOpenBrief, epoch }:
     const result = await captureIdea({
       rawRequest: form.rawRequest.trim(),
       kind: form.kind,
-      projectId: null,
+      // The owner's explicit selection, or null when they selected none. Recorded either way:
+      // a capture against no project is a legitimate capture, and recording the real value is
+      // what lets the project-scoped screens find this request afterwards (F06-AC1, F02-AC1).
+      projectId: selectedProjectId,
       notes: form.notes.trim() === '' ? null : form.notes.trim(),
       detail:
         form.kind === 'Bug'

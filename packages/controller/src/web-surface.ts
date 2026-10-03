@@ -96,6 +96,7 @@ import type {
   ConnectorKind,
   ConnectorRecord,
   ConnectorState,
+  ProjectRecord,
   IdeaExport,
   JobCheckpoint,
   JobLimits,
@@ -163,7 +164,48 @@ export interface SurfaceStoredSession {
 export interface SurfaceOwner {
   readonly ownerId: OwnerId;
   readonly displayName: string;
+  /**
+   * The sign-in address, or null when the owner row carries none (F01-AC1).
+   *
+   * Read from the owner row rather than re-derived from the display name. The transport
+   * showed a blank address beside the name and its only remedy would have been to
+   * reconstruct the same slug rule this module owns, which is how two derivations of one
+   * rule drift and an owner is shown an address that is not theirs (F01-AC1).
+   */
+  readonly email: string | null;
   readonly createdAt: string;
+}
+
+/**
+ * One project as the owner selects it (F02-AC1).
+ *
+ * The identity and the name travel together: the selector needs both, and rendering the
+ * identity where a name belongs would make the owner choose a string (F02-AC1).
+ */
+export interface SurfaceProject {
+  readonly projectId: string;
+  readonly name: string;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+  readonly archivedAt: string | null;
+}
+
+/**
+ * Project listing and creation (F02-AC1).
+ *
+ * Creation is the only project write that needs no configured provider. Every other write
+ * that creates the row behind the owner's back — a profile save, a connector registration,
+ * a procedure append — is refused by name when no adapter declares the capability it needs
+ * (F03-AC2), so without this an owner who configured nothing had no project to select and
+ * every project-scoped screen addressed nothing at all.
+ */
+export interface SurfaceProjectUseCases {
+  listProjects(): Promise<Result<readonly SurfaceProject[], DomainError>>;
+  createProject(command: {
+    readonly projectId: string;
+    readonly name: string;
+    readonly at: string;
+  }): Promise<Result<SurfaceProject, DomainError>>;
 }
 
 export interface SurfaceSessionGrant {
@@ -244,6 +286,16 @@ export interface SurfaceOwnerUseCases {
     readonly password: string;
     readonly at: string;
   }): Promise<Result<SurfaceOwner, DomainError>>;
+  /**
+   * The identity this owner signs in with, read from the owner row (F01-AC1).
+   *
+   * A read rather than a field on `signIn`, because every request that re-establishes a
+   * session needs the address, not only the one that created it, and the transport's only
+   * alternative was to reconstruct the address from the display name — a second copy of the
+   * rule this module owns, which drifts and then shows the owner an address that is not
+   * theirs (F01-AC1).
+   */
+  describe(command: { readonly ownerId: OwnerId }): Promise<Result<SurfaceOwner, DomainError>>;
   signIn(command: {
     readonly identifier: string;
     readonly password: string;
@@ -1295,6 +1347,7 @@ export interface SurfaceGenerationUseCases {
 /** The whole injected surface. One argument, so a missing use case is a type error. */
 export interface ControllerSurface {
   readonly owners: SurfaceOwnerUseCases;
+  readonly projects: SurfaceProjectUseCases;
   readonly sessions: SurfaceSessionUseCases;
   readonly profiles: SurfaceProfileUseCases;
   readonly connectors: SurfaceConnectorUseCases;
@@ -1321,6 +1374,31 @@ export type SurfaceRootResolver = () => Result<CompositionRoot, DomainError>;
 /** The owner actor every capability-checked use case demands. */
 function ownerActor(actorId: OwnerId): OwnerActor {
   return { actorId, role: 'Owner', ownerId: actorId, sessionId: null };
+}
+
+/**
+ * The address one owner row carries, or null when it carries none.
+ *
+ * Null rather than a refusal: an owner row without an address is a legitimate row, and the
+ * sign-in identifier is matched against the display name as well, so an owner with no
+ * address can still sign in. Turning that into an error would refuse a working owner (F01-AC1).
+ */
+function readOwnerEmail(root: CompositionRoot, ownerId: OwnerId): string | null {
+  const credential = root.credentials.findByOwnerId(ownerId);
+  if (!credential.ok || credential.value === null) return null;
+  const email = credential.value.email.trim();
+  return email === '' ? null : email;
+}
+
+/** One project row, projected for the transport. */
+function toSurfaceProject(record: ProjectRecord): SurfaceProject {
+  return {
+    projectId: String(record.projectId),
+    name: record.name,
+    createdAt: record.createdAt,
+    updatedAt: record.updatedAt,
+    archivedAt: record.archivedAt,
+  };
 }
 
 function toSurfaceSession(record: StoredSessionRecord): SurfaceStoredSession {
@@ -2191,6 +2269,10 @@ export function createControllerSurface(resolve: SurfaceRootResolver): Controlle
           return ok({
             ownerId: provisioned.value.ownerId,
             displayName: command.displayName,
+            // Read back from the row just written rather than re-derived from the name: the
+            // row is the authority for what this owner signs in with, so provisioning and a
+            // later session read cannot describe two different addresses (F01-AC1).
+            email: readOwnerEmail(root, provisioned.value.ownerId),
             createdAt: provisioned.value.provisionedAt,
           });
         }),
@@ -2207,6 +2289,73 @@ export function createControllerSurface(resolve: SurfaceRootResolver): Controlle
           const granted = root.useCases.openOwnerSession(command, root.sessionUseCases);
           if (!granted.ok) return err(granted.error);
           return ok({ session: toSurfaceSession(granted.value) });
+        }),
+
+      /**
+       * Reads the owner's stored identity back, so a session the transport re-establishes
+       * carries the same address the owner provisioned with (F01-AC1).
+       */
+      describe: async (command) =>
+        use((root) => {
+          const record = root.owners.current();
+          if (!record.ok) return err(record.error);
+          if (record.value === null) {
+            return err({ code: 'NotFound', reason: 'No owner has been provisioned on this deployment.' });
+          }
+          // Read the row the session names rather than the oldest row: with one provisioned
+          // owner they agree today, and keying on the request means a future second owner
+          // cannot be described by the first one's address (F01-AC1).
+          if (String(record.value.ownerId) !== String(command.ownerId)) {
+            return err({
+              code: 'NotFound',
+              reason: `This deployment holds no owner with the identity this session was proved for (F01-AC1).`,
+            });
+          }
+          return ok({
+            ownerId: record.value.ownerId,
+            displayName: record.value.displayName,
+            email: readOwnerEmail(root, record.value.ownerId),
+            createdAt: record.value.createdAt,
+          });
+        }),
+    },
+
+    projects: {
+      /**
+       * Every project the store holds, oldest first (F02-AC1).
+       *
+       * A read carrying no caller, following the rule every other read in this file follows:
+       * there is exactly one provisioned owner, so a project list cannot be scoped to one and
+       * a request has nothing to authorize it with (F01-AC1).
+       */
+      listProjects: async () =>
+        use((root) => {
+          const listed = root.projects.list();
+          if (!listed.ok) return err(listed.error);
+          return ok(listed.value.map(toSurfaceProject));
+        }),
+
+      /**
+       * Creates a project the owner can then select (F02-AC1, F03-AC2).
+       *
+       * Idempotent by identity, so a resubmitted form addresses the one project rather than
+       * colliding with it, and the actor is the identity the transport proved even though the
+       * write itself is not capability-checked: the write is attributable (F01-AC1).
+       */
+      createProject: async (command) =>
+        use((root) => {
+          const actor = root.useCases.resolveOwnerActor();
+          if (!actor.ok) return err(actor.error);
+          const created = root.projects.create({
+            // Narrowed here rather than at the transport because this module is also the
+            // consumer: the branded type records that a repository checked the identifier,
+            // and the transport's own validation is a separate concern from that check.
+            projectId: command.projectId as ProjectId,
+            name: command.name,
+            at: command.at,
+          });
+          if (!created.ok) return err(created.error);
+          return ok(toSurfaceProject(created.value));
         }),
     },
 

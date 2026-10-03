@@ -13,7 +13,16 @@ import { StatusBadge, type StatusTone } from '../components/StatusBadge.tsx';
 import { ProfileEditor } from './ProfileEditor.tsx';
 
 export interface ProfilesPageProps {
-  readonly projectId: string;
+  /**
+   * The selected project, or null when none is selected (F02-AC1).
+   *
+   * Nullable rather than an empty string. This page used to take `string` and treat `''` as
+   * "nothing to load", so a signed-in owner with no project silently saw an empty list — and
+   * when the shell passed the literal text `undefined` it requested `/api/profiles/undefined`
+   * and reported that 404 as "that project has no saved profile yet". A null cannot be
+   * interpolated into a request path, so the unselected state renders as itself (F02-AC4).
+   */
+  readonly projectId: string | null;
   readonly activeProfileId: string;
   readonly onSelectProfile: (profileId: string, label: string) => void;
   readonly epoch: number;
@@ -58,7 +67,7 @@ export function ProfilesPage({
   const [reload, setReload] = useState(0);
 
   useEffect(() => {
-    if (projectId === '') return;
+    if (projectId === null) return;
     let current = true;
     const load = async (): Promise<void> => {
       const result = await fetchProfiles(projectId);
@@ -79,7 +88,7 @@ export function ProfilesPage({
   }, [projectId, epoch, reload]);
 
   useEffect(() => {
-    if (projectId === '') return;
+    if (projectId === null) return;
     let current = true;
     const load = async (): Promise<void> => {
       const result = await fetchProfileVersions(projectId);
@@ -118,16 +127,26 @@ export function ProfilesPage({
 
   const nowMs = Date.now();
 
-  const profileState: 'loading' | 'empty' | 'ready' | 'error' =
-    profilesError !== null ? 'error' : profiles === null ? 'loading' : known.length === 0 ? 'empty' : 'ready';
+  const profileState: 'no-project' | 'loading' | 'empty' | 'ready' | 'error' =
+    projectId === null
+      ? 'no-project'
+      : profilesError !== null
+        ? 'error'
+        : profiles === null
+          ? 'loading'
+          : known.length === 0
+            ? 'empty'
+            : 'ready';
   const profileStateText =
-    profileState === 'error'
-      ? `The profile list could not be loaded: ${profilesError ?? 'unknown reason'}`
-      : profileState === 'loading'
-        ? 'Loading saved profiles…'
-        : profileState === 'empty'
-          ? 'No profiles are saved for this project yet.'
-          : `${known.length} ${known.length === 1 ? 'profile is' : 'profiles are'} saved.`;
+    profileState === 'no-project'
+      ? 'No project is selected, so there is nothing to read a profile for. Choose or create a project in the header.'
+      : profileState === 'error'
+        ? `The profile list could not be loaded: ${profilesError ?? 'unknown reason'}`
+        : profileState === 'loading'
+          ? 'Loading saved profiles…'
+          : profileState === 'empty'
+            ? 'No profiles are saved for this project yet.'
+            : `${known.length} ${known.length === 1 ? 'profile is' : 'profiles are'} saved.`;
 
   return (
     <section className="page" aria-labelledby="profiles-title">
@@ -135,9 +154,13 @@ export function ProfilesPage({
         <h2 className="page__title" id="profiles-title">
           Profiles
         </h2>
-        <button className="button button--secondary" type="button" onClick={() => setEditorOpen((open) => !open)}>
-          {editorOpen ? 'Close the profile form' : 'Add a profile'}
-        </button>
+        {/* The form is only offered for a selected project, because a profile is bound to one
+            and submitting a profile for "no project" would address nothing (F02-AC1). */}
+        {projectId === null ? null : (
+          <button className="button button--secondary" type="button" onClick={() => setEditorOpen((open) => !open)}>
+            {editorOpen ? 'Close the profile form' : 'Add a profile'}
+          </button>
+        )}
       </div>
 
       <p
@@ -294,7 +317,7 @@ export function ProfilesPage({
         </p>
       )}
 
-      {editorOpen ? (
+      {editorOpen && projectId !== null ? (
         <ProfileEditor
           projectId={projectId}
           onCancel={() => setEditorOpen(false)}

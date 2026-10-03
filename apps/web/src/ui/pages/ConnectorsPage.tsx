@@ -13,7 +13,8 @@ import {
 import { StatusBadge, type StatusTone } from '../components/StatusBadge.tsx';
 
 export interface ConnectorsPageProps {
-  readonly projectId: string;
+  /** The selected project, or null when none is selected (F02-AC1). */
+  readonly projectId: string | null;
   readonly profileId: string;
   readonly profileName: string;
   readonly epoch: number;
@@ -71,7 +72,7 @@ export function ConnectorsPage({
   const [reload, setReload] = useState(0);
 
   useEffect(() => {
-    if (projectId === '') return;
+    if (projectId === null) return;
     let current = true;
     const load = async (): Promise<void> => {
       const result = await fetchConnectors(projectId);
@@ -94,20 +95,40 @@ export function ConnectorsPage({
   const known = connectors ?? [];
   const nowMs = Date.now();
 
-  const listState: 'loading' | 'empty' | 'ready' | 'error' =
-    listError !== null ? 'error' : connectors === null ? 'loading' : known.length === 0 ? 'empty' : 'ready';
+  const listState: 'no-project' | 'loading' | 'empty' | 'ready' | 'error' =
+    projectId === null
+      ? 'no-project'
+      : listError !== null
+        ? 'error'
+        : connectors === null
+          ? 'loading'
+          : known.length === 0
+            ? 'empty'
+            : 'ready';
   const listStateText =
-    listState === 'error'
-      ? `The connector list could not be loaded: ${listError ?? 'unknown reason'}`
-      : listState === 'loading'
-        ? 'Loading connectors…'
-        : listState === 'empty'
-          ? 'No connectors are configured for this project yet.'
-          : `${known.length} ${known.length === 1 ? 'connector is' : 'connectors are'} configured.`;
+    listState === 'no-project'
+      ? 'No project is selected, so there are no connectors to read. Choose or create a project in the header.'
+      : listState === 'error'
+        ? `The connector list could not be loaded: ${listError ?? 'unknown reason'}`
+        : listState === 'loading'
+          ? 'Loading connectors…'
+          : listState === 'empty'
+            ? 'No connectors are configured for this project yet.'
+            : `${known.length} ${known.length === 1 ? 'connector is' : 'connectors are'} configured.`;
 
   const submit = async (event: FormEvent<HTMLFormElement>): Promise<void> => {
     event.preventDefault();
     if (saving) return;
+
+    // A connector belongs to a project. With none selected there is no identity to address, and
+    // sending the empty string would build `/api/profiles//connectors` rather than refusing
+    // here where the owner can read what to do about it (F02-AC1, F02-AC4).
+    if (projectId === null) {
+      setFormErrors({});
+      setFormMessage('Choose a project in the header before adding a connector: a connector belongs to one project.');
+      setFormOutcome('refused');
+      return;
+    }
 
     const local: Record<string, string> = {};
     if (form.provider.trim() === '') local['provider'] = 'Name the provider this connector reaches.';

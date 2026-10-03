@@ -44,6 +44,7 @@ import { registerHealthRoutes } from './routes/health.ts';
 import { registerIntakeRoutes } from './routes/intake.ts';
 import { registerOwnerRoutes } from './routes/owner.ts';
 import { registerOwnerTestRoutes } from './routes/owner-tests.ts';
+import { registerProjectRoutes } from './routes/projects.ts';
 import { registerPlanningRoutes } from './routes/planning.ts';
 import { registerProfileRoutes } from './routes/profiles.ts';
 import { registerRunRoutes } from './routes/runs.ts';
@@ -106,6 +107,7 @@ export async function buildApp(deps: AppDependencies): Promise<FastifyInstance> 
 
   registerHealthRoutes(app);
   registerOwnerRoutes(app, { config, controller, guard, now });
+  registerProjectRoutes(app, { controller, guard, now });
   registerProfileRoutes(app, { controller, guard, now });
   registerConnectorRoutes(app, { controller, guard, now });
   registerIntakeRoutes(app, { controller, guard, now });

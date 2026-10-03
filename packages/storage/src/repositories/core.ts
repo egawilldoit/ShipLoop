@@ -785,6 +785,117 @@ function toConnector(row: SqlRow): ConnectorRecord {
 }
 
 /**
+ * Projects (F02-AC1, F06-AC1).
+ *
+ * A project is the unit every other durable record hangs off: profiles, connectors,
+ * procedures, work items and captured requests all carry a `project_id` foreign key
+ * into this table. It therefore has to be readable on its own, and it has to be
+ * creatable on its own, because until it is both an owner cannot *choose* a project
+ * and an owner cannot create their first one.
+ *
+ * That is the whole reason this repository exists. Before it, a `projects` row only
+ * ever appeared as a side effect of a profile save, a connector registration or a
+ * procedure append — three writes that each need a configured provider before they
+ * succeed. A fresh deployment therefore had projects only as a consequence of
+ * provider setup, and an owner who had configured no provider had no project to name,
+ * which left project identity arriving at the UI as `undefined` rather than as a
+ * choice. Creation here is explicit and provider-free; the profile and connector
+ * repositories keep their own `ON CONFLICT DO NOTHING` inserts so neither of them is
+ * disturbed by a project that already exists.
+ *
+ * `list` is ordered by `created_at` then `project_id` rather than by recency of use.
+ * The list is a set of things the owner named, not a log, and a stable order is what
+ * lets a client render the same first entry every time it loads rather than jumping
+ * to whichever project happened to be touched last (N04-AC2).
+ */
+export interface ProjectRecord {
+  readonly projectId: ProjectId;
+  readonly name: string;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+  readonly archivedAt: string | null;
+}
+
+/** The columns {@link toProject} reads. One list, so no read can miss a column. */
+const PROJECT_COLUMNS = 'project_id, name, created_at, updated_at, archived_at';
+
+function toProject(row: SqlRow): ProjectRecord {
+  return {
+    projectId: requiredText(row, 'project_id') as ProjectId,
+    name: requiredText(row, 'name'),
+    createdAt: requiredText(row, 'created_at'),
+    updatedAt: requiredText(row, 'updated_at'),
+    archivedAt: nullableText(row, 'archived_at'),
+  };
+}
+
+export class ProjectRepository extends SqlRepository {
+  /**
+   * The projects this store holds, oldest first.
+   *
+   * Archived projects are included and marked rather than filtered out: a client that
+   * silently dropped them would let an owner look at a capture whose project is gone
+   * from the list and conclude the capture is gone too. The caller decides what to
+   * offer for selection, and it cannot do that from a list that has already hidden
+   * half of what exists (F02-AC3).
+   */
+  list(): Result<readonly ProjectRecord[]> {
+    return this.attempt('list projects', () =>
+      this.bounded(() =>
+        ok(
+          this.statement(`SELECT ${PROJECT_COLUMNS} FROM projects ORDER BY created_at ASC, project_id ASC`)
+            .all()
+            .map(toProject),
+        ),
+      ),
+    );
+  }
+
+  /** One project, or null when the store holds no row with that identity. */
+  get(projectId: ProjectId): Result<ProjectRecord | null> {
+    return this.attempt('read a project', () => {
+      const row = this.statement(`SELECT ${PROJECT_COLUMNS} FROM projects WHERE project_id = ?`).get(projectId);
+      return ok(row === undefined ? null : toProject(row));
+    });
+  }
+
+  /**
+   * Creates a project, or returns the one that already holds that identity.
+   *
+   * Idempotent by `project_id` rather than conflicting, because a project identity is
+   * something an owner types and retypes: refusing the second attempt would make a
+   * retried form look like a collision with a project the owner cannot see. The name is
+   * **not** overwritten on the repeat, so a project an owner renamed is not silently
+   * renamed back by a stale tab resubmitting the creation form (F02-AC2, F24-AC4).
+   *
+   * This is the one project write that needs no configured provider, which is what
+   * makes it usable on a deployment that has none (F03-AC2).
+   */
+  create(input: { readonly projectId: ProjectId; readonly name: string; readonly at: string }): Result<ProjectRecord> {
+    return this.attempt('create a project', () =>
+      this.bounded(() => {
+        const projectId = input.projectId.trim();
+        const name = input.name.trim();
+        if (projectId === '') {
+          return err(invalid('A project needs an identity.', [{ path: 'projectId', message: 'Required.' }]));
+        }
+        if (name === '') {
+          return err(invalid('A project needs a name.', [{ path: 'name', message: 'Required.' }]));
+        }
+        this.statement(
+          `INSERT INTO projects (project_id, name, created_at, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT (project_id) DO NOTHING`,
+        ).run(projectId, name, input.at, input.at);
+        const created = this.statement(`SELECT ${PROJECT_COLUMNS} FROM projects WHERE project_id = ?`).get(projectId);
+        if (created === undefined) {
+          return err({ code: 'Unavailable', reason: `Project ${projectId} could not be written.` });
+        }
+        return ok(toProject(created));
+      }),
+    );
+  }
+}
+
+/**
  * Connectors (F03-AC2, F03-AC3).
  *
  * A row holds a credential *reference* and nothing else. A value that matches a

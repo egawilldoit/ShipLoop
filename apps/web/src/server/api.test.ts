@@ -88,6 +88,7 @@ import {
   type ProfileContent,
   type ProfileVersionView,
   type ProvisionOwnerCommand,
+  type ProjectView,
   type RegisterConnectorCommand,
   type RelatednessReportView,
   type RelatedWorkChoiceView,
@@ -327,7 +328,12 @@ class InMemoryController implements ControllerSurface {
   private readonly intakeIdeas = new Map<string, IntakeIdeaView>();
   private readonly plans = new Map<string, PlanView>();
   private readonly capabilities: CapabilityDeclarationsByProvider;
+  private readonly projectRecords = new Map<string, ProjectView>();
   private passwordHash = '';
+  /** The address provisioning recorded, read back by `describe` (F01-AC1). */
+  private ownerEmail: string | null = null;
+  /** The owner's creation instant, recorded by the same write that recorded the address. */
+  private ownerCreatedAt = '';
   private readonly scripted = new Map<string, DomainError>();
   private readonly recordedRuns = new Map<string, RunJobView>();
   private readonly checkpoints = new Map<string, RunCheckpointView>();
@@ -603,7 +609,28 @@ class InMemoryController implements ControllerSurface {
       if (!hashed.ok) return { ok: false, error: hashed.error };
       if (this.passwordHash !== '') return { ok: false, error: conflict('An owner is already provisioned.', 'none', 'one') };
       this.passwordHash = hashed.value;
-      return ok({ ownerId: OWNER_ID, displayName: command.displayName, createdAt: command.at });
+      this.ownerEmail = `${command.displayName.toLowerCase().replace(/[^a-z0-9]+/g, '-')}@owners.shiploop.invalid`;
+      this.ownerCreatedAt = command.at;
+      return ok({ ownerId: OWNER_ID, displayName: command.displayName, email: this.ownerEmail, createdAt: command.at });
+    },
+
+    /**
+     * The provisioned owner's stored identity, read rather than re-derived (F01-AC1).
+     *
+     * The session and sign-in routes read the address from here, so a test that asserts the
+     * header carries an address is asserting the route read the row rather than recomputing
+     * a slug — which is the exact substitution that produced the blank header.
+     */
+    describe: async (command: { readonly ownerId: OwnerId }): Promise<Result<OwnerView, DomainError>> => {
+      if (command.ownerId !== OWNER_ID || this.passwordHash === '') {
+        return { ok: false, error: { code: 'NotFound', reason: 'No owner matches that identity.' } };
+      }
+      return ok({
+        ownerId: OWNER_ID,
+        displayName: OWNER_NAME,
+        email: this.ownerEmail,
+        createdAt: this.ownerCreatedAt,
+      });
     },
 
     signIn: async (command: SignInCommand): Promise<Result<SignInGrant, DomainError>> => {
@@ -686,6 +713,30 @@ class InMemoryController implements ControllerSurface {
       if (record === undefined) return { ok: false, error: { code: 'NotFound', reason: 'No such session.' } };
       this.sessionsById.set(record.sessionId, { ...record, lastActivityAt: command.lastActivityAt });
       return ok(null);
+    },
+  };
+
+  readonly projects = {
+    listProjects: async (): Promise<Result<readonly ProjectView[], DomainError>> =>
+      ok([...this.projectRecords.values()].map((record) => ({ ...record }))),
+
+    createProject: async (command: {
+      readonly projectId: string;
+      readonly name: string;
+      readonly at: string;
+    }): Promise<Result<ProjectView, DomainError>> => {
+      const existing = this.projectRecords.get(command.projectId);
+      // Idempotent by identity and it does not overwrite the name, matching the store: a
+      // resubmitted creation form must not rename a project a stale tab is looking at.
+      const record = existing ?? {
+        projectId: command.projectId,
+        name: command.name,
+        createdAt: command.at,
+        updatedAt: command.at,
+        archivedAt: null,
+      };
+      this.projectRecords.set(command.projectId, record);
+      return ok({ ...record });
     },
   };
 
@@ -2139,7 +2190,13 @@ test('the loaded controller module is validated before it can serve a request', 
     false,
   );
   const complete = {
-    owners: { provision() {}, signIn() {} },
+    // `describe` and the whole `projects` group are declared for the same reason the
+    // generation group is below: the session response once omitted the owner's address and
+    // nothing named a project, so every project-scoped request addressed
+    // `/api/profiles/undefined` and the client reported the 404 as "no saved profile yet"
+    // (F01-AC1, F02-AC1).
+    owners: { provision() {}, signIn() {}, describe() {} },
+    projects: { listProjects() {}, createProject() {} },
     sessions: { loadByToken() {}, create() {}, revoke() {}, touch() {} },
     profiles: { saveVersion() {}, currentVersion() {}, listVersions() {} },
     connectors: { register() {}, listForProject() {}, revoke() {} },
@@ -2210,6 +2267,18 @@ test('the loaded controller module is validated before it can serve a request', 
     isControllerSurface(missingGeneration),
     false,
     'a surface without generation must not pass the guard: the use cases would be unreachable',
+  );
+  const missingProjects = { ...complete, projects: undefined };
+  assert.equal(
+    isControllerSurface(missingProjects),
+    false,
+    'a surface without the projects group must not pass the guard: with nothing to select, every project-scoped request would address an undefined identity (F02-AC1)',
+  );
+  const missingDescribe = { ...complete, owners: { ...complete.owners, describe: undefined } };
+  assert.equal(
+    isControllerSurface(missingDescribe),
+    false,
+    'a surface whose owners cannot be described must not pass the guard: the session response would omit the address the header renders (F01-AC1)',
   );
   assert.equal(
     isControllerSurface(missingPlanningMethod),

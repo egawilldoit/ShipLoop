@@ -35,7 +35,8 @@ export interface PublicationPageProps {
    * (F10-AC1).
    */
   readonly ideaId: string;
-  readonly projectId: string;
+  /** The selected project, or null when none is selected (F02-AC1). Adoption needs one. */
+  readonly projectId: string | null;
   readonly onBackToPlan: () => void;
   readonly epoch: number;
 }
@@ -216,6 +217,15 @@ export function PublicationPage({ planId, ideaId, projectId, onBackToPlan, epoch
 
   const adopt = async (): Promise<void> => {
     if (adoptState === 'working') return;
+    if (projectId === null) {
+      // Adoption binds a work item to a project, so with none selected there is no identity to
+      // address. Refusing here names the fix; sending the empty string would have asked the
+      // provider to adopt an issue into a project named "" (F11-AC1, F02-AC1).
+      setAdoptErrors({});
+      setAdoptMessage('Nothing was adopted: choose a project in the header first. Adoption binds an issue to one project.');
+      setAdoptState('refused');
+      return;
+    }
     if (issueId.trim() === '') {
       setAdoptErrors({ issueId: 'Name the issue by its provider identity, never by a title (F11-AC3).' });
       setAdoptMessage('Nothing was adopted because no issue was named (F11-AC1).');

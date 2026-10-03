@@ -107,7 +107,7 @@ export function registerOwnerRoutes(app: FastifyInstance, options: OwnerRouteOpt
     const session = granted.value.session;
     setSessionCookie(reply, options.config, token, session.expiresAt, issuedAt);
     const csrfToken = deriveCsrfToken(session.sessionId, options.config.csrfSecret);
-    return reply.status(200).send(identityOf(session, csrfToken));
+    return reply.status(200).send(identityOf(session, csrfToken, await ownerEmailOf(options.controller, session.ownerId)));
   });
 
   app.post('/api/owner/sign-out', { preHandler: options.guard }, async (request, reply) => {
@@ -125,7 +125,9 @@ export function registerOwnerRoutes(app: FastifyInstance, options: OwnerRouteOpt
   app.get('/api/owner/session', { preHandler: options.guard }, async (request, reply) => {
     const session = request.session;
     if (session === null) return sendProblem(reply, signInRequiredProblem());
-    return reply.status(200).send(identityOf(session, session.csrfToken));
+    return reply
+      .status(200)
+      .send(identityOf(session, session.csrfToken, await ownerEmailOf(options.controller, session.ownerId)));
   });
 }
 
@@ -150,16 +152,33 @@ interface SessionIdentity {
  * back from this response without a second sign-in. The browser cannot reach it any
  * other way, because the cookie it belongs to is `HttpOnly` (F01-AC4).
  */
-function identityOf(session: SessionIdentity, csrfToken: string): {
-  readonly owner: { readonly ownerId: OwnerId; readonly displayName: string };
+function identityOf(session: SessionIdentity, csrfToken: string, email: string | null): {
+  readonly owner: { readonly ownerId: OwnerId; readonly displayName: string; readonly email: string | null };
   readonly session: { readonly sessionId: string; readonly issuedAt: string; readonly expiresAt: string };
   readonly csrfToken: string;
 } {
   return {
-    owner: { ownerId: session.ownerId, displayName: session.displayName },
+    owner: { ownerId: session.ownerId, displayName: session.displayName, email },
     session: { sessionId: session.sessionId, issuedAt: session.issuedAt, expiresAt: session.expiresAt },
     csrfToken,
   };
+}
+
+/**
+ * The sign-in address for one owner, or null when the row carries none.
+ *
+ * Read through the owner repository rather than reconstructed from the display name. The
+ * client used to render a blank address here and could only have filled it by re-deriving
+ * the same slug rule the controller owns; two derivations of one rule drift, and a drifted
+ * one shows the owner an address that is not theirs (F01-AC1).
+ */
+function ownerEmailOf(
+  controller: ControllerSurface,
+  ownerId: OwnerId,
+): Promise<string | null> {
+  return controller.owners
+    .describe({ ownerId })
+    .then((described) => (described.ok ? described.value.email : null));
 }
 
 /**

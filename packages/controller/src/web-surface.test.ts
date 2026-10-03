@@ -73,7 +73,8 @@ const FAST_PASSWORD_COST = { N: 1024, r: 8, p: 1, keyLength: 32, saltLength: 16 
  * the way the web server's own guard names it.
  */
 const REQUIRED_METHODS = {
-  owners: ['provision', 'signIn'],
+  owners: ['provision', 'signIn', 'describe'],
+  projects: ['listProjects', 'createProject'],
   sessions: ['loadByToken', 'create', 'revoke', 'touch'],
   profiles: ['saveVersion', 'currentVersion', 'listVersions'],
   connectors: ['register', 'listForProject', 'revoke'],

@@ -150,7 +150,48 @@ export interface ProvisionOwnerCommand {
 export interface OwnerView {
   readonly ownerId: OwnerId;
   readonly displayName: string;
+  /**
+   * The sign-in address this owner provisioned with, or null when the owner row carries none.
+   *
+   * Carried rather than left to the client to reconstruct, because the client displayed a
+   * blank address beside the display name and the only way to fill it was to re-derive the
+   * same slug rule the controller owns. Two derivations of one rule is how they drift, and a
+   * drifted derivation shows the owner someone else's address (F01-AC1).
+   */
+  readonly email: string | null;
   readonly createdAt: string;
+}
+
+/**
+ * One project as the owner selects it (F02-AC1).
+ *
+ * The identity and the display name travel together because the selector needs both and a
+ * client that rendered an id where a name belongs would make the owner select a string.
+ */
+export interface ProjectView {
+  readonly projectId: string;
+  readonly name: string;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+  readonly archivedAt: string | null;
+}
+
+/**
+ * Project listing and creation, which the owner selects from (F02-AC1).
+ *
+ * `create` is the one project write that needs no configured provider. Every other write
+ * that brings a `projects` row into existence — a profile save, a connector registration, a
+ * procedure append — is refused by name when no adapter declares the capability it needs,
+ * so without this an owner with no configured provider had no project to select and every
+ * project-scoped screen had nothing to address (F03-AC2).
+ */
+export interface ProjectUseCases {
+  listProjects(): Promise<Result<readonly ProjectView[], DomainError>>;
+  createProject(command: {
+    readonly projectId: string;
+    readonly name: string;
+    readonly at: string;
+  }): Promise<Result<ProjectView, DomainError>>;
 }
 
 export interface SignInCommand {
@@ -176,6 +217,15 @@ export interface SignInGrant {
 
 export interface OwnerUseCases {
   provision(command: ProvisionOwnerCommand): Promise<Result<OwnerView, DomainError>>;
+  /**
+   * The identity this owner signs in with, read from the owner row (F01-AC1).
+   *
+   * A separate read rather than a field on `signIn` because the session route needs the
+   * address on every request that re-establishes a session, not only at the moment one was
+   * created, and a client that had to re-derive the address from the display name would own
+   * a second copy of the controller's slug rule.
+   */
+  describe(command: { readonly ownerId: OwnerId }): Promise<Result<OwnerView, DomainError>>;
   /**
    * Verifies a credential and opens a session in one step.
    *
@@ -1502,6 +1552,7 @@ export interface GenerationUseCases {
 /** The whole injected surface. One argument, so a missing use case is a type error. */
 export interface ControllerSurface {
   readonly owners: OwnerUseCases;
+  readonly projects: ProjectUseCases;
   readonly sessions: SessionUseCases;
   readonly profiles: ProfileUseCases;
   readonly connectors: ConnectorUseCases;
@@ -1516,7 +1567,8 @@ export interface ControllerSurface {
 }
 
 const REQUIRED_METHODS = {
-  owners: ['provision', 'signIn'],
+  owners: ['provision', 'signIn', 'describe'],
+  projects: ['listProjects', 'createProject'],
   sessions: ['loadByToken', 'create', 'revoke', 'touch'],
   profiles: ['saveVersion', 'currentVersion', 'listVersions'],
   connectors: ['register', 'listForProject', 'revoke'],

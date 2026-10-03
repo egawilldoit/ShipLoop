@@ -76,6 +76,7 @@ import {
   OwnerRepository,
   ProcedureRepository,
   ProjectProfileRepository,
+  ProjectRepository,
   PublicationRepository,
   ScopeRepository,
   WorkItemRepository,
@@ -214,6 +215,7 @@ export interface CompositionRootConfig {
 export interface CompositionRoot {
   readonly database: Database;
   readonly owners: OwnerRepository;
+  readonly projects: ProjectRepository;
   readonly profiles: ProjectProfileRepository;
   readonly connectors: ConnectorRepository;
   readonly procedures: ProcedureRepository;
@@ -1072,6 +1074,7 @@ export function createCompositionRoot(config: CompositionRootConfig): Result<Com
   }
 
   const owners = new OwnerRepository(database);
+  const projects = new ProjectRepository(database);
   const profiles = new ProjectProfileRepository(database);
   const connectors = new ConnectorRepository(database);
   const procedures = new ProcedureRepository(database);
@@ -1252,6 +1255,7 @@ export function createCompositionRoot(config: CompositionRootConfig): Result<Com
   return ok({
     database,
     owners,
+    projects,
     profiles,
     connectors,
     procedures,

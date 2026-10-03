@@ -110,10 +110,17 @@ export type ApiResult<T> =
   | { readonly ok: true; readonly value: T }
   | { readonly ok: false; readonly error: ApiFailure };
 
-/** The signed-in owner. Identity only: never a credential or a token (F03-AC3). */
+/**
+ * The signed-in owner. Identity only: never a credential or a token (F03-AC3).
+ *
+ * `email` is the address read back from the owner row. It was `string` here while the
+ * server sent no such field at all, so the header rendered an empty pair of parentheses and
+ * no type in this file noticed; it is nullable because an owner row can carry no address,
+ * and a client must show that fact rather than an empty string (F01-AC1).
+ */
 export interface OwnerIdentity {
   readonly ownerId: string;
-  readonly email: string;
+  readonly email: string | null;
   readonly displayName: string;
 }
 
@@ -641,8 +648,15 @@ export type PlanEditRequest =
 export interface SessionResponse {
   readonly owner: OwnerIdentity;
   readonly csrfToken: string;
+}
+
+/** One project the owner selects from (F02-AC1). */
+export interface ProjectSummary {
   readonly projectId: string;
-  readonly projectName: string;
+  readonly name: string;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+  readonly archivedAt: string | null;
 }
 
 export type SignInResponse = SessionResponse;
@@ -1307,6 +1321,36 @@ export function signIn(credentials: SignInRequest): Promise<ApiResult<SignInResp
     method: 'POST',
     csrf: false,
     body: { identifier: credentials.email, password: credentials.password },
+  });
+}
+
+/**
+ * The projects this deployment holds, oldest first (F02-AC1).
+ *
+ * Fetched explicitly rather than read off the session, so the selector's contents are a fact
+ * about durable state at the moment the owner opened the app. The header's *selected* project
+ * is client state and starts as null; nothing here decides which project the owner is in,
+ * because a server that picked one would make the choice invisible (F02-AC1).
+ */
+export function fetchProjects(): Promise<ApiResult<{ readonly projects: readonly ProjectSummary[] }>> {
+  return request<{ readonly projects: readonly ProjectSummary[] }>('/api/projects', { method: 'GET', csrf: false });
+}
+
+/**
+ * Creates a project, or addresses the one that already holds that identity (F02-AC1).
+ *
+ * Idempotent by identity, so a resubmitted form is not an error the owner has to understand:
+ * the server answers 200 for one that existed and 201 for one this call created, and both
+ * carry the project (F02-AC3).
+ */
+export function createProject(input: {
+  readonly projectId: string;
+  readonly name: string;
+}): Promise<ApiResult<{ readonly project: ProjectSummary }>> {
+  return request<{ readonly project: ProjectSummary }>('/api/projects', {
+    method: 'POST',
+    csrf: true,
+    body: input,
   });
 }
 
