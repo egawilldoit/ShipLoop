@@ -5,7 +5,12 @@ export * from './migrations.ts';
 export * from './tx.ts';
 export * from './repositories/types.ts';
 export * from './repositories/core.ts';
+// Both are required and neither replaces the other: the request/delivery-contract repositories are
+// the foundation's persistence, the MVP review repositories are the review slice's. They were built
+// in parallel and both claimed this position in the barrel, so the resolution is both lines, not a
+// choice between them.
 export * from './repositories/contracts.ts';
+export * from './repositories/mvp-review.ts';
 export * from './repositories/scope.ts';
 export * from './repositories/intake.ts';
 export * from './repositories/publication.ts';

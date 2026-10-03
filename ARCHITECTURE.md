@@ -142,6 +142,9 @@ leaving the decision open.
 ## Interfaces to establish with each slice
 
 - Commands validate input and return typed results, including Blocked and Outcome unknown.
+- The minimal-MVP review path (verification sources, evidence binding, criterion states,
+  readiness gates and owner decisions) has one contract, stated in
+  [MVP review contract](docs/product/mvp-review.md).
 - Engine adapters translate native output into progress/checkpoint/result events.
   Protocol versions and runtime compatibility are tested at the boundary.
 - Verification results distinguish Passed, Failed, Missing, Waiting, Stale and

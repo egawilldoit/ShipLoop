@@ -4,3 +4,4 @@ export * from './process-runner.ts';
 export * from './checks.ts';
 export * from './evidence.ts';
 export * from './workspace.ts';
+export * from './mvp-sources.ts';

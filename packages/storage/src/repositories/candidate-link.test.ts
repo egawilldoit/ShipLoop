@@ -30,7 +30,7 @@ import { candidateBindingFingerprint } from '@shiploop/domain';
 import type { CommitSha, DomainError, ProjectId, Result } from '@shiploop/domain';
 
 import { openDatabase, type Database } from '../db.ts';
-import { LATEST_SCHEMA_VERSION, migrate } from '../migrations.ts';
+import { LATEST_SCHEMA_VERSION, migrate, migrationDefinitions } from '../migrations.ts';
 import {
   DeliveryCandidateRepository,
   type DeliveryCandidateRecord,
@@ -362,10 +362,20 @@ test('deleting a candidate row aborts, because the head evidence was collected f
 });
 
 test('the migration that owns this table is the one the build declares', async () => {
-  // 15, not 13: this slice was built in parallel with the review bindings and both claimed 13, so
-  // the foundation's 13 and 14 come first and candidate linking follows. The assertion is that this
-  // build declares the version it actually applies, not that the number is a particular value.
-  assert.equal(LATEST_SCHEMA_VERSION, 15, 'the MVP candidate link arrived as migration 15');
+  // Looked up by name rather than asserted against LATEST_SCHEMA_VERSION. This slice and the review
+  // bindings both claimed version 13 while being built in parallel, so the foundation's 13 and 14
+  // come first, candidate linking is 15, and the review bindings are 16 — which makes "latest" a
+  // property of whatever landed after this table, not of this table. The claim worth pinning is that
+  // the entry which creates `delivery_candidates` declares the version this test expects.
+  const owning = migrationDefinitions.find((migration) => migration.name === 'mvp_candidate_linking');
+  assert.ok(owning, 'no migration declares the candidate linking table');
+  assert.equal(owning.version, 15, 'the MVP candidate link arrived as migration 15');
+
+  // And the ledger a database replays holds one entry per version, in ascending order.
+  const versions = migrationDefinitions.map((migration) => migration.version);
+  assert.deepEqual(versions, [...new Set(versions)], 'two migrations share a version number');
+  assert.deepEqual(versions, [...versions].sort((a, b) => a - b), 'the migration ledger is out of order');
+  assert.ok(LATEST_SCHEMA_VERSION >= owning.version, 'the declared latest version precedes this one');
 });
 
 /* -------------------------------------------------------------------------- */

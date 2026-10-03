@@ -2923,6 +2923,99 @@ CREATE TABLE owner_active_project (
 CREATE INDEX owner_active_project_by_project ON owner_active_project(project_id);
 `;
 
+const MIGRATION_16_MVP_REVIEW_BINDINGS = `
+/*
+ * MVP review storage.
+ *
+ * The tables above bind evidence and decisions to a candidate *fingerprint*, which is a
+ * hash over head, base, scope, profile, procedure, environment, policy and deployment
+ * identity. That is sufficient for F20/F25 staleness, but it is not readable: an owner
+ * asking "is this result about the commit I am looking at?" cannot be answered by
+ * comparing two hashes, and the review projection needs to say which of them moved.
+ *
+ * So the MVP review path stores the two facts the owner actually reasons about, in
+ * columns rather than inside the hashed fingerprint:
+ *
+ *   - 'candidate_head_sha', CHECKed to be a full 40/64 character commit SHA. A branch
+ *     name, an abbreviation or a PR number cannot be written here at all, which is what
+ *     makes "evidence for SHA A can never prove SHA B" a schema property rather than a
+ *     convention. 'observed_head_sha' is nullable and separate, because an observation a
+ *     source could not attribute is a real fact that must be storable and must read as
+ *     stale, not something to reject at the boundary;
+ *   - 'contract_revision', so a decision made against revision 3 is visibly not a
+ *     decision about revision 4.
+ *
+ * 'mvp_review_evidence' is append-only: a re-run writes a new row and the projection
+ * picks the newest applicable one. A correction therefore converges by superseding
+ * rather than by overwriting a recorded observation (ARCHITECTURE "Idempotent
+ * operations"; operations that converge on the same end state across retries).
+ *
+ * 'mvp_owner_decisions' is also append-only and append-only enforced by trigger, because
+ * an acceptance is a fact about what the owner said at a moment, and editing one would
+ * make an unattributable acceptance representable (F25-AC1, F25-AC4).
+ */
+CREATE TABLE mvp_review_evidence (
+  evidence_id             TEXT PRIMARY KEY,
+  project_id              TEXT NOT NULL,
+  request_id              TEXT NOT NULL,
+  contract_id             TEXT NOT NULL,
+  contract_revision       INTEGER NOT NULL CHECK (contract_revision > 0),
+  candidate_id            TEXT NOT NULL,
+  candidate_head_sha      TEXT NOT NULL ${commitShaCheck('candidate_head_sha')},
+  subject_kind            TEXT NOT NULL CHECK (subject_kind IN ('criterion', 'check')),
+  subject_id              TEXT NOT NULL CHECK (length(trim(subject_id)) > 0),
+  method_kind             TEXT NOT NULL
+                            CHECK (method_kind IN ('AutomatedCheck', 'OwnerTest', 'BrowserEvidence', 'ApiEvidence')),
+  method_detail           TEXT,
+  source                  TEXT NOT NULL
+                            CHECK (source IN ('project_command', 'github_check', 'browser', 'owner_test')),
+  outcome                 TEXT NOT NULL
+                            CHECK (outcome IN ('passed', 'failed', 'waiting', 'missing', 'capture_failed')),
+  /* The SHA and revision this observation was actually made against; null when the source could not attribute it. */
+  observed_head_sha       TEXT ${nullableCommitShaCheck('observed_head_sha')},
+  observed_contract_revision INTEGER CHECK (observed_contract_revision IS NULL OR observed_contract_revision > 0),
+  observed_at             TEXT,
+  detail_redacted         TEXT,
+  artifact_ref            TEXT,
+  recorded_at             TEXT NOT NULL,
+  correlation_id          TEXT NOT NULL,
+  /* The authenticated owner, required exactly for an owner_test row (F25-AC1). */
+  owner_id                TEXT,
+  CHECK (length(trim(evidence_id)) > 0),
+  CHECK ((observed_head_sha IS NULL) = (observed_contract_revision IS NULL)),
+  CHECK (observed_head_sha IS NULL OR observed_at IS NOT NULL),
+  CHECK ((source = 'owner_test') = (owner_id IS NOT NULL))
+);
+CREATE INDEX mvp_review_evidence_by_candidate
+  ON mvp_review_evidence(candidate_id, observed_at DESC);
+CREATE INDEX mvp_review_evidence_by_subject
+  ON mvp_review_evidence(subject_kind, subject_id, observed_at DESC);
+CREATE INDEX mvp_review_evidence_by_request
+  ON mvp_review_evidence(request_id, contract_revision, candidate_head_sha);
+
+CREATE TABLE mvp_owner_decisions (
+  decision_id        TEXT PRIMARY KEY,
+  project_id         TEXT NOT NULL,
+  request_id         TEXT NOT NULL,
+  contract_id        TEXT NOT NULL,
+  contract_revision  INTEGER NOT NULL CHECK (contract_revision > 0),
+  candidate_id       TEXT NOT NULL,
+  candidate_head_sha TEXT NOT NULL ${commitShaCheck('candidate_head_sha')},
+  kind               TEXT NOT NULL CHECK (kind IN ('accepted', 'changes_requested')),
+  owner_id           TEXT NOT NULL,
+  decided_at         TEXT NOT NULL,
+  feedback_redacted  TEXT,
+  correlation_id     TEXT NOT NULL,
+  CHECK (length(trim(decision_id)) > 0),
+  CHECK (kind <> 'changes_requested' OR feedback_redacted IS NOT NULL),
+  CHECK (feedback_redacted IS NULL OR length(trim(feedback_redacted)) > 0)
+);
+CREATE INDEX mvp_owner_decisions_by_candidate
+  ON mvp_owner_decisions(candidate_id, decided_at DESC);
+CREATE INDEX mvp_owner_decisions_by_request
+  ON mvp_owner_decisions(request_id, contract_revision, candidate_head_sha, decided_at DESC);
+`;
+
 const MIGRATIONS: readonly Migration[] = [
   {
     version: 1,
@@ -3064,6 +3157,29 @@ const MIGRATIONS: readonly Migration[] = [
         'delivery_candidates',
         'delivery_candidates are retained: the head a piece of evidence was collected for is a fact about the past',
       )) {
+        db.exec(trigger);
+      }
+    },
+  },
+  {
+    // Renumbered from 13 during integration, for the same reason the candidate linking above was:
+    // the review bindings and the candidate table both claimed version 13 while being built in
+    // parallel, and `MIGRATIONS` is the ordered ledger a database replays, so two entries cannot
+    // share a version. The foundation is the earlier slice and keeps 13 and 14.
+    version: 16,
+    name: 'mvp_review_bindings',
+    up: (db) => {
+      db.exec(MIGRATION_16_MVP_REVIEW_BINDINGS);
+      for (const trigger of [
+        ...appendOnlyTriggers(
+          'mvp_review_evidence',
+          'mvp_review_evidence rows are retained: an observation that happened is a fact about the past, and a re-run supersedes it rather than editing it',
+        ),
+        ...appendOnlyTriggers(
+          'mvp_owner_decisions',
+          'mvp_owner_decisions rows are retained: an owner acceptance is a fact about what was decided, and editing one would make an unattributable acceptance representable',
+        ),
+      ]) {
         db.exec(trigger);
       }
     },
@@ -3318,6 +3434,17 @@ function commitShaCheck(column: string): string {
 
 function fingerprintCheck(column: string): string {
   return `CHECK (${fingerprintCondition(column)})`;
+}
+
+/**
+ * The same restriction for a commit-SHA column that is absent when a source could not
+ * attribute its observation. It is a separate helper rather than a nested
+ * `CHECK (x IS NULL OR CHECK (...))` because SQLite rejects the nested form, and an
+ * unattributed observation still has to be storable so it can read as stale rather than
+ * being refused at the boundary.
+ */
+function nullableCommitShaCheck(column: string): string {
+  return `CHECK (${column} IS NULL OR (length(${column}) IN (40, 64) AND ${column} NOT GLOB '*[^0-9a-f]*'))`;
 }
 
 /**
