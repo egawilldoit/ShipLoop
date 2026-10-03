@@ -7,6 +7,8 @@ export * from './scope.ts';
 export * from './evidence.ts';
 export * from './authorization.ts';
 export * from './capability.ts';
+export * from './request.ts';
+export * from './contract.ts';
 export * from './readiness.ts';
 export * from './attention.ts';
 export * from './redaction.ts';
