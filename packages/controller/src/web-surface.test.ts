@@ -92,6 +92,10 @@ const REQUIRED_METHODS = {
   sessions: ['loadByToken', 'create', 'revoke', 'touch'],
   profiles: ['saveVersion', 'currentVersion', 'listVersions'],
   connectors: ['register', 'listForProject', 'revoke'],
+  // Declared here for the same reason it is declared in `contracts.ts`: a group the port
+  // requires and this surface omits would be a use case no transport can reach, which is how
+  // generation shipped implemented and invisible (L02-AC2).
+  settings: ['readSettings', 'updateSettings'],
   intake: [
     'captureIdea',
     'listIdeas',

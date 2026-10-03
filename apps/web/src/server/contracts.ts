@@ -439,6 +439,105 @@ export interface ConnectorUseCases {
   revoke(command: RevokeConnectorCommand): Promise<Result<ConnectorView, DomainError>>;
 }
 
+/**
+ * The optional external-execution target, as the settings screen reads it
+ * (L02-AC2, L02-AC3).
+ *
+ * `configured` is carried rather than inferred from `url`, so "this project has
+ * no T3 deployment" is a state the transport can render rather than something a
+ * client has to deduce from a null - and so an absent value is never mistaken for
+ * a failed read (L02-AC3).
+ */
+export interface T3LaunchSettingView {
+  readonly configured: boolean;
+  /**
+   * The configured base URL, or null when none is configured.
+   *
+   * Never a credential: a URL carrying a username, password or token is refused
+   * before it is stored, so nothing returned here can be one (L02-AC2).
+   */
+  readonly url: string | null;
+}
+
+/**
+ * The repository configuration this project already has, read from its current
+ * profile version (F02-AC1, F02-AC2).
+ *
+ * A projection with the version identity attached rather than a second writable
+ * copy: `profileVersionId` and `versionNumber` tell the client which version it
+ * is looking at, and the profile route remains the only place one is saved.
+ */
+export interface RepositorySettingView {
+  readonly configured: boolean;
+  readonly profileVersionId: ProfileVersionId | null;
+  readonly versionNumber: number | null;
+  readonly repository: string | null;
+  readonly baseBranch: string | null;
+  readonly targetBranch: string | null;
+  readonly ticketProvider: string | null;
+  readonly deploymentProvider: string | null;
+  readonly engine: string | null;
+}
+
+/**
+ * One configured provider, as settings reports it (F03-AC3).
+ *
+ * There is no `credentialReference` field here and the connector's own view has
+ * one, so a settings response cannot be where a credential pointer leaks. What
+ * travels is the stored digest, which identifies the reference without carrying
+ * it (F32-AC2).
+ */
+export interface ProviderSettingView {
+  readonly connectorId: ConnectorId;
+  readonly kind: ProfileConnectorKind;
+  readonly provider: string;
+  readonly resourceScope: string;
+  readonly credentialReferenceDigest: string;
+  readonly state: ProfileConnectorState;
+  readonly lastCheckedAt: string | null;
+  readonly lastSuccessAt: string | null;
+}
+
+/** Everything one project's settings currently hold (mvp-spec 3). */
+export interface ProjectSettingsView {
+  readonly projectId: string;
+  readonly t3: T3LaunchSettingView;
+  readonly repository: RepositorySettingView;
+  readonly providers: readonly ProviderSettingView[];
+  /** When these settings were last written, or null when they never were. */
+  readonly updatedAt: string | null;
+}
+
+/**
+ * Project settings (mvp-spec 3, L02-AC2, L02-AC3).
+ *
+ * Both commands carry the owner the transport proved, and `projectId`, because
+ * neither alone addresses a row: a project this deployment does not hold is a
+ * `NotFound` here rather than an empty answer that reads as "configured and blank"
+ * (F02-AC2). `readSettings` answers a project that has configured nothing with
+ * `configured: false` and a 200, because that is the state a fresh MVP deployment
+ * is in and the journey must work there (L02-AC3).
+ */
+export interface SettingsUseCases {
+  readSettings(command: {
+    readonly projectId: ProjectId;
+    readonly actor: OwnerId;
+  }): Promise<Result<ProjectSettingsView, DomainError>>;
+  /**
+   * Saves or clears the T3 deployment URL.
+   *
+   * `t3Url` absent means "nothing to change" and reads back rather than writing,
+   * so a read-then-save round trip is idempotent. A malformed, credential-bearing
+   * or non-http(s) value is refused with a remedy and never echoed (L02-AC2).
+   */
+  updateSettings(command: {
+    readonly projectId: ProjectId;
+    readonly t3Url?: string | null;
+    readonly at: string;
+    readonly actor: OwnerId;
+  }): Promise<Result<ProjectSettingsView, DomainError>>;
+}
+
 
 /** How a request was captured (F06-AC1, F06-AC3). */
 export type IntakeRequestKind = 'FeatureRequest' | 'Bug';
@@ -1778,6 +1877,7 @@ export interface ControllerSurface {
   readonly sessions: SessionUseCases;
   readonly profiles: ProfileUseCases;
   readonly connectors: ConnectorUseCases;
+  readonly settings: SettingsUseCases;
   readonly intake: IntakeUseCases;
   readonly runs: RunUseCases;
   readonly attention: AttentionUseCases;
@@ -1808,6 +1908,10 @@ const REQUIRED_METHODS = {
   sessions: ['loadByToken', 'create', 'revoke', 'touch'],
   profiles: ['saveVersion', 'currentVersion', 'listVersions'],
   connectors: ['register', 'listForProject', 'revoke'],
+  // The settings group is declared on the surface rather than left optional: without it the
+  // optional T3 launch target would be unreachable from any shipped path, which is the state
+  // generation was in when it was implemented and never wired (L02-AC2).
+  settings: ['readSettings', 'updateSettings'],
   intake: [
     'captureIdea',
     'listIdeas',
