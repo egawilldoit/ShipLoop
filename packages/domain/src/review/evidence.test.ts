@@ -1,12 +1,15 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
+import { asCommitSha } from '../ids.ts';
+import type { OwnerId } from '../ids.ts';
 import { recordMvpEvidence, bindingAppliesTo, assessMvpEvidence } from './evidence.ts';
 import type { RecordMvpEvidenceInput } from './evidence.ts';
 import { deriveCriterionState } from './criterion.ts';
 
-const HEAD = 'a'.repeat(40);
-const HEAD_2 = 'b'.repeat(40);
+const HEAD = asCommitSha('a'.repeat(40));
+const HEAD_2 = asCommitSha('b'.repeat(40));
+const OWNER = 'own-1' as OwnerId;
 
 function input(overrides: Partial<RecordMvpEvidenceInput> = {}): RecordMvpEvidenceInput {
   return {
@@ -93,7 +96,7 @@ test('an unattributed observation is recordable but never applies', () => {
 test('a candidate-bound result must say when it was observed', () => {
   const recorded = recordMvpEvidence(input({ observedAt: null }));
   assert.equal(recorded.ok, false);
-  if (recorded.ok) return;
+  if (recorded.ok || recorded.error.code !== 'Invalid') return;
   assert.ok(recorded.error.fields.some((field) => field.path === 'observedAt'));
 });
 
@@ -102,7 +105,7 @@ test('a command result must be bound to a check, not to a criterion directly', (
     input({ subject: { kind: 'criterion', criterionId: 'c1' } }),
   );
   assert.equal(recorded.ok, false);
-  if (recorded.ok) return;
+  if (recorded.ok || recorded.error.code !== 'Invalid') return;
   assert.ok(recorded.error.fields.some((field) => field.path === 'subject.kind'));
 });
 
@@ -110,7 +113,7 @@ test('an owner test cannot be filed against a check', () => {
   const recorded = recordMvpEvidence(
     input({
       subject: { kind: 'check', checkId: 'lint' },
-      observation: { kind: 'owner_test', outcome: 'passed', actor: { role: 'owner', ownerId: 'own-1' } },
+      observation: { kind: 'owner_test', outcome: 'passed', actor: { role: 'owner', ownerId: OWNER } },
     }),
   );
   assert.equal(recorded.ok, false);

@@ -43,6 +43,17 @@ export interface MvpContractCriterionView {
   readonly id: string;
   readonly description: string;
   readonly verificationType: MvpVerificationType;
+  /**
+   * For an `automated` criterion, the check whose result verifies it.
+   *
+   * The criterion names its verifier rather than the projection inferring it from
+   * whichever check happened to pass. Inference is how a green suite ends up
+   * "verifying" a criterion no one bound to it (F23-AC1), and it would let a caller
+   * point a criterion at a check purely because that check is green. Null for an
+   * owner test, and null for an automated criterion nobody assigned, which leaves it
+   * `unverified`.
+   */
+  readonly verificationCheckId: string | null;
 }
 
 export type MvpContractStatus = 'draft' | 'approved' | 'stale';
@@ -275,15 +286,27 @@ export function buildMvpReviewReadModel(input: MvpReviewInput): Result<MvpReview
   }));
 
   const criteria = contract.acceptanceCriteria.map((criterion) => {
-    const related = verdicts.filter(
-      (verdict) => verdict.evidence.subject.kind === 'criterion' && verdict.evidence.subject.criterionId === criterion.id,
-    );
+    // An automated criterion reads the check it names; an owner test reads the
+    // observation recorded against the criterion itself. Neither falls back to "some
+    // check that passed", so an unassigned criterion stays unverified.
+    const related = verdicts.filter((verdict) => {
+      if (criterion.verificationType === 'automated') {
+        return (
+          criterion.verificationCheckId !== null &&
+          verdict.evidence.subject.kind === 'check' &&
+          verdict.evidence.subject.checkId === criterion.verificationCheckId
+        );
+      }
+      return verdict.evidence.subject.kind === 'criterion' && verdict.evidence.subject.criterionId === criterion.id;
+    });
     const applicable = related.filter((verdict) => verdict.match.applies);
-    // Newest applicable observation wins, so a re-run replaces rather than races.
+    // Newest applicable observation wins, so a re-run replaces rather than races, and
+    // an observation bound elsewhere still surfaces as `stale` rather than vanishing.
     const chosen = applicable.at(-1) ?? related.at(-1) ?? null;
+    const method = methodFor(criterion, chosen);
     const state = deriveCriterionState({
       verificationType: criterion.verificationType,
-      method: methodFor(chosen, criterion),
+      method,
       observation: chosen === null ? null : {
         outcome: chosen.evidence.outcome,
         source: chosen.evidence.source,
@@ -298,7 +321,7 @@ export function buildMvpReviewReadModel(input: MvpReviewInput): Result<MvpReview
       description: criterion.description,
       verificationType: criterion.verificationType,
       state: state.state,
-      method: methodFor(chosen, criterion),
+      method,
       evidenceId: chosen?.evidence.evidenceId ?? null,
       observedAt: chosen?.evidence.observedAt ?? null,
       reason: state.reason,
@@ -316,14 +339,25 @@ export function buildMvpReviewReadModel(input: MvpReviewInput): Result<MvpReview
   return ok({ request, contract, candidate, policy, checks, criteria, evidence: evidenceViews, staleness, decision, eligibility });
 }
 
+/**
+ * The method a criterion's evidence was recorded under.
+ *
+ * The contract's own assignment is the answer whenever there is one; the recorded
+ * method is only consulted when the contract is silent, so a caller cannot retag a
+ * criterion's verification by writing evidence under a different method (F23-AC1).
+ */
 function methodFor(
-  chosen: { evidence: MvpRecordedEvidence } | null,
   criterion: MvpContractCriterionView,
+  chosen: MvpEvidenceVerdict | null,
 ): CriterionVerificationMethod {
-  if (chosen !== null) return chosen.evidence.method;
-  return criterion.verificationType === 'owner_test'
-    ? { kind: 'OwnerTest', instructions: criterion.description }
-    : { kind: 'Untested', reason: `No verification method is assigned to "${criterion.id}", so nothing can verify it (F23-AC1).` };
+  if (criterion.verificationType === 'owner_test') {
+    return { kind: 'OwnerTest', instructions: criterion.description };
+  }
+  if (criterion.verificationCheckId !== null) {
+    return { kind: 'AutomatedCheck', checkId: criterion.verificationCheckId };
+  }
+  if (chosen !== null && chosen.evidence.method.kind !== 'Untested') return chosen.evidence.method;
+  return { kind: 'Untested', reason: `No verification method is assigned to "${criterion.id}", so nothing can verify it (F23-AC1).` };
 }
 
 function policyView(
@@ -464,6 +498,15 @@ function eligibilityView(
     deliveryReasons.push(
       `Acceptance ${stale.decisionId} does not describe this candidate: ${stale.reason}`,
     );
+  }
+  // `verified is not accepted` and `accepted is not merged`: delivery needs an owner
+  // decision that applies to this candidate, whatever else is true. A change request is
+  // an explicit refusal, not an absence of permission, so it is named rather than
+  // reported as "no decision yet" (F25-AC2).
+  if (decision.outcome === 'none') {
+    deliveryReasons.push('No owner decision applies to this candidate, so nothing authorises delivery (F25-AC1).');
+  } else if (decision.outcome === 'changes_requested') {
+    deliveryReasons.push('The owner requested changes on this candidate, so it has not been accepted (F25-AC2).');
   }
   if (staleness.stale) {
     deliveryReasons.push('Some evidence or decisions no longer describe this candidate and must be re-established (F20-AC3).');
