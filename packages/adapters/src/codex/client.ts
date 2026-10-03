@@ -42,16 +42,50 @@
  * test in `codex.test.ts` is written so that reverting to the denylist makes it fail (F03-AC5,
  * N02-AC3).
  *
- * **`CODEX_HOME` is ShipLoop-owned, never the operator's.** Two facts forced this. First,
- * Codex reads its own configuration from `$CODEX_HOME/config.toml`, and on this host that file
- * sets an unrestricted `sandbox_mode` together with `approval_policy = "never"` for every
- * trusted project, this repository included — so inheriting the operator's `CODEX_HOME` would
- * hand the engine a configuration that disables the sandbox the flag above requests. Second, Codex keeps
- * its ChatGPT login in `$CODEX_HOME/auth.json`, so pointing `CODEX_HOME` at an empty directory
- * without seeding anything turns every run into a `401`. {@link prepareEngineState} therefore
- * creates a state root this product owns and copies **only** `auth.json` into it; the operator's
- * `config.toml`, trusted-project list, model preferences, MCP servers and hooks are simply not
- * there to be inherited.
+ * **`CODEX_HOME` is ShipLoop-owned, never the operator's, and it is never seeded from the
+ * operator's credential.** Two facts forced the first. Codex reads its own configuration from
+ * `$CODEX_HOME/config.toml`, and on this host that file sets an unrestricted `sandbox_mode`
+ * together with `approval_policy = "never"` for every trusted project, this repository included —
+ * so inheriting the operator's `CODEX_HOME` would hand the engine a configuration that disables
+ * the sandbox the flag above requests.
+ *
+ * The second fact is the reason this module used to **copy** `auth.json`, and copying it was a
+ * defect rather than a convenience. A ChatGPT login is a *rotating* credential: Codex spends the
+ * refresh token and writes a new one back into `$CODEX_HOME/auth.json` in place. Two files holding
+ * the same refresh token are therefore two writers of one credential, and the second one to
+ * refresh loses, with the provider's own wording, `Your access token could not be refreshed
+ * because your refresh token was already used. Please log out and sign in again.` The old code
+ * copied the operator's login on every launch and re-copied it whenever the operator's file looked
+ * newer, which both made the engine's own rotated token unrecoverable and put the operator's
+ * interactive session one refresh away from breaking. **The copy is gone.** The engine's
+ * credential is whatever ShipLoop provisioned into its own `CODEX_HOME`, and
+ * {@link resolveEngineAuthentication} refuses a run that finds nothing there instead of reaching
+ * for the operator's file (F15-AC5).
+ *
+ * **What Codex 0.160.0 actually supports was measured, not assumed**, on this host on 2 October
+ * 2026, because the supported route is the whole answer to "how does the engine get its own
+ * identity":
+ *
+ * - **`CODEX_API_KEY` in the environment is honoured and is never written to disk.** With an
+ *   empty `CODEX_HOME` and `CODEX_API_KEY=sk-invalid-…`, the provider answered `401 Incorrect API
+ *   key provided: sk-inval***…` with `auth error code: invalid_api_key` — the engine had read the
+ *   key out of the environment and presented it — and **no `auth.json` appeared**. The binary's
+ *   own string table says why: `externally provided auth cannot be loaded from auth storage`.
+ * - **`OPENAI_API_KEY` alone is *not* honoured.** The identical run with only `OPENAI_API_KEY` set
+ *   produced the baseline `401 Missing bearer or basic authentication in header`, byte for byte the
+ *   answer an unauthenticated run gives. Shipping that variable would have been a credential that
+ *   does nothing.
+ * - **`codex login --with-api-key` provisions a static credential** into any `CODEX_HOME`: it
+ *   reads the key from stdin and writes exactly `{"auth_mode":"apikey","OPENAI_API_KEY":"sk-…"}`,
+ *   mode 0600, after which `codex login status` prints `Logged in using an API key`. An API key
+ *   has no refresh token, so there is nothing to rotate and nothing to collide over. This is the
+ *   route {@link ENGINE_CREDENTIAL_PROVISION_COMMAND} names.
+ * - **`codex login --device-auth` exists** and produces a genuinely separate ChatGPT identity, but
+ *   it needs the owner to complete a browser or device-code flow, and its login is a rotating
+ *   refresh token again. It is supported and is not what this adapter requires.
+ *
+ * The operator's `config.toml`, trusted-project list, model preferences, MCP servers and hooks are
+ * not there to be inherited, and neither is their login.
  *
  * The residual exposure is stated rather than hidden: the child runs as the same uid as the
  * worker, so an absolute path to `~/.codex/auth.json` or `~/.ssh/id_ed25519` is still readable.
@@ -104,12 +138,12 @@
 
 import { spawn, type ChildProcessByStdio } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import type { Readable } from 'node:stream';
 
-import { conflict, err, invalid, ok, type DomainError, type Result } from '@shiploop/domain';
+import { blocked, conflict, err, invalid, ok, type DomainError, type Result } from '@shiploop/domain';
 import type { AdapterContext, EngineResultRequest, EngineResultSchema } from '../contracts/index.ts';
 import { mapCodexVersionProbeFailure } from './errors.ts';
 
@@ -140,6 +174,47 @@ export const MINIMUM_CODEX_VERSION = '0.159.1';
  * these questions (F04-AC2).
  */
 export const CODEX_RESULT_CHANNEL_VERSION = '0.160.0';
+
+/**
+ * The version the engine's **separate-credential** behaviour was measured on.
+ *
+ * A third constant for the same reason the other two exist: `--output-schema` was read off 0.160.0
+ * and the `--json` event schema off 0.159.1, and this one — `CODEX_API_KEY` being honoured while
+ * `OPENAI_API_KEY` alone is not, and env-provided auth never reaching `auth.json` — was measured
+ * on 0.160.0 on 2 October 2026. One number cannot honestly carry three different binaries (F04-AC2).
+ */
+export const CODEX_SEPARATE_CREDENTIAL_VERSION = '0.160.0';
+
+/**
+ * The exact command that provisions this product's engine credential, quoted wherever a run is
+ * blocked for want of one.
+ *
+ * Named here rather than written into each message so the blocker, the provisioning script and the
+ * README cannot drift apart: three copies of a command an owner has to type is three chances to
+ * be wrong. The `env -i` form is deliberate — the key is read on stdin, never on a command line,
+ * because `argv` is world-readable through `/proc/<pid>/cmdline` for the life of the process.
+ */
+export const ENGINE_CREDENTIAL_PROVISION_COMMAND =
+  'printenv OPENAI_API_KEY | env -i PATH="$PATH" HOME="$HOME" CODEX_HOME=<stateRoot>/codex codex login --with-api-key';
+
+/**
+ * The credential ShipLoop provisions for the engine, and how it was established.
+ *
+ * Reported rather than inferred, because the two modes differ in a way an owner must be told:
+ * `ApiKey` is static and cannot collide with anything, while `ChatGPT` is a rotating refresh token
+ * and this adapter deliberately refuses to rotate the operator's copy of one. A run on `ChatGPT`
+ * is honest about what it is rather than being reported as a separate identity (F15-AC5).
+ */
+export type CodexCredentialMode = 'ApiKey' | 'ChatGPT';
+
+export interface CodexEngineAuthentication {
+  /** Which kind of credential the ShipLoop-owned `CODEX_HOME` holds. */
+  readonly mode: CodexCredentialMode;
+  /** The ShipLoop-owned `CODEX_HOME` the engine was pointed at. Never the operator's. */
+  readonly codexHome: string;
+  /** The credential file inside it. Reported for diagnostics; never printed by value. */
+  readonly credentialPath: string;
+}
 
 /** The sandbox modes a ShipLoop coding session may be granted. */
 export const CODEX_SANDBOX_MODES = ['read-only', 'workspace-write'] as const;
@@ -419,9 +494,11 @@ export class CodexClient {
    *
    * The ShipLoop-owned state is created first, because the engine's environment cannot be
    * assembled without it and because a failure to create it must be a refusal rather than a
-   * fallback onto the operator's `~/.codex`. The structured-result channel is prepared after
-   * that and before the process exists, so a schema that cannot be written or a result path that
-   * cannot be confined leaves no running engine behind.
+   * fallback onto the operator's `~/.codex`. The engine's credential is then *resolved*, so a
+   * ShipLoop-owned `CODEX_HOME` with nothing in it is a typed blocker with the provisioning
+   * command rather than a copy of the operator's rotating login. The structured-result channel is
+   * prepared after that and before the process exists, so a schema that cannot be written or a
+   * result path that cannot be confined leaves no running engine behind.
    */
   start(request: CodexSpawnRequest): Result<CodexProcess> {
     if (request.invocation === 'Resume' && request.priorSessionId === undefined) {
@@ -438,6 +515,9 @@ export class CodexClient {
       attempt: request.cwd,
     });
     if (!state.ok) return err(state.error);
+
+    const authentication = resolveEngineAuthentication(state.value);
+    if (!authentication.ok) return err(authentication.error);
 
     const resultChannel =
       request.result === undefined || request.result === null
@@ -484,11 +564,11 @@ export class CodexClient {
    * descendants, and the caller only needs its exit status and stdout. If it overruns, the child
    * itself is killed and the call fails rather than waiting.
    *
-   * It runs with the same allowlist as a session. A probe inherits an environment exactly like
-   * any other child, so leaving it on `process.env` would keep the whole exposure in place for
-   * the one call an operator most often runs by hand. The login is deliberately **not** seeded
-   * for a version probe: `--version` never authenticates, and copying a credential for a call
-   * that cannot use it would be a credential on disk for nothing.
+* It runs with the same allowlist as a session. A probe inherits an environment exactly like
+   * any other child, so leaving it on `process.env` would keep the whole exposure in place for the
+   * one call an operator most often runs by hand. The credential is deliberately **not** required
+   * for a version probe and is never created for one: `--version` never authenticates, so resolving
+   * a login here would make "can I run codex at all" depend on a credential it does not use.
    */
   private probe(
     argv: readonly string[],
@@ -498,7 +578,6 @@ export class CodexClient {
     const state = prepareEngineState({
       stateRoot: this.options.stateRoot,
       attempt: `codex-version-probe:${this.options.binary}`,
-      seedAuthFrom: null,
     });
     if (!state.ok) return Promise.resolve(err(state.error));
     const environment = engineEnvironment(process.env, state.value);
@@ -587,9 +666,9 @@ function signalGroup(child: CodexChildProcess, signal: NodeJS.Signals): void {
  *   `locale is not UTF-8 - unicode glyphs may render incorrectly` when neither is usable, so
  *   the operator's locale is forwarded rather than invented.
  * - `TZ` — timestamps in the engine's own output are rendered through it.
- * - `CODEX_HOME` — where Codex reads `auth.json` and writes rollouts. It points at a directory
- *   this product created, never at the operator's `~/.codex`; see the module comment for why
- *   inheriting that one would disable the sandbox.
+ * - `CODEX_HOME` — where Codex reads the login this product provisioned and writes its rollouts. It
+ *   points at a directory this product created and never at the operator's `~/.codex`; see the
+ *   module comment for both reasons (the operator's `sandbox_mode`, and the rotating login).
  *
  * Deliberately absent, each because inheriting it hands the engine authority or a pointer to
  * authority: every other provider credential (`GH_TOKEN`, `LINEAR_API_KEY`, …), `DATABASE_URL`
@@ -657,17 +736,18 @@ export function engineStateLayout(options: {
  * Creates the directories the engine runs against and returns them.
  *
  * Mode 0700 because the state root holds the engine's login: a directory the operator's other
- * accounts can list is a directory they can read a credential out of. Idempotent, and it copies
- * the operator's `auth.json` when there is one and the destination has none or an older copy —
- * a token the operator re-authenticated in place would otherwise leave the engine holding a
- * refresh token that has already been consumed.
+ * accounts can list is a directory they can read a credential out of. Idempotent, and it creates
+ * nothing but directories — in particular it no longer seeds `auth.json` from the operator's
+ * `~/.codex`, because copying a rotating credential is what made the engine and the operator two
+ * writers of one refresh token (F15-AC5).
  *
  * A failure here is a refusal, not a warning: a run whose `CODEX_HOME` could not be created
  * would otherwise fall back to `~/.codex` and inherit that file's unrestricted sandbox mode.
  */
-export function prepareEngineState(
-  options: { readonly stateRoot?: string | undefined; readonly attempt: string; readonly seedAuthFrom?: string | null | undefined },
-): Result<EngineStateLayout> {
+export function prepareEngineState(options: {
+  readonly stateRoot?: string | undefined;
+  readonly attempt: string;
+}): Result<EngineStateLayout> {
   const layout = engineStateLayout(options);
   try {
     mkdirSync(layout.stateRoot, { recursive: true, mode: 0o700 });
@@ -680,39 +760,121 @@ export function prepareEngineState(
       reason: `the ShipLoop-owned engine state directory ${layout.stateRoot} could not be created (${describe(cause)}). Running without it would make the engine fall back to the operator's ~/.codex, whose config.toml sets an unrestricted sandbox_mode and approval_policy = "never" on this host, so the attempt is refused rather than started (F03-AC5).`,
     });
   }
-
-  const source = options.seedAuthFrom === undefined ? operatorCodexAuthPath() : options.seedAuthFrom;
-  if (source === null) return ok(layout);
-  try {
-    if (!existsSync(source)) return ok(layout);
-    const sourceStat = statSync(source);
-    const destination = join(layout.codexHome, 'auth.json');
-    const destinationStat = existsSync(destination) ? statSync(destination) : null;
-    if (destinationStat !== null && destinationStat.size === sourceStat.size && destinationStat.mtimeMs >= sourceStat.mtimeMs) {
-      return ok(layout);
-    }
-    copyFileSync(source, destination);
-    chmodSync(destination, 0o600);
-  } catch (cause) {
-    return err({
-      code: 'Unavailable',
-      reason: `the Codex login at ${source} could not be copied into ${layout.codexHome} (${describe(cause)}). Without it every run would be refused by the provider as unauthenticated, so this is reported rather than left to fail as a 401 (F03-AC5).`,
-    });
-  }
   return ok(layout);
 }
 
+/** The credential file Codex reads out of `CODEX_HOME`, and the only file ever read from it. */
+export const ENGINE_CREDENTIAL_FILE = 'auth.json';
+
 /**
- * Where the operator keeps their Codex login, when they have one.
+ * Decides what the engine will authenticate as, or blocks the run with the command that fixes it.
  *
- * Read from `CODEX_HOME` when the worker was started with it and from `~/.codex` otherwise,
- * because that is where `codex login` puts `auth.json`. Only the file name is used; the
- * operator's `config.toml` next to it is deliberately never copied.
+ * This is the replacement for the copy that used to live in {@link prepareEngineState}, and it is a
+ * *read*. It never writes the credential, never refreshes it, and never looks outside the
+ * ShipLoop-owned `CODEX_HOME` it is given — in particular it does not consult `~/.codex`, so there
+ * is no path by which a run can begin by reading the operator's rotating token.
+ *
+ * Four outcomes, and the difference between them is the difference between a four-word fix and an
+ * afternoon:
+ *
+ *   - **present and recognised** → the run proceeds, and the mode is reported rather than guessed;
+ *   - **absent** → a `Blocked` error whose prerequisite names
+ *     {@link ENGINE_CREDENTIAL_PROVISION_COMMAND}, because a 401 eleven reconnects deep into a
+ *     turn is a far worse report than a refusal before a process exists;
+ *   - **unreadable or unparseable** → `Unavailable`, naming the file, because a truncated login is
+ *     a different fault from a missing one and has a different fix;
+ *   - **group- or world-readable** → `Forbidden`, because a credential another account on this host
+ *     can read is not a credential this product provisioned.
+ *
+ * `statSync` and not `lstatSync`, and the containment is not re-checked: `codexHome` is derived
+ * from `stateRoot` by {@link engineStateLayout} rather than accepted from a caller, so there is no
+ * path here that a symlink or an argument could redirect (F15-AC5).
  */
-function operatorCodexAuthPath(parent: NodeJS.ProcessEnv = process.env): string | null {
-  const configured = parent['CODEX_HOME'];
-  const codexHome = typeof configured === 'string' && configured.length > 0 ? configured : join(homedir(), '.codex');
-  return join(codexHome, 'auth.json');
+export function resolveEngineAuthentication(layout: EngineStateLayout): Result<CodexEngineAuthentication> {
+  const credentialPath = join(layout.codexHome, ENGINE_CREDENTIAL_FILE);
+  let info: ReturnType<typeof statSync>;
+  try {
+    info = statSync(credentialPath);
+  } catch (cause) {
+    return err(
+      blocked(
+        `No Codex credential is provisioned for the ShipLoop engine at ${credentialPath} (${describe(cause)}), so this run was refused before any engine process existed. Codex answers an unauthenticated turn with eleven reconnects and a 401, which names the symptom rather than the fix (F15-AC5).`,
+        [
+          {
+            name: 'engine-credential',
+            detail:
+              'Codex reads its login from $CODEX_HOME/auth.json. ShipLoop points CODEX_HOME at a directory it owns and does not fill it from the operator\'s ~/.codex, because a ChatGPT login is a rotating refresh token and copying one makes the engine and the operator two writers of the same credential. Measured on codex-cli ' +
+              CODEX_SEPARATE_CREDENTIAL_VERSION +
+              ': an `apikey` login has no refresh token and therefore nothing to rotate.',
+            remedy: `Provision one credential into ${layout.codexHome} with: ${ENGINE_CREDENTIAL_PROVISION_COMMAND}`,
+          },
+        ],
+      ),
+    );
+  }
+
+  if (!info.isFile()) {
+    return err({
+      code: 'Unavailable',
+      reason: `The Codex credential at ${credentialPath} is not a regular file. Codex cannot read it, so this run was refused rather than started against a login that may be somebody else's (F15-AC5).`,
+    });
+  }
+  if ((info.mode & 0o077) !== 0) {
+    return err({
+      code: 'Forbidden',
+      reason: `The Codex credential at ${credentialPath} has mode ${modeText(info.mode)}, so every account on this host can read it. A credential another user can read is not a credential this product provisioned, so the run is refused until the mode is 0600 (F15-AC5).`,
+    });
+  }
+
+  let mode: CodexCredentialMode | null;
+  try {
+    mode = readCredentialMode(readFileSync(credentialPath, 'utf8'));
+  } catch (cause) {
+    return err({
+      code: 'Unavailable',
+      reason: `The Codex credential at ${credentialPath} could not be read (${describe(cause)}). A login that cannot be read is a different fault from a login that is absent, so it is reported as such rather than as missing (F15-AC5).`,
+    });
+  }
+  if (mode === null) {
+    return err({
+      code: 'Unavailable',
+      reason: `The Codex credential at ${credentialPath} declares neither an "apikey" mode with a key nor a "chatgpt" mode with tokens, so this adapter cannot say what the engine would authenticate as. It is refused rather than run against a credential of unknown provenance (F15-AC5).`,
+    });
+  }
+  return ok({ mode, codexHome: layout.codexHome, credentialPath });
+}
+
+/**
+ * Which credential a login file holds, or null when it declares neither.
+ *
+ * The two shapes are the two `codex login` routes measured on this host: `--with-api-key` writes
+ * `{"auth_mode":"apikey","OPENAI_API_KEY":"sk-…"}`, and an interactive or device-code ChatGPT login
+ * writes `{"auth_mode":"chatgpt","tokens":{…refresh_token…},"last_refresh":"…"}`. Both are checked
+ * for the field that makes them *usable*, not only for the mode string, because a login file that
+ * names a mode and carries nothing of it is precisely the state a half-finished provisioning leaves
+ * behind — and reporting that as provisioned would produce a 401 rather than a fix.
+ */
+function readCredentialMode(text: string): CodexCredentialMode | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== 'object' || parsed === null) return null;
+  const record = parsed as Record<string, unknown>;
+  if (record['auth_mode'] === 'apikey' && typeof record['OPENAI_API_KEY'] === 'string' && record['OPENAI_API_KEY'].length > 0) {
+    return 'ApiKey';
+  }
+  if (record['auth_mode'] === 'chatgpt' && typeof record['tokens'] === 'object' && record['tokens'] !== null) {
+    return 'ChatGPT';
+  }
+  return null;
+}
+
+/** `0600` rather than `-rw-------`: the mode is a claim about access, not a rendering of it. */
+function modeText(mode: number): string {
+  return `0${(mode & 0o777).toString(8).padStart(3, '0')}`;
 }
 
 /**
@@ -720,7 +882,8 @@ function operatorCodexAuthPath(parent: NodeJS.ProcessEnv = process.env): string 
  *
  * `HOME` and `CODEX_HOME` are *computed*, never copied — copying the operator's `HOME` is
  * precisely the failure this function exists to prevent, and copying the operator's `CODEX_HOME`
- * would carry that unrestricted `sandbox_mode` with it.
+ * would carry that unrestricted `sandbox_mode` with it along with a rotating credential that must
+ * never be spent twice.
  */
 export function engineEnvironment(
   parent: NodeJS.ProcessEnv,

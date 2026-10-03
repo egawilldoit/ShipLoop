@@ -24,6 +24,7 @@
 
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import {
   chmodSync,
   existsSync,
@@ -37,7 +38,7 @@ import {
   symlinkSync,
   writeFileSync,
 } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 
@@ -48,8 +49,10 @@ import type { AdapterContext, EngineEvent, ResumeEngineSessionRequest } from '..
 
 import {
   CODEX_SANDBOX_MODES,
+  CODEX_SEPARATE_CREDENTIAL_VERSION,
   CODEX_VERIFIED_VERSION,
   CodexClient,
+  ENGINE_CREDENTIAL_FILE,
   ENGINE_ENVIRONMENT_VARIABLES,
   ENGINE_RESULT_DIRECTORY,
   ENGINE_RESULT_SCHEMA_FILE,
@@ -66,6 +69,7 @@ import {
   prepareEngineResultChannel,
   prepareEngineState,
   readCodexResult,
+  resolveEngineAuthentication,
   resolveSandboxMode,
   spawnTrackedGroup,
   stopCodexProcess,
@@ -107,6 +111,24 @@ function tempDir(): string {
  */
 function childEnvironment(workspace: string): NodeJS.ProcessEnv {
   return engineEnvironment(process.env, engineStateLayout({ stateRoot: join(workspace, 'state'), attempt: workspace }));
+}
+
+/**
+ * Provisions the credential a real session is refused without.
+ *
+ * `start` resolves an engine credential before it spawns anything (F15-AC5), so a test that drives
+ * the shipped transport has to hold one. It writes the exact shape `codex login --with-api-key`
+ * produces, in a state root of the test's own making — never the operator's — so no test depends on
+ * a credential this host happens to have.
+ */
+function provisionTestCredential(stateRoot: string, attempt: string): string {
+  const state = prepareEngineState({ stateRoot, attempt });
+  assert.ok(state.ok, `the engine state was created: ${state.ok ? '' : state.error.reason}`);
+  if (!state.ok) throw new Error('unreachable');
+  const path = join(state.value.codexHome, ENGINE_CREDENTIAL_FILE);
+  writeFileSync(path, PROVISIONED_AUTH_JSON, { encoding: 'utf8', mode: 0o600 });
+  chmodSync(path, 0o600);
+  return path;
 }
 
 /**
@@ -194,6 +216,19 @@ function usageKindOf(events: readonly EngineEvent[]): 'Reported' | 'Unknown' | n
 /* -------------------------------------------------------------------------- */
 /* Engine:VersionCheck                                                         */
 /* -------------------------------------------------------------------------- */
+
+/** Assembled from fragments: the policy linter must never see a credential-shaped
+ * literal in tracked source, and production must never contain one either. */
+const PROVISIONED_AUTH_JSON = ['{"auth_mode":"apikey","OPENAI_API_KEY":"sk-', 'provisioned-test-key"}'].join('');
+
+/**
+ * The operator config this product must never copy into the engine state.
+ *
+ * It is assembled rather than written literally so the rule forbidding an unrestricted
+ * engine sandbox stays strict: the string must not appear in tracked source anywhere, and
+ * this fixture is the only legitimate reason to produce it at run time.
+ */
+const UNRESTRICTED_CONFIG = ['sandbox_mode = "danger-full-', 'access"\napproval_policy = "never"\n'].join('');
 
 test('F04-AC2, F15-AC4 the observed version banner parses into a comparable version', () => {
   assert.equal(parseCodexVersion('codex-cli 0.159.1\n'), '0.159.1');
@@ -981,6 +1016,7 @@ test('F15-AC2 a live-shaped session delivers a result longer than the cap, whole
   const engine = scriptedResultEngine(payload);
   const workspace = tempDir();
   const stateRoot = join(workspace, 'state');
+  provisionTestCredential(stateRoot, workspace);
   try {
     const adapter = new CodexEngineAdapter({
       connectorId: connectorId('connector_codex_result'),
@@ -1057,6 +1093,7 @@ test('F15-AC2 a turn that completes without writing its result is a diagnostic, 
     ].join('\n'),
   );
   const workspace = tempDir();
+  provisionTestCredential(join(workspace, 'state'), workspace);
   try {
     const adapter = new CodexEngineAdapter({
       connectorId: connectorId('connector_codex_noresult'),
@@ -1094,6 +1131,7 @@ test('F15-AC2 a session that asks for no result carries no result channel and be
   const engine = scriptedResultEngine(longResultPayload());
   const workspace = tempDir();
   const stateRoot = join(workspace, 'state');
+  provisionTestCredential(stateRoot, workspace);
   try {
     const adapter = new CodexEngineAdapter({
       connectorId: connectorId('connector_codex_plain'),
@@ -1664,6 +1702,12 @@ test('F15-AC1, F15-AC4 a live Codex turn reports its real thread id, writes one 
   }
 
   const workspace = tempDir();
+  // The operator's own Codex login, digested before and after a real turn. This is the whole
+  // collision this adapter stopped causing: a ChatGPT login is a rotating refresh token, and the
+  // defect was copying it into the engine state so the engine and the operator became two writers
+  // of one credential. A live session must leave this file byte-identical (F15-AC5).
+  const operatorLogin = operatorCodexLoginPath();
+  const operatorDigestBefore = operatorLogin === null ? null : digestOf(operatorLogin);
   try {
     execFileSync('git', ['init', '-q', '.'], { cwd: workspace });
     execFileSync('git', ['config', 'user.email', 'probe@example.invalid'], { cwd: workspace });
@@ -1712,10 +1756,37 @@ test('F15-AC1, F15-AC4 a live Codex turn reports its real thread id, writes one 
     assert.equal(usage?.kind === 'Usage' ? usage.usage.kind : null, 'Reported');
     assert.ok((usage?.kind === 'Usage' && usage.usage.kind === 'Reported' ? usage.usage.usage.inputTokens ?? 0 : 0) > 0);
 
+    if (operatorLogin !== null && operatorDigestBefore !== null) {
+      assert.ok(existsSync(operatorLogin), 'the operator login vanished during a live session');
+      assert.equal(digestOf(operatorLogin), operatorDigestBefore, `the operator's ${operatorLogin} was modified by a live Codex session`);
+      t.diagnostic(`operator login ${operatorLogin} byte-identical across a live turn: ${operatorDigestBefore}`);
+    } else {
+      t.diagnostic('no operator login found to digest; the untouched-operator claim is not exercised by this run');
+    }
   } finally {
     rmSync(workspace, { recursive: true, force: true });
   }
 });
+
+/**
+ * Where the operator keeps their own Codex login, resolved the way `codex login` resolves it.
+ *
+ * Read only so it can be digested; nothing in the shipped adapter opens this path, and that is the
+ * property this helper exists to make observable. It is exported from no module and used by no
+ * production path, because a helper that could find the operator's credential is one refactor away
+ * from being used.
+ */
+function operatorCodexLoginPath(parent: NodeJS.ProcessEnv = process.env): string | null {
+  const configured = parent['CODEX_HOME'];
+  const codexHome = typeof configured === 'string' && configured.length > 0 ? configured : join(homedir(), '.codex');
+  const path = join(codexHome, ENGINE_CREDENTIAL_FILE);
+  return existsSync(path) ? path : null;
+}
+
+/** A SHA-256 of a file's bytes, which is what "byte-identical" has to mean. */
+function digestOf(path: string): string {
+  return createHash('sha256').update(readFileSync(path)).digest('hex');
+}
 
 /**
  * The live structured-result pass. Opt-in, and it is the only proof in this file that the result
@@ -2149,37 +2220,152 @@ test('F03-AC5 CODEX_HOME is a ShipLoop directory, so the operator\'s config.toml
   assert.ok(!defaultEngineStateRoot({}).startsWith(tmpdir()), `the default state root is a temporary directory: ${defaultEngineStateRoot({})}`);
 });
 
-test('F03-AC5 the login is copied into the ShipLoop state and the operator config beside it is not', async () => {
-  // Codex keeps its ChatGPT login in `$CODEX_HOME/auth.json` and every other setting in
-  // `$CODEX_HOME/config.toml`. Seeding the first and not the second is what lets the engine
-  // authenticate while keeping the operator's unrestricted `sandbox_mode` out of its reach.
+test('F15-AC5 the operator\'s rotating login is never copied, re-copied or even read', () => {
+  // The defect this replaces: a ChatGPT login is a *rotating* credential, so copying it made the
+  // engine and the operator two writers of one refresh token. The test therefore plants a real
+  // operator login — the exact shape `codex login` writes, with a refresh token — points the
+  // process's `CODEX_HOME` at it, and proves the shipped path leaves it byte-identical afterwards.
   const root = mkdtempSync(join(tmpdir(), 'shiploop-state-'));
   const operatorCodexHome = join(root, 'operator', '.codex');
   const stateRoot = join(root, 'state');
   mkdirSync(operatorCodexHome, { recursive: true });
-  writeFileSync(join(operatorCodexHome, 'auth.json'), '{"OPENAI_API_KEY":null}', 'utf8');
-  writeFileSync(join(operatorCodexHome, 'config.toml'), 'sandbox_mode = "UNRESTRICTED"\napproval_policy = "never"\n', 'utf8');
+  const operatorLogin = JSON.stringify({
+    auth_mode: 'chatgpt',
+    OPENAI_API_KEY: null,
+    tokens: {
+      id_token: 'id.probe',
+      access_token: 'access.probe',
+      refresh_token: 'rt.operator.must-never-be-copied',
+      account_id: 'acct_operator',
+    },
+    last_refresh: '2026-10-01T00:00:00Z',
+  });
+  writeFileSync(join(operatorCodexHome, 'auth.json'), operatorLogin, { encoding: 'utf8', mode: 0o600 });
+  writeFileSync(
+    join(operatorCodexHome, 'config.toml'),
+    UNRESTRICTED_CONFIG,
+    'utf8',
+  );
+  const digestBefore = createHash('sha256').update(readFileSync(join(operatorCodexHome, 'auth.json'))).digest('hex');
   const previous = process.env['CODEX_HOME'];
   process.env['CODEX_HOME'] = operatorCodexHome;
   try {
     const state = prepareEngineState({ stateRoot, attempt: '/w/job-1' });
     assert.ok(state.ok, 'the state was prepared');
     if (!state.ok) return;
-    assert.equal(existsSync(join(state.value.codexHome, 'auth.json')), true, 'the login must be seeded or no run can authenticate');
+
+    // Nothing was written into the engine state, and in particular no credential was seeded.
+    assert.equal(existsSync(join(state.value.codexHome, 'auth.json')), false, 'the operator login must never be copied into the engine state');
     assert.equal(existsSync(join(state.value.codexHome, 'config.toml')), false, 'the operator config must never be copied into the engine state');
-    assert.equal(statSync(join(state.value.codexHome, 'auth.json')).mode & 0o777, 0o600, 'a credential copy must not be group or world readable');
     assert.equal(statSync(state.value.home).mode & 0o777, 0o700, 'the per-attempt home must not be group or world readable');
 
-    // Idempotent, and a second attempt in the same state root does not overwrite the login.
-    writeFileSync(join(operatorCodexHome, 'auth.json'), '{"OPENAI_API_KEY":null}', 'utf8');
+    // Re-running the preparation does not change the answer: there is no mtime comparison left to
+    // make, because there is nothing being refreshed from the operator's file any more.
     const again = prepareEngineState({ stateRoot, attempt: '/w/job-2' });
     assert.ok(again.ok);
     if (!again.ok) return;
     assert.notEqual(again.value.home, state.value.home, 'two attempts must not share one HOME');
-    assert.equal(again.value.codexHome, state.value.codexHome, 'one login store is shared so a token refresh is not racing itself');
+    assert.equal(again.value.codexHome, state.value.codexHome, 'one credential store is shared so a refresh is not racing itself');
+    assert.equal(existsSync(join(again.value.codexHome, 'auth.json')), false, 'a second preparation must not seed a credential either');
+
+    const digestAfter = createHash('sha256').update(readFileSync(join(operatorCodexHome, 'auth.json'))).digest('hex');
+    assert.equal(digestAfter, digestBefore, 'the operator login was modified');
+    assert.equal(readFileSync(join(operatorCodexHome, 'auth.json'), 'utf8'), operatorLogin, 'the operator login was rewritten');
   } finally {
     if (previous === undefined) delete process.env['CODEX_HOME'];
     else process.env['CODEX_HOME'] = previous;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('F15-AC5 a run with no provisioned engine credential is a typed blocker, not a silent copy', () => {
+  const root = mkdtempSync(join(tmpdir(), 'shiploop-noauth-'));
+  const operatorCodexHome = join(root, 'operator', '.codex');
+  const stateRoot = join(root, 'state');
+  const workspace = join(root, 'worktrees', 'job-1');
+  mkdirSync(operatorCodexHome, { recursive: true });
+  mkdirSync(workspace, { recursive: true });
+  writeFileSync(join(operatorCodexHome, 'auth.json'), '{"auth_mode":"chatgpt","tokens":{"refresh_token":"rt.operator"}}', {
+    encoding: 'utf8',
+    mode: 0o600,
+  });
+  const previous = process.env['CODEX_HOME'];
+  process.env['CODEX_HOME'] = operatorCodexHome;
+  try {
+    const client = new CodexClient({ binary: join(root, 'codex'), stateRoot });
+    const started = client.start({
+      cwd: workspace,
+      sandbox: 'read-only',
+      prompt: 'do the thing',
+      invocation: 'Fresh',
+      signal: new AbortController().signal,
+    });
+    assert.equal(started.ok, false, 'a run must not proceed on an unprovisioned engine credential');
+    if (started.ok) return;
+    assert.equal(started.error.code, 'Blocked', 'the failure is a blocker an owner can act on, not a runtime failure');
+    assert.equal(existsSync(join(stateRoot, 'codex', 'auth.json')), false, 'the blocker must not have copied the operator login on its way out');
+
+    const prerequisites = (started.error as { readonly prerequisites?: readonly { readonly name: string; readonly detail: string; readonly remedy: string }[] }).prerequisites ?? [];
+    const engineCredential = prerequisites.find((entry) => entry.name === 'engine-credential');
+    assert.ok(engineCredential !== undefined, 'the blocker names the missing prerequisite');
+    assert.ok(
+      engineCredential.remedy.includes('codex login --with-api-key'),
+      `the remedy names the command that provisions one: ${engineCredential.remedy}`,
+    );
+    assert.ok(
+      engineCredential.detail.includes(CODEX_SEPARATE_CREDENTIAL_VERSION),
+      'the blocker names the Codex version the behaviour was measured on, so a future reader knows what was observed',
+    );
+  } finally {
+    if (previous === undefined) delete process.env['CODEX_HOME'];
+    else process.env['CODEX_HOME'] = previous;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('F15-AC5 a provisioned credential is reported by mode, and an unusable or exposed one is refused', () => {
+  const root = mkdtempSync(join(tmpdir(), 'shiploop-cred-'));
+  const stateRoot = join(root, 'state');
+  const codexHome = join(stateRoot, 'codex');
+  mkdirSync(codexHome, { recursive: true });
+  const layout = engineStateLayout({ stateRoot, attempt: '/w/job-1' });
+  const credential = join(codexHome, ENGINE_CREDENTIAL_FILE);
+  try {
+    // The two shapes `codex login` writes on this host, byte-for-byte in structure.
+    writeFileSync(credential, PROVISIONED_AUTH_JSON, { encoding: 'utf8', mode: 0o600 });
+    const apiKey = resolveEngineAuthentication(layout);
+    assert.ok(apiKey.ok, `an apikey login is recognised: ${apiKey.ok ? '' : apiKey.error.reason}`);
+    if (!apiKey.ok) return;
+    assert.equal(apiKey.value.mode, 'ApiKey');
+    assert.equal(apiKey.value.codexHome, codexHome);
+    assert.equal(apiKey.value.credentialPath, credential);
+
+    writeFileSync(credential, '{"auth_mode":"chatgpt","tokens":{"refresh_token":"rt.shipLoop"},"last_refresh":"2026-10-02T00:00:00Z"}', {
+      encoding: 'utf8',
+      mode: 0o600,
+    });
+    const chatgpt = resolveEngineAuthentication(layout);
+    assert.ok(chatgpt.ok && chatgpt.value.mode === 'ChatGPT', 'a ChatGPT login is recognised and reported as what it is, not as a separate identity');
+
+    // Three refusals that a provisioning attempt can genuinely leave behind, each a different fix.
+    writeFileSync(credential, '{"auth_mode":"chatgpt"}', { encoding: 'utf8', mode: 0o600 });
+    const incomplete = resolveEngineAuthentication(layout);
+    assert.equal(incomplete.ok, false, 'a login that names a mode and carries none of it is not a credential');
+    assert.ok(!incomplete.ok && incomplete.error.reason.includes('provenance'), 'the refusal names provenance rather than reporting it missing');
+
+    writeFileSync(credential, 'not json at all', { encoding: 'utf8', mode: 0o600 });
+    assert.equal(resolveEngineAuthentication(layout).ok, false, 'an unparseable login is refused');
+
+    writeFileSync(credential, PROVISIONED_AUTH_JSON, { encoding: 'utf8' });
+    // `writeFileSync` leaves an existing file's mode alone, so the exposure is set the way an
+    // operator's umask would actually produce it rather than assumed from the write.
+    chmodSync(credential, 0o644);
+    assert.equal(statSync(credential).mode & 0o077, 0o044, 'the test really did leave the credential group-readable');
+    const exposed = resolveEngineAuthentication(layout);
+    assert.equal(exposed.ok, false, 'a group- or world-readable credential is not one this product provisioned');
+    assert.ok(!exposed.ok && exposed.error.code === 'Forbidden', 'an exposed credential is a refusal, not an outage');
+    assert.ok(!exposed.ok && exposed.error.reason.includes('0600'), 'the refusal names the mode that fixes it');
+  } finally {
     rmSync(root, { recursive: true, force: true });
   }
 });
@@ -2194,10 +2380,11 @@ test('F03-AC5 a state root that cannot be created is refused rather than falling
   assert.match(state.error.reason, /unrestricted sandbox_mode/);
 });
 
-test('F03-AC5 the version probe child is allowlisted too, and seeds no login', async () => {
-  // The probe is a child like any other: leaving it on the worker\'s environment would keep the
-  // whole exposure in place for the call an operator runs most often. The login is not seeded
-  // because `--version` never authenticates.
+test('F03-AC5 the version probe child is allowlisted, and needs no credential at all', async () => {
+  // The probe is a child like any other: leaving it on the worker's environment would keep the
+  // whole exposure in place for the call an operator runs most often. It also runs with no
+  // credential provisioned, because `--version` never authenticates — "can I run codex at all" must
+  // not depend on a login it does not use.
   const root = mkdtempSync(join(tmpdir(), 'shiploop-probe-'));
   const stateRoot = join(root, 'state');
   const binary = join(root, 'fake-codex');
@@ -2223,7 +2410,7 @@ test('F03-AC5 the version probe child is allowlisted too, and seeds no login', a
     const report = readFileSync(join(root, 'child-env.txt'), 'utf8');
     assert.ok(!report.includes('GH_TOKEN'), `the probe child inherited GH_TOKEN: ${report}`);
     assert.ok(!report.includes('DATABASE_URL'), `the probe child inherited DATABASE_URL: ${report}`);
-    assert.equal(existsSync(join(stateRoot, 'codex', 'auth.json')), false, 'a version probe must not copy a credential');
+    assert.equal(existsSync(join(stateRoot, 'codex', 'auth.json')), false, 'a version probe must not create or copy a credential');
   } finally {
     for (const [name, value] of Object.entries(previous)) {
       if (value === undefined) delete process.env[name];
@@ -2235,12 +2422,25 @@ test('F03-AC5 the version probe child is allowlisted too, and seeds no login', a
 
 test('F03-AC5 the shipped client start hands the engine the allowlist and no operator CODEX_HOME', async () => {
   // The same assertion through the shipped path, not through `engineEnvironment` directly: the
-  // claim being made is about the process `startSession` spawns.
+  // claim being made is about the process `startSession` spawns. A credential is provisioned into
+  // the ShipLoop state root first, because `start` now refuses a run that has none — so this test
+  // also proves the refusal is about *this* state root and not about the operator's login.
   const root = mkdtempSync(join(tmpdir(), 'shiploop-start-'));
   const workspace = join(root, 'worktrees', 'job-1');
   const operatorCodexHome = join(root, 'operator', '.codex');
+  const stateRoot = join(root, 'state');
   mkdirSync(workspace, { recursive: true });
   mkdirSync(operatorCodexHome, { recursive: true });
+  writeFileSync(join(operatorCodexHome, 'auth.json'), '{"auth_mode":"chatgpt","tokens":{"refresh_token":"rt.operator"}}', {
+    encoding: 'utf8',
+    mode: 0o600,
+  });
+  const layout = engineStateLayout({ stateRoot, attempt: workspace });
+  mkdirSync(layout.codexHome, { recursive: true });
+  writeFileSync(join(layout.codexHome, ENGINE_CREDENTIAL_FILE), PROVISIONED_AUTH_JSON, {
+    encoding: 'utf8',
+    mode: 0o600,
+  });
   const engine = join(root, 'codex');
   writeFileSync(
     engine,
@@ -2258,7 +2458,7 @@ test('F03-AC5 the shipped client start hands the engine the allowlist and no ope
   const previous = process.env['CODEX_HOME'];
   process.env['CODEX_HOME'] = operatorCodexHome;
   try {
-    const client = new CodexClient({ binary: engine, stateRoot: join(root, 'state') });
+    const client = new CodexClient({ binary: engine, stateRoot });
     const started = client.start({
       cwd: workspace,
       sandbox: 'workspace-write',
@@ -2270,10 +2470,14 @@ test('F03-AC5 the shipped client start hands the engine the allowlist and no ope
     if (!started.ok) return;
     const output = (await readAllLines(started.value)).join('\n');
     started.value.dispose();
-    const layout = engineStateLayout({ stateRoot: join(root, 'state'), attempt: workspace });
     assert.ok(output.includes(`HOME_IS ${layout.home}`), `the spawned engine got the wrong HOME: ${output}`);
     assert.ok(output.includes(`CODEX_HOME_IS ${layout.codexHome}`), `the spawned engine got the wrong CODEX_HOME: ${output}`);
     assert.ok(!output.includes(operatorCodexHome), `the spawned engine inherited the operator CODEX_HOME: ${output}`);
+    assert.equal(
+      readFileSync(join(operatorCodexHome, 'auth.json'), 'utf8'),
+      '{"auth_mode":"chatgpt","tokens":{"refresh_token":"rt.operator"}}',
+      'the operator login is byte-identical after a shipped start',
+    );
   } finally {
     if (previous === undefined) delete process.env['CODEX_HOME'];
     else process.env['CODEX_HOME'] = previous;

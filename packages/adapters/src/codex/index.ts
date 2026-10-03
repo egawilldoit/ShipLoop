@@ -8,22 +8,36 @@
  */
 
 export {
+  CODEX_RESULT_CHANNEL_VERSION,
   CODEX_SANDBOX_MODES,
+  CODEX_SEPARATE_CREDENTIAL_VERSION,
   CODEX_VERIFIED_VERSION,
   CodexClient,
+  ENGINE_CREDENTIAL_FILE,
+  ENGINE_CREDENTIAL_PROVISION_COMMAND,
+  MAX_RESULT_BYTES,
   MINIMUM_CODEX_VERSION,
   buildArgv,
   checkCodexVersion,
+  defaultEngineStateRoot,
+  engineStateLayout,
   parseCodexVersion,
+  prepareEngineState,
+  resolveEngineAuthentication,
   resolveSandboxMode,
   stopCodexProcess,
   type CodexClientOptions,
+  type CodexCredentialMode,
+  type CodexEngineAuthentication,
   type CodexInvocation,
   type CodexProcess,
+  type CodexResultChannel,
+  type CodexResultRead,
   type CodexSandboxMode,
   type CodexSpawnRequest,
   type CodexStopReport,
   type CodexVersionVerdict,
+  type EngineStateLayout,
 } from './client.ts';
 
 export {
