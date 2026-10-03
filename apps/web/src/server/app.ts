@@ -48,6 +48,8 @@ import { registerOwnerTestRoutes } from './routes/owner-tests.ts';
 import { registerProjectRoutes } from './routes/projects.ts';
 import { registerPlanningRoutes } from './routes/planning.ts';
 import { registerProfileRoutes } from './routes/profiles.ts';
+import { registerReviewRoutes } from './routes/review.ts';
+import type { ReviewCardRouteSources } from './routes/review.ts';
 import { registerRunRoutes } from './routes/runs.ts';
 
 const CONTENT_SECURITY_POLICY = [
@@ -76,6 +78,17 @@ export interface AppDependencies {
   readonly config: ServerConfig;
   readonly controller: ControllerSurface;
   readonly now: () => Date;
+  /**
+   * The review card use cases, or null when this process composed none.
+   *
+   * Injected rather than read off `ControllerSurface` because that surface is the shared port
+   * every route registration and every surface guard in this repository reads; adding a group
+   * to it is a change to that boundary, not to the two routes below. Whoever wires the
+   * composition root passes `createMvpReviewCardUseCases` here. Until then both review routes
+   * answer 503 naming the missing composition, which is a different claim from "no such
+   * candidate" and from a card of empty arrays (F24-AC2).
+   */
+  readonly reviewSources?: ReviewCardRouteSources | null;
 }
 
 /**
@@ -120,6 +133,10 @@ export async function buildApp(deps: AppDependencies): Promise<FastifyInstance> 
   registerAttentionRoutes(app, { controller, guard, now });
   registerPlanningRoutes(app, { controller, guard, now });
   registerOwnerTestRoutes(app, { controller, guard });
+  // Appended after the project routes for the same reason they are nested under
+  // `/api/projects`: a review card and a decision are addressed by project, by candidate and by
+  // commit, and none of the three can be left out of the path (mvp-spec 3, F24-AC4).
+  registerReviewRoutes(app, { guard, sources: deps.reviewSources ?? null });
 
   const staticRoot = config.staticRoot;
   if (staticRoot !== null) {
