@@ -136,6 +136,9 @@ import { PLAN_TASK_CONTENT_FIELDS } from '@shiploop/domain';
 import { blocked } from '@shiploop/domain';
 import type { ReconciliationOutcome, TicketPublication, TicketToPublish } from './publication.ts';
 import type { ContractContentInput, ContractView, RequestDetailView } from './contracts.ts';
+import type { ImplementationHandoff } from './handoff/handoff.ts';
+import { buildImplementationHandoff } from './handoff/handoff.ts';
+import { T3_URL_ENV_VAR } from './handoff/t3-launch.ts';
 import type {
   BriefSectionsInput,
   BriefView,
@@ -1641,11 +1644,83 @@ export interface SurfaceContractUseCases {
   }): Promise<Result<SurfaceContract, DomainError>>;
 }
 
+/** The packet, exactly as the generator rendered it (mvp-spec L02-AC3). */
+export interface SurfaceHandoffPacket {
+  /**
+   * The document, byte for byte.
+   *
+   * The transport neither reformats nor reflows it: the value of a packet is that the same
+   * approved contract produces the same bytes in every environment it is pasted into, and a
+   * response that tidied the text would make two of them differ for no stated reason.
+   */
+  readonly markdown: string;
+  /** The digest of those bytes, so two packets can be compared without diffing them. */
+  readonly fingerprint: string;
+}
+
+/**
+ * Where the browser may open the external executor, if anywhere (mvp-spec L02).
+ *
+ * Three states rather than a nullable URL: nothing configured is the normal state of a
+ * deployment that does not use T3, and a configured value that is refused is a third thing
+ * that is neither. None of them ever reproduces the configured value (N02-AC2).
+ */
+export type SurfaceHandoffT3 =
+  | { readonly state: 'Configured'; readonly url: string }
+  | {
+      readonly state: 'NotConfigured';
+      readonly reason: string;
+      readonly prerequisites: readonly SurfaceBlockedPrerequisite[];
+    }
+  | {
+      readonly state: 'Unusable';
+      readonly reason: string;
+      readonly prerequisites: readonly SurfaceBlockedPrerequisite[];
+    };
+
+/** A missing prerequisite, with the remedy the owner can act on (F04-AC3). */
+export interface SurfaceBlockedPrerequisite {
+  readonly name: string;
+  readonly detail: string;
+  readonly remedy: string;
+}
+
+/**
+ * One approved revision, rendered into the text an implementer outside ShipLoop receives.
+ *
+ * The controller owns this text. A client that assembled packet content itself would own the
+ * redaction guarantee instead, and a token pasted into a criterion description would travel
+ * from a clipboard to a thread with nothing in between stopping it (N02-AC2).
+ */
+export interface SurfaceHandoff {
+  readonly contractId: string;
+  readonly revision: number;
+  readonly packet: SurfaceHandoffPacket;
+  readonly t3: SurfaceHandoffT3;
+}
+
+/**
+ * The external-execution handoff (mvp-spec L02).
+ *
+ * One method, and the command carries the actor because this read is project-scoped: the
+ * revision belongs to a project, and the project belongs to an owner who has to be proved
+ * before the row is read at all (F01-AC1, F02-AC2).
+ */
+export interface SurfaceHandoffUseCases {
+  buildHandoff(command: {
+    readonly projectId: string;
+    readonly contractId: string;
+    readonly revision: number;
+    readonly actor: string;
+  }): Promise<Result<SurfaceHandoff, DomainError>>;
+}
+
 /** The whole injected surface. One argument, so a missing use case is a type error. */
 export interface ControllerSurface {
   readonly owners: SurfaceOwnerUseCases;
   readonly projects: SurfaceProjectUseCases;
   readonly contracts: SurfaceContractUseCases;
+  readonly handoff: SurfaceHandoffUseCases;
   readonly sessions: SurfaceSessionUseCases;
   readonly profiles: SurfaceProfileUseCases;
   readonly connectors: SurfaceConnectorUseCases;
@@ -1747,6 +1822,24 @@ function toSurfaceSession(record: StoredSessionRecord): SurfaceStoredSession {
  */
 function ownerActorFor(ownerId: string): Result<OwnerActor, DomainError> {
   return ok({ actorId: ownerId, role: 'Owner', ownerId: ownerId as OwnerId, sessionId: null });
+}
+
+/**
+ * One handoff, projected for the transport.
+ *
+ * Renaming only: `markdown` and `fingerprint` are carried across unchanged and the T3 union
+ * keeps its three variants. A projection that trimmed the document or collapsed two T3
+ * states into one boolean would make the response disagree with the generator it claims to
+ * serve, and the redaction guarantee would then belong to the adapter rather than to the
+ * renderer (N02-AC2).
+ */
+function toSurfaceHandoff(handoff: ImplementationHandoff): SurfaceHandoff {
+  return {
+    contractId: handoff.contractId,
+    revision: handoff.revision,
+    packet: { markdown: handoff.packet.markdown, fingerprint: handoff.packet.fingerprint },
+    t3: handoff.t3,
+  };
 }
 
 /** One request, projected for the transport. */
@@ -2990,6 +3083,44 @@ export function createControllerSurface(resolve: SurfaceRootResolver): Controlle
           );
           if (!stale.ok) return err(stale.error);
           return ok(toSurfaceContract(stale.value));
+        }),
+    },
+
+    /**
+     * The implementation handoff for one approved revision (mvp-spec L02, L02-AC3).
+     *
+     * The reads and every refusal live in `handoff.ts`; this adapter supplies the four
+     * handles and the owner actor and renames the result, exactly as it does for every other
+     * group. The project-scoped, actor-gated contract read is `contractUseCases.getContract`
+     * - the same read the `GET .../:revision` route makes - so "which revisions may be handed
+     * off" cannot be a second answer to a question the product already answered once
+     * (F01-AC1, F02-AC2).
+     */
+    handoff: {
+      buildHandoff: async (command) =>
+        use((root) => {
+          const actor = ownerActorFor(command.actor);
+          if (!actor.ok) return err(actor.error);
+          const handoff = buildImplementationHandoff(
+            {
+              contracts: root.contractUseCases,
+              requests: root.requests,
+              projects: root.projects,
+              profiles: root.profiles,
+            },
+            {
+              projectId: command.projectId as ProjectId,
+              contractId: command.contractId as ContractId,
+              revision: command.revision,
+              // The operator's configuration, not a client-supplied value: a browser that
+              // could name its own T3 target would be an open redirect the owner never
+              // configured (N02-AC2).
+              t3Url: root.t3Url,
+            },
+            actor.value,
+          );
+          if (!handoff.ok) return err(handoff.error);
+          return ok(toSurfaceHandoff(handoff.value));
         }),
     },
 
@@ -4459,6 +4590,26 @@ export function resolveSurfaceRoot(env: NodeJS.ProcessEnv): Result<CompositionRo
     providers: registry.value,
     sessionIdleTimeoutSeconds: readPositiveInteger(env[SESSION_IDLE_TIMEOUT_ENV]),
     artifactRoot: env[ARTIFACT_ROOT_ENV] === undefined || env[ARTIFACT_ROOT_ENV] === '' ? null : env[ARTIFACT_ROOT_ENV],
+    /**
+     * The operator's external deployment, passed through unvalidated.
+     *
+     * This is where an environment becomes configuration, so `T3_URL_ENV_VAR` is read here
+     * and nowhere else, and the value crosses this boundary as a string the handoff use case
+     * validates with `parseT3LaunchUrl` - the single implementation of what a usable T3 URL
+     * is. It is the `resolveT3Launch(process.env)` fallback the MVP specifies, and it is read
+     * at composition rather than inside the request so a test can state the value instead of
+     * mutating ambient state.
+     *
+     * Only "absent" is normalised here. A blank string is passed through, because deciding
+     * that a configured-but-blank value is absent rather than unusable is the use case's
+     * rule and duplicating it in two places would let the two disagree (mvp-spec L02-AC3).
+     *
+     * Precedence, unresolved here: another slice stores an optional T3 launch URL per
+     * project, and a stored project setting should win over this environment default. That
+     * table is not reachable from this branch, so this value is used and the question is
+     * recorded rather than guessed at.
+     */
+    t3Url: env[T3_URL_ENV_VAR] === undefined ? null : env[T3_URL_ENV_VAR],
     ...(workspace === null ? {} : { generationWorkspace: workspace }),
   });
 }

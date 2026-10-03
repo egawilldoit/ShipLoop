@@ -89,6 +89,7 @@ const REQUIRED_METHODS = {
     'reviseContract',
     'invalidateRevision',
   ],
+  handoff: ['buildHandoff'],
   sessions: ['loadByToken', 'create', 'revoke', 'touch'],
   profiles: ['saveVersion', 'currentVersion', 'listVersions'],
   connectors: ['register', 'listForProject', 'revoke'],
