@@ -17,6 +17,7 @@ import {
   createProviderRegistry,
   readProviderConfiguration,
 } from './providers.ts';
+import { CANDIDATE_PORT_MEMBERS } from '@shiploop/adapters';
 
 function expectOk<T>(result: { readonly ok: true; readonly value: T } | { readonly ok: false; readonly error: unknown }): T {
   assert.equal(result.ok, true, result.ok ? '' : JSON.stringify(result.error));
@@ -175,5 +176,55 @@ test('F11-AC3 two configurations resolve to their own repository and provider, n
     assert.ok(foreign !== null, 'a reference from another profile does not silently pass');
     assert.match(foreign.reason, /vault:shiploop\/profile-one/, 'the refusal names the reference actually in force');
     assert.notEqual(first.git, second.git, 'two configurations do not share one adapter instance');
+  });
+
+  test('the registry publishes a read-only candidate view alongside the full git adapter', () => {
+    withWorktree((worktree) => {
+      const configured = expectOk(
+        createProviderRegistry(
+          expectOk(readProviderConfiguration({
+            [GIT_PROVIDER_ENV]: 'github',
+            [GIT_CREDENTIAL_REFERENCE_ENV]: 'vault:shiploop/profile-candidate',
+            [GIT_SECRET_ENV]: 'SHIPLOOP_FIXTURE_GIT_SECRET',
+            [GIT_WORKTREE_ENV]: worktree,
+          })),
+          { readSecret: () => 'fixture', fetchImpl: async () => new Response('{}') },
+        ),
+      );
+
+      assert.ok(configured.candidateGit, 'a configured git provider publishes a candidate port');
+      // The full adapter keeps its writes for the slices that already use them...
+      const full = configured.git as unknown as Record<string, unknown>;
+      assert.equal(typeof full['mergePullRequest'], 'function');
+      // ...while the candidate view a linking controller is handed has none. This is the
+      // structural half of "the MVP GitHub integration is read-oriented": the registry decides
+      // it, so no caller has to be trusted not to call a write it was handed.
+      // The port is a fresh two-method object, not the adapter: an interface is erased at
+      // runtime, so publishing the same instance would leave every write reachable from a
+      // value that is merely *typed* read-only.
+      const port = configured.candidateGit as unknown as Record<string, unknown>;
+      assert.deepEqual(
+        Object.keys(port).sort(),
+        [...CANDIDATE_PORT_MEMBERS].sort(),
+        'the candidate port carries the identity surface and the two reads, and nothing else',
+      );
+      for (const member of Object.keys(port)) {
+        assert.ok(
+          !/merge|push|close|approve|deploy|protect|upsert|create|update|delete|write/i.test(member),
+          `${member} must be a read`,
+        );
+      }
+      for (const forbidden of ['mergePullRequest', 'pushBranch', 'upsertDraft', 'declareNoCodeOutcome', 'findDrafts']) {
+        assert.equal(port[forbidden], undefined, `${forbidden} must not be reachable from candidateGit`);
+      }
+      assert.notEqual(configured.candidateGit, configured.git, 'the view is a narrowed facade, not the adapter itself');
+      assert.equal((configured.git as unknown as Record<string, unknown>)['mergePullRequest'] !== undefined, true);
+    });
+  });
+
+  test('a process with no git provider publishes no candidate port', () => {
+    const configured = expectOk(createProviderRegistry(expectOk(readProviderConfiguration({})), { readSecret: () => 'fixture' }));
+    assert.equal(configured.git, null);
+    assert.equal(configured.candidateGit, null);
   });
 });

@@ -38,12 +38,15 @@ import {
   GitHubGitAdapter,
   createGitTransport,
   deniedCodingCapabilities,
+  readOnlyCandidateGit,
 } from '@shiploop/adapters';
 import type {
   AdapterCapabilities,
   AdapterCompatibility,
   AdapterContext,
+  CandidateGitPort,
   CodingSessionCapability,
+  LinkedPullRequestFacts,
   DeclareNoCodeOutcomeRequest,
   DescribeTransitionsRequest,
   DraftRef,
@@ -69,6 +72,7 @@ import type {
   PushBranchRequest,
   ReadChecksRequest,
   ReadGitStateRequest,
+  ReadLinkedPullRequestRequest,
   ReadTicketScopeRequest,
   RelatedIssue,
   RelatedIssueSearchRequest,
@@ -220,6 +224,16 @@ export interface ProviderRegistry {
   readonly ticket: TicketAdapter | null;
   /** Present only when a git provider is configured; adopting a branch needs one (F11-AC2). */
   readonly git: GitAdapter | null;
+  /**
+   * The read-only view of the configured git provider the MVP candidate journey uses, or null.
+   *
+   * Published separately from `git` rather than by narrowing `git`, because the candidate
+   * journey must not be able to merge, push, close, approve or deploy: `CandidateGitPort`
+   * exposes `readLinkedPullRequest` and `readChecks` and nothing else, so the composition root
+   * has no write to hand a candidate-linking controller (SHARED.md, MVP journey). Additive, so
+   * every existing reader of `git` is unaffected.
+   */
+  readonly candidateGit: CandidateGitPort | null;
   /**
    * The coding engine this process registered, or null when it configured none.
    *
@@ -593,12 +607,20 @@ class CredentialScopedGitAdapter implements GitAdapter {
   readonly kind = 'Git' as const;
   readonly connectorId: ConnectorId;
   private readonly declarations: readonly CapabilityDeclaration[];
-  private readonly resolve: (operation: string) => Result<GitAdapter>;
+  /**
+   * Resolves the credential for one operation and hands back the real adapter.
+   *
+   * Typed `GitAdapter & CandidateGitPort` because the underlying `GitHubGitAdapter` implements
+   * both, and this wrapper forwards a read-only candidate view of it. Declaring the narrower
+   * type here means the forwarding method below needs no cast and cannot be handed an adapter
+   * that lacks the read.
+   */
+  private readonly resolve: (operation: string) => Result<GitAdapter & CandidateGitPort>;
 
   constructor(
     connectorId: ConnectorId,
     declarations: readonly CapabilityDeclaration[],
-    resolve: (operation: string) => Result<GitAdapter>,
+    resolve: (operation: string) => Result<GitAdapter & CandidateGitPort>,
   ) {
     this.connectorId = connectorId;
     this.declarations = declarations;
@@ -628,6 +650,28 @@ class CredentialScopedGitAdapter implements GitAdapter {
     return adapter.ok
       ? adapter.value.readChecks(context, request)
       : refusal<readonly ProviderCheckObservation[]>(adapter.error);
+  }
+
+  /**
+   * Reads one pull request for candidate linking.
+   *
+   * Scoped to `Git:ReadRepository` rather than a new capability: reading a pull request *is* a
+   * repository read, `readState` already reads pull requests under that capability, and a new
+   * kind here would make a connector declare support for something it already supports while the
+   * profile gate gained a requirement no project has stated.
+   *
+   * `resolve` yields the full `GitAdapter`, and this wrapper deliberately does not forward
+   * anything but its reads — so a caller holding the narrowed `candidateGit` view has no write
+   * to reach even though the adapter behind it does.
+   */
+  readLinkedPullRequest(
+    context: AdapterContext,
+    request: ReadLinkedPullRequestRequest,
+  ): Promise<Result<LinkedPullRequestFacts>> {
+    const adapter = this.resolve('Git:ReadRepository');
+    return adapter.ok
+      ? adapter.value.readLinkedPullRequest(context, request)
+      : refusal<LinkedPullRequestFacts>(adapter.error);
   }
 
   pushBranch(context: AdapterContext, request: PushBranchRequest): Promise<Result<PushBranchOutcome>> {
@@ -975,6 +1019,10 @@ export function createProviderRegistry(
     adapters,
     ticket: ticketAdapter,
     git: gitAdapter,
+    // Narrowed here, at the registry, and narrowed into a *fresh* two-method object rather than
+    // published as the same instance: a TypeScript interface is erased at runtime, so handing
+    // out the adapter itself would leave every write reachable from a value typed as read-only.
+    candidateGit: gitAdapter === null ? null : readOnlyCandidateGit(gitAdapter),
     engine,
     credentialBlocker: (kind, operation, storedReference) =>
       credentialBlockerFor(bindingFor(kind), operation, storedReference, readSecret),
@@ -1054,8 +1102,8 @@ function buildGitAdapter(
   fetchImpl: typeof fetch,
   git: GitTransport,
   readSecret: ProviderSecretReader,
-): GitAdapter {
-  const build = (token: string, transport: typeof fetch): GitAdapter =>
+): GitAdapter & CandidateGitPort {
+  const build = (token: string, transport: typeof fetch): GitAdapter & CandidateGitPort =>
     new GitHubGitAdapter({
       connectorId: binding.connectorId,
       client: { token, fetchImpl: transport, ...(binding.endpoint === null ? {} : { apiBaseUrl: binding.endpoint }) },

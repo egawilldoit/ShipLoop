@@ -780,6 +780,9 @@ test('the Git port this module holds exposes only reads, so no write is reachabl
   const git = new ScriptedGit([]);
   const port = git.asPort() as unknown as Record<string, unknown>;
   assert.deepEqual(Object.keys(port).sort(), ['kind', 'readChecks', 'readLinkedPullRequest']);
+  for (const member of Object.keys(port)) {
+    assert.ok(!/merge|push|close|approve|deploy|protect|upsert|create|update/i.test(member), `${member} must be a read`);
+  }
   for (const forbidden of [
     'mergePullRequest',
     'pushBranch',

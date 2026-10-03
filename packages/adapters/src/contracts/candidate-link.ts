@@ -6,17 +6,18 @@
  * owner pastes the address of a pull request that already exists. That is a claim about
  * the product's scope, so it is expressed in the type rather than in a UI convention:
  *
- * - the port below has **two methods, and both are reads**. It is not `GitAdapter`
- *   narrowed by `Pick`, because a `Pick` of the wrong key would compile again the moment
- *   someone reached for `mergePullRequest`. A separate interface means a caller that
- *   depends on it *cannot* call a write: there is no such member to call.
- * - the read verbs are listed as data in `CANDIDATE_READ_METHODS`, and
- *   `readOnlyCandidateGit` is the function that hands a caller exactly those two methods.
- *   A test asserts against that list, so widening the port by one write method fails a
- *   test rather than shipping a capability nobody reviewed.
+ * - the port below has **no write on it**. It is not `GitAdapter` narrowed by `Pick`, because
+ *   a `Pick` of the wrong key would compile again the moment someone reached for
+ *   `mergePullRequest`, and it is not `GitAdapter` re-typed under a read-only name, because a
+ *   TypeScript interface is erased at runtime and the writes would still be reachable.
+ *   `readOnlyCandidateGit` returns a fresh object, so both the type and the runtime value name
+ *   reads only.
+ * - the members are listed as data in `CANDIDATE_PORT_MEMBERS` and asserted against in
+ *   `github/candidate-link.test.ts`, so widening the port by one write method fails a test rather
+ *   than shipping a capability nobody reviewed.
  * - the "do not write" property is additionally asserted against the shipped
- *   `GitHubGitAdapter`, which *does* hold `mergePullRequest`: the guarantee is that this
- *   module cannot reach it, not that the underlying adapter lacks it.
+ *   `GitHubGitAdapter`, which *does* hold `mergePullRequest`: the guarantee is that nothing on
+ *   this path can reach it, not that the underlying adapter lacks it.
  *
  * Reusing `ReadChecksRequest` and `ProviderCheckObservation` from `./git.ts` is
  * deliberate. Check retrieval, the six-state result vocabulary and the "a required check
@@ -123,24 +124,44 @@ export interface CandidateCheckReader extends AdapterIdentity {
  */
 export type CandidateGitPort = CandidateLinkReader & CandidateCheckReader;
 
-/** Every method name the port exposes. Asserted against in `candidate-link.test.ts`. */
+/** The two provider reads the candidate journey performs. */
 export const CANDIDATE_READ_METHODS = ['readLinkedPullRequest', 'readChecks'] as const;
 
 /**
- * Hands a caller exactly the read surface of an adapter.
+ * Every member the port carries, including the identity surface.
  *
- * The returned object is a fresh literal naming two methods, so the caller holds no
- * reference to the underlying adapter and cannot reach a write through it. It is the
- * function the composition root calls: wiring a candidate journey means passing the result
- * of this call, and the type of that result has no write member to call.
+ * All of them are reads: `capabilities` states what the provider offers and `checkCompatibility`
+ * asks whether the credential works. Keeping them means a narrowed object still identifies its
+ * connector, which the connector layer needs, and keeps the forbidden set to writes only — the
+ * thing actually worth asserting.
  */
-export function readOnlyCandidateGit(
-  adapter: CandidateGitPort,
-): {
-  readLinkedPullRequest: CandidateLinkReader['readLinkedPullRequest'];
-  readChecks: CandidateCheckReader['readChecks'];
-} {
+export const CANDIDATE_PORT_MEMBERS = [
+  'kind',
+  'connectorId',
+  'capabilities',
+  'checkCompatibility',
+  ...CANDIDATE_READ_METHODS,
+] as const;
+
+/**
+ * Hands a caller the read-only surface of an adapter.
+ *
+ * The result is a **fresh literal** naming six members, not the adapter itself. That matters: a
+ * TypeScript interface is erased at runtime, so passing the adapter along under a read-only type
+ * would leave `mergePullRequest` reachable from a value that only *claims* to be read-only. A
+ * caller holding the result holds no reference to the adapter, so there is no path from it to a
+ * write.
+ *
+ * This is the function the composition root calls: wiring a candidate journey means passing the
+ * result of this call, and both the type and the runtime shape of that result have no write on
+ * them.
+ */
+export function readOnlyCandidateGit(adapter: CandidateGitPort): CandidateGitPort {
   return {
+    kind: adapter.kind,
+    connectorId: adapter.connectorId,
+    capabilities: () => adapter.capabilities(),
+    checkCompatibility: (context) => adapter.checkCompatibility(context),
     readLinkedPullRequest: (context, request) => adapter.readLinkedPullRequest(context, request),
     readChecks: (context, request) => adapter.readChecks(context, request),
   };

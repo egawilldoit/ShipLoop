@@ -40,7 +40,7 @@ import {
   connectorId,
 } from '../testing/fixtures.ts';
 import type { AdapterContext, GitRepositoryRef, ProviderCheckObservation } from '../contracts/index.ts';
-import { CANDIDATE_READ_METHODS, readOnlyCandidateGit } from '../contracts/candidate-link.ts';
+import { CANDIDATE_PORT_MEMBERS, readOnlyCandidateGit } from '../contracts/candidate-link.ts';
 import { GitHubGitAdapter } from './adapter.ts';
 import { githubCandidatePort } from './candidate-link.ts';
 import type { GitTransport } from './client.ts';
@@ -446,7 +446,7 @@ test('a retargeted base branch is read from the payload rather than assumed from
 /* The port is read-only                                                        */
 /* -------------------------------------------------------------------------- */
 
-test('the read-only candidate port exposes exactly the two reads and nothing else', async () => {
+test('the read-only candidate port exposes exactly the declared reads and nothing else', async () => {
   const { adapter } = adapterFor({
     'GET /repos/egawilldoit/ShipLoop': { status: 200, body: REPOSITORY_CAPTURE },
     [`GET ${PULL_PATH}`]: { status: 200, body: pullRequestCapture() },
@@ -459,7 +459,16 @@ test('the read-only candidate port exposes exactly the two reads and nothing els
   assert.equal(typeof writable['upsertDraft'], 'function');
 
   const port = githubCandidatePort(adapter);
-  assert.deepEqual(Object.keys(port).sort(), [...CANDIDATE_READ_METHODS].sort());
+  const keys = Object.keys(port).sort();
+  assert.deepEqual(keys, [...CANDIDATE_PORT_MEMBERS].sort());
+  // Every member is a read: the two provider reads plus the identity surface a connector needs
+  // to recognise the object. No write is among them.
+  for (const member of keys) {
+    assert.ok(
+      !/merge|push|close|approve|deploy|protect|create|update|upsert|delete|write|post/i.test(member),
+      `${member} must not be on the read-only candidate port`,
+    );
+  }
   for (const forbidden of [
     'mergePullRequest',
     'pushBranch',
@@ -478,11 +487,17 @@ test('the read-only candidate port exposes exactly the two reads and nothing els
     );
   }
 
+  // The port is a fresh object rather than the adapter under a read-only type, because a
+  // TypeScript interface is erased at runtime and the adapter's writes would still be reachable.
+  assert.notEqual(port as unknown, writable);
+
   // And the port is a working reader, not an empty shell.
   const facts = await okOf(
     port.readLinkedPullRequest(adapterContext('op_port'), { repository: REPOSITORY, pullRequestNumber: 7 }),
   );
   assert.equal(facts.headSha, FIXTURE_HEAD_SHA);
+  assert.equal(port.kind, 'Git');
+  assert.ok(port.capabilities().declarations.length > 0);
   assert.equal(typeof readOnlyCandidateGit(adapter).readChecks, 'function');
 });
 
