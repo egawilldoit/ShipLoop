@@ -40,7 +40,11 @@ import {
 import { openDatabase, type Database } from '../db.ts';
 import { migrate } from '../migrations.ts';
 import { ActiveProjectRepository } from './core.ts';
-import { ContractRepository, RequestRepository } from './contracts.ts';
+import {
+  ContractRepository,
+  RequestRepository,
+  type ApprovalExpectation,
+} from './contracts.ts';
 
 const OWNER = 'own-contracts-01' as OwnerId;
 const PROJECT = '5c0a1f22-0000-4000-8000-00000000000a' as ProjectId;
@@ -158,8 +162,19 @@ function storedDraft(context: Harness, overrides: Partial<Parameters<typeof crea
 }
 
 function approve(contract: DeliveryContract, at = T1): DeliveryContract {
-  const approvedValue = expectOk(approveContract(contract, { approvedBy: OWNER, at }));
+  const approvedValue = expectOk(
+    approveContract(contract, {
+      approvedBy: OWNER,
+      at,
+      expectedContentFingerprint: contract.contentFingerprint,
+    }),
+  );
   return approvedValue;
+}
+
+/** The guard a store call carries: the instant and the text the owner reviewed. */
+function guard(contract: DeliveryContract): ApprovalExpectation {
+  return { updatedAt: contract.updatedAt, contentFingerprint: contract.contentFingerprint };
 }
 
 /* -------------------------------------------------------------------------- */
@@ -401,7 +416,7 @@ test('an edit against a stale read is a conflict, and the stored draft is unchan
 test('approving stores the owner and the instant, and the revision stays readable', async () => {
   await withDatabase((context) => {
     const stored = storedDraft(context);
-    const written = expectOk(context.contracts.approve(approve(stored), stored.updatedAt));
+    const written = expectOk(context.contracts.approve(approve(stored), guard(stored)));
 
     assert.equal(written.status, 'approved');
     assert.equal(written.approvedBy, OWNER);
@@ -414,8 +429,8 @@ test('approving stores the owner and the instant, and the revision stays readabl
 test('approving twice is a conflict, and the recorded approver is the first one', async () => {
   await withDatabase((context) => {
     const stored = storedDraft(context);
-    const approved = expectOk(context.contracts.approve(approve(stored), stored.updatedAt));
-    expectError(context.contracts.approve(approved, T1), 'Conflict');
+    const approved = expectOk(context.contracts.approve(approve(stored), guard(stored)));
+    expectError(context.contracts.approve(approved, { updatedAt: T1, contentFingerprint: approved.contentFingerprint }), 'Conflict');
     assert.equal(expectOk(context.contracts.read(PROJECT, CONTRACT, 1)).approvedAt, T1);
   });
 });
@@ -423,7 +438,7 @@ test('approving twice is a conflict, and the recorded approver is the first one'
 test('an approved revision cannot be edited through the repository either', async () => {
   await withDatabase((context) => {
     const stored = storedDraft(context);
-    expectOk(context.contracts.approve(approve(stored), stored.updatedAt));
+    expectOk(context.contracts.approve(approve(stored), guard(stored)));
 
     // The domain refuses first, and that refusal is what the test asserts: the store has
     // no path that would produce an edited approved revision.
@@ -437,6 +452,78 @@ test('an approved revision cannot be edited through the repository either', asyn
   });
 });
 
+test('approving text the owner did not review is a conflict, and the draft is left alone', async () => {
+  await withDatabase((context) => {
+    const stored = storedDraft(context);
+    // What the stale tab holds: the fingerprint from before the other tab's edit.
+    const reviewed = stored.contentFingerprint;
+    const edited = expectOk(
+      editContract(stored, CHANGED, { expectedUpdatedAt: stored.updatedAt, at: T1, editedBy: OWNER }),
+    );
+    expectOk(context.contracts.editDraft(edited, stored.updatedAt));
+
+    const refused = expectError(
+      context.contracts.approve(approve(edited), { updatedAt: edited.updatedAt, contentFingerprint: reviewed }),
+      'Conflict',
+    );
+    // The refusal names both fingerprints, so a client can tell "you read older text" from
+    // "you sent nonsense" without a second round trip.
+    assert.equal(refused.code === 'Conflict' ? refused.expected : null, reviewed);
+    assert.equal(refused.code === 'Conflict' ? refused.actual : null, edited.contentFingerprint);
+
+    const after = expectOk(context.contracts.read(PROJECT, CONTRACT, 1));
+    assert.equal(after.status, 'draft', 'a refused approval writes nothing');
+    assert.equal(after.approvedBy, null);
+    assert.equal(after.approvedAt, null);
+    assert.equal(after.outcome, CHANGED.outcome);
+    assert.equal(expectOk(context.contracts.currentApproved(PROJECT, REQUEST)), null);
+  });
+});
+
+test('the approval guard moves even when two edits share one instant', async () => {
+  await withDatabase((context) => {
+    const stored = storedDraft(context);
+    const reviewed = stored.contentFingerprint;
+
+    // The second tab writes in the same millisecond as the first, so `updated_at` cannot
+    // tell the two edits apart. The fingerprint can, which is why the guard carries it:
+    // a store that relied on the instant alone would let this approval through.
+    const first = expectOk(
+      editContract(stored, CHANGED, { expectedUpdatedAt: stored.updatedAt, at: T1, editedBy: OWNER }),
+    );
+    expectOk(context.contracts.editDraft(first, stored.updatedAt));
+    const THIRD: ContractContent = { ...CHANGED, outcome: 'A third outcome, written in the same millisecond.' };
+    const second = expectOk(
+      editContract(first, THIRD, { expectedUpdatedAt: first.updatedAt, at: T1, editedBy: OWNER }),
+    );
+    expectOk(context.contracts.editDraft(second, first.updatedAt));
+
+    assert.equal(second.updatedAt, first.updatedAt, 'the instant is the same for both edits');
+    assert.notEqual(second.contentFingerprint, reviewed, 'and the text is not');
+
+    expectError(
+      context.contracts.approve(approve(second), { updatedAt: second.updatedAt, contentFingerprint: reviewed }),
+      'Conflict',
+    );
+    expectOk(context.contracts.approve(approve(second), guard(second)));
+    assert.equal(expectOk(context.contracts.read(PROJECT, CONTRACT, 1)).status, 'approved');
+  });
+});
+
+test('the approval guard names a fingerprint of text that was never stored', async () => {
+  await withDatabase((context) => {
+    const stored = storedDraft(context);
+    const invented = fingerprint({ outcome: 'Something no owner of this project ever read.' });
+    const refused = expectError(
+      context.contracts.approve(approve(stored), { updatedAt: stored.updatedAt, contentFingerprint: invented }),
+      'Conflict',
+    );
+    assert.equal(refused.code === 'Conflict' ? refused.expected : null, invented);
+    assert.equal(refused.code === 'Conflict' ? refused.actual : null, stored.contentFingerprint);
+    assert.equal(expectOk(context.contracts.read(PROJECT, CONTRACT, 1)).status, 'draft');
+  });
+});
+
 /* -------------------------------------------------------------------------- */
 /* Revision and staleness                                                      */
 /* -------------------------------------------------------------------------- */
@@ -444,7 +531,7 @@ test('an approved revision cannot be edited through the repository either', asyn
 test('revising writes the new revision and retires the old approval in one step', async () => {
   await withDatabase((context) => {
     const stored = storedDraft(context);
-    const approved = expectOk(context.contracts.approve(approve(stored), stored.updatedAt));
+    const approved = expectOk(context.contracts.approve(approve(stored), guard(stored)));
 
     const revised = expectOk(
       reviseContract(approved, {
@@ -474,7 +561,7 @@ test('revising writes the new revision and retires the old approval in one step'
 test('revising leaves the whole history readable, oldest revision first', async () => {
   await withDatabase((context) => {
     const stored = storedDraft(context);
-    const approved = expectOk(context.contracts.approve(approve(stored), stored.updatedAt));
+    const approved = expectOk(context.contracts.approve(approve(stored), guard(stored)));
     const revised = expectOk(
       reviseContract(approved, {
         contractId: NEXT_CONTRACT,
@@ -504,7 +591,7 @@ test('revising leaves the whole history readable, oldest revision first', async 
 test('an invalidated approval records why, and a second explanation cannot replace the first', async () => {
   await withDatabase((context) => {
     const stored = storedDraft(context);
-    const approved = expectOk(context.contracts.approve(approve(stored), stored.updatedAt));
+    const approved = expectOk(context.contracts.approve(approve(stored), guard(stored)));
 
     const stale = expectOk(invalidateContract(approved, { reason: 'The owner changed the scope.', at: T2 }));
     expectOk(context.contracts.markStale(stale, T1));

@@ -416,6 +416,22 @@ export class RequestRepository implements RequestStore {
   }
 }
 
+/**
+ * What an approval must still find in the row for the write to be applied.
+ *
+ * `updatedAt` is the store's own concurrency token for a draft edit, and it is kept
+ * because a tab that edited the revision moves it. `contentFingerprint` is the owner's
+ * reviewed text, and it is the one that decides whether an approval is answering the
+ * question its owner asked. They are separate fields rather than one token because they
+ * answer different questions: an owner who never reloaded still holds the fingerprint
+ * they read, and an edit made in the same millisecond as the previous one leaves
+ * `updatedAt` unchanged while the fingerprint has certainly moved.
+ */
+export interface ApprovalExpectation {
+  readonly updatedAt: string;
+  readonly contentFingerprint: Fingerprint;
+}
+
 /** The whole durable record of delivery contract revisions. */
 export interface ContractStore {
   createDraft(contract: DeliveryContract): Result<DeliveryContract>;
@@ -424,7 +440,7 @@ export interface ContractStore {
   currentApproved(projectId: ProjectId, requestId: RequestId): Result<DeliveryContract | null>;
   latest(projectId: ProjectId, requestId: RequestId): Result<DeliveryContract | null>;
   editDraft(contract: DeliveryContract, expectedUpdatedAt: string): Result<DeliveryContract>;
-  approve(contract: DeliveryContract, expectedUpdatedAt: string): Result<DeliveryContract>;
+  approve(contract: DeliveryContract, expected: ApprovalExpectation): Result<DeliveryContract>;
   markStale(contract: DeliveryContract, expectedUpdatedAt: string): Result<DeliveryContract>;
   /** Writes a new revision and supersedes the approval it replaces, in one transaction. */
   revise(input: {
@@ -445,9 +461,11 @@ export interface ContractStore {
  *     not the caller's value. A caller that stored a fingerprint of different text would
  *     otherwise produce a revision whose identity does not describe it, and every later
  *     "did this change?" comparison would be answering about the wrong thing.
- *   - **Approving is a distinct statement from editing.** `approve` writes the status and
- *     the approval together, so there is no intermediate row that claims an approval it
- *     does not have.
+ *   - **Approving is a distinct statement from editing, and it names the text.** `approve`
+ *     writes the status and the approval together, so there is no intermediate row that
+ *     claims an approval it does not have, and its WHERE clause names the fingerprint the
+ *     owner reviewed as well as the status and the instant - so the statement that seals an
+ *     agreement is the same statement that refuses to seal one nobody read (mvp-spec 3).
  */
 export class ContractRepository implements ContractStore {
   private readonly db: Database;
@@ -486,16 +504,30 @@ export class ContractRepository implements ContractStore {
   /**
    * The stored row for a contract the domain has already transitioned.
    *
-   * The compare-and-set on `updated_at` and `status` is what stops two writers from both
-   * acting on the same draft: the second finds the row no longer in the state it read,
-   * and is refused with the state it actually found (mvp-spec 7, "Reject stale requests").
+   * The compare-and-set on `status` and `updated_at` is what stops two writers from both
+   * acting on the same draft: the second finds the row no longer in the state it read, and
+   * is refused with the state it actually found (mvp-spec 7, "Reject stale requests").
+   *
+   * `guard` names the caller's own transition condition - the approval's reviewed-text
+   * fingerprint - so it can be read back off the row before the write and quoted in the
+   * refusal. The condition itself belongs in the caller's `sql`, because a check performed
+   * before the statement is a check performed before it and another writer can commit in
+   * between; naming it in the statement means SQLite decides, so a lost race changes zero
+   * rows instead of overwriting. Zero rows is then reported as the conflict it is, naming
+   * the row as it now reads.
    */
   private writeTransition(
     contract: DeliveryContract,
     expectedStatus: DeliveryContract['status'],
     expectedUpdatedAt: string,
     sql: string,
-    ...parameters: readonly SqlInputValue[]
+    parameters: readonly SqlInputValue[],
+    guard?: {
+      /** What the refusal says the caller asked for. */
+      readonly expected: string;
+      /** The same fact read off a row, so the refusal names what it found instead. */
+      readonly actual: (row: SqlRow) => string;
+    },
   ): Result<DeliveryContract> {
     return this.attempt('write delivery contract revision', () =>
       withTransaction(this.db, () => {
@@ -511,7 +543,35 @@ export class ContractRepository implements ContractStore {
             actual: `${actualStatus}@${actualUpdatedAt}`,
           });
         }
-        this.statement(sql).run(...parameters);
+        // Read before the write as well as inside it, so a caller that never got as far as
+        // the statement is told what it asked for rather than that it lost a race it never
+        // entered.
+        if (guard !== undefined && guard.actual(row.value) !== guard.expected) {
+          return err({
+            code: 'Conflict',
+            reason: 'The delivery contract revision is not the text that was reviewed. Read it again before approving it.',
+            expected: guard.expected,
+            actual: guard.actual(row.value),
+          });
+        }
+        const changes = this.statement(sql).run(...parameters);
+        if (Number(changes.changes) === 0) {
+          // The statement named the guard, so zero rows means a writer committed between
+          // the read above and this statement. Nothing was written, so there is nothing to
+          // roll back; the row is read once more so the refusal names the state that won.
+          const current = this.rowOf(contract.projectId, contract.contractId, contract.revision);
+          return err({
+            code: 'Conflict',
+            reason:
+              'The delivery contract revision changed while it was being written, so the change was not saved. Read it again before saving.',
+            expected: guard === undefined ? `${expectedStatus}@${expectedUpdatedAt}` : guard.expected,
+            actual: current.ok
+              ? guard === undefined
+                ? `${requiredText(current.value, 'status')}@${requiredText(current.value, 'updated_at')}`
+                : guard.actual(current.value)
+              : 'a state this store cannot now read',
+          });
+        }
         const written = this.rowOf(contract.projectId, contract.contractId, contract.revision);
         if (!written.ok) return written;
         return toContract(written.value);
@@ -638,20 +698,32 @@ export class ContractRepository implements ContractStore {
       `UPDATE delivery_contracts SET outcome = ?, scope_json = ?, out_of_scope_json = ?, acceptance_criteria_json = ?,
          content_fingerprint = ?, request_fingerprint = ?, updated_at = ?
        WHERE contract_id = ? AND revision = ? AND project_id = ? AND status = 'draft'`,
-      contract.outcome,
-      canonicalize(contract.scope),
-      canonicalize(contract.outOfScope),
-      canonicalize(contract.acceptanceCriteria),
-      contractContentFingerprint(contract),
-      contract.requestFingerprint,
-      contract.updatedAt,
-      contract.contractId,
-      contract.revision,
-      contract.projectId,
+      [
+        contract.outcome,
+        canonicalize(contract.scope),
+        canonicalize(contract.outOfScope),
+        canonicalize(contract.acceptanceCriteria),
+        contractContentFingerprint(contract),
+        contract.requestFingerprint,
+        contract.updatedAt,
+        contract.contractId,
+        contract.revision,
+        contract.projectId,
+      ],
     );
   }
 
-  approve(contract: DeliveryContract, expectedUpdatedAt: string): Result<DeliveryContract> {
+  /**
+   * Seals an approval, and only over the text its owner said they reviewed.
+   *
+   * The reviewed fingerprint goes into the WHERE clause rather than being compared in the
+   * caller, so the condition SQLite evaluates is the whole of what makes this an approval:
+   * the row is still a draft, still at the instant the caller read, and still holding that
+   * exact text. An owner approving from a tab that missed an edit gets a `Conflict` naming
+   * the fingerprint that is stored now, and the agreement is not written (mvp-spec 3,
+   * mvp-spec 7 "Reject stale requests").
+   */
+  approve(contract: DeliveryContract, expected: ApprovalExpectation): Result<DeliveryContract> {
     if (contract.status !== 'approved') {
       return err(
         invalid(`Revision ${contract.revision} is ${contract.status}, so it cannot be approved.`, [
@@ -662,17 +734,26 @@ export class ContractRepository implements ContractStore {
     return this.writeTransition(
       contract,
       'draft',
-      expectedUpdatedAt,
+      expected.updatedAt,
       `UPDATE delivery_contracts SET status = 'approved', approved_by_owner_id = ?, approved_at = ?,
          content_fingerprint = ?, updated_at = ?
-       WHERE contract_id = ? AND revision = ? AND project_id = ? AND status = 'draft'`,
-      contract.approvedBy,
-      contract.approvedAt,
-      contractContentFingerprint(contract),
-      contract.updatedAt,
-      contract.contractId,
-      contract.revision,
-      contract.projectId,
+       WHERE contract_id = ? AND revision = ? AND project_id = ? AND status = 'draft'
+         AND updated_at = ? AND content_fingerprint = ?`,
+      [
+        contract.approvedBy,
+        contract.approvedAt,
+        contractContentFingerprint(contract),
+        contract.updatedAt,
+        contract.contractId,
+        contract.revision,
+        contract.projectId,
+        expected.updatedAt,
+        expected.contentFingerprint,
+      ],
+      {
+        expected: expected.contentFingerprint,
+        actual: (row) => fingerprintOf(row, 'content_fingerprint'),
+      },
     );
   }
 
@@ -696,13 +777,16 @@ export class ContractRepository implements ContractStore {
       'approved',
       expectedUpdatedAt,
       `UPDATE delivery_contracts SET status = 'stale', stale_reason = ?, superseded_by_revision = ?, updated_at = ?
-       WHERE contract_id = ? AND revision = ? AND project_id = ? AND status = 'approved'`,
-      contract.staleReason,
-      contract.supersededByRevision,
-      contract.updatedAt,
-      contract.contractId,
-      contract.revision,
-      contract.projectId,
+       WHERE contract_id = ? AND revision = ? AND project_id = ? AND status = 'approved' AND updated_at = ?`,
+      [
+        contract.staleReason,
+        contract.supersededByRevision,
+        contract.updatedAt,
+        contract.contractId,
+        contract.revision,
+        contract.projectId,
+        expectedUpdatedAt,
+      ],
     );
   }
 
