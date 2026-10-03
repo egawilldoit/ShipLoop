@@ -1489,6 +1489,15 @@ export interface SurfaceContractCriterion {
   readonly id: string;
   readonly description: string;
   readonly verificationType: 'automated' | 'owner_test';
+  /**
+   * The check that verifies an automated criterion, or null when none is bound.
+   *
+   * Travels in both directions: a read always carries it, and a submit may omit it. Null
+   * is reported rather than inferred from whichever check is green, and an omitted binding
+   * on an automated criterion is refused at approval rather than accepted as "anything will
+   * do" (F23-AC1, F24-AC3).
+   */
+  readonly verificationCheckId?: string | null;
 }
 
 /**
@@ -1955,6 +1964,9 @@ function contractContentOf(command: {
       id: criterion.id,
       description: criterion.description,
       verificationType: criterion.verificationType,
+      // Absent stays absent here and becomes an explicit unbound criterion below, which is
+      // what the domain's approval gate is written against.
+      verificationCheckId: criterion.verificationCheckId ?? null,
     })),
   };
 }

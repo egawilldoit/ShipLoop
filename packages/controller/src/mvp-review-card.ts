@@ -96,8 +96,9 @@ export interface MvpCriterionProjection {
   /**
    * The check that verifies an automated criterion, or null when nobody assigned one.
    *
-   * Null is reported rather than filled in from whichever check happened to pass: a criterion
-   * with no bound verifier is `unverified`, and that is the honest state (F23-AC1).
+   * Reported from the criterion's assigned method rather than filled in from whichever check
+   * happened to pass: a criterion with no bound verifier is `unverified`, and that is the
+   * honest state (F23-AC1).
    */
   readonly verificationCheckId: string | null;
   readonly state: MvpCriterionState;
@@ -264,6 +265,8 @@ export interface MvpReviewCard {
     readonly acceptanceCriteria: readonly {
       readonly id: string;
       readonly verificationType: 'automated' | 'owner_test';
+      /** The check that verifies an automated criterion, or null when none is bound. */
+      readonly verificationCheckId: string | null;
     }[];
     readonly createdAt: string;
     readonly updatedAt: string;
@@ -414,10 +417,11 @@ function toFacts(
     // scope from the stored row below, so nothing on the wire depends on this flattening.
     scope: contract.scope.join('\n'),
     outOfScope: [...contract.outOfScope],
-    // `verificationCheckId` is null because the MVP contract carries no assignment of a
-    // criterion to a check. That leaves an automated criterion `unverified`, which is the
-    // honest reading of "nothing is bound to it" rather than an inference from whichever check
-    // happened to pass (F23-AC1).
+    // Each criterion carries its own binding from the stored revision, so the read model
+    // resolves it against the recorded results for this exact candidate SHA. Nothing is
+    // inferred from whichever check happened to pass: an automated criterion whose revision
+    // names no check reads `unverified`, which is the honest reading of "nothing is bound
+    // to it" (F23-AC1).
     acceptanceCriteria: contract.acceptanceCriteria.map(toCriterionView),
     status: contract.status,
     approvedAt: contract.approvedAt,
@@ -440,12 +444,23 @@ function toFacts(
   return { request: requestView, contract: contractView, candidate: candidateView };
 }
 
+/**
+ * One stored criterion, as the read model wants it.
+ *
+ * The binding is passed through from the revision rather than decided here. This module
+ * supplies the *facts*; which check decides which criterion is the agreement's statement,
+ * and a projection that chose one would be the inference F23-AC1 forbids. `owner_test` is
+ * forced to null because the domain refuses to store a binding on one - and forcing it here
+ * as well means a stored row that somehow carried one cannot reach the projection as an
+ * automated binding (F23-AC1).
+ */
 function toCriterionView(criterion: DeliveryContract['acceptanceCriteria'][number]): MvpContractCriterionView {
   return {
     id: criterion.id,
     description: criterion.description,
     verificationType: criterion.verificationType,
-    verificationCheckId: null,
+    verificationCheckId:
+      criterion.verificationType === 'automated' ? criterion.verificationCheckId : null,
   };
 }
 
@@ -492,6 +507,7 @@ function toCard(model: MvpReviewReadModel, facts: ReviewFacts, collectedAt: stri
       acceptanceCriteria: model.contract.acceptanceCriteria.map((criterion) => ({
         id: criterion.id,
         verificationType: criterion.verificationType,
+        verificationCheckId: criterion.verificationCheckId,
       })),
       createdAt: model.contract.createdAt,
       updatedAt: model.contract.updatedAt,
