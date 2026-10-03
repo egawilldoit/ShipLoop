@@ -7,6 +7,14 @@ surface (`capabilities`, `checkCompatibility`). It also carries one method beyon
 contract, `readCommitRange`, because `GitStateRead` has no slot for a commit range and F20-AC1
 needs one.
 
+It carries a second method beyond the contract, `readLinkedPullRequest`, for the MVP candidate
+journey (`../contracts/candidate-link.ts`). That contract is deliberately **read-only** and this
+method is its only provider call beyond `readChecks`: it reads one pull request by display
+number for an owner who pasted its address. It answers a different question from `readState`,
+which takes a *branch* and reports the latest pull request for it; `readLinkedPullRequest`
+takes the *number* the owner named, which is the question manual linking asks. See
+"Proven against CONSTRUCTED payloads only" for its proof status.
+
 This file exists because **"it typechecks" and "it works against GitHub" are different
 claims**, and only one of them is evidence. Everything below is separated into what was
 observed from the live API and what is proven only against constructed payloads. Where a
@@ -26,7 +34,9 @@ left for a reader to discover.
 | `client.ts` | The REST transport (auth header, pinned API version, rate-limit policy, lost-write classification) and the `git` CLI transport (argv only, group-killed on abort) |
 | `errors.ts` | GitHub status, error body and `git` stderr to `DomainError`; check-run and commit-status mapping |
 | `adapter.ts` | The `GitAdapter` implementation: reads, translation, reconciliation, writes, merge |
+| `candidate-link.ts` | Narrows this adapter to the read-only `CandidateGitPort` the MVP candidate journey is handed |
 | `github.test.ts` | The adapter's own tests, plus the scripted REST and `git` surfaces they drive |
+| `candidate-link.test.ts` | `readLinkedPullRequest`, the check mapping and the read-only port, against its own scripted REST surface |
 
 Every assertion in `github.test.ts` travels through the shipped `client.ts`, `errors.ts` and
 `adapter.ts`. Only HTTP and the `git` argv are scripted, and only by the `StubGitHub` and
@@ -162,6 +172,7 @@ confirming it live would have cost.
 | `GET /branches/{b}/protection/required_pull_request_reviews` returns `required_approving_review_count` | OpenAPI | `main` is unprotected, so this endpoint returns 404 on every branch here |
 | The auth header is `Authorization: Bearer <token>` | OpenAPI plus a live 200 on every call above | The 401 probe confirms the header is what authenticates, not that no other form works |
 | A pull request reports `state` (`open` / `closed`), `merged`, `merged_at`, `merge_commit_sha`, `draft` | OpenAPI | No open pull request to read |
+| `head.repo.full_name` distinguishes a pull request opened from a fork | OpenAPI | No open pull request to read. `readLinkedPullRequest` reports it so a controller can refuse a fork rather than attribute a stranger's commits to the project; that refusal is proven only against a constructed payload |
 
 ## Proven against CONSTRUCTED payloads only
 
@@ -180,6 +191,7 @@ compatibility proofs.
 | Every check conclusion other than `success` | The live repository has one check run, and manufacturing others means pushing a branch and running CI |
 | `Stale` derivation | Requires a required check reported on a base commit but not on a candidate head; no such pair exists here |
 | Review states other than "no reviews" | No pull request exists to review |
+| `readLinkedPullRequest` — the whole path, including the abbreviated-head refusal, the fork report, the merged/closed/unrecognised state mapping and every refusal before it | The live repository has no pull request to read. Reading one would need `upsertDraft` to create it, which is a write this unit is not authorized to perform |
 
 ## Live write paths are unproven — owner action required
 

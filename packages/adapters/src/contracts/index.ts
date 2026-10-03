@@ -265,6 +265,7 @@ export interface AdapterIdentity {
 
 export * from './ticket.ts';
 export * from './git.ts';
+export * from './candidate-link.ts';
 export * from './deployment.ts';
 export * from './engine.ts';
 export * from './verification.ts';

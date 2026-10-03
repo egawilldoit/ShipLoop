@@ -3,6 +3,7 @@ export * from './fingerprint.ts';
 export * from './result.ts';
 export * from './lifecycle.ts';
 export * from './candidate.ts';
+export * from './candidate-link.ts';
 export * from './scope.ts';
 export * from './evidence.ts';
 export * from './authorization.ts';

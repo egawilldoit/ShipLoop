@@ -21,6 +21,7 @@ export * from './adoption.ts';
 export * from './composition.ts';
 export * from './context-packet.ts';
 export * from './brief-generation.ts';
+export * from './candidate-linking.ts';
 export * from './connectors.ts';
 export * from './contracts.ts';
 export * from './delivery.ts';
