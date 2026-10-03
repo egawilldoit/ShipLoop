@@ -116,7 +116,7 @@ export function deriveCriterionState(input: CriterionStateInput): CriterionState
     };
   }
 
-  if (!methodSatisfiedBy(method, observation.source)) {
+  if (!methodSatisfiedBy(method, observation)) {
     return {
       state: 'unverified',
       reason: `The recorded ${observation.source} result does not use this criterion's assigned method, so it cannot verify it (F23-AC1).`,
@@ -144,21 +144,35 @@ export function deriveCriterionState(input: CriterionStateInput): CriterionState
 }
 
 /**
- * Whether an observation source can discharge a method.
+ * Whether one observation can discharge one criterion's assigned method.
  *
- * `Untested` cannot be satisfied by anything, which is what makes a criterion left
- * without an assignment permanently unverified rather than quietly passing on the first
- * green check (F23-AC1).
+ * The check identity is compared, not just its source kind. A criterion bound to check
+ * `unit` is not verified by a green `lint`, and treating any automated result as
+ * interchangeable is precisely how a criterion ends up "verified" by a check nobody
+ * connected it to (F23-AC1). `Untested` cannot be satisfied by anything, which is what
+ * makes a criterion left without an assignment permanently unverified rather than
+ * quietly passing on the first green check.
  */
-export function methodSatisfiedBy(method: CriterionVerificationMethod, source: MvpEvidenceSource): boolean {
+export function methodSatisfiedBy(
+  method: CriterionVerificationMethod,
+  observation: Pick<Observation, 'source' | 'method'>,
+): boolean {
   switch (method.kind) {
     case 'AutomatedCheck':
-      return source === 'project_command' || source === 'github_check';
+      return (
+        (observation.source === 'project_command' || observation.source === 'github_check') &&
+        observation.method.kind === 'AutomatedCheck' &&
+        observation.method.checkId === method.checkId
+      );
     case 'BrowserEvidence':
     case 'ApiEvidence':
-      return source === 'browser';
+      return (
+        observation.source === 'browser' &&
+        observation.method.kind === method.kind &&
+        observation.method.evidenceId === method.evidenceId
+      );
     case 'OwnerTest':
-      return source === 'owner_test';
+      return observation.source === 'owner_test' && observation.method.kind === 'OwnerTest';
     case 'Untested':
       return false;
   }
