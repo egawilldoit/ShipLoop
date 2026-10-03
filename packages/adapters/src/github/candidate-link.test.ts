@@ -45,7 +45,7 @@ import { createFakeAdapterSet } from '../testing/fake.ts';
 import type { FakeLinkedPullRequest } from '../testing/fake.ts';
 import type { AdapterContext, GitRepositoryRef, ProviderCheckObservation } from '../contracts/index.ts';
 import { CANDIDATE_PORT_MEMBERS, readOnlyCandidateGit } from '../contracts/candidate-link.ts';
-import { GitHubGitAdapter } from './adapter.ts';
+import { GitHubGitAdapter, managedMarkerLine } from './adapter.ts';
 import { githubCandidatePort } from './candidate-link.ts';
 import type { GitTransport } from './client.ts';
 
@@ -177,6 +177,10 @@ function pullRequestCapture(options: {
   readonly mergedAt?: string | null;
   readonly baseRef?: string;
   readonly draft?: boolean;
+  /** The PR author. Defaults to the repository owner so head-based lookups match. */
+  readonly author?: string;
+  /** ShipLoop's managed marker, so a list-based lookup can treat this as one of its own. */
+  readonly managedBody?: string;
 } = {}): Record<string, unknown> {
   return {
     id: 2722333444,
@@ -189,8 +193,8 @@ function pullRequestCapture(options: {
     merged_at: options.mergedAt ?? null,
     merge_commit_sha: options.mergeCommitSha ?? null,
     title: 'Candidate under review',
-    body: null,
-    user: { login: 'example-owner' },
+    body: options.managedBody ?? null,
+    user: { login: options.author ?? 'egawilldoit' },
     head: {
       ref: 'task/mvp-candidate',
       sha: options.headSha ?? FIXTURE_HEAD_SHA,
@@ -503,6 +507,66 @@ test('the read-only candidate port exposes exactly the declared reads and nothin
   assert.equal(port.kind, 'Git');
   assert.ok(port.capabilities().declarations.length > 0);
   assert.equal(typeof readOnlyCandidateGit(adapter).readChecks, 'function');
+});
+
+test('the state rule also holds on the pre-existing read paths, not only the new one', async () => {
+  // `pullRequestStateOf` replaced an inline expression inside `pullRequestRefOf`, which every
+  // read path shares. An unrecognised state used to read as Open there, and Open is the
+  // direction that authorises something; it now reads as Closed. This case pins that change on
+  // the *shared* path so it cannot drift back unnoticed.
+  const marker = managedMarkerLine({
+    operationId: 'op_state_shared',
+    headSha: FIXTURE_HEAD_SHA,
+    baseBranch: 'main',
+    link: 'none',
+    digest: '0'.repeat(64),
+    writtenAt: FIXED_INSTANT,
+  });
+
+  const listed = (body: Record<string, unknown> | Record<string, unknown>[]): Record<string, { status: number; body: unknown }> => ({
+    'GET /repos/egawilldoit/ShipLoop/pulls': { status: 200, body },
+  });
+
+  const findOne = async (
+    replies: Record<string, { status: number; body: unknown }>,
+  ): Promise<readonly { readonly pullRequest: { readonly state: string } }[]> => {
+    const { adapter } = adapterFor(replies);
+    return okOf(
+      adapter.findDrafts(adapterContext('op_state_shared'), {
+        repository: REPOSITORY,
+        headSha: FIXTURE_HEAD_SHA,
+        link: { kind: 'None', reason: 'no ticket is linked' },
+        operationId: adapterContext('op_state_shared').operationId,
+      }),
+    );
+  };
+
+  const unknown = await findOne(
+    listed([
+      pullRequestCapture({ state: 'a-state-this-adapter-has-never-heard-of', managedBody: marker }),
+    ]),
+  );
+  assert.equal(unknown.length, 1);
+  assert.equal(unknown[0]?.pullRequest.state, 'Closed', 'an unknown state is never reported as open');
+
+  const merged = await findOne(
+    listed([
+      pullRequestCapture({
+        state: 'closed',
+        merged: true,
+        mergedAt: '2026-10-01T09:00:00.000Z',
+        managedBody: marker,
+      }),
+    ]),
+  );
+  assert.equal(
+    merged[0]?.pullRequest.state,
+    'Merged',
+    'merged is read before state, because GitHub reports a merged pull request as closed',
+  );
+
+  const open = await findOne(listed([pullRequestCapture({ managedBody: marker })]));
+  assert.equal(open[0]?.pullRequest.state, 'Open');
 });
 
 /* -------------------------------------------------------------------------- */
