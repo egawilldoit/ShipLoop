@@ -15,9 +15,15 @@
  *     can attribute an approval to somebody else. The approver is read from the proved
  *     session; the schema is `strictObject({})` rather than no schema, so a body that meant
  *     to say who approved is refused rather than silently dropped (mvp-spec 3).
- *   - **Every edit and every approval carries `expectedUpdatedAt`.** A stale tab is refused
- *     with a 409 rather than overwriting text somebody else has since replaced, and the
- *     conflict names both instants (mvp-spec 7, F24-AC4).
+ *   - **Every edit carries `expectedUpdatedAt`; approval carries none, and this file says
+ *     so rather than implying otherwise.** A stale tab editing a request or a draft
+ *     revision is refused with a 409 instead of overwriting text somebody else has since
+ *     replaced, and the conflict names both instants (mvp-spec 7, F24-AC4). An approval
+ *     names a revision and freezes the text that revision holds when the call lands, so it
+ *     has no instant to compare against - which leaves a real gap: an owner who approves a
+ *     draft another tab edited since their page was rendered approves text they did not
+ *     read. That gap belongs to the approval use case rather than to this file, and it is
+ *     stated here so no caller is told a guard exists that does not (mvp-spec 3).
  *   - **Reads of one revision are keyed by `(projectId, contractId, revision)`.** A revision
  *     number is not decoration: a candidate and its evidence bind to it, so addressing a
  *     revision without its number is addressing something unidentifiable (mvp-spec 3).
@@ -156,6 +162,10 @@ const editContractBody = contractContent.extend({
  * `status` is refused with a named field rather than having it ignored, because a body that
  * *thinks* it named the approver is the exact defect this route is shaped to prevent
  * (mvp-spec 3).
+ *
+ * Empty means empty: adding a compare-and-set instant here would make an approval
+ * refusable on a field whose only other purpose is to say who approved, and the approver
+ * is the one thing this body must never carry (mvp-spec 3).
  */
 const approveBody = z.strictObject({});
 
@@ -283,8 +293,14 @@ export function registerContractRoutes(app: FastifyInstance, options: ContractRo
 
   /* --------------------------------------------------------------- contracts */
 
-  /** Drafts revision 1 of this request's delivery contract (mvp-spec 3). */
-  app.post('/api/projects/:projectId/requests/:requestId/contract', { preHandler: options.guard }, async (request, reply) => {
+  /**
+   * Drafts revision 1 of this request's delivery contract (mvp-spec 3).
+   *
+   * `/contracts`, plural, the same sub-resource the listing beside it answers: a client
+   * that drafts revision 1 and then lists the revisions holds one path and one noun, and a
+   * singular twin would be a second shape for the same write.
+   */
+  app.post('/api/projects/:projectId/requests/:requestId/contracts', { preHandler: options.guard }, async (request, reply) => {
     const session = request.session;
     if (session === null) return sendProblem(reply, signInRequiredProblem());
     const params = parseBody(requestParams, request.params);
