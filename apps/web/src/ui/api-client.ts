@@ -1282,7 +1282,17 @@ function readRefusal(body: unknown, status: number): ApiFailure {
   };
 }
 
-function request<T>(path: string, options: SendOptions): Promise<ApiResult<T>> {
+/**
+ * The single JSON transport: a session-scoped `fetch` that turns the refusal envelope and the
+ * connection banner's state into an `ApiResult`.
+ *
+ * Exported for `src/ui/mvp/client.ts` so the MVP screens use this transport rather than a second
+ * one. Two transports in one browser would mean two answers to "is this session signed in" and
+ * "is my view current", and the two could disagree; sharing the function is what keeps the CSRF
+ * token, the refusal parsing and the connection state single-sourced while the endpoint lists
+ * stay separate per surface.
+ */
+export function request<T>(path: string, options: SendOptions): Promise<ApiResult<T>> {
   return send(path, options).then(async (outcome) => {
     if (outcome.kind === 'offline') return failure('Unavailable', 'The server could not be reached.');
     const { response } = outcome;

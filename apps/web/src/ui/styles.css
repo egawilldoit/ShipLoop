@@ -218,6 +218,76 @@ li {
   overflow-wrap: anywhere;
 }
 
+/*
+ * MVP surfaces.
+ *
+ * Four additions only: a full commit SHA, the repeating contract editors, a multi-line input, and
+ * a link styled as a button. Nothing here restates an existing rule — the panels, badges, lists,
+ * state lines and field treatment the rest of this file already defines are used unchanged, so the
+ * MVP looks like the same application rather than a second one.
+ */
+
+/*
+ * A commit SHA is 40 characters of unbroken hex. Without `overflow-wrap` it is the single widest
+ * token on any surface and pushes a 375px phone sideways, which is how a page that has no other
+ * wide content still scrolls horizontally.
+ */
+.sha {
+  overflow-wrap: anywhere;
+  word-break: break-all;
+}
+
+.field__input--area {
+  min-height: 6rem;
+  padding: 0.5rem;
+  resize: vertical;
+  font: inherit;
+}
+
+.packet {
+  min-height: 18rem;
+  white-space: pre-wrap;
+  font-family: ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace;
+  font-size: 0.9rem;
+}
+
+/*
+ * The repeating editors. A fieldset rather than a div so the legend is announced as the group
+ * name, and each row stacks label, control, message and its remove button so a phone never needs a
+ * horizontal scroll to reach the control that deletes a row.
+ */
+.repeater {
+  min-width: 0;
+  margin: 0;
+  padding: 0.75rem;
+  border: 2px solid var(--line);
+  border-radius: 0.35rem;
+}
+
+.repeater__legend {
+  padding: 0 0.35rem;
+  font-weight: 700;
+}
+
+.repeater__list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.repeater__row {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  min-width: 0;
+  padding-bottom: 0.5rem;
+}
+
+.repeater__row + .repeater__row {
+  border-top: 1px solid var(--line);
+  padding-top: 0.75rem;
+}
+
 /* Buttons and controls */
 
 .button {
