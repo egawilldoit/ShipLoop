@@ -101,14 +101,23 @@ interface Seed {
   readonly requestId: string;
   readonly contractId: string;
   readonly candidateId: string;
+  readonly projectId: ProjectId;
 }
+
+/**
+ * The commit shape the harness works in.
+ *
+ * `HEAD`, `NEXT_HEAD` and `BASE_SHA` are all the same 40 hex characters wide, so a fixture
+ * cannot drift into an abbreviation and start passing for an identity it no longer is.
+ */
+type Sha = typeof HEAD;
 
 interface Harness {
   readonly card: MvpReviewCardUseCases;
   readonly db: Database;
   readonly review: SqliteMvpReviewStore;
   /** Appends the observation a push produces: a new candidate identity at a new commit. */
-  readonly push: (seed: Seed, headSha: typeof HEAD) => CandidateId;
+  readonly push: (seed: Seed, headSha: Sha) => CandidateId;
   readonly at: (instant: string) => void;
 }
 
@@ -124,7 +133,7 @@ function seed(
     readonly contractId: ContractId;
     readonly candidateId: CandidateId;
     readonly criteria?: readonly { readonly id: string; readonly description: string; readonly verificationType: 'automated' | 'owner_test' }[];
-    readonly headSha?: typeof HEAD;
+    readonly headSha?: Sha;
   },
 ): Seed {
   const projects = new ProjectRepository(db);
@@ -196,7 +205,7 @@ function seed(
     }),
   );
 
-  return { requestId: options.requestId, contractId: options.contractId, candidateId: options.candidateId };
+  return { requestId: options.requestId, contractId: options.contractId, candidateId: options.candidateId, projectId };
 }
 
 /** Drives the use cases against a real migrated database. */
@@ -574,6 +583,73 @@ test('F25-AC3: a push refuses a second acceptance of the same commit and reopens
       }),
     );
     assert.equal(blocked.code, 'Blocked', 'the new commit needs its own owner test before acceptance');
+  });
+});
+
+test('F25-AC4: an owner actor carrying no identity decides nothing, on either method', async () => {
+  await withCard(async (harness) => {
+    const stored = seed(harness.db, OWNER_ONLY_SEED);
+
+    // `role: 'owner'` with an empty identity is the shape a forged body would produce if the
+    // transport ever read the deciding owner from the request instead of the session. The role
+    // claims owner and the identity says nobody, and the identity is what the decision is
+    // attributed to - so it is refused rather than narrowed or defaulted (F01-AC1, F25-AC4).
+    //
+    // A *well-formed* id nobody provisioned is a different case and is not asserted here: it
+    // is unreachable over HTTP, because the only owner id this transport can carry is the one
+    // on a stored session row and that column is a foreign key into `owners`. Asserting it
+    // here would pin a rule the use case does not and should not own.
+    const anonymous: MvpOwnerActor = { role: 'owner', ownerId: '' as OwnerId };
+    const calls: readonly {
+      readonly name: string;
+      readonly call: () => Promise<Result<unknown, DomainError>>;
+    }[] = [
+      {
+        name: 'decide',
+        call: () =>
+          harness.card.decide({
+            projectId: PROJECT,
+            candidateId: stored.candidateId,
+            actor: anonymous,
+            decision: 'changes_requested',
+            expectedHeadSha: HEAD,
+            expectedContractRevision: 1,
+            feedback: 'Decided by nobody.',
+          }),
+      },
+      {
+        name: 'getReview',
+        call: () => harness.card.getReview({ projectId: PROJECT, candidateId: stored.candidateId, actor: anonymous }),
+      },
+    ];
+    for (const entry of calls) {
+      const refused = expectErr(await entry.call());
+      assert.equal(refused.code, 'Forbidden', `${entry.name} must refuse an owner carrying no identity`);
+      assert.ok(
+        !refused.reason.includes(stored.candidateId),
+        `the ${entry.name} refusal must not name the candidate it hid: ${refused.reason}`,
+      );
+    }
+
+    // And the owner that does exist is unaffected: refusing an unattributed actor must not
+    // have narrowed what a real owner may do.
+    const changed = expectOk(
+      await harness.card.decide({
+        projectId: PROJECT,
+        candidateId: stored.candidateId,
+        actor: OWNER,
+        decision: 'changes_requested',
+        expectedHeadSha: HEAD,
+        expectedContractRevision: 1,
+        feedback: 'Decided as the owner the session proved.',
+      }),
+    );
+    assert.equal(changed.decision.outcome, 'changes_requested');
+    assert.equal(
+      changed.decision.decision?.ownerId,
+      OWNER_ID,
+      'and it is attributed to the actor that made it, not to a refused one',
+    );
   });
 });
 
