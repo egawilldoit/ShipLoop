@@ -217,7 +217,7 @@ test('a candidate cannot be recorded for a project that does not exist', async (
 /* Idempotency and change                                                      */
 /* -------------------------------------------------------------------------- */
 
-test('re-recording the same identity is idempotent and reports that nothing was appended', async () => {
+test('re-recording the same observation is idempotent and reports that nothing was appended', async () => {
   await withDatabase((_db, store) => {
     const first = expectOk(store.record(candidateInput()));
     // A different minted id and a different read instant: the retry a controller performs
@@ -229,6 +229,45 @@ test('re-recording the same identity is idempotent and reports that nothing was 
     assert.equal(second.candidate.candidateId, first.candidate.candidateId);
     assert.equal(second.candidate.observedAt, T0, 'the stored observation is the first one, not the retry');
     assert.equal(expectOk(store.historyForRequest('request-01')).length, 1);
+  });
+});
+
+test('a pull request whose head did not move but which closed is a new observation', async () => {
+  await withDatabase((_db, store) => {
+    const open = expectOk(store.record(candidateInput())).candidate;
+    const closed = expectOk(store.record(candidateInput({ pullRequestState: 'Closed', observedAt: T1 }))).candidate;
+    // Keying idempotency on the commit alone would make this observation unrepresentable, and
+    // a closed pull request would keep reading as the candidate that was linked while open.
+    assert.notEqual(closed.candidateId, open.candidateId);
+    assert.equal(closed.headSha, open.headSha, 'the commit did not move');
+    assert.equal(closed.pullRequestState, 'Closed');
+    assert.equal(closed.observationSequence, 2);
+    assert.equal(recordOf(store)?.candidateId, closed.candidateId);
+    // The earlier observation is untouched and still says Open.
+    assert.equal(expectOk(store.get(open.candidateId)).pullRequestState, 'Open');
+  });
+});
+
+test('a retargeted base branch and a renamed head branch are new observations too', async () => {
+  await withDatabase((_db, store) => {
+    const original = expectOk(store.record(candidateInput())).candidate;
+    const retargeted = expectOk(
+      store.record(candidateInput({ baseBranch: 'release', headBranch: 'task/renamed', observedAt: T1 })),
+    ).candidate;
+    assert.notEqual(retargeted.candidateId, original.candidateId);
+    assert.equal(retargeted.baseBranch, 'release');
+    assert.equal(retargeted.headBranch, 'task/renamed');
+    assert.equal(recordOf(store)?.candidateId, retargeted.candidateId);
+  });
+});
+
+test('a draft flag flip is recorded, because a draft is not reviewable and Open is not enough', async () => {
+  await withDatabase((_db, store) => {
+    const plain = expectOk(store.record(candidateInput())).candidate;
+    const draft = expectOk(store.record(candidateInput({ draft: true, observedAt: T1 }))).candidate;
+    assert.notEqual(draft.candidateId, plain.candidateId);
+    assert.equal(draft.draft, true);
+    assert.equal(recordOf(store)?.draft, true);
   });
 });
 
@@ -287,10 +326,9 @@ test('the same head under a different contract revision is a different candidate
     assert.equal(recordOf(store)?.candidateId, revised.candidateId);
   });
 });
-
 test('a closed pull request is recorded as Closed rather than Open', async () => {
   await withDatabase((_db, store) => {
-    const row = expectOk(store.record(candidateInput({ pullRequestState: 'Closed', observedAt: T1 }))).candidate;
+    const row = expectOk(store.record(candidateInput({ pullRequestState: 'Closed' }))).candidate;
     assert.equal(row.pullRequestState, 'Closed');
     assert.equal(row.headSha, HEAD, 'closing a pull request does not change the commit it held');
   });

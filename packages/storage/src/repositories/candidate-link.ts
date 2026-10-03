@@ -17,11 +17,14 @@
  *    request. Timestamps are not used to pick it, because two refreshes inside the same
  *    millisecond would tie, and a tie two readers resolve differently is exactly how an
  *    outdated card comes to look current.
- * 3. **Re-linking the same identity is idempotent; re-linking a different one is visible.**
- *    The `UNIQUE (contract_id, contract_revision, head_sha)` constraint means a second
- *    attempt at the same commit returns the row that already exists rather than recording a
- *    second belief about it. A *different* head is a new row by design: a changed candidate
- *    has to be a fact somebody can read, not a silent overwrite.
+ * 3. **Re-linking the same facts is idempotent; a different observation is visible.**
+ *    The `UNIQUE (contract_id, contract_revision, head_sha, base_sha, base_branch,
+ *    head_branch, pull_request_state, draft)` constraint means a second attempt at the same
+ *    observation returns the row that already exists rather than recording a second belief
+ *    about it. A *different* observation is a new row by design, and that includes a pull
+ *    request whose head did not move but which was closed, marked draft or retargeted: each
+ *    of those changes what the owner would be approving, and a changed candidate has to be a
+ *    fact somebody can read rather than a silent overwrite.
  * 4. **No provider call happens here.** This package never reaches GitHub. The row is
  *    written from facts a caller already read, because a transaction that waited on the
  *    network would hold the single global writer open and make a lost response
@@ -138,11 +141,13 @@ export interface RecordedCandidate {
 /** The persistence port the candidate-linking controller depends on. */
 export interface CandidateLinkStore {
   /**
-   * Records a candidate, or returns the row that already records this exact identity.
+   * Records a candidate, or returns the row that already records these exact facts.
    *
-   * Idempotent on `(contractId, contractRevision, headSha)`. `alreadyRecorded` is what lets
-   * a caller distinguish "I read the same candidate again" from "the candidate changed", so
-   * a retry after a timeout cannot present a re-read as a new candidate.
+   * Idempotent on the whole material fact set — contract revision, head, base, both branch
+   * names, state and draft — rather than on the head alone. `alreadyRecorded` is what lets a
+   * caller distinguish "I read the same state of the same commit again" from "the candidate
+   * changed", so a retry after a timeout cannot present a re-read as a new candidate while a
+   * closed pull request still gets recorded.
    */
   record(input: RecordDeliveryCandidateInput): Result<RecordedCandidate>;
   get(candidateId: CandidateId): Result<DeliveryCandidateRecord>;
@@ -314,12 +319,32 @@ export class DeliveryCandidateRepository implements CandidateLinkStore {
     return row === undefined ? null : toRecord(row);
   }
 
+  /**
+   * The row already recording these exact facts, if there is one.
+   *
+   * Matches the schema's uniqueness tuple rather than the identity alone, because a pull
+   * request can change without its head moving: a closed pull request, a draft flag and a
+   * retargeted base all have to become a new row. Keying on the identity alone would make
+   * those observations impossible to record, which is how a closed pull request would keep
+   * reporting as the candidate that was linked when it was open.
+   */
   private findExisting(input: RecordDeliveryCandidateInput): DeliveryCandidateRecord | null {
     return this.rowOf(
       this.statement(
         `SELECT ${COLUMNS} FROM delivery_candidates
-         WHERE contract_id = ? AND contract_revision = ? AND head_sha = ? LIMIT 1`,
-      ).get(input.contractId, input.contractRevision, input.headSha),
+         WHERE contract_id = ? AND contract_revision = ? AND head_sha = ? AND base_sha = ?
+           AND base_branch = ? AND head_branch = ? AND pull_request_state = ? AND draft = ?
+         LIMIT 1`,
+      ).get(
+        input.contractId,
+        input.contractRevision,
+        input.headSha,
+        input.baseSha,
+        input.baseBranch,
+        input.headBranch,
+        input.pullRequestState,
+        input.draft ? 1 : 0,
+      ),
     );
   }
 

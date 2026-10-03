@@ -2633,10 +2633,16 @@ CREATE TABLE delivery_candidates (
   observed_at           TEXT NOT NULL,
   linked_at             TEXT NOT NULL DEFAULT ${NOW},
   correlation_id        TEXT,
-  -- One row per exact identity, so re-linking the same contract revision at the same
-  -- head is idempotent at the schema and a second belief about the same commit cannot be
-  -- recorded beside the first.
-  UNIQUE (contract_id, contract_revision, head_sha),
+  -- One row per distinct observation of this candidate's facts.
+  --
+  -- The key covers the material facts and not only the commit, because a pull request can
+  -- change without its head moving: closing it, marking it draft or retargeting its base all
+  -- change what the owner would be approving, and each has to be recorded rather than
+  -- silently dropped by an identity that already exists. Two identical observations are
+  -- still refused at the schema, so a retried link cannot create a second belief about the
+  -- same state of the same commit.
+  UNIQUE (contract_id, contract_revision, head_sha, base_sha, base_branch, head_branch,
+          pull_request_state, draft),
   -- Sequence is per request, so "the current candidate" is one row rather than an
   -- ordering the reader has to guess at.
   UNIQUE (request_id, observation_sequence)
