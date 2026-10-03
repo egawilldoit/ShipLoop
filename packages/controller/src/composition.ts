@@ -1,3 +1,5 @@
+import { randomUUID } from 'node:crypto';
+
 /**
  * The composition root (F01-AC1, F02-AC1, F03-AC1, F06-AC1, F07-AC3, ARCHITECTURE
  * "Authority and durable state").
@@ -50,6 +52,7 @@ import {
   type OwnerId,
   type ReadOnlyCapabilityProfile,
   type PasswordHash,
+  type CandidateId,
   type Plan,
   type PlanEdit,
   type PlanProposal,
@@ -86,6 +89,7 @@ import {
   WorkItemRepository,
 } from '@shiploop/storage';
 import { withTransaction } from '@shiploop/storage';
+import { DeliveryCandidateRepository, SqliteMvpReviewStore } from '@shiploop/storage';
 import type {
   Database,
   JobLimits,
@@ -147,6 +151,10 @@ import {
 import { requireIntakeOwner } from './intake.ts';
 import { createContractUseCases, type ContractUseCases } from './contracts.ts';
 import { createSettingsUseCases, type SettingsUseCases } from './settings.ts';
+import type { CandidateLinkUseCases } from './candidate-linking.ts';
+import { createCandidateLinkUseCases } from './candidate-linking.ts';
+import type { MvpReviewUseCases } from './mvp-review.ts';
+import { createMvpReviewUseCases } from './mvp-review.ts';
 
 export interface CompositionRootConfig {
   readonly databasePath: string;
@@ -291,6 +299,17 @@ export interface CompositionRoot {
    * handoff packet's launch button needs the same answer the settings screen shows.
    */
   readonly settingsUseCases: SettingsUseCases;
+
+  /**
+   * Candidate linking and the live provider read, or `null` when no Git provider is configured.
+   *
+   * Nullable rather than absent so a deployment without GitHub answers the candidate routes with an
+   * honest reason instead of a 404 that reads as "no such candidate".
+   */
+  readonly candidateLinkUseCases: CandidateLinkUseCases | null;
+
+  /** Evidence, readiness, and the owner's Accept / Request Changes decision. */
+  readonly mvpReviewUseCases: MvpReviewUseCases;
   /** Run start, lifecycle transitions and owner limit decisions (F13, F17, F18). */
   readonly jobUseCases: JobUseCases;
   /** The attention dashboard and acknowledgement (F31). */
@@ -1198,6 +1217,7 @@ export function createCompositionRoot(config: CompositionRootConfig): Result<Com
     ideas,
     artifactRoot: config.artifactRoot ?? null,
   });
+
   /**
    * The owner's request and the agreement that answers it (mvp-spec 3).
    *
@@ -1318,6 +1338,74 @@ export function createCompositionRoot(config: CompositionRootConfig): Result<Com
    */
   const generationLedger = new SqliteGenerationLedger(database);
   const configuredEngine = providers?.engine ?? null;
+
+  /**
+   * The exact implementation under review: a GitHub pull request the owner linked, read back as a
+   * full commit SHA (MVP "GitHub Candidate").
+   *
+   * Built from the read-only `candidateGit` port rather than the full `git` adapter, so the object
+   * this composition hands out has no merge, close, approve or protection method on it at all — the
+   * MVP reads provider facts and never writes them. It is `null` on a deployment that has configured
+   * no Git provider, and the candidate routes then answer an honest reason instead of a 404 that
+   * reads as "no such candidate".
+   *
+   * The repository and the required check names come from the project's own saved profile, never
+   * from the request. Taking them from a caller would let a caller name the repository its pasted
+   * address is compared against, which is the comparison this exists to perform.
+   */
+  const candidateLinkUseCases =
+    providers?.candidateGit == null
+      ? null
+      : createCandidateLinkUseCases({
+          clock: config.clock,
+          candidates: new DeliveryCandidateRepository(database),
+          git: providers.candidateGit,
+          repositoryRef: (projectId) => {
+            const references = readProfileReferences(profiles, projectId);
+            if (references === null) {
+              return err({
+                code: 'NotFound',
+                reason:
+                  'This project has no saved profile, so it has no repository to compare a pull request against (MVP candidate).',
+              });
+            }
+            const repository = references.repository.trim();
+            const separator = repository.indexOf('/');
+            if (separator <= 0 || separator === repository.length - 1) {
+              return err({
+                code: 'NotFound',
+                reason: `The saved profile for this project does not name an owner and a repository, so a pull request cannot be compared against it (MVP candidate).`,
+              });
+            }
+            return ok({
+              provider: 'github',
+              fullName: repository,
+              defaultBranch: references.targetBranch,
+              url: `https://github.com/${repository}`,
+            });
+          },
+          requiredCheckNames: (projectId) => {
+            const current = profiles.currentVersion(projectId);
+            if (!current.ok) return err(current.error);
+            return ok(current.value?.content.policy.requiredChecks ?? []);
+          },
+          newCandidateId: () => randomUUID() as CandidateId,
+        });
+
+  /**
+   * Verification evidence bound to a contract revision and a full candidate SHA, plus the owner's
+   * Accept / Request Changes decision bound to the same (MVP "Verification", "Owner Decision").
+   *
+   * Constructed unconditionally: it reads only the local store, so it has to work on a deployment
+   * that has configured no provider at all. A missing optional connector must not make
+   * Request → Contract → Candidate → Verify → Review impossible.
+   */
+  const mvpReviewUseCases = createMvpReviewUseCases({
+    clock: config.clock,
+    store: new SqliteMvpReviewStore(database),
+    newDecisionId: () => randomUUID(),
+  });
+
   const briefGenerationFor =
     configuredEngine === null
       ? null
@@ -1378,6 +1466,8 @@ export function createCompositionRoot(config: CompositionRootConfig): Result<Com
     contractUseCases,
     sessionUseCases,
     settingsUseCases,
+    candidateLinkUseCases,
+    mvpReviewUseCases,
     jobUseCases,
     attentionUseCases,
     verificationUseCases,
