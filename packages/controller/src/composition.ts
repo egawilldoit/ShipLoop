@@ -67,6 +67,7 @@ import {
   createLeaseManager,
   migrate,
   openDatabase,
+  ActiveProjectRepository,
   AttentionItemRepository,
   CandidateRepository,
   OwnerDecisionRepository,
@@ -219,6 +220,14 @@ export interface CompositionRoot {
   readonly database: Database;
   readonly owners: OwnerRepository;
   readonly projects: ProjectRepository;
+  /**
+   * Which project the owner has selected (F02-AC1).
+   *
+   * Published because the answer has to be reachable from anywhere a session is
+   * re-established: a selection the client holds is a selection the next session load does
+   * not have, and every project-scoped screen then addresses the previous project.
+   */
+  readonly activeProjects: ActiveProjectRepository;
   readonly profiles: ProjectProfileRepository;
   readonly connectors: ConnectorRepository;
   readonly procedures: ProcedureRepository;
@@ -313,6 +322,10 @@ const REQUIRED_TABLES: readonly string[] = [
   'idea_questions',
   'briefs',
   'plans',
+  // The durable project selection. Checked here for the same reason as the tables below:
+  // without it, a session read on a database that predates the table fails with an opaque
+  // driver error rather than a named startup refusal (F02-AC1).
+  'owner_active_project',
   // A request and its delivery-contract revisions. Checked here because
   // `RequestRepository` and `ContractRepository` would otherwise fail at the first call
   // rather than at startup, which is the difference between an operator reading a
@@ -1095,6 +1108,7 @@ export function createCompositionRoot(config: CompositionRootConfig): Result<Com
 
   const owners = new OwnerRepository(database);
   const projects = new ProjectRepository(database);
+  const activeProjects = new ActiveProjectRepository(database);
   const profiles = new ProjectProfileRepository(database);
   const connectors = new ConnectorRepository(database);
   const procedures = new ProcedureRepository(database);
@@ -1294,6 +1308,7 @@ export function createCompositionRoot(config: CompositionRootConfig): Result<Com
     database,
     owners,
     projects,
+    activeProjects,
     profiles,
     connectors,
     procedures,

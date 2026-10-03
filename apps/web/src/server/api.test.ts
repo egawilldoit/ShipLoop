@@ -49,9 +49,11 @@ import {
 import type { JobOperation } from '@shiploop/storage';
 import type { FastifyInstance } from 'fastify';
 import { buildApp } from './app.ts';
+import { CSRF_HEADER } from './auth-guard.ts';
 import { describeConfigErrors, readServerConfig, type ServerConfig } from './config.ts';
 import {
   isControllerSurface,
+  type ActiveProjectView,
   type AttentionBoardView,
   type AttentionItemView,
   type BriefVersionView,
@@ -252,8 +254,15 @@ interface ErrorPayload {
   readonly signInRequired?: boolean;
 }
 
+/**
+ * What the session and sign-in routes answer with (F01-AC1, F02-AC1).
+ *
+ * `owner` is the full `OwnerView` rather than the two fields these tests used to read,
+ * because the point of the assertions below is that the whole identity travels: the address
+ * (read, not re-derived) and the selected project (a real state, not a fabricated id).
+ */
 interface OwnerPayload {
-  readonly owner: { readonly ownerId: string; readonly displayName: string };
+  readonly owner: OwnerView;
   readonly session: { readonly sessionId: string; readonly issuedAt: string; readonly expiresAt: string };
   readonly csrfToken: string;
 }
@@ -334,6 +343,8 @@ class InMemoryController implements ControllerSurface {
   private ownerEmail: string | null = null;
   /** The owner's creation instant, recorded by the same write that recorded the address. */
   private ownerCreatedAt = '';
+  /** The project this owner has selected, or null when none is selected (F02-AC1). */
+  private activeProjectId: string | null = null;
   private readonly scripted = new Map<string, DomainError>();
   private readonly recordedRuns = new Map<string, RunJobView>();
   private readonly checkpoints = new Map<string, RunCheckpointView>();
@@ -356,6 +367,39 @@ class InMemoryController implements ControllerSurface {
       if (!hashed.ok) throw new Error('The test owner password must satisfy the domain policy.');
       this.passwordHash = hashed.value;
     }
+  }
+
+  /**
+   * The project state this owner is in, exactly as the controller reports it (F02-AC1).
+   *
+   * `NoProjectSelected` carries the count the owner could choose from, so onboarding can
+   * distinguish "create a project" from "choose one" rather than rendering a blank field.
+   * There is deliberately no fallback: this double must not be able to answer with a project
+   * nobody selected, which is the defect the union exists to make unrepresentable (F02-AC4).
+   */
+  private activeProjectView(): ActiveProjectView {
+    if (this.activeProjectId === null) {
+      return { state: 'NoProjectSelected', selectableProjectCount: this.projectRecords.size };
+    }
+    const selected = this.projectRecords.get(this.activeProjectId);
+    if (selected === undefined) {
+      // A selection naming a project this double does not hold is the state that must be
+      // impossible; reporting the onboarding state is the honest answer and keeps a test from
+      // passing on an identity nobody chose.
+      return { state: 'NoProjectSelected', selectableProjectCount: this.projectRecords.size };
+    }
+    return { state: 'Selected', activeProjectId: selected.projectId, activeProjectName: selected.name };
+  }
+
+  /**
+   * The address provisioning recorded, or null when it provisioned none.
+   *
+   * Read through a method so a route test can assert the session response carries the
+   * *stored* value without reaching into the double's fields, and so the assertion fails if
+   * the response is carrying something the store never held (F01-AC1).
+   */
+  provisionedEmail(): string | null {
+    return this.ownerEmail;
   }
 
   /** Arms a one-shot domain error for the next call of a use case. */
@@ -611,15 +655,24 @@ class InMemoryController implements ControllerSurface {
       this.passwordHash = hashed.value;
       this.ownerEmail = `${command.displayName.toLowerCase().replace(/[^a-z0-9]+/g, '-')}@owners.shiploop.invalid`;
       this.ownerCreatedAt = command.at;
-      return ok({ ownerId: OWNER_ID, displayName: command.displayName, email: this.ownerEmail, createdAt: command.at });
+      return ok({
+        ownerId: OWNER_ID,
+        displayName: command.displayName,
+        email: this.ownerEmail,
+        createdAt: command.at,
+        // A newly provisioned owner has selected nothing, and this double says so the way
+        // the controller does: an explicit state, never a fabricated project (F02-AC1).
+        activeProject: this.activeProjectView(),
+      });
     },
 
     /**
      * The provisioned owner's stored identity, read rather than re-derived (F01-AC1).
      *
-     * The session and sign-in routes read the address from here, so a test that asserts the
-     * header carries an address is asserting the route read the row rather than recomputing
-     * a slug — which is the exact substitution that produced the blank header.
+     * The session and sign-in routes read the address and the selected project from here, so
+     * a test asserting the session response carries them is asserting the route read stored
+     * state rather than recomputing anything — which is the exact substitution that produced
+     * the blank header and the `/api/profiles/undefined` requests (F02-AC1, F02-AC4).
      */
     describe: async (command: { readonly ownerId: OwnerId }): Promise<Result<OwnerView, DomainError>> => {
       if (command.ownerId !== OWNER_ID || this.passwordHash === '') {
@@ -630,7 +683,31 @@ class InMemoryController implements ControllerSurface {
         displayName: OWNER_NAME,
         email: this.ownerEmail,
         createdAt: this.ownerCreatedAt,
+        activeProject: this.activeProjectView(),
       });
+    },
+
+    /**
+     * Records which project this owner's subsequent calls address (F02-AC1).
+     *
+     * Refuses a project this double does not hold with the same `NotFound` the controller
+     * produces, because a route test that let an unknown project be selected would prove the
+     * route forwards refusals while testing a controller that invents projects (F02-AC4).
+     */
+    selectActiveProject: async (command: {
+      readonly ownerId: OwnerId;
+      readonly projectId: string;
+      readonly at: string;
+    }): Promise<Result<ActiveProjectView, DomainError>> => {
+      if (command.ownerId !== OWNER_ID || this.passwordHash === '') {
+        return { ok: false, error: { code: 'NotFound', reason: 'No owner matches that identity.' } };
+      }
+      const record = this.projectRecords.get(command.projectId);
+      if (record === undefined) {
+        return { ok: false, error: { code: 'NotFound', reason: `Project ${command.projectId} does not exist.` } };
+      }
+      this.activeProjectId = record.projectId;
+      return ok({ state: 'Selected', activeProjectId: record.projectId, activeProjectName: record.name });
     },
 
     signIn: async (command: SignInCommand): Promise<Result<SignInGrant, DomainError>> => {
@@ -1530,6 +1607,23 @@ async function signIn(app: FastifyInstance, identifier = OWNER_NAME, password = 
   return { cookie: cookieFrom(response), csrfToken: body.csrfToken };
 }
 
+/**
+ * Creates a project the owner can then select (F02-AC1).
+ *
+ * The CSRF header is the one the guard reads, named here rather than repeated: a write that
+ * looks anonymous fails with a refusal about forgery protection, which reads as an
+ * authorization failure and hides the real mistake.
+ */
+async function createProject(h: Harness, session: Session, projectId: string, name: string): Promise<void> {
+  const response = await h.app.inject({
+    method: 'POST',
+    url: '/api/projects',
+    headers: { cookie: session.cookie, [CSRF_HEADER]: session.csrfToken },
+    payload: { projectId, name },
+  });
+  assert.ok(response.statusCode === 200 || response.statusCode === 201, `project creation failed: ${response.body}`);
+}
+
 async function seedProfile(h: Harness, session: Session, projectId = PROJECT_ID): Promise<ProfilePayload> {
   const response = await h.app.inject({
     method: 'POST',
@@ -1633,6 +1727,223 @@ test('F01-AC2, F01-AC4: sign-in sets an HttpOnly, Secure, SameSite session cooki
   assert.equal(body.owner.displayName, OWNER_NAME);
   assert.ok(!response.body.includes(OWNER_PASSWORD), 'the response must not echo the password');
   assert.ok(!response.body.includes(SEEDED_SECRET));
+});
+
+test('F02-AC1, F02-AC4: the session response names the project it addresses, or says none is selected', async (t) => {
+  // The defect this closes: the session response carried no project identity, so the client
+  // reached for one it did not have and every project-scoped request went out for a project
+  // literally named "undefined". The server's honest 404 was then reported as "that project
+  // has no saved profile yet" — a different and wrong claim about a project's contents
+  // (F02-AC1, F02-AC4).
+  await t.test('an owner who has selected nothing is told so, with a count rather than a blank', async () => {
+    const h = await harness();
+    const session = await signIn(h.app);
+
+    const response = await h.app.inject({ method: 'GET', url: '/api/owner/session', headers: { cookie: session.cookie } });
+    assert.equal(response.statusCode, 200);
+    const body = parse<OwnerPayload>(response);
+
+    // A real onboarding state. The narrowing is the assertion: the count is only reachable
+    // on the variant that means "nothing is selected", so reading it proves the server said
+    // that rather than that a test read past a missing field.
+    const project = body.owner.activeProject;
+    assert.equal(project.state, 'NoProjectSelected');
+    assert.equal(project.state === 'NoProjectSelected' ? project.selectableProjectCount : -1, 0);
+    // And no id to interpolate into a path: the field a project-scoped URL is built from is
+    // absent rather than present-and-empty, which is what produced `/api/profiles/undefined`.
+    assert.equal('activeProjectId' in project, false);
+  });
+
+  await t.test('a selected project arrives with its identity and its name', async () => {
+    const h = await harness();
+    const session = await signIn(h.app);
+    await createProject(h, session, 'checkout', 'Checkout');
+
+    const before = parse<OwnerPayload>(
+      await h.app.inject({ method: 'GET', url: '/api/owner/session', headers: { cookie: session.cookie } }),
+    );
+    // Creating a project does not select it: the owner chooses, and a create that also
+    // switched context would silently redirect every other project-scoped page (F02-AC2).
+    assert.equal(before.owner.activeProject.state, 'NoProjectSelected');
+    assert.equal(
+      before.owner.activeProject.state === 'NoProjectSelected' ? before.owner.activeProject.selectableProjectCount : 0,
+      1,
+      'the one project is offered for selection',
+    );
+
+    const selected = await h.app.inject({
+      method: 'PUT',
+      url: '/api/owner/active-project',
+      headers: { cookie: session.cookie, [CSRF_HEADER]: session.csrfToken },
+      payload: { projectId: 'checkout' },
+    });
+    assert.equal(selected.statusCode, 200, selected.body);
+    assert.deepEqual(parse<{ activeProject: ActiveProjectView }>(selected).activeProject, {
+      state: 'Selected',
+      activeProjectId: 'checkout',
+      activeProjectName: 'Checkout',
+    });
+
+    const after = parse<OwnerPayload>(
+      await h.app.inject({ method: 'GET', url: '/api/owner/session', headers: { cookie: session.cookie } }),
+    );
+    assert.deepEqual(after.owner.activeProject, {
+      state: 'Selected',
+      activeProjectId: 'checkout',
+      activeProjectName: 'Checkout',
+    });
+    // The rest of the identity travels on the same response: the display name and the owner
+    // id (F01-AC1). The address is asserted against what this harness actually recorded,
+    // because the pre-provisioned harness has no provision call to have derived one.
+    assert.equal(after.owner.displayName, OWNER_NAME);
+    assert.equal(after.owner.ownerId, OWNER_ID);
+    assert.equal(after.owner.email, h.controller.provisionedEmail());
+  });
+
+  await t.test('the selection survives a reload, because the server holds it', async () => {
+    const h = await harness();
+    const session = await signIn(h.app);
+    await createProject(h, session, 'checkout', 'Checkout');
+    await h.app.inject({
+      method: 'PUT',
+      url: '/api/owner/active-project',
+      headers: { cookie: session.cookie, [CSRF_HEADER]: session.csrfToken },
+      payload: { projectId: 'checkout' },
+    });
+
+    // Every reload answers the same. A client-held selection would be gone here, and the
+    // project-scoped request that followed would address nothing (F02-AC1). The assertion
+    // reads the union rather than narrowing it, so a change to the variant is a change to
+    // what these lines prove.
+    for (const attempt of [1, 2, 3]) {
+      const response = await h.app.inject({ method: 'GET', url: '/api/owner/session', headers: { cookie: session.cookie } });
+      const project = parse<OwnerPayload>(response).owner.activeProject;
+      assert.equal(project.state, 'Selected', `load ${attempt} must still name the project`);
+      assert.equal(
+        project.state === 'Selected' ? project.activeProjectId : null,
+        'checkout',
+        `load ${attempt} must name the same project`,
+      );
+    }
+
+    // And it survives a new session: the sign-in response carries it too.
+    const fresh = await signIn(h.app);
+    const body = parse<OwnerPayload>(
+      await h.app.inject({ method: 'GET', url: '/api/owner/session', headers: { cookie: fresh.cookie } }),
+    );
+    assert.equal(body.owner.activeProject.state, 'Selected');
+  });
+});
+
+test('F02-AC4: selecting a project this deployment does not hold is a 404, not a silent success', async () => {
+  const h = await harness();
+  const session = await signIn(h.app);
+
+  const missing = await h.app.inject({
+    method: 'PUT',
+    url: '/api/owner/active-project',
+    headers: { cookie: session.cookie, [CSRF_HEADER]: session.csrfToken },
+    payload: { projectId: 'no-such-project' },
+  });
+  assert.equal(missing.statusCode, 404, missing.body);
+  assert.equal(parse<ErrorPayload>(missing).error.code, 'NotFound');
+
+  // The refusal changed nothing, so the session still reports the onboarding state rather
+  // than a project that does not exist (F02-AC1).
+  const body = parse<OwnerPayload>(
+    await h.app.inject({ method: 'GET', url: '/api/owner/session', headers: { cookie: session.cookie } }),
+  );
+  assert.equal(body.owner.activeProject.state, 'NoProjectSelected');
+});
+
+test('F02-AC4: a project id that is a path, and a null selection, are both refused', async () => {
+  const h = await harness();
+  const session = await signIn(h.app);
+
+  for (const projectId of ['../etc', 'a/b', 'a\\b', '  ']) {
+    const response = await h.app.inject({
+      method: 'PUT',
+      url: '/api/owner/active-project',
+      headers: { cookie: session.cookie, [CSRF_HEADER]: session.csrfToken },
+      payload: { projectId },
+    });
+    assert.equal(response.statusCode, 400, `"${projectId}" must be refused: ${response.body}`);
+    assert.equal(parse<ErrorPayload>(response).error.code, 'Invalid');
+  }
+
+  // Null is refused rather than accepted: "no project selected" is reached by never
+  // selecting one, so a client asking to select nothing is expressing something the write
+  // has no meaning for (F02-AC1).
+  const nulled = await h.app.inject({
+    method: 'PUT',
+    url: '/api/owner/active-project',
+    headers: { cookie: session.cookie, [CSRF_HEADER]: session.csrfToken },
+    payload: { projectId: null },
+  });
+  assert.equal(nulled.statusCode, 400, nulled.body);
+
+  // An unknown key is refused rather than dropped, so a body that meant to select something
+  // else cannot appear to have succeeded (F02-AC4).
+  const extra = await h.app.inject({
+    method: 'PUT',
+    url: '/api/owner/active-project',
+    headers: { cookie: session.cookie, [CSRF_HEADER]: session.csrfToken },
+    payload: { projectId: 'checkout', activeProjectName: 'A name the client invented' },
+  });
+  assert.equal(extra.statusCode, 400, extra.body);
+});
+
+test('F02-AC1: the session and sign-in responses agree about the project, because both read the controller', async () => {
+  const h = await harness();
+  const session = await signIn(h.app);
+  await createProject(h, session, 'checkout', 'Checkout');
+  await h.app.inject({
+    method: 'PUT',
+    url: '/api/owner/active-project',
+    headers: { cookie: session.cookie, [CSRF_HEADER]: session.csrfToken },
+    payload: { projectId: 'checkout' },
+  });
+
+  const onLoad = parse<OwnerPayload>(
+    await h.app.inject({ method: 'GET', url: '/api/owner/session', headers: { cookie: session.cookie } }),
+  ).owner.activeProject;
+  const onSignIn = parse<OwnerPayload>(
+    await h.app.inject({
+      method: 'POST',
+      url: '/api/owner/sign-in',
+      payload: { identifier: OWNER_NAME, password: OWNER_PASSWORD },
+    }),
+  ).owner.activeProject;
+
+  // Two routes, one answer. If sign-in re-derived the project or omitted it, a client that
+  // cached the sign-in response would address the wrong project until the next reload - which
+  // is the class of defect this set out to close (F02-AC1, F02-AC4).
+  assert.deepEqual(onLoad, onSignIn);
+  assert.deepEqual(onLoad, { state: 'Selected', activeProjectId: 'checkout', activeProjectName: 'Checkout' });
+});
+
+test('F01-AC1: selecting a project needs a session and a CSRF token like any other write', async () => {
+  const h = await harness();
+  const anonymous = await h.app.inject({
+    method: 'PUT',
+    url: '/api/owner/active-project',
+    payload: { projectId: 'checkout' },
+  });
+  assert.equal(anonymous.statusCode, 401, anonymous.body);
+
+  const session = await signIn(h.app);
+  const withoutToken = await h.app.inject({
+    method: 'PUT',
+    url: '/api/owner/active-project',
+    headers: { cookie: session.cookie },
+    payload: { projectId: 'checkout' },
+  });
+  assert.equal(withoutToken.statusCode, 403, withoutToken.body);
+
+  const body = parse<OwnerPayload>(
+    await h.app.inject({ method: 'GET', url: '/api/owner/session', headers: { cookie: session.cookie } }),
+  );
+  assert.equal(body.owner.activeProject.state, 'NoProjectSelected', 'neither refused write changed the selection');
 });
 
 test('F01-AC2: signing out revokes the session, so the old cookie stops working', async (t) => {
@@ -2195,7 +2506,7 @@ test('the loaded controller module is validated before it can serve a request', 
     // nothing named a project, so every project-scoped request addressed
     // `/api/profiles/undefined` and the client reported the 404 as "no saved profile yet"
     // (F01-AC1, F02-AC1).
-    owners: { provision() {}, signIn() {}, describe() {} },
+    owners: { provision() {}, signIn() {}, describe() {}, selectActiveProject() {} },
     projects: { listProjects() {}, createProject() {} },
     sessions: { loadByToken() {}, create() {}, revoke() {}, touch() {} },
     profiles: { saveVersion() {}, currentVersion() {}, listVersions() {} },

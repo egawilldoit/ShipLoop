@@ -39,6 +39,7 @@ import {
 } from '@shiploop/domain';
 import { openDatabase, type Database } from '../db.ts';
 import { migrate } from '../migrations.ts';
+import { ActiveProjectRepository } from './core.ts';
 import { ContractRepository, RequestRepository } from './contracts.ts';
 
 const OWNER = 'own-contracts-01' as OwnerId;
@@ -84,6 +85,8 @@ function expectError<T>(result: Result<T, DomainError>, code: DomainError['code'
 interface Harness {
   readonly requests: RequestRepository;
   readonly contracts: ContractRepository;
+  readonly activeProjects: ActiveProjectRepository;
+  readonly database: Database;
   readonly request: Request;
   readonly close: () => void;
 }
@@ -116,7 +119,14 @@ async function withDatabase(run: (context: Harness) => Promise<void> | void): Pr
       ),
     );
 
-    await run({ requests, contracts: new ContractRepository(connection), request, close: () => connection.close() });
+    await run({
+      requests,
+      contracts: new ContractRepository(connection),
+      activeProjects: new ActiveProjectRepository(connection),
+      database: connection,
+      request,
+      close: () => connection.close(),
+    });
   } finally {
     connection.close();
     await rm(directory, { recursive: true, force: true });
@@ -155,6 +165,79 @@ function approve(contract: DeliveryContract, at = T1): DeliveryContract {
 /* -------------------------------------------------------------------------- */
 /* Requests                                                                    */
 /* -------------------------------------------------------------------------- */
+
+/* -------------------------------------------------------------------------- */
+/* The selected project                                                        */
+/* -------------------------------------------------------------------------- */
+
+test('no selection reads as the onboarding state, not as a failure', async () => {
+  await withDatabase((context) => {
+    const active = context.activeProjects;
+    assert.equal(expectOk(active.read(OWNER)), null);
+  });
+});
+
+test('a selection carries the project identity and the name the store holds', async () => {
+  await withDatabase((context) => {
+    const selected = expectOk(context.activeProjects.select(OWNER, PROJECT, T1));
+    assert.equal(selected.projectId, PROJECT);
+    assert.equal(selected.name, 'Checkout');
+
+    const read = expectOk(context.activeProjects.read(OWNER));
+    assert.equal(read?.projectId, PROJECT);
+    assert.equal(read?.name, 'Checkout');
+  });
+});
+
+test('selecting a project this store does not hold is refused by name', async () => {
+  await withDatabase((context) => {
+    expectError(context.activeProjects.select(OWNER, 'no-such-project' as ProjectId, T1), 'NotFound');
+    assert.equal(expectOk(context.activeProjects.read(OWNER)), null);
+  });
+});
+
+test('selecting for an owner that does not exist is refused', async () => {
+  await withDatabase((context) => {
+    expectError(context.activeProjects.select('own_nobody' as OwnerId, PROJECT, T1), 'NotFound');
+  });
+});
+
+test('one owner has one selection: a second replaces the first', async () => {
+  await withDatabase((context) => {
+    expectOk(context.activeProjects.select(OWNER, PROJECT, T1));
+    const other = expectOk(context.activeProjects.select(OWNER, OTHER_PROJECT, T2));
+    assert.equal(other.projectId, OTHER_PROJECT);
+    assert.equal(expectOk(context.activeProjects.read(OWNER))?.projectId, OTHER_PROJECT);
+    // One row, not two. Two would make "the selected project" answerable two ways, which is
+    // the ambiguity the table exists to remove.
+    assert.equal(
+      context.database.prepare('SELECT count(*) AS rows FROM owner_active_project').get()?.['rows'],
+      1,
+    );
+  });
+});
+
+test('a selection survives being read by a second handle on the same file', async () => {
+  await withDatabase((context) => {
+    expectOk(context.activeProjects.select(OWNER, PROJECT, T1));
+    // Re-read through the row directly rather than the same repository: what "durable" has
+    // to mean is that the fact outlives the object that wrote it.
+    const row = context.database
+      .prepare('SELECT project_id FROM owner_active_project WHERE owner_id = ?')
+      .get(OWNER);
+    assert.equal(row?.['project_id'], PROJECT);
+  });
+});
+
+test('clearing the selection returns the owner to the onboarding state', async () => {
+  await withDatabase((context) => {
+    expectOk(context.activeProjects.select(OWNER, PROJECT, T1));
+    expectOk(context.activeProjects.clear(OWNER));
+    assert.equal(expectOk(context.activeProjects.read(OWNER)), null);
+    // Idempotent: clearing nothing is not a failure, so a retried sign-out path is not one.
+    expectOk(context.activeProjects.clear(OWNER));
+  });
+});
 
 test('a request is written once and reads back byte-equal', async () => {
   await withDatabase((context) => {

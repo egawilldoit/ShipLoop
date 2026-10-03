@@ -42,9 +42,30 @@ import {
   signInFailureProblem,
   signInRequiredProblem,
 } from '../http-error.ts';
-import type { ControllerSurface } from '../contracts.ts';
+import type { HttpProblem } from '../http-error.ts';
+import type { ControllerSurface, OwnerView } from '../contracts.ts';
 import type { ServerConfig } from '../config.ts';
 import type { SessionGuard } from '../auth-guard.ts';
+
+/**
+ * A project identity, validated the way `routes/projects.ts` validates one.
+ *
+ * The two spellings of this rule are kept identical deliberately: a project id addresses an
+ * artifact root, a workspace and a git checkout, so a value carrying `/` or `..` is a
+ * traversal rather than a name (F06-AC1). This route exists so a client never holds the
+ * answer, so it inherits the rule rather than inventing a looser one.
+ */
+const selectProjectBody = z.strictObject({
+  projectId: z
+    .string()
+    .trim()
+    .min(1, 'A project id is required.')
+    .max(128, 'A project id may be at most 128 characters.')
+    .refine(
+      (value) => !/[/\\]/.test(value) && !value.includes('..'),
+      'A project id may not contain a path separator or "..".',
+    ),
+});
 
 const provisionBody = z.strictObject({
   displayName: z
@@ -107,7 +128,14 @@ export function registerOwnerRoutes(app: FastifyInstance, options: OwnerRouteOpt
     const session = granted.value.session;
     setSessionCookie(reply, options.config, token, session.expiresAt, issuedAt);
     const csrfToken = deriveCsrfToken(session.sessionId, options.config.csrfSecret);
-    return reply.status(200).send(identityOf(session, csrfToken, await ownerEmailOf(options.controller, session.ownerId)));
+    const described = await describedOwnerOf(options.controller, session.ownerId);
+    if (described === null) {
+      // The credential was just verified, so a describe that finds nothing is a controller
+      // that cannot describe the identity it just proved. Reporting the real failure beats
+      // sending a session block with an invented owner in it (F01-AC1).
+      return sendProblem(reply, undescribedOwnerProblem());
+    }
+    return reply.status(200).send(identityOf(session, csrfToken, described));
   });
 
   app.post('/api/owner/sign-out', { preHandler: options.guard }, async (request, reply) => {
@@ -125,9 +153,45 @@ export function registerOwnerRoutes(app: FastifyInstance, options: OwnerRouteOpt
   app.get('/api/owner/session', { preHandler: options.guard }, async (request, reply) => {
     const session = request.session;
     if (session === null) return sendProblem(reply, signInRequiredProblem());
-    return reply
-      .status(200)
-      .send(identityOf(session, session.csrfToken, await ownerEmailOf(options.controller, session.ownerId)));
+    // This is the response the client reads to learn *which project it is acting in*. It
+    // must be the same on a first load and on every reload afterwards, which is why the
+    // selection is durable on the server rather than held by the client: a client-held
+    // selection is lost on reload, and the project-scoped request that follows then addresses
+    // the previous project, or none (F02-AC1, F02-AC4).
+    const described = await describedOwnerOf(options.controller, session.ownerId);
+    if (described === null) {
+      return sendProblem(reply, undescribedOwnerProblem());
+    }
+    return reply.status(200).send(identityOf(session, session.csrfToken, described));
+  });
+
+  /**
+   * Chooses the project every subsequent project-scoped call addresses (F02-AC1).
+   *
+   * `PUT` rather than `POST` because the resource is the session's current project and
+   * re-selecting one is idempotent: a stale tab resubmitting the same choice lands on the
+   * same answer rather than creating a second one. A `projectId` this deployment does not
+   * hold is the controller's 404, forwarded unchanged, so "no such project" stays a claim
+   * about existence rather than becoming "that project has no saved profile yet" (F02-AC4).
+   *
+   * Null is not accepted. "No project selected" is reached by never selecting one - it is the
+   * onboarding state the session response already reports - so a client asking to select
+   * nothing is expressing something the write has no meaning for, and is refused rather than
+   * quietly clearing the selection the owner made.
+   */
+  app.put('/api/owner/active-project', { preHandler: options.guard }, async (request, reply) => {
+    const session = request.session;
+    if (session === null) return sendProblem(reply, signInRequiredProblem());
+    const body = parseBody(selectProjectBody, request.body);
+    if (!body.ok) return sendProblem(reply, fieldsProblem(fieldErrorsOf(body.problem)));
+
+    const selected = await options.controller.owners.selectActiveProject({
+      ownerId: session.ownerId,
+      projectId: body.value.projectId,
+      at: options.now().toISOString(),
+    });
+    if (!selected.ok) return sendProblem(reply, problemFor(selected.error));
+    return reply.status(200).send({ activeProject: selected.value });
   });
 }
 
@@ -151,34 +215,60 @@ interface SessionIdentity {
  * The CSRF token is derived rather than stored, so a page that reloads can read it
  * back from this response without a second sign-in. The browser cannot reach it any
  * other way, because the cookie it belongs to is `HttpOnly` (F01-AC4).
+ *
+ * `activeProject` travels here rather than being fetched separately, and that is the fix for
+ * the historical defect rather than a convenience: the session response used to carry no
+ * project identity at all, so the client reached for one it did not have and every
+ * project-scoped request went out for a project literally named `undefined`. The server's
+ * honest 404 was then reported as "that project has no saved profile yet", which is a
+ * different and wrong claim (F02-AC1, F02-AC4).
+ *
+ * The client's only remaining job is to read `activeProjectId` when `state` is `Selected`.
+ * There is no derivation left for it to get wrong, and no value to fall back on when the
+ * owner has not chosen yet.
  */
-function identityOf(session: SessionIdentity, csrfToken: string, email: string | null): {
-  readonly owner: { readonly ownerId: OwnerId; readonly displayName: string; readonly email: string | null };
+function identityOf(session: SessionIdentity, csrfToken: string, described: OwnerView): {
+  readonly owner: OwnerView;
   readonly session: { readonly sessionId: string; readonly issuedAt: string; readonly expiresAt: string };
   readonly csrfToken: string;
 } {
   return {
-    owner: { ownerId: session.ownerId, displayName: session.displayName, email },
+    owner: described,
     session: { sessionId: session.sessionId, issuedAt: session.issuedAt, expiresAt: session.expiresAt },
     csrfToken,
   };
 }
 
 /**
- * The sign-in address for one owner, or null when the row carries none.
+ * The owner's stored identity, including which project this session addresses.
  *
- * Read through the owner repository rather than reconstructed from the display name. The
- * client used to render a blank address here and could only have filled it by re-deriving
- * the same slug rule the controller owns; two derivations of one rule drift, and a drifted
- * one shows the owner an address that is not theirs (F01-AC1).
+ * A refusal is reported as an empty owner rather than swallowed: the session path either has
+ * a proved owner or it has nothing to describe, and returning `null` here would leave the
+ * caller with an owner block it has to invent. The controller is the sole authority for the
+ * address and the project - this layer re-derives neither (F01-AC1, F02-AC1).
  */
-function ownerEmailOf(
-  controller: ControllerSurface,
-  ownerId: OwnerId,
-): Promise<string | null> {
-  return controller.owners
-    .describe({ ownerId })
-    .then((described) => (described.ok ? described.value.email : null));
+async function describedOwnerOf(controller: ControllerSurface, ownerId: OwnerId): Promise<OwnerView | null> {
+  const described = await controller.owners.describe({ ownerId });
+  if (!described.ok) return null;
+  return described.value;
+}
+
+/**
+ * The session response when the owner cannot be described.
+ *
+ * 503 rather than a session block with a blank owner in it. A credential was just verified,
+ * so the identity exists and something in the read failed; answering with a partial identity
+ * would have the client cache a session that names nobody and address nothing, which is the
+ * same defect this response set out to close (F01-AC1, F02-AC1).
+ */
+function undescribedOwnerProblem(): HttpProblem {
+  // Built through the shared mapper rather than hand-written, so the status and code are the
+  // ones every other `Unavailable` in this server already produces and the error-to-status
+  // test cannot pass while this one disagrees (N02-AC1).
+  return problemFor({
+    code: 'Unavailable',
+    reason: 'The signed-in owner could not be described, so no session identity is returned (F01-AC1).',
+  });
 }
 
 /**

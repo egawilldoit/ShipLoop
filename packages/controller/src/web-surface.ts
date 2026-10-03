@@ -161,6 +161,38 @@ export interface SurfaceStoredSession {
   readonly lastActivityAt: string | null;
 }
 
+/**
+ * The project the owner is acting in, or the state they are in when none is selected
+ * (F02-AC1, F02-AC2).
+ *
+ * A discriminated union rather than a nullable pair of fields, and that is the whole point.
+ * The defect this closes is a session response that carried no project identity at all, so
+ * the client reached for one it did not have and every project-scoped request went to a path
+ * spelled `/api/profiles/undefined`; the server's honest 404 was then reported as "that
+ * project has no saved profile yet", which is a different and wrong claim (F02-AC4).
+ *
+ * Two consequences of the union, both of which a nullable pair could not give:
+ *
+ *   - **`NoProjectSelected` is a real state with a count in it**, so an owner who has not
+ *     chosen yet is told what to do next rather than shown a blank field. No placeholder
+ *     project and no fabricated id appears anywhere: the only way to hold an
+ *     `activeProjectId` is to hold a `Selected` variant that names a project this store has.
+ *   - **The transport cannot pick the wrong variant.** Rendering `activeProjectName` from a
+ *     `NoProjectSelected` is unrepresentable rather than a bug someone has to remember to
+ *     avoid.
+ */
+export type SurfaceActiveProject =
+  | {
+      readonly state: 'Selected';
+      readonly activeProjectId: string;
+      readonly activeProjectName: string;
+    }
+  | {
+      readonly state: 'NoProjectSelected';
+      /** How many projects the owner could choose from, so onboarding can say "choose one". */
+      readonly selectableProjectCount: number;
+    };
+
 export interface SurfaceOwner {
   readonly ownerId: OwnerId;
   readonly displayName: string;
@@ -174,6 +206,15 @@ export interface SurfaceOwner {
    */
   readonly email: string | null;
   readonly createdAt: string;
+  /**
+   * Which project this session is acting in (F02-AC1).
+   *
+   * Part of the owner read rather than a separate call, because a client that has to make a
+   * second request to learn which project it is addressing has a window in which it
+   * addresses the previous one - and the previous one is what produced the defect this
+   * field exists to close.
+   */
+  readonly activeProject: SurfaceActiveProject;
 }
 
 /**
@@ -296,6 +337,20 @@ export interface SurfaceOwnerUseCases {
    * theirs (F01-AC1).
    */
   describe(command: { readonly ownerId: OwnerId }): Promise<Result<SurfaceOwner, DomainError>>;
+  /**
+   * Chooses which project every subsequent project-scoped call addresses (F02-AC1).
+   *
+   * A server-side write rather than a client-side value, for the reason above: a selection
+   * the client holds is a selection a re-established session does not have. `projectId: null`
+   * is refused rather than accepted, because "no project selected" is reached by never
+   * selecting one - the onboarding state - and a client that wanted to express it can simply
+   * not select.
+   */
+  selectActiveProject(command: {
+    readonly ownerId: OwnerId;
+    readonly projectId: string;
+    readonly at: string;
+  }): Promise<Result<SurfaceActiveProject, DomainError>>;
   signIn(command: {
     readonly identifier: string;
     readonly password: string;
@@ -1401,6 +1456,39 @@ function toSurfaceProject(record: ProjectRecord): SurfaceProject {
   };
 }
 
+/**
+ * How many projects the owner could select, for the onboarding state.
+ *
+ * Counted rather than described, because "no project selected" is only actionable if the
+ * client can say whether to invite a choice or to invite a creation. Archived projects are
+ * counted: they are in the list the owner sees, and a selector that quietly dropped them
+ * would offer fewer choices than the store holds (F02-AC1).
+ */
+function noProjectSelected(root: CompositionRoot): SurfaceActiveProject {
+  const listed = root.projects.list();
+  return {
+    state: 'NoProjectSelected',
+    selectableProjectCount: listed.ok ? listed.value.length : 0,
+  };
+}
+
+/**
+ * The project this owner has selected, or the onboarding state when none is selected.
+ *
+ * A store that cannot be read reports the onboarding state rather than an invented
+ * selection: the alternative is refusing the whole session read because of a storage
+ * problem, which would sign the owner out for a fault they cannot see or fix (F02-AC1).
+ */
+function readActiveProject(root: CompositionRoot, ownerId: OwnerId): SurfaceActiveProject {
+  const selected = root.activeProjects.read(ownerId);
+  if (!selected.ok || selected.value === null) return noProjectSelected(root);
+  return {
+    state: 'Selected',
+    activeProjectId: String(selected.value.projectId),
+    activeProjectName: selected.value.name,
+  };
+}
+
 function toSurfaceSession(record: StoredSessionRecord): SurfaceStoredSession {
   return { ...record };
 }
@@ -2274,6 +2362,10 @@ export function createControllerSurface(resolve: SurfaceRootResolver): Controlle
             // later session read cannot describe two different addresses (F01-AC1).
             email: readOwnerEmail(root, provisioned.value.ownerId),
             createdAt: provisioned.value.provisionedAt,
+            // A brand-new owner has selected nothing, and saying so is the honest answer. The
+            // alternative - defaulting to the first project in the store - would be handing a
+            // session an identity nobody chose (F02-AC1).
+            activeProject: noProjectSelected(root),
           });
         }),
 
@@ -2316,6 +2408,34 @@ export function createControllerSurface(resolve: SurfaceRootResolver): Controlle
             displayName: record.value.displayName,
             email: readOwnerEmail(root, record.value.ownerId),
             createdAt: record.value.createdAt,
+            // Read from the durable selection, not from anything the caller passed and not
+            // from the first project in the store. Both of those would answer "which project
+            // is this" with something the owner did not choose, which is the defect that
+            // produced `/api/profiles/undefined` in the first place (F02-AC1, F02-AC4).
+            activeProject: readActiveProject(root, record.value.ownerId),
+          });
+        }),
+
+      /**
+       * Records which project this owner's subsequent calls address (F02-AC1).
+       *
+       * The write is durable rather than returned to the caller to hold, because a selection
+       * the client keeps is a selection a re-established session does not have. The repository
+       * refuses a project this store does not hold, so the only way to hold an
+       * `activeProjectId` is to have named a real one.
+       */
+      selectActiveProject: async (command) =>
+        use((root) => {
+          const selected = root.activeProjects.select(
+            command.ownerId,
+            command.projectId as ProjectId,
+            command.at,
+          );
+          if (!selected.ok) return err(selected.error);
+          return ok({
+            state: 'Selected' as const,
+            activeProjectId: selected.value.projectId,
+            activeProjectName: selected.value.name,
           });
         }),
     },

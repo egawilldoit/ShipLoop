@@ -2825,6 +2825,40 @@ BEGIN
 END;
 `;
 
+/**
+ * The owner's selected project (F02-AC1, F02-AC2).
+ *
+ * One row per owner, and it exists because the project identity has to be *carried* rather
+ * than re-derived. The defect this table closes: every project-scoped route needed a project
+ * id, and nothing the client could read told it which project it was acting in, so a request
+ * went out for a project literally named "undefined" and the server's honest 404 ("no such
+ * project") was reported as "that project has no saved profile yet" - a different and wrong
+ * claim about a project's contents.
+ *
+ * The rules, in the schema where they can be:
+ *
+ *   - **Keyed by owner, not by session.** A re-established session therefore carries the same
+ *     project the owner selected before. Keying it on the session would make the answer depend
+ *     on which cookie the browser still held, so signing out and back in would silently change
+ *     what "the current project" addresses.
+ *   - **The foreign key to `projects` is what makes a selection real.** A selection is not a
+ *     string the client invents; it can only name a row this store holds. `ON DELETE CASCADE`
+ *     because a deleted project has nothing left to be the current one, and a selection pointing
+ *     at a project that no longer exists would address nothing while claiming to address
+ *     something.
+ *   - **No `active` flag anywhere else.** The project's own `archived_at` stays the only record
+ *     of whether a project is retired; a second flag here would be a second answer to "is this
+ *     project current" and the two could disagree.
+ */
+const MIGRATION_14_OWNER_ACTIVE_PROJECT = `
+CREATE TABLE owner_active_project (
+  owner_id    TEXT PRIMARY KEY REFERENCES owners(owner_id) ON DELETE CASCADE,
+  project_id  TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
+  selected_at TEXT NOT NULL
+);
+CREATE INDEX owner_active_project_by_project ON owner_active_project(project_id);
+`;
+
 const MIGRATIONS: readonly Migration[] = [
   {
     version: 1,
@@ -2941,6 +2975,13 @@ const MIGRATIONS: readonly Migration[] = [
     name: 'requests_and_delivery_contracts',
     up: (db) => {
       db.exec(MIGRATION_13_REQUESTS_AND_DELIVERY_CONTRACTS);
+    },
+  },
+  {
+    version: 14,
+    name: 'owner_active_project',
+    up: (db) => {
+      db.exec(MIGRATION_14_OWNER_ACTIVE_PROJECT);
     },
   },
 ];

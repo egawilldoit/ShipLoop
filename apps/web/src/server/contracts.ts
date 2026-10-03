@@ -147,6 +147,38 @@ export interface ProvisionOwnerCommand {
   readonly at: string;
 }
 
+/**
+ * The project this session addresses, or the state the owner is in when none is selected
+ * (F02-AC1, F02-AC2).
+ *
+ * A discriminated union rather than a nullable pair of fields, and that is the fix. The
+ * historical defect was a session response carrying no project identity at all, so the client
+ * reached for one it did not have and every project-scoped request went to a path spelled
+ * `/api/profiles/undefined`; the server's honest 404 - "no such project" - was then reported
+ * as "that project has no saved profile yet", which is a different and wrong claim about a
+ * project's contents (F02-AC4).
+ *
+ * Two properties follow from the union:
+ *
+ *   - **no fabricated identity is representable.** The only way to hold an
+ *     `activeProjectId` is to hold a `Selected` variant, which the controller produced from a
+ *     project row this store holds. There is no placeholder project and no default to fall
+ *     back on.
+ *   - **"not chosen yet" is a state with a count in it.** `selectableProjectCount` lets the UI
+ *     say "choose one of three" rather than showing an empty field, so an owner who has not
+ *     selected anything is given the next action instead of a blank.
+ */
+export type ActiveProjectView =
+  | {
+      readonly state: 'Selected';
+      readonly activeProjectId: string;
+      readonly activeProjectName: string;
+    }
+  | {
+      readonly state: 'NoProjectSelected';
+      readonly selectableProjectCount: number;
+    };
+
 export interface OwnerView {
   readonly ownerId: OwnerId;
   readonly displayName: string;
@@ -160,6 +192,14 @@ export interface OwnerView {
    */
   readonly email: string | null;
   readonly createdAt: string;
+  /**
+   * Which project this session addresses (F02-AC1).
+   *
+   * Part of the owner read rather than a second request, because a client that has to ask
+   * separately has a window in which it addresses the previous project - which is what
+   * produced the defect this field closes.
+   */
+  readonly activeProject: ActiveProjectView;
 }
 
 /**
@@ -226,6 +266,19 @@ export interface OwnerUseCases {
    * a second copy of the controller's slug rule.
    */
   describe(command: { readonly ownerId: OwnerId }): Promise<Result<OwnerView, DomainError>>;
+  /**
+   * Chooses which project every subsequent project-scoped call addresses (F02-AC1).
+   *
+   * A server-side write rather than a value the client keeps, because a selection the client
+   * holds is a selection the next session load does not have. A `projectId` this store does
+   * not hold is refused by the controller with a 404, so the only way to hold an
+   * `activeProjectId` is to have named a real one (F02-AC4).
+   */
+  selectActiveProject(command: {
+    readonly ownerId: OwnerId;
+    readonly projectId: string;
+    readonly at: string;
+  }): Promise<Result<ActiveProjectView, DomainError>>;
   /**
    * Verifies a credential and opens a session in one step.
    *
@@ -1567,7 +1620,7 @@ export interface ControllerSurface {
 }
 
 const REQUIRED_METHODS = {
-  owners: ['provision', 'signIn', 'describe'],
+  owners: ['provision', 'signIn', 'describe', 'selectActiveProject'],
   projects: ['listProjects', 'createProject'],
   sessions: ['loadByToken', 'create', 'revoke', 'touch'],
   profiles: ['saveVersion', 'currentVersion', 'listVersions'],

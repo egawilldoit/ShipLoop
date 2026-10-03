@@ -895,6 +895,113 @@ export class ProjectRepository extends SqlRepository {
   }
 }
 
+/** The whole durable record of which project the owner has selected. */
+export interface ActiveProjectStore {
+  /** The selected project and its name, or null when none is selected. */
+  read(ownerId: OwnerId): Result<ProjectRecord | null>;
+  select(ownerId: OwnerId, projectId: ProjectId, at: string): Result<ProjectRecord>;
+  /** Forgets the selection, so the next read reports the onboarding state rather than one. */
+  clear(ownerId: OwnerId): Result<true>;
+}
+
+/**
+ * Which project the owner is acting in (F02-AC1, F02-AC2, F02-AC4).
+ *
+ * This exists because the client must not be the one holding the answer. The defect it closes
+ * is historical and worth stating: every project-scoped route needs a project id, nothing the
+ * client could read told it which project it was addressing, so a request went out for a
+ * project literally named `undefined` and the server's honest 404 - "no such project" - was
+ * reported as "that project has no saved profile yet", which is a different and wrong claim
+ * about a project's contents (F02-AC4).
+ *
+ * Three properties are structural rather than conventional:
+ *
+ *   - **The name comes from a join, not from a stored copy.** A selection row that also held a
+ *     name would report a project under a name it had been renamed away from, and the owner
+ *     would be looking at a label addressing something else.
+ *   - **`select` refuses a project this store does not hold, by name.** Selecting the same
+ *     project twice succeeds and moves the instant; selecting one that is not there is a
+ *     `NotFound`, because "selected" would otherwise be a claim about a project this deployment
+ *     does not have.
+ *   - **No selection reads as null, not as a failure.** "No project selected" is the state an
+ *     owner passes through on the way to being onboarded, so it is a value. Refusing it would
+ *     make an owner who has not chosen yet indistinguishable from a broken deployment, which is
+ *     the same confusion as the 404 above.
+ */
+export class ActiveProjectRepository implements ActiveProjectStore {
+  private readonly connection: StorageConnection;
+  private readonly statements = new Map<string, StorageStatement>();
+
+  constructor(connection: StorageConnection) {
+    this.connection = connection;
+  }
+
+  private statement(sql: string): StorageStatement {
+    const cached = this.statements.get(sql);
+    if (cached !== undefined) return cached;
+    const prepared = this.connection.prepare(sql);
+    this.statements.set(sql, prepared);
+    return prepared;
+  }
+
+  private attempt<T>(description: string, body: () => Result<T, DomainError>): Result<T, DomainError> {
+    try {
+      return body();
+    } catch (error) {
+      return err({ code: 'Unavailable', reason: `${description} failed: ${failureDetail(error)}` });
+    }
+  }
+
+  read(ownerId: OwnerId): Result<ProjectRecord | null> {
+    return this.attempt('read the selected project', () => {
+      const row = this.statement(
+        `SELECT p.${PROJECT_COLUMNS.split(', ').join(', p.')}
+           FROM owner_active_project a
+           JOIN projects p ON p.project_id = a.project_id
+          WHERE a.owner_id = ?`,
+      ).get(ownerId);
+      if (row === undefined) return ok(null);
+      return ok(toProject(row));
+    });
+  }
+
+  /**
+   * Selects a project for this owner.
+   *
+   * One row per owner, replaced rather than appended: a second row would make "the selected
+   * project" answerable two ways, which is the ambiguity this table exists to remove. The
+   * upsert keeps a repeat selection from failing, and moves `selected_at` so an owner who
+   * re-selects something sees that the selection is theirs and current (F02-AC2).
+   */
+  select(ownerId: OwnerId, projectId: ProjectId, at: string): Result<ProjectRecord> {
+    return this.attempt('select a project', () => {
+      const owner = this.statement('SELECT owner_id FROM owners WHERE owner_id = ?').get(ownerId);
+      if (owner === undefined) return err(notFound('Owner', ownerId));
+      const project = this.statement('SELECT project_id FROM projects WHERE project_id = ?').get(projectId);
+      if (project === undefined) return err(notFound(`Project ${projectId}`, projectId));
+
+      this.statement(
+        `INSERT INTO owner_active_project (owner_id, project_id, selected_at) VALUES (?, ?, ?)
+         ON CONFLICT (owner_id) DO UPDATE SET project_id = excluded.project_id, selected_at = excluded.selected_at`,
+      ).run(ownerId, projectId, at);
+
+      const selected = this.read(ownerId);
+      if (!selected.ok) return err(selected.error);
+      if (selected.value === null) {
+        return err({ code: 'Unavailable', reason: `The project selected for owner ${ownerId} could not be read back.` });
+      }
+      return ok(selected.value);
+    });
+  }
+
+  clear(ownerId: OwnerId): Result<true> {
+    return this.attempt('clear the selected project', () => {
+      this.statement('DELETE FROM owner_active_project WHERE owner_id = ?').run(ownerId);
+      return ok(true);
+    });
+  }
+}
+
 /**
  * Connectors (F03-AC2, F03-AC3).
  *
