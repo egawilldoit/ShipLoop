@@ -88,6 +88,7 @@ import {
   type DeclinedExtensionView,
   type GrantedExtensionView,
   type HandoffView,
+  type MvpReviewCardView,
   type PausedRunView,
   type PlanTaskView,
   type PlanView,
@@ -1281,6 +1282,54 @@ class InMemoryController implements ControllerSurface {
         };
       }
       return notImplemented<HandoffView>('buildHandoff');
+    },
+  };
+
+  /**
+   * The review card and the owner decision (F24, F25).
+   *
+   * Both methods refuse by name rather than answering a fixture: the card is one
+   * projection over four stores, and a double that assembled its own could agree with the
+   * route while disagreeing with the use case about what is stale. The refusals are real
+   * ones this port owes its callers — a candidate this project does not hold is `NotFound`
+   * — so the cross-project case can be driven here; everything else about the card and the
+   * decision is proven against the real controller in `routes/review.test.ts`.
+   */
+  readonly mvpReview = {
+    getReview: async (command: {
+      readonly projectId: string;
+      readonly candidateId: string;
+      readonly actor: string;
+    }): Promise<Result<MvpReviewCardView, DomainError>> => {
+      const scripted = this.takeScripted('getReview');
+      if (scripted !== null) return { ok: false, error: scripted };
+      return {
+        ok: false,
+        error: {
+          code: 'NotFound',
+          reason: `This project holds no candidate ${command.candidateId} (F02-AC2).`,
+        },
+      };
+    },
+
+    decide: async (command: {
+      readonly projectId: string;
+      readonly candidateId: string;
+      readonly actor: string;
+      readonly decision: 'accepted' | 'changes_requested';
+      readonly expectedHeadSha: string;
+      readonly expectedContractRevision: number;
+      readonly feedback: string | null;
+    }): Promise<Result<MvpReviewCardView, DomainError>> => {
+      const scripted = this.takeScripted('decide');
+      if (scripted !== null) return { ok: false, error: scripted };
+      return {
+        ok: false,
+        error: {
+          code: 'NotFound',
+          reason: `This project holds no candidate ${command.candidateId} (F02-AC2).`,
+        },
+      };
     },
   };
 
@@ -4083,6 +4132,10 @@ test('the loaded controller module is validated before it can serve a request', 
       invalidateRevision() {},
     },
     handoff: { buildHandoff() {} },
+    // The review card and the owner decision, for the same reason: an MVP whose journey ends
+    // at Accept or Request Changes needs both methods declared on the surface, or the step
+    // that ends the journey is unreachable from any shipped path (F24-AC2, F25-AC2).
+    mvpReview: { getReview() {}, decide() {} },
     sessions: { loadByToken() {}, create() {}, revoke() {}, touch() {} },
     profiles: { saveVersion() {}, currentVersion() {}, listVersions() {} },
     connectors: { register() {}, listForProject() {}, revoke() {} },
@@ -4180,6 +4233,12 @@ test('the loaded controller module is validated before it can serve a request', 
     isControllerSurface(missingPlanningMethod),
     false,
     'a planning group without publication must not pass the guard: reaching the provider has to be a declared method',
+  );
+  const missingReviewDecision = { ...complete, mvpReview: { getReview() {} } };
+  assert.equal(
+    isControllerSurface(missingReviewDecision),
+    false,
+    'a review group without the decision must not pass the guard: the step that ends the MVP journey would be unreachable (F25-AC2)',
   );
 });
 test('F01-AC1: a request over the body limit is refused with its own status', async (t) => {

@@ -1190,7 +1190,11 @@ test('mvp-spec F03-AC5: no verb other than GET and POST addresses a candidate, a
     { method: 'POST', url: `/api/projects/${PROJECT_ID}/candidates/${LINKED_CANDIDATE_ID}/merge` },
     { method: 'POST', url: `/api/projects/${PROJECT_ID}/candidates/${LINKED_CANDIDATE_ID}/close` },
     { method: 'POST', url: `/api/projects/${PROJECT_ID}/candidates/${LINKED_CANDIDATE_ID}/approve` },
-    { method: 'POST', url: `/api/projects/${PROJECT_ID}/candidates/${LINKED_CANDIDATE_ID}/decision` },
+    // `POST .../decision` was listed here when the MVP transport contract had no decision
+    // route at all. It does now, and it is the owner decision named by the contract - not a
+    // provider write - so it is proved in `routes/review.test.ts` against the real controller
+    // and it no longer belongs in this list. What this file still proves is unchanged: none
+    // of the remaining verbs exists, and the candidate port itself has no provider write.
   ];
   for (const attempt of attempts) {
     const response = await h.app.inject({

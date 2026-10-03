@@ -537,10 +537,13 @@ async function harness(options: { readonly sources?: HomeEvidenceSources | null 
     reviewCards: new Proxy({} as ControllerSurface['reviewCards'], { get: () => () => notImplemented('reviewCards') }),
     acceptance: new Proxy({} as ControllerSurface['acceptance'], { get: () => () => notImplemented('acceptance') }),
     ownerTests: new Proxy({} as ControllerSurface['ownerTests'], { get: () => () => notImplemented('ownerTests') }),
-    // The home projection reads neither of these; it derives its board from the contract, candidate
-    // and review groups. They are stubbed through the same Proxy the neighbouring groups use, rather
-    // than omitted, so this double still has to satisfy the whole surface.
     handoff: new Proxy({} as ControllerSurface['handoff'], { get: () => () => notImplemented('handoff') }),
+    // The home projection reads none of these; it derives its board from the contract, candidate
+    // and review groups. They are stubbed through the same Proxy the neighbouring groups use, rather
+    // than omitted, so this double still has to satisfy the whole surface. `mvpReview` is here for
+    // that reason alone: the board composes its own projection through `sources`, and the review
+    // card routes are not exercised here at all.
+    mvpReview: new Proxy({} as ControllerSurface['mvpReview'], { get: () => () => notImplemented('mvpReview') }),
     settings: new Proxy({} as ControllerSurface['settings'], { get: () => () => notImplemented('settings') }),
     planning: new Proxy({} as ControllerSurface['planning'], { get: () => () => notImplemented('planning') }),
     generation: new Proxy({} as ControllerSurface['generation'], { get: () => () => notImplemented('generation') }),
@@ -1000,10 +1003,13 @@ test('N02-AC1: a refusal from the candidate read is not hidden behind a shorter 
     reviewCards: new Proxy({} as ControllerSurface['reviewCards'], { get: () => () => notImplemented('reviewCards') }),
     acceptance: new Proxy({} as ControllerSurface['acceptance'], { get: () => () => notImplemented('acceptance') }),
     ownerTests: new Proxy({} as ControllerSurface['ownerTests'], { get: () => () => notImplemented('ownerTests') }),
-    // The home projection reads neither of these; it derives its board from the contract, candidate
-    // and review groups. They are stubbed through the same Proxy the neighbouring groups use, rather
-    // than omitted, so this double still has to satisfy the whole surface.
     handoff: new Proxy({} as ControllerSurface['handoff'], { get: () => () => notImplemented('handoff') }),
+    // The home projection reads none of these; it derives its board from the contract, candidate
+    // and review groups. They are stubbed through the same Proxy the neighbouring groups use, rather
+    // than omitted, so this double still has to satisfy the whole surface. `mvpReview` is here for
+    // that reason alone: the board composes its own projection through `sources`, and the review
+    // card routes are not exercised here at all.
+    mvpReview: new Proxy({} as ControllerSurface['mvpReview'], { get: () => () => notImplemented('mvpReview') }),
     settings: new Proxy({} as ControllerSurface['settings'], { get: () => () => notImplemented('settings') }),
     planning: new Proxy({} as ControllerSurface['planning'], { get: () => () => notImplemented('planning') }),
     generation: new Proxy({} as ControllerSurface['generation'], { get: () => () => notImplemented('generation') }),

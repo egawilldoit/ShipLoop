@@ -23,6 +23,8 @@ import type {
   AttentionState,
   CapabilityKind,
   ConnectorId,
+  ContractStatus,
+  CriterionState,
   DomainError,
   IdeaId,
   JobId,
@@ -1944,12 +1946,271 @@ export interface HandoffUseCases {
   }): Promise<Result<HandoffView, DomainError>>;
 }
 
+/* -------------------------------------------------------------------------- */
+/* The review card and the owner decision                                       */
+/* -------------------------------------------------------------------------- */
+
+/** The criterion states the domain already enumerates; nothing here adds one. */
+type ReviewCriterionState = CriterionState;
+
+/** What a check may read. `not_run` and `stale` are members, not absences. */
+export type ReviewCheckResult =
+  | 'passed'
+  | 'failed'
+  | 'waiting'
+  | 'missing'
+  | 'capture_failed'
+  | 'stale'
+  | 'not_run';
+
+/** The two decisions the MVP ends at, and nothing else (mvp-spec 3, F25). */
+export type ReviewDecisionKind = 'accepted' | 'changes_requested';
+
+export interface ReviewRequestView {
+  readonly requestId: string;
+  readonly projectId: string;
+  readonly title: string;
+  readonly description: string;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+}
+
+export interface ReviewContractView {
+  readonly contractId: string;
+  readonly projectId: string;
+  readonly requestId: string;
+  /** The revision every criterion, every evidence row and every decision binds to. */
+  readonly revision: number;
+  readonly status: ContractStatus;
+  readonly outcome: string;
+  readonly scope: readonly string[];
+  readonly outOfScope: readonly string[];
+  readonly approval: { readonly approvedAt: string | null; readonly approvedBy: string | null };
+  readonly acceptanceCriteria: readonly {
+    readonly id: string;
+    readonly verificationType: 'automated' | 'owner_test';
+  }[];
+  readonly createdAt: string;
+  readonly updatedAt: string;
+}
+
+export interface ReviewCandidateView {
+  readonly candidateId: string;
+  readonly projectId: string;
+  readonly requestId: string;
+  readonly contractId: string;
+  readonly contractRevision: number;
+  readonly repository: string;
+  readonly pullRequestNumber: number;
+  readonly pullRequestUrl: string;
+  /** The provider's own spelling, passed through and never inferred (mvp-spec 3). */
+  readonly pullRequestState: string;
+  readonly draft: boolean;
+  readonly baseBranch: string;
+  /** The full commit SHA. Never an abbreviation, a branch name or a pull request number. */
+  readonly headSha: string;
+  readonly observedAt: string;
+}
+
+export interface ReviewPolicyView {
+  readonly policyId: string;
+  readonly requiredAutomatedCheckIds: readonly string[];
+  readonly ownerTestBlocksReview: boolean;
+  readonly ownerTestBlocksDelivery: boolean;
+}
+
+export interface ReviewCheckView {
+  readonly checkId: string;
+  readonly required: boolean;
+  readonly blocking: boolean;
+  readonly result: ReviewCheckResult;
+  readonly evidenceId: string | null;
+  readonly source: string | null;
+  readonly reason: string;
+}
+
+export interface ReviewCriterionView {
+  readonly criterionId: string;
+  readonly description: string;
+  readonly verificationType: 'automated' | 'owner_test';
+  /** Null when the contract assigned no verifier; a criterion with none is `unverified`. */
+  readonly verificationCheckId: string | null;
+  readonly state: ReviewCriterionState;
+  readonly methodKind: string;
+  readonly methodDetail: string | null;
+  readonly evidenceId: string | null;
+  readonly observedAt: string | null;
+  readonly reason: string;
+}
+
+export interface ReviewOwnerTestView {
+  readonly criterionId: string;
+  readonly description: string;
+  readonly instructions: string | null;
+  /** `pending` until the owner records a result; nothing on this card may move it. */
+  readonly state: ReviewCriterionState;
+  readonly evidenceId: string | null;
+  readonly observedAt: string | null;
+  readonly reason: string;
+}
+
+/**
+ * One recorded observation, with its staleness stated rather than implied (F20-AC3, F24-AC3).
+ *
+ * The three fields are named so that none of them can be reached for by mistake:
+ *
+ *   - `recordedOutcome` is what the source said at the time. It stays `passed` after a
+ *     later push, so it is history and never a verdict on the candidate on screen.
+ *   - `currentOutcome` is what that observation means *now*; it is `stale` whenever
+ *     `countsForCurrentCandidate` is false.
+ *   - `countsForCurrentCandidate` is the affirmative answer to "may this be shown as this
+ *     candidate's result?".
+ *
+ * There is deliberately no `outcome` member: a client that reached for it would find
+ * nothing, which is the only way this boundary can refuse to hand out the field that
+ * makes a stale pass render green (mvp-review.md, "The read model").
+ */
+export interface ReviewEvidenceView {
+  readonly evidenceId: string;
+  readonly source: 'project_command' | 'github_check' | 'browser' | 'owner_test';
+  readonly criterionId: string | null;
+  readonly checkId: string | null;
+  readonly recordedOutcome: 'passed' | 'failed' | 'waiting' | 'missing' | 'capture_failed';
+  readonly currentOutcome: 'passed' | 'failed' | 'waiting' | 'missing' | 'capture_failed' | 'stale';
+  readonly countsForCurrentCandidate: boolean;
+  readonly staleReasons: readonly string[];
+  readonly reason: string;
+  readonly observedAt: string | null;
+  /** The full commit the source said it observed, or null when it could not attribute one. */
+  readonly candidateHeadSha: string | null;
+  readonly contractRevision: number | null;
+  readonly detail: string | null;
+  readonly artifactRef: string | null;
+}
+
+export interface ReviewStalenessView {
+  readonly stale: boolean;
+  readonly reasons: readonly string[];
+  readonly staleEvidenceIds: readonly string[];
+  readonly staleDecisionIds: readonly string[];
+}
+
+/** One owner decision that no longer describes the candidate on screen (F25-AC3). */
+export interface ReviewStaleDecisionView {
+  readonly decisionId: string;
+  readonly kind: ReviewDecisionKind;
+  readonly candidateHeadSha: string;
+  readonly contractRevision: number;
+  readonly reason: string;
+}
+
+export interface ReviewOwnerDecisionView {
+  readonly decisionId: string;
+  readonly kind: ReviewDecisionKind;
+  /** The authenticated owner. Never read from a request body (F01-AC1, F25-AC4). */
+  readonly ownerId: string;
+  readonly decidedAt: string;
+  readonly requestId: string;
+  readonly contractId: string;
+  readonly contractRevision: number;
+  readonly candidateId: string;
+  readonly candidateHeadSha: string;
+  readonly feedback: string | null;
+}
+
+export interface ReviewDecisionView {
+  readonly outcome: 'none' | ReviewDecisionKind;
+  readonly decision: ReviewOwnerDecisionView | null;
+  readonly staleDecisions: readonly ReviewStaleDecisionView[];
+  /** False after a push: an acceptance for SHA A does not authorise SHA B (F27-AC3). */
+  readonly authorizesCurrentCandidate: boolean;
+}
+
+/** The three gates, kept apart because the product keeps them apart (F24-AC3, F25-AC1). */
+export interface ReviewEligibilityView {
+  readonly readyForOwnerReview: boolean;
+  readonly readyForAcceptance: boolean;
+  readonly readyForDelivery: boolean;
+  readonly blockingReasons: readonly string[];
+  readonly ownerActions: readonly string[];
+  readonly acceptanceBlockers: readonly string[];
+  readonly deliveryBlockers: readonly string[];
+}
+
+/**
+ * The whole review card, computed once (F24-AC2).
+ *
+ * `MvpReviewCardView` is a transcription of the controller's `MvpReviewCard`, and the two
+ * are kept in step by `web-surface.test.ts`, which fails if either side gains or loses a
+ * field. The card arrives by one read and is answered by one write; nothing accumulates it
+ * across requests, which is what makes the criterion states, the evidence rows and the
+ * decision on one card mutually consistent.
+ */
+export interface MvpReviewCardView {
+  readonly collectedAt: string;
+  readonly request: ReviewRequestView;
+  readonly contract: ReviewContractView;
+  readonly candidate: ReviewCandidateView;
+  readonly policy: ReviewPolicyView;
+  readonly checks: readonly ReviewCheckView[];
+  readonly criteria: readonly ReviewCriterionView[];
+  readonly ownerTests: readonly ReviewOwnerTestView[];
+  readonly evidence: readonly ReviewEvidenceView[];
+  readonly staleness: ReviewStalenessView;
+  readonly decision: ReviewDecisionView;
+  readonly eligibility: ReviewEligibilityView;
+}
+
+export interface ReadMvpReviewCommand {
+  readonly projectId: string;
+  readonly candidateId: string;
+  /** The owner the session proved. Never read from the body (F01-AC1). */
+  readonly actor: string;
+}
+
+/**
+ * Accept, or Request Changes.
+ *
+ * `expectedHeadSha` and `expectedContractRevision` are required: they are the identity the
+ * owner's page was rendered against, and comparing them against the live candidate is what
+ * turns an action taken from an outdated card into a `Conflict` rather than a decision
+ * about whatever the candidate has become (F24-AC4, F25-AC3). There is no owner field
+ * here, so a decision cannot be attributed to anybody but the session that made it.
+ */
+export interface RecordMvpOwnerDecisionCommand extends ReadMvpReviewCommand {
+  readonly decision: ReviewDecisionKind;
+  readonly expectedHeadSha: string;
+  readonly expectedContractRevision: number;
+  readonly feedback: string | null;
+}
+
+/**
+ * The MVP review card and the owner's decision (F24, F25).
+ *
+ * Two methods and nothing else: this group has no `merge`, no `deploy` and no provider
+ * write, so "ShipLoop v0.1 ends at Accepted or Changes Requested" is a property of the
+ * type rather than of a reviewer's memory. Both answer the whole card, so a decision
+ * returns the state it produced rather than leaving the client to re-read.
+ */
+export interface MvpReviewUseCases {
+  getReview(command: ReadMvpReviewCommand): Promise<Result<MvpReviewCardView, DomainError>>;
+  decide(command: RecordMvpOwnerDecisionCommand): Promise<Result<MvpReviewCardView, DomainError>>;
+}
+
 /** The whole injected surface. One argument, so a missing use case is a type error. */
 export interface ControllerSurface {
   readonly owners: OwnerUseCases;
   readonly projects: ProjectUseCases;
   readonly contracts: ContractUseCases;
   readonly handoff: HandoffUseCases;
+  /**
+   * The review card and the owner's decision (F24, F25).
+   *
+   * Declared on the surface rather than resolved optionally: a review card and a decision
+   * are the last step of the MVP journey, and a group a route has to discover at runtime
+   * is the same invisibility that left generation implemented and unreachable (L02-AC2).
+   */
+  readonly mvpReview: MvpReviewUseCases;
   readonly sessions: SessionUseCases;
   readonly profiles: ProfileUseCases;
   readonly connectors: ConnectorUseCases;
@@ -1982,6 +2243,10 @@ const REQUIRED_METHODS = {
     'invalidateRevision',
   ],
   handoff: ['buildHandoff'],
+  // The review card and the owner decision, for the same reason `settings` is declared:
+  // an MVP whose journey ends at Accept or Request Changes needs both methods reachable
+  // from a shipped path (F24, F25).
+  mvpReview: ['getReview', 'decide'],
   sessions: ['loadByToken', 'create', 'revoke', 'touch'],
   profiles: ['saveVersion', 'currentVersion', 'listVersions'],
   connectors: ['register', 'listForProject', 'revoke'],
