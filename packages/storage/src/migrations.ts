@@ -3016,6 +3016,48 @@ CREATE INDEX mvp_owner_decisions_by_request
   ON mvp_owner_decisions(request_id, contract_revision, candidate_head_sha, decided_at DESC);
 `;
 
+/**
+ * Project-scoped settings (mvp-spec 3 "Settings"; L02-AC2).
+ *
+ * `project_settings` holds what the owner configured for one project and nothing
+ * else. It exists because no other table can hold it honestly:
+ *
+ *   - `projects` is identity: a project id, a display name and its archival. A launch URL
+ *     is not part of what a project *is*, and putting it there would make every project
+ *     read - the selector, the session response, the attention board - carry a settings
+ *     field it has no business publishing.
+ *   - `project_profile_versions` is versioned and append-only, and its content is
+ *     validated against the adapter capabilities a run needs (F02-AC3, F02-AC4). A T3 URL is
+ *     an optional launch target with no capability attached, so requiring a profile version
+ *     - or a configured adapter - to save it would make it impossible on exactly the
+ *     deployment the MVP promises works (MVP: the journey must work with no configured
+ *     provider).
+ *   - `procedure_versions` is a versioned fact or procedure with a version number and an
+ *     approval state. A setting the owner clears and re-enters is current state, not
+ *     history, and a version per keystroke would be noise rather than an audit trail.
+ *
+ * So one row per project, mutable in place, with `t3_launch_url` nullable because "no T3
+ * deployment is configured" is a normal state the handoff packet survives (L02-AC3). The
+ * scheme CHECK is the same rule the controller validates, enforced here as well: a value
+ * that is not an HTTP or HTTPS absolute URL cannot reach the column even from a caller
+ * that cast past the use case. Comparison is case-insensitive because `URL` normalises the
+ * scheme, so `HTTPS://...` is a value the controller accepts and must therefore be a value
+ * this table accepts too.
+ */
+const MIGRATION_17_PROJECT_SETTINGS = `
+CREATE TABLE project_settings (
+  project_id    TEXT PRIMARY KEY REFERENCES projects(project_id) ON DELETE CASCADE,
+  t3_launch_url TEXT,
+  updated_at    TEXT NOT NULL DEFAULT ${NOW},
+  CHECK (t3_launch_url IS NULL OR length(trim(t3_launch_url)) > 0),
+  CHECK (
+    t3_launch_url IS NULL
+    OR lower(substr(trim(t3_launch_url), 1, 8)) = 'https://'
+    OR lower(substr(trim(t3_launch_url), 1, 7)) = 'http://'
+  )
+);
+`;
+
 const MIGRATIONS: readonly Migration[] = [
   {
     version: 1,
@@ -3182,6 +3224,18 @@ const MIGRATIONS: readonly Migration[] = [
       ]) {
         db.exec(trigger);
       }
+    },
+  },
+  {
+    // Numbered 17 rather than 13: versions 13-16 are the authoritative ordered ledger a
+    // database replays, and four parallel slices claimed 13 while being built. This slice
+    // takes the next free number instead of inserting into the middle of an applied
+    // history, because a migration cannot be inserted out of order once a database has
+    // recorded the ones after it (N01-AC3).
+    version: 17,
+    name: 'project_settings',
+    up: (db) => {
+      db.exec(MIGRATION_17_PROJECT_SETTINGS);
     },
   },
 ];
