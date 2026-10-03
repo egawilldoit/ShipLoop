@@ -942,12 +942,22 @@ class InMemoryController implements ControllerSurface {
       readonly projectId: string;
       readonly requestId: string;
       readonly actor: OwnerId;
-    }): Promise<Result<readonly ContractView[], DomainError>> =>
-      ok(
+    }): Promise<Result<readonly ContractView[], DomainError>> => {
+      // The request is read first and refused when it is not here, matching the real
+      // surface. A listing that answered `[]` for a request id from another project would
+      // make a route test pass on an empty body where production answers 404, and "this
+      // request has no revisions" is not what that path means (F02-AC2).
+      const request = this.requestRecords.get(command.requestId);
+      if (request === undefined || request.projectId !== command.projectId) {
+        return { ok: false, error: { code: 'NotFound', reason: `Request ${command.requestId} does not exist.` } };
+      }
+      return ok(
         [...this.contractRevisions.values()]
-          .filter((contract) => contract.projectId === command.projectId && contract.requestId === command.requestId)
-          .sort((left, right) => left.revision - right.revision),
-      ),
+          .filter((contract) => contract.requestId === command.requestId)
+          .sort((left, right) => left.revision - right.revision)
+          .map((contract) => this.projected(contract)),
+      );
+    },
 
     listContractCriteria: async (command: {
       readonly projectId: string;
@@ -1119,11 +1129,38 @@ class InMemoryController implements ControllerSurface {
     return `2026-03-01T${String(9 + this.contractTicks).padStart(2, '0')}:00:00.000Z`;
   }
 
-  /** One revision, addressed by project as well as identity and number (F02-AC2). */
+  /**
+   * One revision, addressed by project as well as identity and number (F02-AC2).
+   *
+   * The revision comes back projected, so a read reports `answersCurrentRequest` against
+   * the request as it reads *now* rather than as it read when the revision was drafted -
+   * which is what the real surface does, and what makes an edit to the request visible
+   * against an approved revision instead of leaving it silently current (mvp-spec 3).
+   */
   private revisionOf(projectId: string, contractId: string, revision: number): ContractView | null {
     const stored = this.contractRevisions.get(`${contractId}#${revision}`);
     if (stored === undefined || stored.projectId !== projectId) return null;
-    return stored;
+    return this.projected(stored);
+  }
+
+  /** The fingerprint of a request's current text, as the real surface computes it. */
+  private requestFingerprintOf(projectId: string, requestId: string): string {
+    const request = this.requestRecords.get(requestId);
+    return fingerprint({
+      projectId,
+      title: request?.title ?? '',
+      description: request?.description ?? '',
+      sourceIdeaId: request?.sourceIdeaId ?? null,
+    });
+  }
+
+  /** A revision with the one field that is a report about the request, recomputed. */
+  private projected(contract: ContractView): ContractView {
+    return {
+      ...contract,
+      answersCurrentRequest:
+        contract.requestFingerprint === this.requestFingerprintOf(contract.projectId, contract.requestId),
+    };
   }
 
   private storeRevision(contract: ContractView): void {
@@ -1142,7 +1179,6 @@ class InMemoryController implements ControllerSurface {
       readonly acceptanceCriteria: readonly ContractCriterionView[];
     },
   ): ContractView {
-    const request = this.requestRecords.get(requestId);
     const at = this.contractInstant();
     const contract: ContractView = {
       contractId: `dc_${this.contractRevisions.size + 1}`,
@@ -1157,12 +1193,7 @@ class InMemoryController implements ControllerSurface {
       contentFingerprint: fingerprint(content),
       // The fingerprint of the request text as it stands now, so a later edit is detectable -
       // reported as `answersCurrentRequest: false` rather than acted on (mvp-spec 3).
-      requestFingerprint: fingerprint({
-        projectId,
-        title: request?.title ?? '',
-        description: request?.description ?? '',
-        sourceIdeaId: request?.sourceIdeaId ?? null,
-      }),
+      requestFingerprint: this.requestFingerprintOf(projectId, requestId),
       answersCurrentRequest: true,
       approvedAt: null,
       approvedBy: null,
@@ -1188,8 +1219,9 @@ class InMemoryController implements ControllerSurface {
       return { ok: false, error: { code: 'NotFound', reason: `Request ${requestId} does not exist.` } };
     }
     const revisions = [...this.contractRevisions.values()]
-      .filter((contract) => contract.projectId === projectId && contract.requestId === requestId)
-      .sort((left, right) => left.revision - right.revision);
+      .filter((contract) => contract.requestId === requestId)
+      .sort((left, right) => left.revision - right.revision)
+      .map((contract) => this.projected(contract));
     return ok({
       request,
       latestRevision: revisions[revisions.length - 1] ?? null,
@@ -2768,11 +2800,58 @@ test('mvp-spec 3, F02-AC2: nothing here crosses a project boundary', async () =>
         payload: CONTRACT_CONTENT,
       }),
     },
+    {
+      label: 'list the revisions of a request in another project',
+      response: await h.app.inject({
+        method: 'GET',
+        url: `/api/projects/${elsewhere}/requests/${request.requestId}/contracts`,
+        headers: { cookie: session.cookie },
+      }),
+    },
+    {
+      label: 'read the criteria of a revision in another project',
+      response: await h.app.inject({
+        method: 'GET',
+        url: `/api/projects/${elsewhere}/contracts/${contract.contractId}/1/criteria`,
+        headers: { cookie: session.cookie },
+      }),
+    },
+    {
+      label: 'edit a revision in another project',
+      response: await h.app.inject({
+        method: 'PATCH',
+        url: `/api/projects/${elsewhere}/contracts/${contract.contractId}/1`,
+        headers: { cookie: session.cookie, [CSRF_HEADER]: session.csrfToken },
+        payload: { ...CHANGED_CONTRACT_CONTENT, expectedUpdatedAt: contract.updatedAt },
+      }),
+    },
+    {
+      label: 'revise a revision in another project',
+      response: await h.app.inject({
+        method: 'POST',
+        url: `/api/projects/${elsewhere}/contracts/${contract.contractId}/1/revise`,
+        headers: { cookie: session.cookie, [CSRF_HEADER]: session.csrfToken },
+        payload: CHANGED_CONTRACT_CONTENT,
+      }),
+    },
+    {
+      label: 'retire an approval in another project',
+      response: await h.app.inject({
+        method: 'POST',
+        url: `/api/projects/${elsewhere}/contracts/${contract.contractId}/1/invalidate`,
+        headers: { cookie: session.cookie, [CSRF_HEADER]: session.csrfToken },
+        payload: { reason: 'WithdrawnByOwner' },
+      }),
+    },
   ];
 
   for (const { label, response } of writes) {
     assert.equal(response.statusCode, 404, `${label} must be a 404: ${response.body}`);
     assert.equal(parse<ErrorPayload>(response).error.code, 'NotFound', label);
+    // Never an empty success: an empty list would tell the caller "that project has no
+    // requests / no revisions", which is a claim about another project's contents and is
+    // the answer that made a cross-project read look like a read that succeeded (F02-AC2).
+    assert.doesNotMatch(response.body, /"(contracts|criteria)":\s*\[\]/, label);
   }
 
   // None of the refused writes changed anything.
@@ -2786,6 +2865,380 @@ test('mvp-spec 3, F02-AC2: nothing here crosses a project boundary', async () =>
   assert.equal(read.request.title, 'Checkout totals');
   assert.equal(read.latestRevision?.status, 'draft');
   assert.equal(read.approvedRevision, null);
+});
+
+test('mvp-spec 3, F02-AC2: an id that addresses nothing is a 404 on every route, never an empty success', async () => {
+  const h = await harness();
+  const session = await signIn(h.app);
+  const request = await createRequest(h, session);
+  const contract = await draftContract(h, session, request.requestId);
+
+  const probes: readonly {
+    readonly label: string;
+    readonly method: 'GET' | 'POST' | 'PATCH';
+    readonly url: string;
+    readonly payload: Record<string, unknown> | null;
+  }[] = [
+    { label: 'read an unknown request', method: 'GET', url: `/api/projects/${PROJECT_ID}/requests/req_nope`, payload: null },
+    {
+      label: 'edit an unknown request',
+      method: 'PATCH',
+      url: `/api/projects/${PROJECT_ID}/requests/req_nope`,
+      payload: { title: 'Renamed', expectedUpdatedAt: request.updatedAt },
+    },
+    {
+      label: 'list the revisions of an unknown request',
+      method: 'GET',
+      url: `/api/projects/${PROJECT_ID}/requests/req_nope/contracts`,
+      payload: null,
+    },
+    {
+      label: 'draft against an unknown request',
+      method: 'POST',
+      url: `/api/projects/${PROJECT_ID}/requests/req_nope/contracts`,
+      payload: CONTRACT_CONTENT,
+    },
+    {
+      label: 'read an unknown contract',
+      method: 'GET',
+      url: `/api/projects/${PROJECT_ID}/contracts/dc_nope/1`,
+      payload: null,
+    },
+    {
+      label: 'read the criteria of an unknown contract',
+      method: 'GET',
+      url: `/api/projects/${PROJECT_ID}/contracts/dc_nope/1/criteria`,
+      payload: null,
+    },
+    {
+      label: 'edit an unknown contract',
+      method: 'PATCH',
+      url: `/api/projects/${PROJECT_ID}/contracts/dc_nope/1`,
+      payload: { ...CONTRACT_CONTENT, expectedUpdatedAt: contract.updatedAt },
+    },
+    {
+      label: 'approve an unknown contract',
+      method: 'POST',
+      url: `/api/projects/${PROJECT_ID}/contracts/dc_nope/1/approve`,
+      payload: {},
+    },
+    {
+      label: 'revise an unknown contract',
+      method: 'POST',
+      url: `/api/projects/${PROJECT_ID}/contracts/dc_nope/1/revise`,
+      payload: CONTRACT_CONTENT,
+    },
+    {
+      label: 'retire an unknown approval',
+      method: 'POST',
+      url: `/api/projects/${PROJECT_ID}/contracts/dc_nope/1/invalidate`,
+      payload: { reason: 'WithdrawnByOwner' },
+    },
+    // A contract that exists with a revision number it does not hold: the pair is the
+    // identity, so an absent member of it is absent, not "revision 0" and not the newest.
+    {
+      label: 'read a revision number that does not exist',
+      method: 'GET',
+      url: `/api/projects/${PROJECT_ID}/contracts/${contract.contractId}/7`,
+      payload: null,
+    },
+    {
+      label: 'edit a revision number that does not exist',
+      method: 'PATCH',
+      url: `/api/projects/${PROJECT_ID}/contracts/${contract.contractId}/7`,
+      payload: { ...CHANGED_CONTRACT_CONTENT, expectedUpdatedAt: contract.updatedAt },
+    },
+    {
+      label: 'approve a revision number that does not exist',
+      method: 'POST',
+      url: `/api/projects/${PROJECT_ID}/contracts/${contract.contractId}/7/approve`,
+      payload: {},
+    },
+  ];
+
+  for (const probe of probes) {
+    const response = await h.app.inject({
+      method: probe.method,
+      url: probe.url,
+      headers: { cookie: session.cookie, ...(probe.method === 'GET' ? {} : { [CSRF_HEADER]: session.csrfToken }) },
+      ...(probe.payload === null ? {} : { payload: probe.payload }),
+    });
+    assert.equal(response.statusCode, 404, `${probe.label} must be a 404: ${response.body}`);
+    assert.equal(parse<ErrorPayload>(response).error.code, 'NotFound', probe.label);
+    assert.doesNotMatch(response.body, /"(contracts|criteria)":\s*\[\]/, probe.label);
+  }
+
+  // The real revision is still exactly where it was: a refusal that had written something
+  // would be a worse answer than a refusal that did not (F02-AC2).
+  const stillThere = parse<{ contract: ContractView }>(
+    await h.app.inject({
+      method: 'GET',
+      url: `/api/projects/${PROJECT_ID}/contracts/${contract.contractId}/1`,
+      headers: { cookie: session.cookie },
+    }),
+  );
+  assert.equal(stillThere.contract.status, 'draft');
+  assert.equal(stillThere.contract.outcome, CONTRACT_CONTENT.outcome);
+  assert.equal(stillThere.contract.contentFingerprint, contract.contentFingerprint);
+});
+
+test('mvp-spec 3: every revision is readable by its own number, and the listing agrees with them', async () => {
+  const h = await harness();
+  const session = await signIn(h.app);
+  const request = await createRequest(h, session);
+  const first = await draftContract(h, session, request.requestId);
+  await approveRevision(h, session, first.contractId, 1);
+
+  const revised = await h.app.inject({
+    method: 'POST',
+    url: `/api/projects/${PROJECT_ID}/contracts/${first.contractId}/1/revise`,
+    headers: { cookie: session.cookie, [CSRF_HEADER]: session.csrfToken },
+    payload: CHANGED_CONTRACT_CONTENT,
+  });
+  assert.equal(revised.statusCode, 201, revised.body);
+  const second = parse<{ contract: ContractView }>(revised).contract;
+
+  // Each revision answers under its own identity and its own number. A revision is a
+  // different agreement with a fresh identity, so reading revision 2 is not "revision 2 of
+  // contract X" with the number acting as decoration (mvp-spec 3).
+  const readSecond = parse<{ contract: ContractView }>(
+    await h.app.inject({
+      method: 'GET',
+      url: `/api/projects/${PROJECT_ID}/contracts/${second.contractId}/2`,
+      headers: { cookie: session.cookie },
+    }),
+  );
+  assert.equal(readSecond.contract.revision, 2);
+  assert.equal(readSecond.contract.outcome, CHANGED_CONTRACT_CONTENT.outcome);
+
+  // The superseded revision keeps answering at revision 1 with the text it was approved
+  // under: a candidate measured against it must still be able to say what it was measured
+  // against (mvp-spec 3).
+  const readFirst = parse<{ contract: ContractView }>(
+    await h.app.inject({
+      method: 'GET',
+      url: `/api/projects/${PROJECT_ID}/contracts/${first.contractId}/1`,
+      headers: { cookie: session.cookie },
+    }),
+  );
+  assert.equal(readFirst.contract.revision, 1);
+  assert.equal(readFirst.contract.status, 'stale');
+  assert.equal(readFirst.contract.outcome, CONTRACT_CONTENT.outcome);
+
+  // The listing names exactly those two, oldest first, and carries the same identities the
+  // per-revision reads did (mvp-spec 3).
+  const listed = parse<{ contracts: readonly ContractView[] }>(
+    await h.app.inject({
+      method: 'GET',
+      url: `/api/projects/${PROJECT_ID}/requests/${request.requestId}/contracts`,
+      headers: { cookie: session.cookie },
+    }),
+  );
+  assert.deepEqual(
+    listed.contracts.map((contract) => [contract.contractId, contract.revision, contract.status]),
+    [
+      [first.contractId, 1, 'stale'],
+      [second.contractId, 2, 'draft'],
+    ],
+  );
+});
+
+test('mvp-spec 3: approval binds one exact revision and leaves every other revision as it was', async () => {
+  const h = await harness();
+  const session = await signIn(h.app);
+  const request = await createRequest(h, session);
+  const first = await draftContract(h, session, request.requestId);
+  const approvedFirst = await approveRevision(h, session, first.contractId, 1);
+
+  const revised = await h.app.inject({
+    method: 'POST',
+    url: `/api/projects/${PROJECT_ID}/contracts/${first.contractId}/1/revise`,
+    headers: { cookie: session.cookie, [CSRF_HEADER]: session.csrfToken },
+    payload: CHANGED_CONTRACT_CONTENT,
+  });
+  assert.equal(revised.statusCode, 201, revised.body);
+  const second = parse<{ contract: ContractView }>(revised).contract;
+
+  // Before the second approval nothing about the second revision is approved, and the
+  // approval that exists names revision 1.
+  const midway = parse<RequestDetailView>(
+    await h.app.inject({
+      method: 'GET',
+      url: `/api/projects/${PROJECT_ID}/requests/${request.requestId}`,
+      headers: { cookie: session.cookie },
+    }),
+  );
+  assert.equal(midway.approvedRevision, null);
+  assert.equal(midway.latestRevision?.status, 'draft');
+
+  const approvedSecond = await approveRevision(h, session, second.contractId, 2);
+  assert.equal(approvedSecond.revision, 2);
+  assert.equal(approvedSecond.status, 'approved');
+  assert.equal(approvedSecond.approvedBy, OWNER_ID, 'the approver is the session, never the body');
+  assert.match(approvedSecond.approvedAt ?? '', /^2026-03-01T/);
+  assert.equal(approvedSecond.blockedBecause, null);
+
+  // The approval is bound to the revision it was asked for: revision 1 is untouched by the
+  // fact that revision 2 exists and is approved.
+  const detail = parse<RequestDetailView>(
+    await h.app.inject({
+      method: 'GET',
+      url: `/api/projects/${PROJECT_ID}/requests/${request.requestId}`,
+      headers: { cookie: session.cookie },
+    }),
+  );
+  assert.equal(detail.approvedRevision?.contractId, second.contractId);
+  assert.equal(detail.approvedRevision?.revision, 2);
+  assert.deepEqual(
+    detail.revisions.map((revision) => [revision.revision, revision.status]),
+    [
+      [1, 'stale'],
+      [2, 'approved'],
+    ],
+  );
+  assert.equal(detail.revisions[0]?.outcome, CONTRACT_CONTENT.outcome, 'revision 1 kept its own text');
+  assert.equal(detail.revisions[0]?.approvedBy, OWNER_ID, 'revision 1 kept its own approver');
+  assert.equal(detail.revisions[0]?.approvedAt, approvedFirst.approvedAt);
+});
+
+test('mvp-spec 3: a refused approval records nothing, so the revision is still a draft to approve', async () => {
+  const h = await harness();
+  const session = await signIn(h.app);
+  const request = await createRequest(h, session);
+  const contract = await draftContract(h, session, request.requestId);
+
+  // No session: the guard refuses before the handler, so nothing is attributed and nothing
+  // is written. This is the shape of "the executor cannot approve": there is no request
+  // this server answers that approves anything without an authenticated owner's session
+  // (mvp-spec 3, F01-AC1).
+  const anonymous = await h.app.inject({
+    method: 'POST',
+    url: `/api/projects/${PROJECT_ID}/contracts/${contract.contractId}/1/approve`,
+    payload: {},
+  });
+  assert.equal(anonymous.statusCode, 401, anonymous.body);
+
+  // Every attempt to name the approver, the status or the actor in the body is refused by
+  // name, so a client cannot believe it chose who approved (mvp-spec 3).
+  for (const payload of [
+    { approvedBy: 'own_somebody_else' },
+    { status: 'approved' },
+    { actor: 'own_somebody_else' },
+    { role: 'Owner' },
+    { owner: 'own_somebody_else' },
+  ]) {
+    const refused = await h.app.inject({
+      method: 'POST',
+      url: `/api/projects/${PROJECT_ID}/contracts/${contract.contractId}/1/approve`,
+      headers: { cookie: session.cookie, [CSRF_HEADER]: session.csrfToken },
+      payload,
+    });
+    assert.equal(refused.statusCode, 400, `${JSON.stringify(payload)} must be refused: ${refused.body}`);
+  }
+
+  // After every refusal the revision is still the draft it was, addressed by its own
+  // number. A refusal that had half-approved would leave the owner unable to tell whether
+  // the agreement they read is the agreement that was approved.
+  const read = parse<{ contract: ContractView }>(
+    await h.app.inject({
+      method: 'GET',
+      url: `/api/projects/${PROJECT_ID}/contracts/${contract.contractId}/1`,
+      headers: { cookie: session.cookie },
+    }),
+  );
+  assert.equal(read.contract.status, 'draft');
+  assert.equal(read.contract.approvedBy, null);
+  assert.equal(read.contract.approvedAt, null);
+  assert.equal(read.contract.contentFingerprint, contract.contentFingerprint);
+});
+
+test('mvp-spec 3: a retired revision is history, so it is not editable either', async () => {
+  const h = await harness();
+  const session = await signIn(h.app);
+  const request = await createRequest(h, session);
+  const contract = await draftContract(h, session, request.requestId);
+  const approved = await approveRevision(h, session, contract.contractId, 1);
+
+  const retired = await h.app.inject({
+    method: 'POST',
+    url: `/api/projects/${PROJECT_ID}/contracts/${contract.contractId}/1/invalidate`,
+    headers: { cookie: session.cookie, [CSRF_HEADER]: session.csrfToken },
+    payload: { reason: 'WithdrawnByOwner' },
+  });
+  assert.equal(retired.statusCode, 200, retired.body);
+
+  // A retired revision is kept for history, which means its text still says what it said -
+  // and editing it would rewrite the thing a past candidate was measured against (mvp-spec 3).
+  const edit = await h.app.inject({
+    method: 'PATCH',
+    url: `/api/projects/${PROJECT_ID}/contracts/${contract.contractId}/1`,
+    headers: { cookie: session.cookie, [CSRF_HEADER]: session.csrfToken },
+    payload: { ...CHANGED_CONTRACT_CONTENT, expectedUpdatedAt: approved.updatedAt },
+  });
+  assert.equal(edit.statusCode, 400, edit.body);
+  assert.match(edit.body, /stale/i);
+
+  const read = parse<{ contract: ContractView }>(
+    await h.app.inject({
+      method: 'GET',
+      url: `/api/projects/${PROJECT_ID}/contracts/${contract.contractId}/1`,
+      headers: { cookie: session.cookie },
+    }),
+  );
+  assert.equal(read.contract.status, 'stale');
+  assert.equal(read.contract.outcome, CONTRACT_CONTENT.outcome, 'the retired text is unchanged');
+  assert.equal(read.contract.contentFingerprint, contract.contentFingerprint);
+  assert.equal(read.contract.approvedBy, OWNER_ID, 'history keeps the approver it had');
+});
+
+test('mvp-spec 3: a request edit under an approved revision is reported, never absorbed', async () => {
+  const h = await harness();
+  const session = await signIn(h.app);
+  const request = await createRequest(h, session);
+  const contract = await draftContract(h, session, request.requestId);
+  const approved = await approveRevision(h, session, contract.contractId, 1);
+
+  const edited = await h.app.inject({
+    method: 'PATCH',
+    url: `/api/projects/${PROJECT_ID}/requests/${request.requestId}`,
+    headers: { cookie: session.cookie, [CSRF_HEADER]: session.csrfToken },
+    payload: { description: 'The order summary must also show the shipping total.', expectedUpdatedAt: request.updatedAt },
+  });
+  assert.equal(edited.statusCode, 200, edited.body);
+
+  // The revision is frozen and the frozen text is what it was. What changed is whether it
+  // still answers the request, and the API says so rather than letting an approval read as
+  // though it covered a request nobody wrote (mvp-spec 3).
+  const read = parse<{ contract: ContractView }>(
+    await h.app.inject({
+      method: 'GET',
+      url: `/api/projects/${PROJECT_ID}/contracts/${contract.contractId}/1`,
+      headers: { cookie: session.cookie },
+    }),
+  );
+  assert.equal(read.contract.status, 'approved', 'the approval is not silently dropped');
+  assert.equal(read.contract.approvedBy, OWNER_ID);
+  assert.equal(read.contract.approvedAt, approved.approvedAt);
+  assert.equal(read.contract.outcome, CONTRACT_CONTENT.outcome, 'the approved text is unchanged');
+  assert.equal(read.contract.contentFingerprint, contract.contentFingerprint);
+  assert.equal(
+    read.contract.answersCurrentRequest,
+    false,
+    'an approval that no longer answers the request must be reported as such, not presented as current',
+  );
+
+  // The request read carries the same report in its contract context, so a client does not
+  // have to ask twice and get two different moments (mvp-spec 3).
+  const detail = parse<RequestDetailView>(
+    await h.app.inject({
+      method: 'GET',
+      url: `/api/projects/${PROJECT_ID}/requests/${request.requestId}`,
+      headers: { cookie: session.cookie },
+    }),
+  );
+  assert.equal(detail.approvedRevision?.answersCurrentRequest, false);
+  assert.equal(detail.approvedRevision?.status, 'approved');
+  assert.equal(detail.request.description, 'The order summary must also show the shipping total.');
 });
 
 test('F01-AC1: every request and contract route refuses an anonymous caller', async () => {
