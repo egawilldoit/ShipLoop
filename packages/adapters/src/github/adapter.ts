@@ -73,6 +73,7 @@ import {
   type ConnectorId,
   type DomainError,
   type ProviderId,
+  type PullRequestState,
   type Result,
 } from '@shiploop/domain';
 
@@ -103,6 +104,8 @@ import {
   type PushBranchRequest,
   type ReadChecksRequest,
   type ReadGitStateRequest,
+  type ReadLinkedPullRequestRequest,
+  type LinkedPullRequestFacts,
   type TicketIssueRef,
   type UpsertDraftOutcome,
   type UpsertDraftRequest,
@@ -300,6 +303,15 @@ interface PullRequestShape {
   readonly baseRef: string;
   readonly baseSha: CommitSha;
   readonly userLogin: string | null;
+  /**
+   * `owner/repository` the head branch lives in, or null when GitHub did not report one.
+   *
+   * A pull request opened from a fork has its head in another repository entirely. GitHub
+   * still reports the code as a diff against this repository, so a reader that only looked
+   * at the base would attribute a stranger's commits to this project. Captured here so the
+   * decision to refuse that is made from the payload rather than from an assumption.
+   */
+  readonly headRepository: string | null;
 }
 
 function readPullRequest(value: unknown): PullRequestShape | null {
@@ -335,6 +347,7 @@ function readPullRequest(value: unknown): PullRequestShape | null {
     baseRef,
     baseSha: base,
     userLogin: str(field(field(value, 'user'), 'login')),
+    headRepository: str(field(field(field(value, 'head'), 'repo'), 'full_name')),
   };
 }
 
@@ -1274,6 +1287,102 @@ export class GitHubGitAdapter implements GitAdapter {
       base: base.value,
       pullRequest: pullRequest.value === null ? null : pullRequestRefOf(pullRequest.value),
       reviews: policyRules.value,
+      observedAt: context.clock.now(),
+    });
+  }
+
+  /**
+   * Reads one pull request the owner named, by number.
+   *
+   * This is the read side of manual candidate linking, and it is deliberately narrow: no
+   * branch here can push, merge, close, approve, deploy or change a protection rule. The
+   * MVP's external workflow creates the pull request; ShipLoop's job begins once its
+   * address exists, and everything below only *reads*.
+   *
+   * The order of the checks is the order of the questions an owner is asking, and each
+   * refusal answers a different one:
+   *
+   *   1. is this repository one this provider owns? A same-named repository at another
+   *      provider is a different repository, so acting on it would read the wrong code;
+   *   2. is the repository name one GitHub paths can be built from?
+   *   3. does the number name a pull request at all?
+   *   4. can this credential read the repository? This is also the accessibility check:
+   *      a repository the credential cannot open produces GitHub's own refusal, and
+   *      "you cannot see this" is not reported as "it does not exist";
+   *   5. is the repository archived? An archived repository's pull requests are read-only,
+   *      so linking one as new work would promise something nobody can do;
+   *   6. does the pull request exist, and does it carry two full commit SHAs?
+   *
+   * The head and base SHAs come from one payload in one call, so the identity the caller
+   * records is internally consistent rather than a composite of two reads that could
+   * straddle a push.
+   */
+  async readLinkedPullRequest(
+    context: AdapterContext,
+    request: ReadLinkedPullRequestRequest,
+  ): Promise<Result<LinkedPullRequestFacts>> {
+    const foreign = refuseForeignRepository(request.repository, context.redact);
+    if (foreign !== null) return err(foreign);
+    const names = parseRepositoryName(request.repository.fullName);
+    if (!names.ok) return names;
+    const number = request.pullRequestNumber;
+    if (!Number.isSafeInteger(number) || number <= 0) {
+      return err(
+        invalid(`GitHub addresses a pull request by its display number.`, [
+          {
+            path: 'pullRequestNumber',
+            message: `"${String(number)}" is not a positive pull request number. A number alone is also not candidate identity: the full head commit is read from the pull request itself.`,
+          },
+        ]),
+      );
+    }
+
+    const repository = await this.repositoryRead(context, request.repository);
+    if (!repository.ok) return repository;
+    if (repository.value.archived) {
+      return err(
+        blocked(`${request.repository.fullName} is archived on GitHub, so its pull requests are read-only.`, [
+          {
+            name: 'ArchivedRepository',
+            detail: `GitHub reports ${request.repository.fullName} with archived: true.`,
+            remedy:
+              'Link a pull request in a repository that still accepts changes. Nothing was written and no state changed.',
+          },
+        ]),
+      );
+    }
+
+    // GitHub keys every pull-request path by the display number, so the number is the
+    // provider identity here and the global numeric `id` would build a path the API rejects.
+    const pull = await this.pullRequestRead(context, names.value, String(number) as ProviderId);
+    if (!pull.ok) return pull;
+    const observed = pull.value;
+    const head = requireFullSha(observed.headSha, 'headSha');
+    if (!head.ok) return head;
+    const base = requireFullSha(observed.baseSha, 'baseSha');
+    if (!base.ok) return base;
+
+    return ok({
+      repository: {
+        provider: GITHUB_PROVIDER,
+        fullName: repository.value.fullName,
+        defaultBranch: repository.value.defaultBranch,
+        url: repository.value.htmlUrl,
+      },
+      providerPullRequestId: observed.id as ProviderId,
+      number: observed.number,
+      url: observed.htmlUrl,
+      state: pullRequestStateOf(observed),
+      draft: observed.draft,
+      headBranch: observed.headRef,
+      headSha: head.value,
+      baseBranch: observed.baseRef,
+      baseSha: base.value,
+      headRepository: observed.headRepository,
+      mergedSha: observed.mergeCommitSha !== null && isCommitSha(observed.mergeCommitSha)
+        ? (observed.mergeCommitSha as CommitSha)
+        : null,
+      mergedAt: observed.mergedAt,
       observedAt: context.clock.now(),
     });
   }
@@ -2575,14 +2684,30 @@ function detailOfStatus(state: string, description: string | null): string {
 }
 
 function pullRequestRefOf(pull: PullRequestShape): PullRequestRef {
-  const state: PullRequestRef['state'] = pull.merged ? 'Merged' : pull.state === 'closed' ? 'Closed' : 'Open';
   return {
     pullRequestId: pull.id as ProviderId,
     number: pull.number,
     url: pull.htmlUrl,
     draft: pull.draft,
-    state,
+    state: pullRequestStateOf(pull),
   };
+}
+
+/**
+ * GitHub's `state` flag plus its `merged` flag mapped onto the three states an owner acts on.
+ *
+ * `merged` is read first because GitHub reports a merged pull request as `state: "closed"`;
+ * a merged candidate and a withdrawn one are different facts, and collapsing them would tell
+ * the owner their change landed when it was abandoned.
+ *
+ * A `state` this adapter does not recognise becomes `Closed`, never `Open`. An unknown state
+ * is no evidence that the pull request is still open, and defaulting it to open would present
+ * withdrawn work as reviewable — the pull-request-side instance of the rule that a result the
+ * adapter cannot read is never a pass (mvp-spec F20-AC2).
+ */
+function pullRequestStateOf(pull: PullRequestShape): PullRequestState {
+  if (pull.merged) return 'Merged';
+  return pull.state === 'open' ? 'Open' : 'Closed';
 }
 
 function mapReview(review: ReviewShape): GitReviewState {

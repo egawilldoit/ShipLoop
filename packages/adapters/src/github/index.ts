@@ -48,3 +48,17 @@ export {
   type GitHubGitAdapterOptions,
   type ReadCommitRangeRequest,
 } from './adapter.ts';
+
+/*
+ * The read-only candidate surface. The contract types it narrows to
+ * (`CandidateGitPort`, `CandidateLinkReader`, `CandidateCheckReader`, `LinkedPullRequestFacts`,
+ * `ReadLinkedPullRequestRequest`, `readOnlyCandidateGit`, `CANDIDATE_READ_METHODS`) are
+ * declared in `../contracts/candidate-link.ts` and reach consumers through the package root,
+ * so they are not re-exported here — a second spelling of one type would make an integrator
+ * guess which import is canonical.
+ */
+export {
+  githubCandidatePort,
+  type GitHubCandidatePort,
+  type GitHubCandidateSource,
+} from './candidate-link.ts';
