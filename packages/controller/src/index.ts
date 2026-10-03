@@ -31,6 +31,7 @@ export * from './profiles.ts';
 export * from './publication.ts';
 export * from './jobs.ts';
 export * from './mvp-review.ts';
+export * from './mvp-review-card.ts';
 export * from './attention.ts';
 export * from './owner-tests.ts';
 export * from './plan-generation.ts';
