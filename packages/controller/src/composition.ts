@@ -71,6 +71,7 @@ import {
   CandidateRepository,
   OwnerDecisionRepository,
   ConnectorRepository,
+  ContractRepository,
   IdeaRepository,
   IntakeRepository,
   OwnerRepository,
@@ -78,6 +79,7 @@ import {
   ProjectProfileRepository,
   ProjectRepository,
   PublicationRepository,
+  RequestRepository,
   ScopeRepository,
   WorkItemRepository,
 } from '@shiploop/storage';
@@ -141,6 +143,7 @@ import {
   requirePlanningOwner,
 } from './plan-generation.ts';
 import { requireIntakeOwner } from './intake.ts';
+import { createContractUseCases, type ContractUseCases } from './contracts.ts';
 
 export interface CompositionRootConfig {
   readonly databasePath: string;
@@ -221,6 +224,9 @@ export interface CompositionRoot {
   readonly procedures: ProcedureRepository;
   readonly intake: IntakeRepository;
   readonly ideas: IdeaRepository;
+  /** Requests and the revisions of their delivery contracts (mvp-spec 3). */
+  readonly requests: RequestRepository;
+  readonly contracts: ContractRepository;
   /** Over the same handle, so a compare-and-set is meaningful within a process (F02-AC2). */
   readonly workItems: WorkItemRepository;
   readonly scope: ScopeRepository;
@@ -240,6 +246,14 @@ export interface CompositionRoot {
   readonly publications: PublicationRepository;
   readonly useCases: ProfileUseCases & ConnectorUseCases;
   readonly intakeUseCases: IntakeUseCases;
+  /**
+   * Request and delivery-contract use cases (mvp-spec 3).
+   *
+   * Published rather than kept private because the owner's two steps here - "write down
+   * what should change" and "agree what success is" - are exactly this group, and they are
+   * the only entry point to an approval anywhere in the product (mvp-spec 3).
+   */
+  readonly contractUseCases: ContractUseCases;
   readonly sessionUseCases: SessionUseCases;
   /** Run start, lifecycle transitions and owner limit decisions (F13, F17, F18). */
   readonly jobUseCases: JobUseCases;
@@ -299,6 +313,12 @@ const REQUIRED_TABLES: readonly string[] = [
   'idea_questions',
   'briefs',
   'plans',
+  // A request and its delivery-contract revisions. Checked here because
+  // `RequestRepository` and `ContractRepository` would otherwise fail at the first call
+  // rather than at startup, which is the difference between an operator reading a
+  // migration they did not apply and a 500 on the owner's first request (mvp-spec 3).
+  'requests',
+  'delivery_contracts',
 ];
 
 /**
@@ -1080,6 +1100,16 @@ export function createCompositionRoot(config: CompositionRootConfig): Result<Com
   const procedures = new ProcedureRepository(database);
   const intake = new IntakeRepository(database);
   const ideas = new IdeaRepository(database);
+  /**
+   * One handle each, over the same database.
+   *
+   * A request write and the contract revision written against it are separate rows, and
+   * the revision that supersedes an approval has to land in the same transaction as the new
+   * draft - so both repositories are constructed once here rather than opened per use case
+   * (mvp-spec 3).
+   */
+  const requests = new RequestRepository(database);
+  const contracts = new ContractRepository(database);
   const workItems = new WorkItemRepository(database);
   const scope = new ScopeRepository(database);
   const candidates = new CandidateRepository(database);
@@ -1107,6 +1137,14 @@ export function createCompositionRoot(config: CompositionRootConfig): Result<Com
     ideas,
     artifactRoot: config.artifactRoot ?? null,
   });
+  /**
+   * The owner's request and the agreement that answers it (mvp-spec 3).
+   *
+   * Built unconditionally, with no provider and no engine: the MVP journey starts here,
+   * so a deployment that configured neither must still be able to create a request and a
+   * contract (MVP: "No AI engine may be required to create or read a request").
+   */
+  const contractUseCases = createContractUseCases({ clock: config.clock, requests, contracts });
 
   /**
    * One queue, one lease manager and one clock for every run-facing use case.
@@ -1261,6 +1299,8 @@ export function createCompositionRoot(config: CompositionRootConfig): Result<Com
     procedures,
     intake,
     ideas,
+    requests,
+    contracts,
     candidates,
     jobs,
     leases,
@@ -1272,6 +1312,7 @@ export function createCompositionRoot(config: CompositionRootConfig): Result<Com
     scope,
     useCases: { ...profileUseCases, ...connectorUseCases },
     intakeUseCases,
+    contractUseCases,
     sessionUseCases,
     jobUseCases,
     attentionUseCases,
