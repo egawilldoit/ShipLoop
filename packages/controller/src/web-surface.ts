@@ -430,7 +430,7 @@ export interface SurfaceT3LaunchSetting {
 
 export interface SurfaceRepositorySetting {
   readonly configured: boolean;
-  readonly profileVersionId: string | null;
+  readonly profileVersionId: ProfileVersionId | null;
   readonly versionNumber: number | null;
   readonly repository: string | null;
   readonly baseBranch: string | null;
@@ -449,7 +449,7 @@ export interface SurfaceRepositorySetting {
  * the credential store.
  */
 export interface SurfaceProviderSetting {
-  readonly connectorId: string;
+  readonly connectorId: ConnectorId;
   readonly kind: SurfaceConnectorKind;
   readonly provider: string;
   readonly resourceScope: string;
@@ -2019,18 +2019,16 @@ function toSurfaceProfile(version: {
  *
  * A copy of an immutable value: the controller has already validated the URL, dropped the
  * credential references and gated the project, so there is nothing left to decide here. The
- * one field that changes shape is `profileVersionId`, a branded id in the controller and a
- * string on the wire - the same renaming every other projection in this file performs.
+ * identifiers keep their branded types rather than being widened to strings, which is what
+ * lets this surface satisfy the transport's declared port without a cast - the same reason
+ * `SurfaceProfileVersion` carries a `ProfileVersionId`.
  */
 function toSurfaceSettings(view: ProjectSettingsView): SurfaceProjectSettings {
   return {
     projectId: view.projectId,
     t3: { ...view.t3 },
-    repository: {
-      ...view.repository,
-      profileVersionId: view.repository.profileVersionId === null ? null : String(view.repository.profileVersionId),
-    },
-    providers: view.providers.map((provider) => ({ ...provider, connectorId: String(provider.connectorId) })),
+    repository: { ...view.repository },
+    providers: view.providers.map((provider) => ({ ...provider })),
     updatedAt: view.updatedAt,
   };
 }

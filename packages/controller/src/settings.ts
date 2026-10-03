@@ -33,7 +33,14 @@
  */
 
 import { err, ok, redact } from '@shiploop/domain';
-import type { DomainError, OwnerId, ProjectId, Result } from '@shiploop/domain';
+import type {
+  ConnectorId,
+  DomainError,
+  OwnerId,
+  ProfileVersionId,
+  ProjectId,
+  Result,
+} from '@shiploop/domain';
 import type {
   ConnectorRecord,
   ProjectProfileVersion,
@@ -66,7 +73,7 @@ export interface T3LaunchSetting {
 export interface RepositorySetting {
   /** False when this project has no saved profile version yet. */
   readonly configured: boolean;
-  readonly profileVersionId: string | null;
+  readonly profileVersionId: ProfileVersionId | null;
   readonly versionNumber: number | null;
   readonly repository: string | null;
   readonly baseBranch: string | null;
@@ -84,7 +91,7 @@ export interface RepositorySetting {
  * stored digest, which identifies the reference without carrying it (F03-AC3, F32-AC2).
  */
 export interface ProviderSetting {
-  readonly connectorId: string;
+  readonly connectorId: ConnectorId;
   readonly kind: ConnectorRecord['kind'];
   readonly provider: string;
   readonly resourceScope: string;

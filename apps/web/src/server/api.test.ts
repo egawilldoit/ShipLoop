@@ -48,6 +48,9 @@ import {
 } from '@shiploop/domain';
 import type { JobOperation } from '@shiploop/storage';
 import type { FastifyInstance } from 'fastify';
+// The real launch-URL rule, so a route test cannot pass against a validation this double
+// invented (L02-AC2).
+import { validateT3Setting } from '@shiploop/controller';
 import { buildApp } from './app.ts';
 import { CSRF_HEADER } from './auth-guard.ts';
 import { describeConfigErrors, readServerConfig, type ServerConfig } from './config.ts';
@@ -92,6 +95,7 @@ import {
   type ResumedRunView,
   type ProfileContent,
   type ProfileVersionView,
+  type ProjectSettingsView,
   type ProvisionOwnerCommand,
   type ProjectView,
   type RegisterConnectorCommand,
@@ -118,6 +122,7 @@ import {
   type SignInGrant,
   type StartRunCommand,
   type StoredSessionRecord,
+  type T3LaunchSettingView,
   type TouchSessionCommand,
 } from './contracts.ts';
 
@@ -365,6 +370,8 @@ class InMemoryController implements ControllerSurface {
   private readonly acceptanceStates = new Map<string, AcceptanceView>();
   private readonly feedback: { readonly decisionId: string; readonly feedback: string }[] = [];
   private readonly ownerObservations = new Map<string, OwnerObservationView[]>();
+  /** The optional per-project settings, including the T3 launch target (L02-AC2). */
+  private readonly projectSettings = new Map<string, { readonly t3: T3LaunchSettingView; readonly updatedAt: string }>();
 
   constructor(
     _now: () => Date,
@@ -1322,6 +1329,108 @@ class InMemoryController implements ControllerSurface {
       return ok(revoked);
     },
   };
+
+  /**
+   * Settings, in a map rather than SQLite.
+   *
+   * Two decisions are the real ones, because they are the ones the route has to be able to
+   * exercise: a project this double does not hold is a `NotFound` rather than an empty
+   * answer that reads as "configured and blank" (F02-AC2), and a provider is projected
+   * without its `credentialReference` - only the digest travels, so a settings response
+   * cannot be where a credential pointer leaks (F03-AC3). `validateT3Setting` is the real
+   * function, not a copy, so a route test cannot pass against a rule this double invented.
+   */
+  readonly settings = {
+    readSettings: async (command: {
+      readonly projectId: ProjectId;
+      readonly actor: OwnerId;
+    }): Promise<Result<ProjectSettingsView, DomainError>> => {
+      const scripted = this.takeScripted('readSettings');
+      if (scripted !== null) return { ok: false, error: scripted };
+      if (!this.projectRecords.has(command.projectId)) {
+        return {
+          ok: false,
+          error: { code: 'NotFound', reason: 'This deployment holds no project with that identity (F02-AC2).' },
+        };
+      }
+      return ok(this.settingsView(command.projectId));
+    },
+
+    updateSettings: async (command: {
+      readonly projectId: ProjectId;
+      readonly t3Url?: string | null;
+      readonly at: string;
+      readonly actor: OwnerId;
+    }): Promise<Result<ProjectSettingsView, DomainError>> => {
+      const scripted = this.takeScripted('updateSettings');
+      if (scripted !== null) return { ok: false, error: scripted };
+      if (!this.projectRecords.has(command.projectId)) {
+        return {
+          ok: false,
+          error: { code: 'NotFound', reason: 'This deployment holds no project with that identity (F02-AC2).' },
+        };
+      }
+      if (command.t3Url !== undefined) {
+        const validated = validateT3Setting(command.t3Url);
+        if (!validated.ok) return { ok: false, error: validated.error };
+        this.projectSettings.set(command.projectId, {
+          t3: validated.value,
+          updatedAt: command.at,
+        });
+      }
+      return ok(this.settingsView(command.projectId));
+    },
+  };
+
+  /** The settings of one project, assembled from the rows this double holds. */
+  private settingsView(projectId: ProjectId): ProjectSettingsView {
+    const stored = this.projectSettings.get(projectId) ?? null;
+    const history = this.profileVersions.get(projectId) ?? [];
+    const current = history[history.length - 1];
+    const connectors = [...this.connectorRecords.values()].filter(
+      (connector) => connector.projectId === projectId,
+    );
+    return {
+      projectId,
+      t3: stored?.t3 ?? { configured: false, url: null },
+      repository:
+        current === undefined
+          ? {
+              configured: false,
+              profileVersionId: null,
+              versionNumber: null,
+              repository: null,
+              baseBranch: null,
+              targetBranch: null,
+              ticketProvider: null,
+              deploymentProvider: null,
+              engine: null,
+            }
+          : {
+              configured: true,
+              profileVersionId: current.profileVersionId,
+              versionNumber: current.versionNumber,
+              repository: current.content.references.repository,
+              baseBranch: current.content.references.baseBranch,
+              targetBranch: current.content.references.targetBranch,
+              ticketProvider: current.content.references.ticketProvider,
+              deploymentProvider: current.content.references.deploymentProvider,
+              engine: current.content.references.engine,
+            },
+      // The credential reference is deliberately absent from this projection (F03-AC3).
+      providers: connectors.map((connector) => ({
+        connectorId: connector.connectorId,
+        kind: connector.kind,
+        provider: connector.provider,
+        resourceScope: connector.resourceScope,
+        credentialReferenceDigest: connector.credentialReferenceDigest,
+        state: connector.state,
+        lastCheckedAt: connector.lastCheckedAt,
+        lastSuccessAt: connector.lastSuccessAt,
+      })),
+      updatedAt: stored?.updatedAt ?? null,
+    };
+  }
 
   /**
    * Runs, in maps rather than SQLite.
@@ -3476,6 +3585,10 @@ test('the loaded controller module is validated before it can serve a request', 
     sessions: { loadByToken() {}, create() {}, revoke() {}, touch() {} },
     profiles: { saveVersion() {}, currentVersion() {}, listVersions() {} },
     connectors: { register() {}, listForProject() {}, revoke() {} },
+    // The settings group must be declared too: without it the T3 launch target is
+    // unreachable from any shipped path, which is how a use case ends up implemented and
+    // invisible (L02-AC2).
+    settings: { readSettings() {}, updateSettings() {} },
     intake: {
       captureIdea() {},
       listIdeas() {},
@@ -3549,6 +3662,12 @@ test('the loaded controller module is validated before it can serve a request', 
     isControllerSurface(missingProjects),
     false,
     'a surface without the projects group must not pass the guard: with nothing to select, every project-scoped request would address an undefined identity (F02-AC1)',
+  );
+  const missingSettings = { ...complete, settings: undefined };
+  assert.equal(
+    isControllerSurface(missingSettings),
+    false,
+    'a surface without the settings group must not pass the guard: the T3 launch target would be unreachable, and a server that boots without it would 404 every settings request (L02-AC2)',
   );
   const missingDescribe = { ...complete, owners: { ...complete.owners, describe: undefined } };
   assert.equal(
