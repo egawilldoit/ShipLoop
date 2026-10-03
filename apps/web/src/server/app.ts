@@ -51,6 +51,7 @@ import { registerOwnerTestRoutes } from './routes/owner-tests.ts';
 import { registerProjectRoutes } from './routes/projects.ts';
 import { registerPlanningRoutes } from './routes/planning.ts';
 import { registerProfileRoutes } from './routes/profiles.ts';
+import { registerReviewRoutes } from './routes/review.ts';
 import { registerRunRoutes } from './routes/runs.ts';
 import { registerSettingsRoutes } from './routes/settings.ts';
 
@@ -140,6 +141,11 @@ export async function buildApp(deps: AppDependencies): Promise<FastifyInstance> 
   // identity is part of the path, so settings cannot be addressed without one (mvp-spec 3).
   registerSettingsRoutes(app, { controller, guard, now });
   registerHomeRoutes(app, { controller, guard, now, sources: deps.homeSources ?? null });
+  // The last project-scoped pair, and for the same reason as the rest: the review card and
+  // the owner decision are addressed as `/projects/:projectId/candidates/:candidateId/...`,
+  // so a request cannot name a candidate without naming the project that holds it. The MVP
+  // journey ends here — Accept or Request Changes, with nothing after them (mvp-spec 3).
+  registerReviewRoutes(app, { controller, guard });
 
   const staticRoot = config.staticRoot;
   if (staticRoot !== null) {
