@@ -24,6 +24,8 @@ import type {
   OwnerId,
   Result,
 } from '@shiploop/domain';
+import { recordGitHubProjection } from '@shiploop/verification';
+import type { GitHubCandidateProjection } from '@shiploop/verification';
 import { openDatabase } from '@shiploop/storage';
 import { migrate } from '@shiploop/storage';
 import { SqliteMvpReviewStore } from '@shiploop/storage';
@@ -501,6 +503,71 @@ test('a failed capture leaves the criterion unverified rather than failed', asyn
       evidenceId: 'evid-owner-1', observedAt: T2, detail: null, artifactRef: null, correlationId: 'corr-2',
     }));
     assert.equal(model.criteria.find((c) => c.criterionId === 'c-owner')?.state, 'unverified');
+  });
+});
+
+test('a GitHub projection flows from a real source to a passed criterion on the read model', async () => {
+  await withUseCases(async (api) => {
+    api.at(T1);
+    const projection: GitHubCandidateProjection = {
+      candidateId: 'cand-1',
+      contractId: 'contract-1',
+      contractRevision: 2,
+      headSha: HEAD,
+      observedAt: T1,
+      checks: [{ checkId: 'unit', name: 'unit', status: 'success', headSha: HEAD, startedAt: T1, completedAt: T1, detailUrl: null, summary: 'ok' }],
+    };
+    const recorded = expectOk(recordGitHubProjection({
+      projection,
+      target: { candidateId: 'cand-1', contractId: 'contract-1', contractRevision: 2, headSha: HEAD },
+      evidenceIdFor: (check) => `evid-gh-${check.checkId}`,
+    }));
+    assert.equal(recorded.length, 1);
+
+    const model = expectOk(await api.useCases.recordEvidence({
+      ...BASE,
+      facts: facts(),
+      evidenceId: recorded[0]?.evidenceId ?? 'evid-gh-unit',
+      subject: { kind: 'check', checkId: 'unit' },
+      method: { kind: 'AutomatedCheck', checkId: 'unit' },
+      observation: { kind: 'provider_check', outcome: 'passed' },
+      owner: null,
+      observedHeadSha: HEAD,
+      observedContractRevision: 2,
+      observedAt: T1,
+      detail: recorded[0]?.detail ?? null,
+      artifactRef: null,
+      correlationId: 'corr-1',
+    }));
+    assert.equal(model.evidence[0]?.source, 'github_check');
+    assert.equal(model.criteria.find((c) => c.criterionId === 'c-auto')?.state, 'passed');
+    assert.equal(model.criteria.find((c) => c.criterionId === 'c-auto')?.evidenceId, 'evid-gh-unit');
+  });
+});
+
+test('green CI attributed to an older commit does not pass the criterion', async () => {
+  await withUseCases(async (api) => {
+    api.at(T1);
+    // The projection the candidate module must produce for a run it cannot attribute:
+    // headSha null, never the candidate's SHA filled in.
+    const model = expectOk(await api.useCases.recordEvidence({
+      ...BASE,
+      facts: facts(),
+      evidenceId: 'evid-gh-old',
+      subject: { kind: 'check', checkId: 'unit' },
+      method: { kind: 'AutomatedCheck', checkId: 'unit' },
+      observation: { kind: 'provider_check', outcome: 'passed' },
+      owner: null,
+      observedHeadSha: null,
+      observedContractRevision: null,
+      observedAt: T1,
+      detail: 'the provider reported success, but not for this candidate commit',
+      artifactRef: null,
+      correlationId: 'corr-1',
+    }));
+    assert.equal(model.criteria.find((c) => c.criterionId === 'c-auto')?.state, 'stale');
+    assert.equal(model.eligibility.readyForOwnerReview, false);
+    assert.equal(model.staleness.stale, true);
   });
 });
 
