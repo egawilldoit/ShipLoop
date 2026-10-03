@@ -1770,11 +1770,87 @@ export interface ContractUseCases {
   }): Promise<Result<ContractView, DomainError>>;
 }
 
+/**
+ * The implementation handoff packet, as this transport carries it (mvp-spec L02-AC3).
+ *
+ * `markdown` is the controller's bytes, untouched. Nothing in this layer may reformat it,
+ * trim it or re-escape it: the property that makes a handoff trustworthy is that one
+ * approved contract produces one document, and a transport that tidied the text would make
+ * two packets differ for a reason nobody chose. `fingerprint` is the digest of those bytes,
+ * so a client can prove they are the same without diffing them (N02-AC2).
+ */
+export interface HandoffPacketView {
+  readonly markdown: string;
+  readonly fingerprint: string;
+}
+
+/** A missing prerequisite with the remedy the operator can act on (F04-AC3). */
+export interface HandoffPrerequisiteView {
+  readonly name: string;
+  readonly detail: string;
+  readonly remedy: string;
+}
+
+/**
+ * Where the browser may be sent to open the external executor, if anywhere (mvp-spec L02).
+ *
+ * Three states, because a nullable URL cannot tell them apart and the difference changes
+ * what the owner is told: nothing configured is normal and the packet works anyway, while a
+ * configured value that is refused is an operator error with a different remedy. No state
+ * reproduces the configured value, which may itself be the secret (N02-AC2).
+ */
+export type HandoffT3View =
+  | { readonly state: 'Configured'; readonly url: string }
+  | {
+      readonly state: 'NotConfigured';
+      readonly reason: string;
+      readonly prerequisites: readonly HandoffPrerequisiteView[];
+    }
+  | {
+      readonly state: 'Unusable';
+      readonly reason: string;
+      readonly prerequisites: readonly HandoffPrerequisiteView[];
+    };
+
+/**
+ * One approved revision, rendered into the text an implementer outside ShipLoop is handed
+ * (mvp-spec L02-AC3).
+ *
+ * The controller owns this text. A client that assembled packet content itself would own the
+ * redaction guarantee instead, and a credential pasted into a criterion description would
+ * travel from a response to a clipboard to an external tool with nothing in between stopping
+ * it. The route that serves it is a read: it renders, it decides nothing, and it contacts
+ * nothing (N02-AC2).
+ */
+export interface HandoffView {
+  readonly contractId: string;
+  readonly revision: number;
+  readonly packet: HandoffPacketView;
+  readonly t3: HandoffT3View;
+}
+
+/**
+ * The external-execution handoff (mvp-spec L02).
+ *
+ * The command carries the actor because the read is project-scoped and ownership is proved
+ * server-side before the revision is read; a client that supplied a project id it merely
+ * knows would otherwise be addressing another owner's work (F01-AC1, F02-AC2).
+ */
+export interface HandoffUseCases {
+  buildHandoff(command: {
+    readonly projectId: string;
+    readonly contractId: string;
+    readonly revision: number;
+    readonly actor: OwnerId;
+  }): Promise<Result<HandoffView, DomainError>>;
+}
+
 /** The whole injected surface. One argument, so a missing use case is a type error. */
 export interface ControllerSurface {
   readonly owners: OwnerUseCases;
   readonly projects: ProjectUseCases;
   readonly contracts: ContractUseCases;
+  readonly handoff: HandoffUseCases;
   readonly sessions: SessionUseCases;
   readonly profiles: ProfileUseCases;
   readonly connectors: ConnectorUseCases;
@@ -1805,6 +1881,7 @@ const REQUIRED_METHODS = {
     'reviseContract',
     'invalidateRevision',
   ],
+  handoff: ['buildHandoff'],
   sessions: ['loadByToken', 'create', 'revoke', 'touch'],
   profiles: ['saveVersion', 'currentVersion', 'listVersions'],
   connectors: ['register', 'listForProject', 'revoke'],

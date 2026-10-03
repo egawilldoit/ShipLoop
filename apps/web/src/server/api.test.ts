@@ -84,6 +84,7 @@ import {
   type CancelledRunView,
   type DeclinedExtensionView,
   type GrantedExtensionView,
+  type HandoffView,
   type PausedRunView,
   type PlanTaskView,
   type PlanView,
@@ -1197,6 +1198,52 @@ class InMemoryController implements ControllerSurface {
       revisions,
     });
   }
+
+  /**
+   * The external-execution handoff (mvp-spec L02).
+   *
+   * This double does not render packets: the text belongs to the controller's generator, and
+   * a fixture that assembled its own would make the route-level handoff assertions - that the
+   * response is byte-identical to what the generator produces, and that a seeded credential
+   * never reaches it - pass against a document this file wrote. `apps/web/src/server/
+   * handoff.test.ts` drives the route against the real controller on a real migrated store,
+   * which is the only place the packet's bytes can honestly be checked. What this double
+   * still has to answer is the refusal, because an unimplemented group would turn a coverage
+   * gap into a 503 (F01-AC1).
+   */
+  readonly handoff = {
+    buildHandoff: async (command: {
+      readonly projectId: string;
+      readonly contractId: string;
+      readonly revision: number;
+      readonly actor: string;
+    }): Promise<Result<HandoffView, DomainError>> => {
+      const contract = this.contractRevisions.get(`${command.contractId}#${command.revision}`);
+      if (contract === undefined || contract.projectId !== command.projectId) {
+        return {
+          ok: false,
+          error: { code: 'NotFound', reason: `Contract ${command.contractId} revision ${command.revision} does not exist.` },
+        };
+      }
+      if (contract.status !== 'approved') {
+        return {
+          ok: false,
+          error: {
+            code: 'Blocked',
+            reason: contract.blockedBecause ?? `Contract revision ${contract.revision} is ${contract.status}.`,
+            prerequisites: [
+              {
+                name: 'contractApproval',
+                detail: 'Only an approved Delivery Contract revision can be handed off.',
+                remedy: `Have the owner approve revision ${contract.revision} in ShipLoop, then read the handoff again.`,
+              },
+            ],
+          },
+        };
+      }
+      return notImplemented<HandoffView>('buildHandoff');
+    },
+  };
 
   readonly projects = {
     listProjects: async (): Promise<Result<readonly ProjectView[], DomainError>> =>
@@ -3473,6 +3520,7 @@ test('the loaded controller module is validated before it can serve a request', 
       reviseContract() {},
       invalidateRevision() {},
     },
+    handoff: { buildHandoff() {} },
     sessions: { loadByToken() {}, create() {}, revoke() {}, touch() {} },
     profiles: { saveVersion() {}, currentVersion() {}, listVersions() {} },
     connectors: { register() {}, listForProject() {}, revoke() {} },
