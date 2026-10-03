@@ -39,6 +39,7 @@ import {
 } from './http-error.ts';
 import type { ControllerSurface } from './contracts.ts';
 import { registerAttentionRoutes } from './routes/attention.ts';
+import { registerCandidateRoutes } from './routes/candidates.ts';
 import { registerConnectorRoutes } from './routes/connectors.ts';
 import { registerContractRoutes } from './routes/contracts.ts';
 import { registerHealthRoutes } from './routes/health.ts';
@@ -113,6 +114,7 @@ export async function buildApp(deps: AppDependencies): Promise<FastifyInstance> 
   // the project identity is part of every path here, so a request cannot be addressed without
   // one (mvp-spec 3, F02-AC2).
   registerContractRoutes(app, { controller, guard, now });
+  registerCandidateRoutes(app, { controller, guard, now });
   registerProfileRoutes(app, { controller, guard, now });
   registerConnectorRoutes(app, { controller, guard, now });
   registerIntakeRoutes(app, { controller, guard, now });
