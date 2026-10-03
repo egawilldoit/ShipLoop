@@ -21,14 +21,18 @@ import { join } from 'node:path';
 import {
   MINIMUM_PASSWORD_LENGTH,
   SESSION_COOKIE_NAME,
+  approveContract,
+  asFingerprint,
   blocked,
   canTransition,
   capabilitiesFor,
   conflict,
+  contractContentFingerprint,
   fingerprint,
   hashPassword,
   hashSessionToken,
   invalid,
+  isFingerprint,
   ok,
   outcomeUnknown,
   sessionDeadlines,
@@ -37,6 +41,8 @@ import {
   type CapabilityDeclaration,
   type CapabilityKind,
   type ConnectorId,
+  type ContractId,
+  type DeliveryContract,
   type DomainError,
   type IdeaId,
   type JobId,
@@ -44,6 +50,7 @@ import {
   type OwnerId,
   type ProfileVersionId,
   type ProjectId,
+  type RequestId,
   type Result,
 } from '@shiploop/domain';
 import type { JobOperation } from '@shiploop/storage';
@@ -1019,11 +1026,11 @@ class InMemoryController implements ControllerSurface {
         scope: [...command.scope],
         outOfScope: [...command.outOfScope],
         acceptanceCriteria: command.acceptanceCriteria.map((criterion) => ({ ...criterion })),
-        contentFingerprint: fingerprint({
+        contentFingerprint: contractContentFingerprint({
           outcome: command.outcome,
           scope: [...command.scope],
           outOfScope: [...command.outOfScope],
-          acceptanceCriteria: command.acceptanceCriteria.map((criterion) => ({ ...criterion })),
+          acceptanceCriteria: command.acceptanceCriteria,
         }),
         updatedAt: this.contractInstant(),
       };
@@ -1036,29 +1043,47 @@ class InMemoryController implements ControllerSurface {
      *
      * The command carries no approver, which is the whole point: there is no field for a
      * client to fill in, so a route cannot forward one even by accident (mvp-spec 3).
+     *
+     * It does carry `expectedContentFingerprint`, and the decision is the domain's own
+     * `approveContract` rather than a restatement of it. A double that compared the
+     * fingerprint itself would prove that this file's idea of an approval matches this
+     * file's idea of an approval; calling the production function means every refusal below
+     * - including the two-tab one - is the refusal the product gives.
      */
     approveRevision: async (command: {
       readonly projectId: string;
       readonly contractId: string;
       readonly revision: number;
+      readonly expectedContentFingerprint: string;
       readonly actor: OwnerId;
     }): Promise<Result<ContractView, DomainError>> => {
       const stored = this.revisionOf(command.projectId, command.contractId, command.revision);
       if (stored === null) {
         return { ok: false, error: { code: 'NotFound', reason: `Contract revision #${command.revision} does not exist.` } };
       }
-      if (stored.status !== 'draft') {
+      if (!isFingerprint(command.expectedContentFingerprint)) {
         return {
           ok: false,
-          error: conflict(`Revision ${stored.revision} is already ${stored.status}.`, 'draft', stored.status),
+          error: invalid('An approval must name the draft text it approves.', [
+            { path: 'expectedContentFingerprint', message: 'Not a content fingerprint.' },
+          ]),
         };
+      }
+      const sealed = approveContract(recordOf(stored), {
+        approvedBy: command.actor,
+        at: this.contractInstant(),
+        expectedContentFingerprint: asFingerprint(command.expectedContentFingerprint),
+      });
+      if (!sealed.ok) {
+        return { ok: false, error: sealed.error };
       }
       const approved: ContractView = {
         ...stored,
         status: 'approved',
-        approvedAt: this.contractInstant(),
-        approvedBy: String(command.actor),
-        updatedAt: this.contractInstant(),
+        contentFingerprint: sealed.value.contentFingerprint,
+        approvedAt: sealed.value.approvedAt,
+        approvedBy: String(sealed.value.approvedBy),
+        updatedAt: sealed.value.updatedAt,
         blockedBecause: null,
       };
       this.storeRevision(approved);
@@ -1199,7 +1224,9 @@ class InMemoryController implements ControllerSurface {
       scope: [...content.scope],
       outOfScope: [...content.outOfScope],
       acceptanceCriteria: content.acceptanceCriteria.map((criterion) => ({ ...criterion })),
-      contentFingerprint: fingerprint(content),
+      // The production fingerprint of the content, so the value a test compares is the one
+      // the real store derives and an approval's compare-and-set can be exercised against it.
+      contentFingerprint: contractContentFingerprint(content),
       // The fingerprint of the request text as it stands now, so a later edit is detectable -
       // reported as `answersCurrentRequest: false` rather than acted on (mvp-spec 3).
       requestFingerprint: this.requestFingerprintOf(projectId, requestId),
@@ -2262,6 +2289,64 @@ const CHANGED_CONTRACT_CONTENT = {
   scope: [...CONTRACT_CONTENT.scope, 'Show the currency code'],
 } as const;
 
+/**
+ * A stored view widened back into the domain's own record.
+ *
+ * The double holds revisions as `ContractView`s because that is what the transport reads,
+ * but the approval decision belongs to the domain - including the refusal of a revision
+ * that is not a draft, which is why every status is widened rather than only the draft one.
+ * Widening here rather than restating the comparison is what keeps these transport tests
+ * honest: if `approveContract` stopped requiring the reviewed fingerprint, they would start
+ * failing at the route, which is the signal that belongs there.
+ */
+function recordOf(view: ContractView): DeliveryContract {
+  const shared = {
+    contractId: view.contractId as ContractId,
+    projectId: view.projectId as ProjectId,
+    requestId: view.requestId as RequestId,
+    revision: view.revision,
+    sourceBriefId: view.sourceBriefId,
+    sourceBriefVersion: view.sourceBriefVersion,
+    contentFingerprint: asFingerprint(view.contentFingerprint),
+    requestFingerprint: asFingerprint(view.requestFingerprint),
+    createdBy: view.createdBy as OwnerId,
+    createdAt: view.createdAt,
+    updatedAt: view.updatedAt,
+    outcome: view.outcome,
+    scope: [...view.scope],
+    outOfScope: [...view.outOfScope],
+    acceptanceCriteria: view.acceptanceCriteria.map((criterion) => ({ ...criterion })),
+  };
+  if (view.status === 'draft') {
+    return Object.freeze({
+      ...shared,
+      status: 'draft',
+      approvedAt: null,
+      approvedBy: null,
+      staleReason: null,
+      supersededByRevision: null,
+    });
+  }
+  if (view.status === 'approved') {
+    return Object.freeze({
+      ...shared,
+      status: 'approved',
+      approvedAt: view.approvedAt ?? view.updatedAt,
+      approvedBy: view.approvedBy as OwnerId,
+      staleReason: null,
+      supersededByRevision: null,
+    });
+  }
+  return Object.freeze({
+    ...shared,
+    status: 'stale',
+    approvedAt: view.approvedAt,
+    approvedBy: view.approvedBy === null ? null : (view.approvedBy as OwnerId),
+    staleReason: view.staleReason ?? 'This revision is stale.',
+    supersededByRevision: view.supersededByRevision,
+  });
+}
+
 /** Creates a request and returns it, so a case can start from a real one. */
 async function createRequest(h: Harness, session: Session, projectId = PROJECT_ID): Promise<RequestView> {
   const response = await h.app.inject({
@@ -2291,19 +2376,27 @@ async function draftContract(
   return parse<{ contract: ContractView }>(response).contract;
 }
 
-/** Approves a revision and returns it. */
+/**
+ * Approves a revision and returns it.
+ *
+ * `expectedContentFingerprint` is the value the caller was shown, so every call site has to
+ * say which text it is approving - which is the point of the field. Passing the current
+ * fingerprint is the "I have just read this" case; the stale case is driven explicitly where
+ * it is under test.
+ */
 async function approveRevision(
   h: Harness,
   session: Session,
   contractId: string,
   revision: number,
+  expectedContentFingerprint: string,
   projectId = PROJECT_ID,
 ): Promise<ContractView> {
   const response = await h.app.inject({
     method: 'POST',
     url: `/api/projects/${projectId}/contracts/${contractId}/${revision}/approve`,
     headers: { cookie: session.cookie, [CSRF_HEADER]: session.csrfToken },
-    payload: {},
+    payload: { expectedContentFingerprint },
   });
   assert.equal(response.statusCode, 200, `approval failed: ${response.body}`);
   return parse<{ contract: ContractView }>(response).contract;
@@ -2798,16 +2891,30 @@ test('mvp-spec 3: approval attributes itself to the session and carries no appro
   const contract = await draftContract(h, session, request.requestId);
 
   // A body that tries to name the approver is refused rather than ignored: a client that
-  // *believed* it named the approver is the defect this route is shaped to prevent.
+  // *believed* it named the approver is the defect this route is shaped to prevent. The
+  // reviewed fingerprint is present, so this 400 is about the smuggled fields and nothing
+  // else - an approval cannot be talked into carrying an approver even when it is otherwise
+  // complete.
   const smuggled = await h.app.inject({
     method: 'POST',
     url: `/api/projects/${PROJECT_ID}/contracts/${contract.contractId}/1/approve`,
     headers: { cookie: session.cookie, [CSRF_HEADER]: session.csrfToken },
-    payload: { approvedBy: 'own_somebody_else', status: 'approved' },
+    payload: {
+      expectedContentFingerprint: contract.contentFingerprint,
+      approvedBy: 'own_somebody_else',
+      status: 'approved',
+    },
   });
   assert.equal(smuggled.statusCode, 400, smuggled.body);
+  for (const field of ['approvedBy', 'status']) {
+    assert.equal(
+      parse<ErrorPayload>(smuggled).error.fields?.some((entry) => entry.path === field) ?? false,
+      true,
+      `${field} is named in the refusal`,
+    );
+  }
 
-  const approved = await approveRevision(h, session, contract.contractId, 1);
+  const approved = await approveRevision(h, session, contract.contractId, 1, contract.contentFingerprint);
   assert.equal(approved.status, 'approved');
   assert.equal(approved.approvedBy, OWNER_ID, 'the approver is the session, not the body');
   assert.match(approved.approvedAt ?? '', /^2026-03-01T/);
@@ -2829,7 +2936,7 @@ test('mvp-spec 3: an approved revision cannot be edited, and approving twice is 
   const session = await signIn(h.app);
   const request = await createRequest(h, session);
   const contract = await draftContract(h, session, request.requestId);
-  const approved = await approveRevision(h, session, contract.contractId, 1);
+  const approved = await approveRevision(h, session, contract.contractId, 1, contract.contentFingerprint);
 
   const edit = await h.app.inject({
     method: 'PATCH',
@@ -2840,11 +2947,14 @@ test('mvp-spec 3: an approved revision cannot be edited, and approving twice is 
   assert.equal(edit.statusCode, 400, edit.body);
   assert.match(edit.body, /frozen|Draft a new revision/);
 
+  // Naming the same text again is still refused: an approval is not idempotent-by-repetition
+  // here, because the second call is a second claim about an agreement that already exists
+  // and 200 would tell the owner the call was needed.
   const again = await h.app.inject({
     method: 'POST',
     url: `/api/projects/${PROJECT_ID}/contracts/${contract.contractId}/1/approve`,
     headers: { cookie: session.cookie, [CSRF_HEADER]: session.csrfToken },
-    payload: {},
+    payload: { expectedContentFingerprint: contract.contentFingerprint },
   });
   assert.equal(again.statusCode, 409, again.body);
 
@@ -2859,12 +2969,160 @@ test('mvp-spec 3: an approved revision cannot be edited, and approving twice is 
   assert.equal(read.contract.outcome, CONTRACT_CONTENT.outcome, 'the approved text is unchanged');
 });
 
+test('mvp-spec 3, mvp-spec 7: the first of two tabs to approve loses, and the second can approve after a reload', async () => {
+  const h = await harness();
+  const session = await signIn(h.app);
+  const request = await createRequest(h, session);
+  const contract = await draftContract(h, session, request.requestId);
+
+  // Step 1: tab A opens the draft and holds this fingerprint.
+  const tabA = contract.contentFingerprint;
+  assert.match(tabA, /^fp_[0-9a-f]{32}$/);
+
+  // Step 2: tab B edits the draft. It read the same instant, so this is legitimate.
+  const edited = await h.app.inject({
+    method: 'PATCH',
+    url: `/api/projects/${PROJECT_ID}/contracts/${contract.contractId}/1`,
+    headers: { cookie: session.cookie, [CSRF_HEADER]: session.csrfToken },
+    payload: { ...CHANGED_CONTRACT_CONTENT, expectedUpdatedAt: contract.updatedAt },
+  });
+  assert.equal(edited.statusCode, 200, edited.body);
+  const revised = parse<{ contract: ContractView }>(edited).contract;
+  assert.notEqual(revised.contentFingerprint, tabA);
+
+  // Step 3: tab A approves what it is still showing. Before the compare-and-set this was a
+  // 200 and the agreement was sealed over tab B's scope.
+  const stale = await h.app.inject({
+    method: 'POST',
+    url: `/api/projects/${PROJECT_ID}/contracts/${contract.contractId}/1/approve`,
+    headers: { cookie: session.cookie, [CSRF_HEADER]: session.csrfToken },
+    payload: { expectedContentFingerprint: tabA },
+  });
+  assert.equal(stale.statusCode, 409, stale.body);
+  const refused = parse<ErrorPayload>(stale);
+  assert.equal(refused.error.code, 'Conflict');
+  // The refusal carries both fingerprints, so a client can reload and compare without a
+  // second round trip and without being told which text won by assertion alone.
+  assert.equal(refused.error.expected, tabA);
+  assert.equal(refused.error.actual, revised.contentFingerprint);
+  assert.match(refused.error.message, /text you did not review/);
+
+  // Nothing was sealed, and the revision still reads as the draft tab B wrote.
+  const stillDraft = parse<{ contract: ContractView }>(
+    await h.app.inject({
+      method: 'GET',
+      url: `/api/projects/${PROJECT_ID}/contracts/${contract.contractId}/1`,
+      headers: { cookie: session.cookie },
+    }),
+  ).contract;
+  assert.equal(stillDraft.status, 'draft');
+  assert.equal(stillDraft.approvedBy, null);
+  assert.equal(stillDraft.approvedAt, null);
+  assert.equal(stillDraft.outcome, CHANGED_CONTRACT_CONTENT.outcome);
+  const detail = parse<RequestDetailView>(
+    await h.app.inject({
+      method: 'GET',
+      url: `/api/projects/${PROJECT_ID}/requests/${request.requestId}`,
+      headers: { cookie: session.cookie },
+    }),
+  );
+  assert.equal(detail.approvedRevision, null, 'no revision reads as approved after a refused approval');
+
+  // Step 4: the owner reloads.
+  const reloaded = parse<{ contract: ContractView }>(
+    await h.app.inject({
+      method: 'GET',
+      url: `/api/projects/${PROJECT_ID}/contracts/${contract.contractId}/1`,
+      headers: { cookie: session.cookie },
+    }),
+  ).contract;
+  assert.equal(reloaded.contentFingerprint, revised.contentFingerprint);
+  assert.equal(reloaded.outcome, CHANGED_CONTRACT_CONTENT.outcome, 'the owner now sees what will be agreed');
+
+  // Step 5: approving what the reload showed works, and seals that text.
+  const approved = await approveRevision(h, session, contract.contractId, 1, reloaded.contentFingerprint);
+  assert.equal(approved.status, 'approved');
+  assert.equal(approved.approvedBy, OWNER_ID);
+  assert.equal(approved.outcome, CHANGED_CONTRACT_CONTENT.outcome);
+  assert.equal(approved.contentFingerprint, reloaded.contentFingerprint);
+});
+
+test('mvp-spec 3: an approval must name the draft it approves, so a missing or malformed token is a 400', async () => {
+  const h = await harness();
+  const session = await signIn(h.app);
+  const request = await createRequest(h, session);
+  const contract = await draftContract(h, session, request.requestId);
+
+  for (const payload of [
+    {},
+    { expectedContentFingerprint: '' },
+    { expectedContentFingerprint: '   ' },
+    { expectedContentFingerprint: 'the text I read' },
+    { expectedContentFingerprint: 'fp_nothexadecimal00000000000000000000' },
+    { expectedContentFingerprint: contract.contentFingerprint.toUpperCase() },
+  ]) {
+    const refused = await h.app.inject({
+      method: 'POST',
+      url: `/api/projects/${PROJECT_ID}/contracts/${contract.contractId}/1/approve`,
+      headers: { cookie: session.cookie, [CSRF_HEADER]: session.csrfToken },
+      payload,
+    });
+    assert.equal(refused.statusCode, 400, `${JSON.stringify(payload)} must be refused: ${refused.body}`);
+    assert.equal(
+      parse<ErrorPayload>(refused).error.fields?.some((field) => field.path === 'expectedContentFingerprint') ?? false,
+      true,
+      `${JSON.stringify(payload)} must name the field`,
+    );
+  }
+
+  // A refused body is not a refusal to approve: the draft is untouched and still approvable
+  // by a client that sends what the read gave it.
+  const read = parse<{ contract: ContractView }>(
+    await h.app.inject({
+      method: 'GET',
+      url: `/api/projects/${PROJECT_ID}/contracts/${contract.contractId}/1`,
+      headers: { cookie: session.cookie },
+    }),
+  ).contract;
+  assert.equal(read.status, 'draft');
+  const approved = await approveRevision(h, session, contract.contractId, 1, read.contentFingerprint);
+  assert.equal(approved.status, 'approved');
+});
+
+test('mvp-spec 3: a fingerprint of text this revision never held is a 409, not an approval', async () => {
+  const h = await harness();
+  const session = await signIn(h.app);
+  const request = await createRequest(h, session);
+  const contract = await draftContract(h, session, request.requestId);
+
+  const invented = await h.app.inject({
+    method: 'POST',
+    url: `/api/projects/${PROJECT_ID}/contracts/${contract.contractId}/1/approve`,
+    headers: { cookie: session.cookie, [CSRF_HEADER]: session.csrfToken },
+    payload: { expectedContentFingerprint: contractContentFingerprint({ ...CONTRACT_CONTENT, outcome: 'A scope nobody read.' }) },
+  });
+  assert.equal(invented.statusCode, 409, invented.body);
+  const refused = parse<ErrorPayload>(invented);
+  assert.equal(refused.error.expected, contractContentFingerprint({ ...CONTRACT_CONTENT, outcome: 'A scope nobody read.' }));
+  assert.equal(refused.error.actual, contract.contentFingerprint);
+
+  const stillDraft = parse<{ contract: ContractView }>(
+    await h.app.inject({
+      method: 'GET',
+      url: `/api/projects/${PROJECT_ID}/contracts/${contract.contractId}/1`,
+      headers: { cookie: session.cookie },
+    }),
+  ).contract;
+  assert.equal(stillDraft.status, 'draft');
+  assert.equal(stillDraft.approvedBy, null);
+});
+
 test('mvp-spec 3: revising writes the next revision and retires the old approval in one call', async () => {
   const h = await harness();
   const session = await signIn(h.app);
   const request = await createRequest(h, session);
   const contract = await draftContract(h, session, request.requestId);
-  await approveRevision(h, session, contract.contractId, 1);
+  await approveRevision(h, session, contract.contractId, 1, contract.contentFingerprint);
 
   const revised = await h.app.inject({
     method: 'POST',
@@ -2909,7 +3167,7 @@ test('mvp-spec 3: retiring an approval records the reason, and the vocabulary is
   const session = await signIn(h.app);
   const request = await createRequest(h, session);
   const contract = await draftContract(h, session, request.requestId);
-  await approveRevision(h, session, contract.contractId, 1);
+  await approveRevision(h, session, contract.contractId, 1, contract.contentFingerprint);
 
   const unlisted = await h.app.inject({
     method: 'POST',
@@ -2993,7 +3251,9 @@ test('mvp-spec 3, F02-AC2: nothing here crosses a project boundary', async () =>
         method: 'POST',
         url: `/api/projects/${elsewhere}/contracts/${contract.contractId}/1/approve`,
         headers: { cookie: session.cookie, [CSRF_HEADER]: session.csrfToken },
-        payload: {},
+        // Complete, and naming this project's real text: the refusal is about which project
+        // the revision is in, not about a missing field (F02-AC2).
+        payload: { expectedContentFingerprint: contract.contentFingerprint },
       }),
     },
     {
@@ -3125,7 +3385,7 @@ test('mvp-spec 3, F02-AC2: an id that addresses nothing is a 404 on every route,
       label: 'approve an unknown contract',
       method: 'POST',
       url: `/api/projects/${PROJECT_ID}/contracts/dc_nope/1/approve`,
-      payload: {},
+      payload: { expectedContentFingerprint: contract.contentFingerprint },
     },
     {
       label: 'revise an unknown contract',
@@ -3157,7 +3417,7 @@ test('mvp-spec 3, F02-AC2: an id that addresses nothing is a 404 on every route,
       label: 'approve a revision number that does not exist',
       method: 'POST',
       url: `/api/projects/${PROJECT_ID}/contracts/${contract.contractId}/7/approve`,
-      payload: {},
+      payload: { expectedContentFingerprint: contract.contentFingerprint },
     },
   ];
 
@@ -3192,7 +3452,7 @@ test('mvp-spec 3: every revision is readable by its own number, and the listing 
   const session = await signIn(h.app);
   const request = await createRequest(h, session);
   const first = await draftContract(h, session, request.requestId);
-  await approveRevision(h, session, first.contractId, 1);
+  await approveRevision(h, session, first.contractId, 1, first.contentFingerprint);
 
   const revised = await h.app.inject({
     method: 'POST',
@@ -3253,7 +3513,7 @@ test('mvp-spec 3: approval binds one exact revision and leaves every other revis
   const session = await signIn(h.app);
   const request = await createRequest(h, session);
   const first = await draftContract(h, session, request.requestId);
-  const approvedFirst = await approveRevision(h, session, first.contractId, 1);
+  const approvedFirst = await approveRevision(h, session, first.contractId, 1, first.contentFingerprint);
 
   const revised = await h.app.inject({
     method: 'POST',
@@ -3276,7 +3536,7 @@ test('mvp-spec 3: approval binds one exact revision and leaves every other revis
   assert.equal(midway.approvedRevision, null);
   assert.equal(midway.latestRevision?.status, 'draft');
 
-  const approvedSecond = await approveRevision(h, session, second.contractId, 2);
+  const approvedSecond = await approveRevision(h, session, second.contractId, 2, second.contentFingerprint);
   assert.equal(approvedSecond.revision, 2);
   assert.equal(approvedSecond.status, 'approved');
   assert.equal(approvedSecond.approvedBy, OWNER_ID, 'the approver is the session, never the body');
@@ -3324,7 +3584,9 @@ test('mvp-spec 3: a refused approval records nothing, so the revision is still a
   assert.equal(anonymous.statusCode, 401, anonymous.body);
 
   // Every attempt to name the approver, the status or the actor in the body is refused by
-  // name, so a client cannot believe it chose who approved (mvp-spec 3).
+  // name, so a client cannot believe it chose who approved (mvp-spec 3). Each body is
+  // otherwise complete - it carries the reviewed fingerprint - so the 400 is provably about
+  // the smuggled field rather than about something missing.
   for (const payload of [
     { approvedBy: 'own_somebody_else' },
     { status: 'approved' },
@@ -3336,7 +3598,7 @@ test('mvp-spec 3: a refused approval records nothing, so the revision is still a
       method: 'POST',
       url: `/api/projects/${PROJECT_ID}/contracts/${contract.contractId}/1/approve`,
       headers: { cookie: session.cookie, [CSRF_HEADER]: session.csrfToken },
-      payload,
+      payload: { ...payload, expectedContentFingerprint: contract.contentFingerprint },
     });
     assert.equal(refused.statusCode, 400, `${JSON.stringify(payload)} must be refused: ${refused.body}`);
   }
@@ -3362,7 +3624,7 @@ test('mvp-spec 3: a retired revision is history, so it is not editable either', 
   const session = await signIn(h.app);
   const request = await createRequest(h, session);
   const contract = await draftContract(h, session, request.requestId);
-  const approved = await approveRevision(h, session, contract.contractId, 1);
+  const approved = await approveRevision(h, session, contract.contractId, 1, contract.contentFingerprint);
 
   const retired = await h.app.inject({
     method: 'POST',
@@ -3401,7 +3663,7 @@ test('mvp-spec 3: a request edit under an approved revision is reported, never a
   const session = await signIn(h.app);
   const request = await createRequest(h, session);
   const contract = await draftContract(h, session, request.requestId);
-  const approved = await approveRevision(h, session, contract.contractId, 1);
+  const approved = await approveRevision(h, session, contract.contractId, 1, contract.contentFingerprint);
 
   const edited = await h.app.inject({
     method: 'PATCH',
@@ -3462,7 +3724,7 @@ test('F01-AC1: every request and contract route refuses an anonymous caller', as
     { method: 'GET', url: `/api/projects/${PROJECT_ID}/contracts/dc_1/1`, payload: null },
     { method: 'GET', url: `/api/projects/${PROJECT_ID}/contracts/dc_1/1/criteria`, payload: null },
     { method: 'PATCH', url: `/api/projects/${PROJECT_ID}/contracts/dc_1/1`, payload: { ...CONTRACT_CONTENT, expectedUpdatedAt: 'y' } },
-    { method: 'POST', url: `/api/projects/${PROJECT_ID}/contracts/dc_1/1/approve`, payload: {} },
+    { method: 'POST', url: `/api/projects/${PROJECT_ID}/contracts/dc_1/1/approve`, payload: { expectedContentFingerprint: contractContentFingerprint(CONTRACT_CONTENT) } },
     { method: 'POST', url: `/api/projects/${PROJECT_ID}/contracts/dc_1/1/revise`, payload: CONTRACT_CONTENT },
     { method: 'POST', url: `/api/projects/${PROJECT_ID}/contracts/dc_1/1/invalidate`, payload: { reason: 'RequestChanged' } },
   ];

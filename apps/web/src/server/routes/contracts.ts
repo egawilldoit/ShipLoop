@@ -11,19 +11,21 @@
  *     `/api/projects/:projectId/...`, so a request and its contract are always addressed as a
  *     pair. A body carrying the project would let a client read one project's request while
  *     believing it had addressed another, and the server would have no way to check (F02-AC2).
- *   - **`approveRevision` takes an empty body.** No approver field exists to send, so no body
- *     can attribute an approval to somebody else. The approver is read from the proved
- *     session; the schema is `strictObject({})` rather than no schema, so a body that meant
- *     to say who approved is refused rather than silently dropped (mvp-spec 3).
- *   - **Every edit carries `expectedUpdatedAt`; approval carries none, and this file says
- *     so rather than implying otherwise.** A stale tab editing a request or a draft
- *     revision is refused with a 409 instead of overwriting text somebody else has since
- *     replaced, and the conflict names both instants (mvp-spec 7, F24-AC4). An approval
- *     names a revision and freezes the text that revision holds when the call lands, so it
- *     has no instant to compare against - which leaves a real gap: an owner who approves a
- *     draft another tab edited since their page was rendered approves text they did not
- *     read. That gap belongs to the approval use case rather than to this file, and it is
- *     stated here so no caller is told a guard exists that does not (mvp-spec 3).
+ *   - **`approveRevision` names the text it approves, and names no approver.** The body has
+ *     exactly one field, `expectedContentFingerprint`, which is the fingerprint the owner's
+ *     read returned. There is still no approver field to send, so no body can attribute an
+ *     approval to somebody else; the approver is read from the proved session, and the
+ *     schema is `strictObject` rather than open, so a body that meant to say who approved is
+ *     refused rather than silently dropped (mvp-spec 3).
+ *   - **Every write carries what it acted on: an `expectedUpdatedAt`, and for an approval an
+ *     `expectedContentFingerprint`.** A stale tab editing a request or a draft revision is
+ *     refused with a 409 instead of overwriting text somebody else has since replaced, and
+ *     the conflict names both instants (mvp-spec 7, F24-AC4). An approval is the harder
+ *     case, because a revision number outlives its text: two tabs on one draft both address
+ *     `contracts/:id/1`, so the fingerprint the owner's page was rendered against is the
+ *     only thing that separates "I approve what I read" from "I approve what somebody else
+ *     wrote". Without it the two-tab defect was real and undetectable afterwards, because a
+ *     frozen revision reports itself as approved.
  *   - **Reads of one revision are keyed by `(projectId, contractId, revision)`.** A revision
  *     number is not decoration: a candidate and its evidence bind to it, so addressing a
  *     revision without its number is addressing something unidentifiable (mvp-spec 3).
@@ -43,7 +45,7 @@ import {
   CONTRACT_STALE_REASONS,
   type ControllerSurface,
 } from '../contracts.ts';
-import type { OwnerId } from '@shiploop/domain';
+import { isFingerprint, type OwnerId } from '@shiploop/domain';
 import type { SessionGuard } from '../auth-guard.ts';
 
 /** Longest title a request may carry; a title is a label, not a document. */
@@ -156,18 +158,35 @@ const editContractBody = contractContent.extend({
 });
 
 /**
- * Approval carries nothing.
+ * Approval names the draft it approves, and nothing else.
  *
- * `strictObject({})` and not an absent schema: a client that tried to send `approvedBy` or
- * `status` is refused with a named field rather than having it ignored, because a body that
- * *thinks* it named the approver is the exact defect this route is shaped to prevent
- * (mvp-spec 3).
+ * `expectedContentFingerprint` is the `contentFingerprint` the revision carried in the read
+ * that rendered the owner's page, sent straight back. It is required rather than optional
+ * because an approval without it names a revision but not a state: two tabs on one draft
+ * both address `contracts/:id/1`, and the call would seal whatever the other tab had
+ * written since the page was rendered. Nothing afterwards could detect that, since a
+ * frozen revision reports itself as approved (mvp-spec 3, mvp-spec 7).
  *
- * Empty means empty: adding a compare-and-set instant here would make an approval
- * refusable on a field whose only other purpose is to say who approved, and the approver
- * is the one thing this body must never carry (mvp-spec 3).
+ * It is a reference, not an instruction. The shape check is deliberately the *server's*
+ * fingerprint shape and nothing more: this value is compared against the fingerprint the
+ * controller derives from the stored text, so a client cannot use it to describe text of
+ * its own choosing, and a client that sends the wrong text fails on the comparison rather
+ * than on the schema.
+ *
+ * Everything else stays refused. `strictObject` means a client that tried to send
+ * `approvedBy` or `status` gets a named field rather than having it ignored, because a body
+ * that *thinks* it named the approver is the exact defect this route is shaped to prevent.
+ * There is no owner field here, and adding a reviewed-text reference did not create one:
+ * the approver is read from the session (mvp-spec 3).
  */
-const approveBody = z.strictObject({});
+const approveBody = z.strictObject({
+  expectedContentFingerprint: z
+    .string()
+    .trim()
+    .min(1, 'The fingerprint of the revision you read is required, so an approval covers the text you reviewed.')
+    .max(128)
+    .refine(isFingerprint, 'A content fingerprint looks like "fp_" followed by 32 hex characters.'),
+});
 
 const invalidateBody = z.strictObject({
   reason: z.enum(CONTRACT_STALE_REASONS, {
@@ -407,9 +426,15 @@ export function registerContractRoutes(app: FastifyInstance, options: ContractRo
   /**
    * Approves this revision. The owner's action, and the only way to become approved.
    *
-   * The body is empty and the approver is read from the session, so no request can attribute
-   * an approval to somebody else. That is the shape of the whole product rule about approval
-   * rather than an omission (mvp-spec 3).
+   * The approver is read from the session, so no request can attribute an approval to
+   * somebody else. That is the shape of the whole product rule about approval rather than
+   * an omission (mvp-spec 3).
+   *
+   * The body carries the fingerprint of the revision the owner read, and a mismatch is a
+   * 409 rather than an approval: the response names the fingerprint that was asked for and
+   * the one now stored, which is enough for a client to reload and re-read without
+   * guessing what changed. 200 means the text named in the body is now the text that is
+   * sealed (mvp-spec 7, F24-AC4).
    */
   app.post('/api/projects/:projectId/contracts/:contractId/:revision/approve', { preHandler: options.guard }, async (request, reply) => {
     const session = request.session;
@@ -423,6 +448,7 @@ export function registerContractRoutes(app: FastifyInstance, options: ContractRo
       projectId: params.value.projectId,
       contractId: params.value.contractId,
       revision: params.value.revision,
+      expectedContentFingerprint: body.value.expectedContentFingerprint,
       actor: session.ownerId,
     });
     if (!approved.ok) return sendProblem(reply, problemFor(approved.error));
