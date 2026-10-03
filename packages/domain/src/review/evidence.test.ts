@@ -116,13 +116,18 @@ test('an owner test cannot be filed against a check', () => {
   assert.equal(recorded.ok, false);
 });
 
-test('owner feedback is redacted before it can reach a stored row', () => {
+test('a check detail is redacted before it can reach a stored row', () => {
+  // Assembled from parts so the tracked source carries no credential-shaped literal
+  // (N02-AC2), the same way packages/domain/src/redaction.test.ts builds its fixtures.
+  const opaque = '0123456789abcdefghijklmnopqrstuvwxyz';
+  const credential = ['gh', 'p_', opaque].join('');
   const recorded = recordMvpEvidence(
-    input({ detail: 'token ghp_abcdefghijklmnopqrstuvwxyz012345 leaked into the output' }),
+    input({ detail: `token ${credential} leaked into the output` }),
   );
   assert.equal(recorded.ok, true);
   if (!recorded.ok) return;
-  assert.ok(!(recorded.value.detail ?? '').includes('ghp_abcdefghijklmnopqrstuvwxyz012345'));
+  assert.ok(!(recorded.value.detail ?? '').includes(credential));
+  assert.match(recorded.value.detail ?? '', /\[redacted:/);
 });
 
 test('bindingAppliesTo names every differing dimension rather than stopping at the first', () => {

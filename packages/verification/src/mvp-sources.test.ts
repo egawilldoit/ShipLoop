@@ -280,13 +280,16 @@ test('an owner test against an abbreviated SHA binds to nothing', () => {
   assert.equal(recorded.value.binding, null);
 });
 
-test('a redacted check detail never reaches the recorded evidence verbatim', async () => {
+test('check output holding a credential is redacted before it becomes evidence', async () => {
+  // Assembled from parts so the tracked source carries no credential-shaped literal
+  // (N02-AC2), matching packages/domain/src/redaction.test.ts.
+  const credential = ['Bearer', ' ', 'opaque0123456789abcdefghij'].join('');
   const deps: CheckRunnerDeps = {
     run: async () => ({
       status: 'Exited',
       exitCode: 1,
       signal: null,
-      output: 'Authorization: Bearer abcdefghijklmnopqrstuvwxyz012345',
+      output: `Authorization: ${credential}`,
       outputTruncated: false,
       durationMs: 5,
       detail: null,
@@ -297,5 +300,6 @@ test('a redacted check detail never reaches the recorded evidence verbatim', asy
   const recorded = await recordProjectCommand(commandRequest(), deps);
   assert.equal(recorded.ok, true);
   if (!recorded.ok) return;
-  assert.ok(!(recorded.value.detail ?? '').includes('abcdefghijklmnopqrstuvwxyz012345'));
+  assert.equal(recorded.value.outcome, 'failed');
+  assert.ok(!(recorded.value.detail ?? '').includes(credential));
 });
