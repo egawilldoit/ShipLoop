@@ -60,8 +60,18 @@ const CONTENT: ContractContent = {
   scope: ['Sum the line items before tax', 'Apply the configured tax rate'],
   outOfScope: ['Changing the tax rate'],
   acceptanceCriteria: [
-    { id: 'AC1', description: 'The summary returns 200 and displays "Total: 12.00".', verificationType: 'automated' },
-    { id: 'AC2', description: 'The owner confirms the total matches the invoice they were sent.', verificationType: 'owner_test' },
+    {
+      id: 'AC1',
+      description: 'The summary returns 200 and displays "Total: 12.00".',
+      verificationType: 'automated',
+      verificationCheckId: 'unit-tests',
+    },
+    {
+      id: 'AC2',
+      description: 'The owner confirms the total matches the invoice they were sent.',
+      verificationType: 'owner_test',
+      verificationCheckId: null,
+    },
   ],
 };
 
@@ -563,5 +573,59 @@ test('a revision for one request cannot be filed under another request', async (
     expectOk(context.contracts.createDraft(second));
     assert.equal(expectOk(context.contracts.listForRequest(PROJECT, REQUEST)).length, 1);
     assert.equal(expectOk(context.contracts.listForRequest(PROJECT, OTHER_REQUEST)).length, 1);
+  });
+});
+test('a criterion keeps the check it is bound to across a write and a read', async () => {
+  await withDatabase((context) => {
+    const stored = storedDraft(context);
+    const read = expectOk(context.contracts.read(PROJECT, CONTRACT, 1));
+    assert.deepEqual(
+      read.acceptanceCriteria.map((criterion) => criterion.verificationCheckId),
+      stored.acceptanceCriteria.map((criterion) => criterion.verificationCheckId),
+      'the binding is durable, so a re-read names the same check the owner agreed',
+    );
+    assert.deepEqual(
+      read.acceptanceCriteria.map((criterion) => criterion.verificationCheckId),
+      ['unit-tests', null],
+      'an owner test round-trips as unbound, which is the only correct value for it',
+    );
+  });
+});
+
+test('a revision written before the binding existed reads as unbound rather than as an error', async () => {
+  await withDatabase((context) => {
+    storedDraft(context);
+    // A row from before this field existed: the key is simply absent. Reporting that as
+    // unreadable would take down every stored contract on upgrade; reading it as unbound is
+    // the truth about it, and the approval gate is what stops a new one being sealed.
+    context.database
+      .prepare('UPDATE delivery_contracts SET acceptance_criteria_json = ? WHERE contract_id = ?')
+      .run(
+        JSON.stringify([
+          { id: 'AC1', description: 'The summary returns 200.', verificationType: 'automated' },
+        ]),
+        CONTRACT,
+      );
+    const read = expectOk(context.contracts.read(PROJECT, CONTRACT, 1));
+    assert.equal(read.acceptanceCriteria[0]?.verificationCheckId, null);
+  });
+});
+
+test('a criterion whose stored binding is not text is reported rather than read as unbound', async () => {
+  await withDatabase((context) => {
+    storedDraft(context);
+    context.database
+      .prepare('UPDATE delivery_contracts SET acceptance_criteria_json = ? WHERE contract_id = ?')
+      .run(
+        JSON.stringify([
+          { id: 'AC1', description: 'It works.', verificationType: 'automated', verificationCheckId: 7 },
+        ]),
+        CONTRACT,
+      );
+    // Silently coercing this to `null` would show the owner an unbound criterion while the
+    // row says something else, which is the row this module is built to refuse.
+    const read = context.contracts.read(PROJECT, CONTRACT, 1);
+    const error = expectError(read, 'Unavailable');
+    assert.match(error.reason, /verificationCheckId/);
   });
 });
