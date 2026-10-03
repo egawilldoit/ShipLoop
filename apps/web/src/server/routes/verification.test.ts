@@ -581,11 +581,14 @@ async function approvedContract(
   assert.equal(drafted.statusCode, 201, `contract drafting failed: ${drafted.body}`);
   const contract = parse<{ contract: ContractView }>(drafted).contract;
 
+  // An approval names the draft it reviewed. Posting an empty body is the pre-CAS wire shape and
+  // is now refused by name, so the fixture sends the fingerprint the read actually carried rather
+  // than inventing one — this is the same token a real owner's page holds.
   const approved = await app.inject({
     method: 'POST',
     url: `/api/projects/${PROJECT_ID}/contracts/${contract.contractId}/${contract.revision}/approve`,
     headers: { cookie: session.cookie, [CSRF_HEADER]: session.csrfToken },
-    payload: {},
+    payload: { expectedContentFingerprint: contract.contentFingerprint },
   });
   assert.equal(approved.statusCode, 200, `approval failed: ${approved.body}`);
   return {

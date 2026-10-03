@@ -27,6 +27,7 @@ import test from 'node:test';
 import {
   approveContract,
   asCommitSha,
+  contractContentFingerprint,
   createContractDraft,
   createRequest,
   fingerprint,
@@ -342,8 +343,14 @@ function seed(db: Database): Seed {
   );
   const contracts = new ContractRepository(db);
   expectOk(contracts.createDraft(draft));
-  const approved = expectOk(approveContract(draft, { approvedBy: OWNER_ID, at: T0 }));
-  expectOk(contracts.approve(approved, draft.updatedAt));
+  // The approval names the draft it reviewed: the same fingerprint the row carries, which is what
+  // stops a stale tab sealing text this test never saw. Asserted here rather than defaulted, so the
+  // fixture cannot quietly stop exercising the guard.
+  const reviewed = contractContentFingerprint(draft);
+  const approved = expectOk(
+    approveContract(draft, { approvedBy: OWNER_ID, at: T0, expectedContentFingerprint: reviewed }),
+  );
+  expectOk(contracts.approve(approved, { updatedAt: draft.updatedAt, contentFingerprint: reviewed }));
 
   expectOk(
     new DeliveryCandidateRepository(db).record({
