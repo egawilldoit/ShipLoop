@@ -60,6 +60,9 @@ import {
   type ClarificationRoundView,
   type ClarifyingQuestionView,
   type ConnectorView,
+  type ContractCriterionView,
+  type ContractStaleReason,
+  type ContractView,
   type ControllerSurface,
   type CorrectionView,
   type CreateSessionCommand,
@@ -94,6 +97,8 @@ import {
   type RegisterConnectorCommand,
   type RelatednessReportView,
   type RelatedWorkChoiceView,
+  type RequestDetailView,
+  type RequestView,
   type ReviewCardView,
   type RevokeConnectorCommand,
   type RevokeSessionCommand,
@@ -345,6 +350,11 @@ class InMemoryController implements ControllerSurface {
   private ownerCreatedAt = '';
   /** The project this owner has selected, or null when none is selected (F02-AC1). */
   private activeProjectId: string | null = null;
+  /** The requests this double holds, keyed by identity (mvp-spec 3). */
+  private readonly requestRecords = new Map<string, RequestView>();
+  /** The contract revisions this double holds, keyed by `contractId#revision`. */
+  private readonly contractRevisions = new Map<string, ContractView>();
+  private contractTicks = 0;
   private readonly scripted = new Map<string, DomainError>();
   private readonly recordedRuns = new Map<string, RunJobView>();
   private readonly checkpoints = new Map<string, RunCheckpointView>();
@@ -792,6 +802,401 @@ class InMemoryController implements ControllerSurface {
       return ok(null);
     },
   };
+
+  /**
+   * The request and contract group.
+   *
+   * A real in-memory implementation rather than a refusal: these routes are the MVP's first
+   * two steps, and a double that answered "not implemented" would leave every assertion about
+   * them vacuous. What is real here is the *boundary* - project-scoped keys, the
+   * compare-and-set, the frozen approval and the attributed approver - because those are the
+   * properties `routes/contracts.ts` has to forward faithfully. Whether the underlying rules
+   * hold is proved in `packages/domain/src/contract.test.ts` and
+   * `packages/controller/src/contracts.test.ts`, both against the real store.
+   */
+  readonly contracts = {
+    createRequest: async (command: {
+      readonly projectId: string;
+      readonly title: string;
+      readonly description: string;
+      readonly actor: OwnerId;
+    }): Promise<Result<RequestView, DomainError>> => {
+      const request: RequestView = {
+        requestId: `req_${this.requestRecords.size + 1}`,
+        projectId: command.projectId,
+        title: command.title,
+        description: command.description,
+        sourceIdeaId: null,
+        createdAt: this.contractInstant(),
+        updatedAt: this.contractInstant(),
+      };
+      this.requestRecords.set(request.requestId, request);
+      return ok(request);
+    },
+
+    getRequest: async (command: {
+      readonly projectId: string;
+      readonly requestId: string;
+      readonly actor: OwnerId;
+    }): Promise<Result<RequestDetailView, DomainError>> => {
+      const detail = this.detailOf(command.projectId, command.requestId);
+      if (!detail.ok) return detail;
+      return ok(detail.value);
+    },
+
+    listRequests: async (command: {
+      readonly projectId: string;
+      readonly actor: OwnerId;
+    }): Promise<Result<readonly RequestView[], DomainError>> =>
+      ok([...this.requestRecords.values()].filter((request) => request.projectId === command.projectId)),
+
+    updateRequest: async (command: {
+      readonly projectId: string;
+      readonly requestId: string;
+      readonly title?: string;
+      readonly description?: string;
+      readonly expectedUpdatedAt: string;
+      readonly actor: OwnerId;
+    }): Promise<Result<RequestView, DomainError>> => {
+      const stored = this.requestRecords.get(command.requestId);
+      // Project-scoped: a request id from another project is not found, not found-and-refused,
+      // so the refusal cannot confirm that the identifier exists elsewhere (F02-AC2).
+      if (stored === undefined || stored.projectId !== command.projectId) {
+        return { ok: false, error: { code: 'NotFound', reason: `Request ${command.requestId} does not exist.` } };
+      }
+      if (stored.updatedAt !== command.expectedUpdatedAt) {
+        return {
+          ok: false,
+          error: conflict(
+            'The request changed after it was loaded. Reload it before saving again.',
+            command.expectedUpdatedAt,
+            stored.updatedAt,
+          ),
+        };
+      }
+      const title = command.title ?? stored.title;
+      const description = command.description ?? stored.description;
+      if (title === stored.title && description === stored.description) {
+        return { ok: false, error: invalid('Nothing changed; edit the title or the description.', [{ path: 'request', message: 'No-op.' }]) };
+      }
+      const updated: RequestView = { ...stored, title, description, updatedAt: this.contractInstant() };
+      this.requestRecords.set(updated.requestId, updated);
+      return ok(updated);
+    },
+
+    draftContract: async (command: {
+      readonly projectId: string;
+      readonly requestId: string;
+      readonly outcome: string;
+      readonly scope: readonly string[];
+      readonly outOfScope: readonly string[];
+      readonly acceptanceCriteria: readonly ContractCriterionView[];
+      readonly actor: OwnerId;
+    }): Promise<Result<ContractView, DomainError>> => {
+      const request = this.requestRecords.get(command.requestId);
+      if (request === undefined || request.projectId !== command.projectId) {
+        return { ok: false, error: { code: 'NotFound', reason: `Request ${command.requestId} does not exist.` } };
+      }
+      const existing = [...this.contractRevisions.values()].filter((contract) => contract.requestId === command.requestId);
+      if (existing.length > 0) {
+        return {
+          ok: false,
+          error: conflict(
+            `This request already has ${existing.length} contract revision(s).`,
+            'no revisions',
+            `${existing.length} revision(s)`,
+          ),
+        };
+      }
+      if (command.acceptanceCriteria.length === 0) {
+        return {
+          ok: false,
+          error: invalid('A contract needs at least one acceptance criterion.', [
+            { path: 'acceptanceCriteria', message: 'At least one.' },
+          ]),
+        };
+      }
+      const contract = this.newRevision(command.projectId, command.requestId, 1, {
+        outcome: command.outcome,
+        scope: command.scope,
+        outOfScope: command.outOfScope,
+        acceptanceCriteria: command.acceptanceCriteria,
+      });
+      return ok(contract);
+    },
+
+    getContract: async (command: {
+      readonly projectId: string;
+      readonly contractId: string;
+      readonly revision: number;
+      readonly actor: OwnerId;
+    }): Promise<Result<ContractView, DomainError>> => {
+      const contract = this.revisionOf(command.projectId, command.contractId, command.revision);
+      if (contract === null) {
+        return { ok: false, error: { code: 'NotFound', reason: `Contract revision #${command.revision} does not exist.` } };
+      }
+      return ok(contract);
+    },
+
+    listContractRevisions: async (command: {
+      readonly projectId: string;
+      readonly requestId: string;
+      readonly actor: OwnerId;
+    }): Promise<Result<readonly ContractView[], DomainError>> =>
+      ok(
+        [...this.contractRevisions.values()]
+          .filter((contract) => contract.projectId === command.projectId && contract.requestId === command.requestId)
+          .sort((left, right) => left.revision - right.revision),
+      ),
+
+    listContractCriteria: async (command: {
+      readonly projectId: string;
+      readonly contractId: string;
+      readonly revision: number;
+      readonly actor: OwnerId;
+    }): Promise<Result<readonly ContractCriterionView[], DomainError>> => {
+      const contract = this.revisionOf(command.projectId, command.contractId, command.revision);
+      if (contract === null) {
+        return { ok: false, error: { code: 'NotFound', reason: `Contract revision #${command.revision} does not exist.` } };
+      }
+      return ok(contract.acceptanceCriteria.map((criterion) => ({ ...criterion })));
+    },
+
+    editContract: async (command: {
+      readonly projectId: string;
+      readonly contractId: string;
+      readonly revision: number;
+      readonly outcome: string;
+      readonly scope: readonly string[];
+      readonly outOfScope: readonly string[];
+      readonly acceptanceCriteria: readonly ContractCriterionView[];
+      readonly expectedUpdatedAt: string;
+      readonly actor: OwnerId;
+    }): Promise<Result<ContractView, DomainError>> => {
+      const stored = this.revisionOf(command.projectId, command.contractId, command.revision);
+      if (stored === null) {
+        return { ok: false, error: { code: 'NotFound', reason: `Contract revision #${command.revision} does not exist.` } };
+      }
+      // The freeze, which is the property the route has to forward: an approved revision's
+      // text is not editable, and the only way forward is a new revision (mvp-spec 3).
+      if (stored.status !== 'draft') {
+        return {
+          ok: false,
+          error: invalid(
+            `Revision ${stored.revision} is ${stored.status}, so it cannot be edited. Draft a new revision instead.`,
+            [{ path: 'status', message: 'Only a draft revision may be edited.' }],
+          ),
+        };
+      }
+      if (stored.updatedAt !== command.expectedUpdatedAt) {
+        return {
+          ok: false,
+          error: conflict('The contract revision changed after it was loaded.', command.expectedUpdatedAt, stored.updatedAt),
+        };
+      }
+      const edited: ContractView = {
+        ...stored,
+        outcome: command.outcome,
+        scope: [...command.scope],
+        outOfScope: [...command.outOfScope],
+        acceptanceCriteria: command.acceptanceCriteria.map((criterion) => ({ ...criterion })),
+        contentFingerprint: fingerprint({
+          outcome: command.outcome,
+          scope: [...command.scope],
+          outOfScope: [...command.outOfScope],
+          acceptanceCriteria: command.acceptanceCriteria.map((criterion) => ({ ...criterion })),
+        }),
+        updatedAt: this.contractInstant(),
+      };
+      this.storeRevision(edited);
+      return ok(edited);
+    },
+
+    /**
+     * Approves, attributing the approval to the session.
+     *
+     * The command carries no approver, which is the whole point: there is no field for a
+     * client to fill in, so a route cannot forward one even by accident (mvp-spec 3).
+     */
+    approveRevision: async (command: {
+      readonly projectId: string;
+      readonly contractId: string;
+      readonly revision: number;
+      readonly actor: OwnerId;
+    }): Promise<Result<ContractView, DomainError>> => {
+      const stored = this.revisionOf(command.projectId, command.contractId, command.revision);
+      if (stored === null) {
+        return { ok: false, error: { code: 'NotFound', reason: `Contract revision #${command.revision} does not exist.` } };
+      }
+      if (stored.status !== 'draft') {
+        return {
+          ok: false,
+          error: conflict(`Revision ${stored.revision} is already ${stored.status}.`, 'draft', stored.status),
+        };
+      }
+      const approved: ContractView = {
+        ...stored,
+        status: 'approved',
+        approvedAt: this.contractInstant(),
+        approvedBy: String(command.actor),
+        updatedAt: this.contractInstant(),
+        blockedBecause: null,
+      };
+      this.storeRevision(approved);
+      return ok(approved);
+    },
+
+    reviseContract: async (command: {
+      readonly projectId: string;
+      readonly contractId: string;
+      readonly revision: number;
+      readonly outcome: string;
+      readonly scope: readonly string[];
+      readonly outOfScope: readonly string[];
+      readonly acceptanceCriteria: readonly ContractCriterionView[];
+      readonly actor: OwnerId;
+    }): Promise<Result<ContractView, DomainError>> => {
+      const stored = this.revisionOf(command.projectId, command.contractId, command.revision);
+      if (stored === null) {
+        return { ok: false, error: { code: 'NotFound', reason: `Contract revision #${command.revision} does not exist.` } };
+      }
+      const next = this.newRevision(command.projectId, stored.requestId, stored.revision + 1, {
+        outcome: command.outcome,
+        scope: command.scope,
+        outOfScope: command.outOfScope,
+        acceptanceCriteria: command.acceptanceCriteria,
+      });
+      // One step: the old approval is retired here or the new revision never arrives. This is
+      // the property the route has to forward, so it lives in the double too (mvp-spec 3).
+      if (stored.status === 'approved') {
+        this.storeRevision({
+          ...stored,
+          status: 'stale',
+          staleReason: `Superseded by revision ${next.revision}.`,
+          supersededByRevision: next.revision,
+          updatedAt: this.contractInstant(),
+          blockedBecause: `Contract revision ${stored.revision} is stale; only an approved revision may be measured against.`,
+        });
+      }
+      return ok(next);
+    },
+
+    invalidateRevision: async (command: {
+      readonly projectId: string;
+      readonly contractId: string;
+      readonly revision: number;
+      readonly reason: ContractStaleReason;
+      readonly actor: OwnerId;
+    }): Promise<Result<ContractView, DomainError>> => {
+      const stored = this.revisionOf(command.projectId, command.contractId, command.revision);
+      if (stored === null) {
+        return { ok: false, error: { code: 'NotFound', reason: `Contract revision #${command.revision} does not exist.` } };
+      }
+      if (stored.status !== 'approved') {
+        return {
+          ok: false,
+          error: conflict(`Revision ${stored.revision} is ${stored.status}; there is no approval to retire.`, 'approved', stored.status),
+        };
+      }
+      const stale: ContractView = {
+        ...stored,
+        status: 'stale',
+        staleReason: STALE_REASON_TEXT[command.reason],
+        updatedAt: this.contractInstant(),
+        blockedBecause: `Contract revision ${stored.revision} is stale; only an approved revision may be measured against.`,
+      };
+      this.storeRevision(stale);
+      return ok(stale);
+    },
+  };
+
+  /**
+   * A strictly increasing instant, so two recorded times in one case stay ordered and a
+   * compare-and-set can tell them apart (mvp-spec 7).
+   */
+  private contractInstant(): string {
+    this.contractTicks += 1;
+    return `2026-03-01T${String(9 + this.contractTicks).padStart(2, '0')}:00:00.000Z`;
+  }
+
+  /** One revision, addressed by project as well as identity and number (F02-AC2). */
+  private revisionOf(projectId: string, contractId: string, revision: number): ContractView | null {
+    const stored = this.contractRevisions.get(`${contractId}#${revision}`);
+    if (stored === undefined || stored.projectId !== projectId) return null;
+    return stored;
+  }
+
+  private storeRevision(contract: ContractView): void {
+    this.contractRevisions.set(`${contract.contractId}#${contract.revision}`, contract);
+  }
+
+  /** A new draft revision, with a fresh id: a revision is a different agreement. */
+  private newRevision(
+    projectId: string,
+    requestId: string,
+    revision: number,
+    content: {
+      readonly outcome: string;
+      readonly scope: readonly string[];
+      readonly outOfScope: readonly string[];
+      readonly acceptanceCriteria: readonly ContractCriterionView[];
+    },
+  ): ContractView {
+    const request = this.requestRecords.get(requestId);
+    const at = this.contractInstant();
+    const contract: ContractView = {
+      contractId: `dc_${this.contractRevisions.size + 1}`,
+      revision,
+      projectId,
+      requestId,
+      status: 'draft',
+      outcome: content.outcome,
+      scope: [...content.scope],
+      outOfScope: [...content.outOfScope],
+      acceptanceCriteria: content.acceptanceCriteria.map((criterion) => ({ ...criterion })),
+      contentFingerprint: fingerprint(content),
+      // The fingerprint of the request text as it stands now, so a later edit is detectable -
+      // reported as `answersCurrentRequest: false` rather than acted on (mvp-spec 3).
+      requestFingerprint: fingerprint({
+        projectId,
+        title: request?.title ?? '',
+        description: request?.description ?? '',
+        sourceIdeaId: request?.sourceIdeaId ?? null,
+      }),
+      answersCurrentRequest: true,
+      approvedAt: null,
+      approvedBy: null,
+      staleReason: null,
+      supersededByRevision: null,
+      sourceBriefId: null,
+      sourceBriefVersion: null,
+      createdBy: String(OWNER_ID),
+      createdAt: at,
+      updatedAt: at,
+      blockedBecause: `Contract revision ${revision} is draft; only an approved revision may be measured against.`,
+    };
+    this.storeRevision(contract);
+    return contract;
+  }
+
+  private detailOf(
+    projectId: string,
+    requestId: string,
+  ): Result<RequestDetailView, DomainError> {
+    const request = this.requestRecords.get(requestId);
+    if (request === undefined || request.projectId !== projectId) {
+      return { ok: false, error: { code: 'NotFound', reason: `Request ${requestId} does not exist.` } };
+    }
+    const revisions = [...this.contractRevisions.values()]
+      .filter((contract) => contract.projectId === projectId && contract.requestId === requestId)
+      .sort((left, right) => left.revision - right.revision);
+    return ok({
+      request,
+      latestRevision: revisions[revisions.length - 1] ?? null,
+      approvedRevision: revisions.find((contract) => contract.status === 'approved') ?? null,
+      revisions,
+    });
+  }
 
   readonly projects = {
     listProjects: async (): Promise<Result<readonly ProjectView[], DomainError>> =>
@@ -1596,6 +2001,77 @@ interface Session {
   readonly csrfToken: string;
 }
 
+/** The closure each stale reason stands for, so the stored explanation is actionable. */
+const STALE_REASON_TEXT: Readonly<Record<ContractStaleReason, string>> = Object.freeze({
+  RequestChanged: 'The request this revision answers has changed.',
+  SurroundingContextChanged: 'Something the contract depends on outside the contract has changed.',
+  WithdrawnByOwner: 'The owner withdrew this revision without replacing it.',
+});
+
+/** The contract content a request body sends, as the MVP's own example. */
+const CONTRACT_CONTENT = {
+  outcome: 'The order summary shows the total including tax.',
+  scope: ['Sum the line items before tax', 'Apply the configured tax rate'],
+  outOfScope: ['Changing the tax rate'],
+  acceptanceCriteria: [
+    { id: 'AC1', description: 'The summary returns 200 and displays "Total: 12.00".', verificationType: 'automated' },
+    { id: 'AC2', description: 'The owner confirms the total matches the invoice they were sent.', verificationType: 'owner_test' },
+  ],
+} as const;
+
+const CHANGED_CONTRACT_CONTENT = {
+  ...CONTRACT_CONTENT,
+  outcome: 'The order summary shows the total including tax and shipping.',
+  scope: [...CONTRACT_CONTENT.scope, 'Show the currency code'],
+} as const;
+
+/** Creates a request and returns it, so a case can start from a real one. */
+async function createRequest(h: Harness, session: Session, projectId = PROJECT_ID): Promise<RequestView> {
+  const response = await h.app.inject({
+    method: 'POST',
+    url: `/api/projects/${projectId}/requests`,
+    headers: { cookie: session.cookie, [CSRF_HEADER]: session.csrfToken },
+    payload: { title: 'Checkout totals', description: 'The order summary shows the pre-tax total.' },
+  });
+  assert.equal(response.statusCode, 201, `request creation failed: ${response.body}`);
+  return parse<{ request: RequestView }>(response).request;
+}
+
+/** Drafts revision 1 for a request and returns it. */
+async function draftContract(
+  h: Harness,
+  session: Session,
+  requestId: string,
+  projectId = PROJECT_ID,
+): Promise<ContractView> {
+  const response = await h.app.inject({
+    method: 'POST',
+    url: `/api/projects/${projectId}/requests/${requestId}/contract`,
+    headers: { cookie: session.cookie, [CSRF_HEADER]: session.csrfToken },
+    payload: CONTRACT_CONTENT,
+  });
+  assert.equal(response.statusCode, 201, `contract drafting failed: ${response.body}`);
+  return parse<{ contract: ContractView }>(response).contract;
+}
+
+/** Approves a revision and returns it. */
+async function approveRevision(
+  h: Harness,
+  session: Session,
+  contractId: string,
+  revision: number,
+  projectId = PROJECT_ID,
+): Promise<ContractView> {
+  const response = await h.app.inject({
+    method: 'POST',
+    url: `/api/projects/${projectId}/contracts/${contractId}/${revision}/approve`,
+    headers: { cookie: session.cookie, [CSRF_HEADER]: session.csrfToken },
+    payload: {},
+  });
+  assert.equal(response.statusCode, 200, `approval failed: ${response.body}`);
+  return parse<{ contract: ContractView }>(response).contract;
+}
+
 async function signIn(app: FastifyInstance, identifier = OWNER_NAME, password = OWNER_PASSWORD): Promise<Session> {
   const response = await app.inject({
     method: 'POST',
@@ -1891,6 +2367,481 @@ test('F02-AC4: a project id that is a path, and a null selection, are both refus
     payload: { projectId: 'checkout', activeProjectName: 'A name the client invented' },
   });
   assert.equal(extra.statusCode, 400, extra.body);
+});
+
+/* -------------------------------------------------------------------------- */
+/* Requests and delivery contracts (mvp-spec 3)                               */
+/* -------------------------------------------------------------------------- */
+
+test('mvp-spec 3: a request is created and read without an engine, a provider or a session cookie trick', async () => {
+  const h = await harness();
+  const session = await signIn(h.app);
+
+  const created = await createRequest(h, session);
+  assert.equal(created.projectId, PROJECT_ID);
+  assert.equal(created.title, 'Checkout totals');
+  assert.equal(created.description, 'The order summary shows the pre-tax total.');
+  assert.equal(created.sourceIdeaId, null);
+
+  const detail = parse<RequestDetailView>(
+    await h.app.inject({
+      method: 'GET',
+      url: `/api/projects/${PROJECT_ID}/requests/${created.requestId}`,
+      headers: { cookie: session.cookie },
+    }),
+  );
+  assert.equal(detail.request.requestId, created.requestId);
+  assert.equal(detail.latestRevision, null);
+  assert.equal(detail.approvedRevision, null);
+  assert.deepEqual(detail.revisions, []);
+
+  const listed = parse<{ requests: readonly RequestView[] }>(
+    await h.app.inject({
+      method: 'GET',
+      url: `/api/projects/${PROJECT_ID}/requests`,
+      headers: { cookie: session.cookie },
+    }),
+  );
+  assert.equal(listed.requests.length, 1);
+});
+
+test('mvp-spec 3: a request draft is edited with a compare-and-set, and a stale editor gets a 409', async () => {
+  const h = await harness();
+  const session = await signIn(h.app);
+  const request = await createRequest(h, session);
+
+  const edited = await h.app.inject({
+    method: 'PATCH',
+    url: `/api/projects/${PROJECT_ID}/requests/${request.requestId}`,
+    headers: { cookie: session.cookie, [CSRF_HEADER]: session.csrfToken },
+    payload: { description: 'The order summary shows the total including tax.', expectedUpdatedAt: request.updatedAt },
+  });
+  assert.equal(edited.statusCode, 200, edited.body);
+  assert.equal(parse<{ request: RequestView }>(edited).request.description, 'The order summary shows the total including tax.');
+
+  // The same edit against the instant the editor loaded: refused, and the record is
+  // unchanged, so two tabs cannot both believe they saved (F02-AC2, F24-AC4).
+  const stale = await h.app.inject({
+    method: 'PATCH',
+    url: `/api/projects/${PROJECT_ID}/requests/${request.requestId}`,
+    headers: { cookie: session.cookie, [CSRF_HEADER]: session.csrfToken },
+    payload: { title: 'Checkout totals v2', expectedUpdatedAt: request.updatedAt },
+  });
+  assert.equal(stale.statusCode, 409, stale.body);
+  const conflict = parse<ErrorPayload>(stale).error;
+  assert.equal(conflict.code, 'Conflict');
+  assert.equal(conflict.expected, request.updatedAt);
+  assert.notEqual(conflict.actual, request.updatedAt);
+
+  const detail = parse<RequestDetailView>(
+    await h.app.inject({
+      method: 'GET',
+      url: `/api/projects/${PROJECT_ID}/requests/${request.requestId}`,
+      headers: { cookie: session.cookie },
+    }),
+  );
+  assert.equal(detail.request.title, 'Checkout totals');
+});
+
+test('mvp-spec 3: an edit with no compare-and-set, and a no-op, are both refused', async () => {
+  const h = await harness();
+  const session = await signIn(h.app);
+  const request = await createRequest(h, session);
+
+  const withoutInstant = await h.app.inject({
+    method: 'PATCH',
+    url: `/api/projects/${PROJECT_ID}/requests/${request.requestId}`,
+    headers: { cookie: session.cookie, [CSRF_HEADER]: session.csrfToken },
+    payload: { title: 'Renamed' },
+  });
+  assert.equal(withoutInstant.statusCode, 400, withoutInstant.body);
+  assert.equal(
+    parse<ErrorPayload>(withoutInstant).error.fields?.some((field) => field.path === 'expectedUpdatedAt') ?? false,
+    true,
+    'the refusal must name the instant it required',
+  );
+
+  const noop = await h.app.inject({
+    method: 'PATCH',
+    url: `/api/projects/${PROJECT_ID}/requests/${request.requestId}`,
+    headers: { cookie: session.cookie, [CSRF_HEADER]: session.csrfToken },
+    payload: { title: 'Checkout totals', expectedUpdatedAt: request.updatedAt },
+  });
+  assert.equal(noop.statusCode, 400, noop.body);
+});
+
+test('mvp-spec 3: a draft revision carries its criteria and no approval', async () => {
+  const h = await harness();
+  const session = await signIn(h.app);
+  const request = await createRequest(h, session);
+
+  const contract = await draftContract(h, session, request.requestId);
+  assert.equal(contract.revision, 1);
+  assert.equal(contract.status, 'draft');
+  assert.equal(contract.approvedBy, null);
+  assert.equal(contract.approvedAt, null);
+  assert.equal(contract.outcome, CONTRACT_CONTENT.outcome);
+  assert.deepEqual(contract.scope, [...CONTRACT_CONTENT.scope]);
+  assert.deepEqual(contract.outOfScope, [...CONTRACT_CONTENT.outOfScope]);
+  assert.deepEqual(contract.acceptanceCriteria, CONTRACT_CONTENT.acceptanceCriteria.map((criterion) => ({ ...criterion })));
+  assert.match(contract.blockedBecause ?? '', /only an approved revision/);
+
+  const criteria = parse<{ criteria: readonly ContractCriterionView[] }>(
+    await h.app.inject({
+      method: 'GET',
+      url: `/api/projects/${PROJECT_ID}/contracts/${contract.contractId}/1/criteria`,
+      headers: { cookie: session.cookie },
+    }),
+  );
+  assert.deepEqual(
+    criteria.criteria.map((criterion) => [criterion.id, criterion.verificationType]),
+    [
+      ['AC1', 'automated'],
+      ['AC2', 'owner_test'],
+    ],
+    'the criteria are listed with the verification type that decides who may settle each',
+  );
+});
+
+test('mvp-spec 3: a contract with no criterion, or an unknown verification type, is refused by name', async () => {
+  const h = await harness();
+  const session = await signIn(h.app);
+  const request = await createRequest(h, session);
+
+  const empty = await h.app.inject({
+    method: 'POST',
+    url: `/api/projects/${PROJECT_ID}/requests/${request.requestId}/contract`,
+    headers: { cookie: session.cookie, [CSRF_HEADER]: session.csrfToken },
+    payload: { ...CONTRACT_CONTENT, acceptanceCriteria: [] },
+  });
+  assert.equal(empty.statusCode, 400, empty.body);
+
+  const invented = await h.app.inject({
+    method: 'POST',
+    url: `/api/projects/${PROJECT_ID}/requests/${request.requestId}/contract`,
+    headers: { cookie: session.cookie, [CSRF_HEADER]: session.csrfToken },
+    payload: {
+      ...CONTRACT_CONTENT,
+      acceptanceCriteria: [{ id: 'AC1', description: 'It works.', verificationType: 'vibes' }],
+    },
+  });
+  assert.equal(invented.statusCode, 400, invented.body);
+  // Refused rather than defaulted: defaulting a verification type would decide who may
+  // settle a criterion on the client's behalf (mvp-spec 3).
+  assert.equal(
+    parse<ErrorPayload>(invented).error.fields?.some((field) => field.path.includes('verificationType')) ?? false,
+    true,
+  );
+});
+
+test('mvp-spec 3: a draft revision is edited in place and keeps its revision number', async () => {
+  const h = await harness();
+  const session = await signIn(h.app);
+  const request = await createRequest(h, session);
+  const contract = await draftContract(h, session, request.requestId);
+
+  const edited = await h.app.inject({
+    method: 'PATCH',
+    url: `/api/projects/${PROJECT_ID}/contracts/${contract.contractId}/1`,
+    headers: { cookie: session.cookie, [CSRF_HEADER]: session.csrfToken },
+    payload: { ...CHANGED_CONTRACT_CONTENT, expectedUpdatedAt: contract.updatedAt },
+  });
+  assert.equal(edited.statusCode, 200, edited.body);
+  const updated = parse<{ contract: ContractView }>(edited).contract;
+  assert.equal(updated.revision, 1);
+  assert.equal(updated.outcome, CHANGED_CONTRACT_CONTENT.outcome);
+  assert.notEqual(updated.contentFingerprint, contract.contentFingerprint);
+  assert.equal(updated.status, 'draft');
+});
+
+test('mvp-spec 3: approval attributes itself to the session and carries no approver in the body', async () => {
+  const h = await harness();
+  const session = await signIn(h.app);
+  const request = await createRequest(h, session);
+  const contract = await draftContract(h, session, request.requestId);
+
+  // A body that tries to name the approver is refused rather than ignored: a client that
+  // *believed* it named the approver is the defect this route is shaped to prevent.
+  const smuggled = await h.app.inject({
+    method: 'POST',
+    url: `/api/projects/${PROJECT_ID}/contracts/${contract.contractId}/1/approve`,
+    headers: { cookie: session.cookie, [CSRF_HEADER]: session.csrfToken },
+    payload: { approvedBy: 'own_somebody_else', status: 'approved' },
+  });
+  assert.equal(smuggled.statusCode, 400, smuggled.body);
+
+  const approved = await approveRevision(h, session, contract.contractId, 1);
+  assert.equal(approved.status, 'approved');
+  assert.equal(approved.approvedBy, OWNER_ID, 'the approver is the session, not the body');
+  assert.match(approved.approvedAt ?? '', /^2026-03-01T/);
+  assert.equal(approved.blockedBecause, null);
+
+  const detail = parse<RequestDetailView>(
+    await h.app.inject({
+      method: 'GET',
+      url: `/api/projects/${PROJECT_ID}/requests/${request.requestId}`,
+      headers: { cookie: session.cookie },
+    }),
+  );
+  assert.equal(detail.approvedRevision?.revision, 1);
+  assert.equal(detail.latestRevision?.status, 'approved');
+});
+
+test('mvp-spec 3: an approved revision cannot be edited, and approving twice is a conflict', async () => {
+  const h = await harness();
+  const session = await signIn(h.app);
+  const request = await createRequest(h, session);
+  const contract = await draftContract(h, session, request.requestId);
+  const approved = await approveRevision(h, session, contract.contractId, 1);
+
+  const edit = await h.app.inject({
+    method: 'PATCH',
+    url: `/api/projects/${PROJECT_ID}/contracts/${contract.contractId}/1`,
+    headers: { cookie: session.cookie, [CSRF_HEADER]: session.csrfToken },
+    payload: { ...CHANGED_CONTRACT_CONTENT, expectedUpdatedAt: approved.updatedAt },
+  });
+  assert.equal(edit.statusCode, 400, edit.body);
+  assert.match(edit.body, /frozen|Draft a new revision/);
+
+  const again = await h.app.inject({
+    method: 'POST',
+    url: `/api/projects/${PROJECT_ID}/contracts/${contract.contractId}/1/approve`,
+    headers: { cookie: session.cookie, [CSRF_HEADER]: session.csrfToken },
+    payload: {},
+  });
+  assert.equal(again.statusCode, 409, again.body);
+
+  const read = parse<{ contract: ContractView }>(
+    await h.app.inject({
+      method: 'GET',
+      url: `/api/projects/${PROJECT_ID}/contracts/${contract.contractId}/1`,
+      headers: { cookie: session.cookie },
+    }),
+  );
+  assert.equal(read.contract.status, 'approved');
+  assert.equal(read.contract.outcome, CONTRACT_CONTENT.outcome, 'the approved text is unchanged');
+});
+
+test('mvp-spec 3: revising writes the next revision and retires the old approval in one call', async () => {
+  const h = await harness();
+  const session = await signIn(h.app);
+  const request = await createRequest(h, session);
+  const contract = await draftContract(h, session, request.requestId);
+  await approveRevision(h, session, contract.contractId, 1);
+
+  const revised = await h.app.inject({
+    method: 'POST',
+    url: `/api/projects/${PROJECT_ID}/contracts/${contract.contractId}/1/revise`,
+    headers: { cookie: session.cookie, [CSRF_HEADER]: session.csrfToken },
+    payload: CHANGED_CONTRACT_CONTENT,
+  });
+  assert.equal(revised.statusCode, 201, revised.body);
+  const revision2 = parse<{ contract: ContractView }>(revised).contract;
+  assert.equal(revision2.revision, 2);
+  assert.equal(revision2.status, 'draft');
+  assert.equal(revision2.approvedBy, null);
+  assert.notEqual(revision2.contractId, contract.contractId, 'a revision is a different agreement');
+
+  // The old approval no longer reads as current. This is the state the single call exists to
+  // prevent: a new revision beside a still-current approval would let a candidate measured
+  // against revision 1 be described by revision 2's text (mvp-spec 3).
+  const detail = parse<RequestDetailView>(
+    await h.app.inject({
+      method: 'GET',
+      url: `/api/projects/${PROJECT_ID}/requests/${request.requestId}`,
+      headers: { cookie: session.cookie },
+    }),
+  );
+  assert.equal(detail.approvedRevision, null);
+  assert.deepEqual(
+    detail.revisions.map((revision) => [revision.revision, revision.status]),
+    [
+      [1, 'stale'],
+      [2, 'draft'],
+    ],
+  );
+  assert.equal(detail.revisions[0]?.supersededByRevision, 2);
+  assert.match(detail.revisions[0]?.staleReason ?? '', /revision 2/);
+  // History, not a deletion: the retired revision kept the text and the approver it had.
+  assert.equal(detail.revisions[0]?.outcome, CONTRACT_CONTENT.outcome);
+  assert.equal(detail.revisions[0]?.approvedBy, OWNER_ID);
+});
+
+test('mvp-spec 3: retiring an approval records the reason, and the vocabulary is closed', async () => {
+  const h = await harness();
+  const session = await signIn(h.app);
+  const request = await createRequest(h, session);
+  const contract = await draftContract(h, session, request.requestId);
+  await approveRevision(h, session, contract.contractId, 1);
+
+  const unlisted = await h.app.inject({
+    method: 'POST',
+    url: `/api/projects/${PROJECT_ID}/contracts/${contract.contractId}/1/invalidate`,
+    headers: { cookie: session.cookie, [CSRF_HEADER]: session.csrfToken },
+    payload: { reason: 'because' },
+  });
+  assert.equal(unlisted.statusCode, 400, unlisted.body);
+  assert.equal(
+    parse<ErrorPayload>(unlisted).error.fields?.some((field) => field.path === 'reason') ?? false,
+    true,
+  );
+
+  const stale = await h.app.inject({
+    method: 'POST',
+    url: `/api/projects/${PROJECT_ID}/contracts/${contract.contractId}/1/invalidate`,
+    headers: { cookie: session.cookie, [CSRF_HEADER]: session.csrfToken },
+    payload: { reason: 'RequestChanged' },
+  });
+  assert.equal(stale.statusCode, 200, stale.body);
+  const retired = parse<{ contract: ContractView }>(stale).contract;
+  assert.equal(retired.status, 'stale');
+  assert.match(retired.staleReason ?? '', /request this revision answers has changed/);
+  assert.match(retired.blockedBecause ?? '', /only an approved revision/);
+
+  // A second retirement is refused, so the first explanation survives.
+  const again = await h.app.inject({
+    method: 'POST',
+    url: `/api/projects/${PROJECT_ID}/contracts/${contract.contractId}/1/invalidate`,
+    headers: { cookie: session.cookie, [CSRF_HEADER]: session.csrfToken },
+    payload: { reason: 'WithdrawnByOwner' },
+  });
+  assert.equal(again.statusCode, 409, again.body);
+});
+
+test('mvp-spec 3, F02-AC2: nothing here crosses a project boundary', async () => {
+  const h = await harness();
+  const session = await signIn(h.app);
+  const request = await createRequest(h, session, PROJECT_ID);
+  const contract = await draftContract(h, session, request.requestId, PROJECT_ID);
+  const elsewhere = `${PROJECT_ID}-other`;
+
+  const elsewhereRequests = parse<{ requests: readonly RequestView[] }>(
+    await h.app.inject({
+      method: 'GET',
+      url: `/api/projects/${elsewhere}/requests`,
+      headers: { cookie: session.cookie },
+    }),
+  );
+  assert.deepEqual(elsewhereRequests.requests, [], 'a request is not in another project\'s list');
+
+  const writes: readonly { readonly label: string; readonly response: InjectedResponse }[] = [
+    {
+      label: 'read request',
+      response: await h.app.inject({
+        method: 'GET',
+        url: `/api/projects/${elsewhere}/requests/${request.requestId}`,
+        headers: { cookie: session.cookie },
+      }),
+    },
+    {
+      label: 'edit request',
+      response: await h.app.inject({
+        method: 'PATCH',
+        url: `/api/projects/${elsewhere}/requests/${request.requestId}`,
+        headers: { cookie: session.cookie, [CSRF_HEADER]: session.csrfToken },
+        payload: { title: 'Stolen', expectedUpdatedAt: request.updatedAt },
+      }),
+    },
+    {
+      label: 'read revision',
+      response: await h.app.inject({
+        method: 'GET',
+        url: `/api/projects/${elsewhere}/contracts/${contract.contractId}/1`,
+        headers: { cookie: session.cookie },
+      }),
+    },
+    {
+      label: 'approve',
+      response: await h.app.inject({
+        method: 'POST',
+        url: `/api/projects/${elsewhere}/contracts/${contract.contractId}/1/approve`,
+        headers: { cookie: session.cookie, [CSRF_HEADER]: session.csrfToken },
+        payload: {},
+      }),
+    },
+    {
+      label: 'draft against a request in another project',
+      response: await h.app.inject({
+        method: 'POST',
+        url: `/api/projects/${elsewhere}/requests/${request.requestId}/contract`,
+        headers: { cookie: session.cookie, [CSRF_HEADER]: session.csrfToken },
+        payload: CONTRACT_CONTENT,
+      }),
+    },
+  ];
+
+  for (const { label, response } of writes) {
+    assert.equal(response.statusCode, 404, `${label} must be a 404: ${response.body}`);
+    assert.equal(parse<ErrorPayload>(response).error.code, 'NotFound', label);
+  }
+
+  // None of the refused writes changed anything.
+  const read = parse<RequestDetailView>(
+    await h.app.inject({
+      method: 'GET',
+      url: `/api/projects/${PROJECT_ID}/requests/${request.requestId}`,
+      headers: { cookie: session.cookie },
+    }),
+  );
+  assert.equal(read.request.title, 'Checkout totals');
+  assert.equal(read.latestRevision?.status, 'draft');
+  assert.equal(read.approvedRevision, null);
+});
+
+test('F01-AC1: every request and contract route refuses an anonymous caller', async () => {
+  const h = await harness();
+  const probes: readonly {
+    readonly method: 'GET' | 'POST' | 'PATCH';
+    readonly url: string;
+    readonly payload: Record<string, unknown> | null;
+  }[] = [
+    { method: 'GET', url: `/api/projects/${PROJECT_ID}/requests`, payload: null },
+    { method: 'POST', url: `/api/projects/${PROJECT_ID}/requests`, payload: { title: 'x', description: 'y' } },
+    { method: 'GET', url: `/api/projects/${PROJECT_ID}/requests/req_1`, payload: null },
+    { method: 'PATCH', url: `/api/projects/${PROJECT_ID}/requests/req_1`, payload: { title: 'x', expectedUpdatedAt: 'y' } },
+    { method: 'POST', url: `/api/projects/${PROJECT_ID}/requests/req_1/contract`, payload: CONTRACT_CONTENT },
+    { method: 'GET', url: `/api/projects/${PROJECT_ID}/requests/req_1/contracts`, payload: null },
+    { method: 'GET', url: `/api/projects/${PROJECT_ID}/contracts/dc_1/1`, payload: null },
+    { method: 'GET', url: `/api/projects/${PROJECT_ID}/contracts/dc_1/1/criteria`, payload: null },
+    { method: 'PATCH', url: `/api/projects/${PROJECT_ID}/contracts/dc_1/1`, payload: { ...CONTRACT_CONTENT, expectedUpdatedAt: 'y' } },
+    { method: 'POST', url: `/api/projects/${PROJECT_ID}/contracts/dc_1/1/approve`, payload: {} },
+    { method: 'POST', url: `/api/projects/${PROJECT_ID}/contracts/dc_1/1/revise`, payload: CONTRACT_CONTENT },
+    { method: 'POST', url: `/api/projects/${PROJECT_ID}/contracts/dc_1/1/invalidate`, payload: { reason: 'RequestChanged' } },
+  ];
+
+  for (const probe of probes) {
+    const response = await h.app.inject({
+      method: probe.method,
+      url: probe.url,
+      ...(probe.payload === null ? {} : { payload: probe.payload }),
+    });
+    assert.equal(response.statusCode, 401, `${probe.method} ${probe.url} must refuse an anonymous caller: ${response.body}`);
+  }
+});
+
+test('F02-AC4: an unknown route parameter is refused, not coerced', async () => {
+  const h = await harness();
+  const session = await signIn(h.app);
+
+  // A revision number is a positive integer in the path, so "zero" and "abc" cannot parse as
+  // revision 0 and be silently accepted (mvp-spec 3).
+  for (const revision of ['0', '-1', 'abc', '1.5']) {
+    const response = await h.app.inject({
+      method: 'GET',
+      url: `/api/projects/${PROJECT_ID}/contracts/dc_1/${revision}`,
+      headers: { cookie: session.cookie },
+    });
+    assert.equal(response.statusCode, 400, `revision "${revision}" must be refused: ${response.body}`);
+  }
+
+  // A traversal in the project segment is refused here too, because it addresses an artifact
+  // root, a workspace and a git checkout (F06-AC1).
+  const traversal = await h.app.inject({
+    method: 'GET',
+    url: `/api/projects/..%2F..%2Fetc/requests`,
+    headers: { cookie: session.cookie },
+  });
+  assert.equal(traversal.statusCode, 400, traversal.body);
 });
 
 test('F02-AC1: the session and sign-in responses agree about the project, because both read the controller', async () => {
@@ -2508,6 +3459,20 @@ test('the loaded controller module is validated before it can serve a request', 
     // (F01-AC1, F02-AC1).
     owners: { provision() {}, signIn() {}, describe() {}, selectActiveProject() {} },
     projects: { listProjects() {}, createProject() {} },
+    contracts: {
+      createRequest() {},
+      getRequest() {},
+      listRequests() {},
+      updateRequest() {},
+      draftContract() {},
+      getContract() {},
+      listContractRevisions() {},
+      listContractCriteria() {},
+      editContract() {},
+      approveRevision() {},
+      reviseContract() {},
+      invalidateRevision() {},
+    },
     sessions: { loadByToken() {}, create() {}, revoke() {}, touch() {} },
     profiles: { saveVersion() {}, currentVersion() {}, listVersions() {} },
     connectors: { register() {}, listForProject() {}, revoke() {} },

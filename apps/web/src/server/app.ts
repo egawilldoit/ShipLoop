@@ -40,6 +40,7 @@ import {
 import type { ControllerSurface } from './contracts.ts';
 import { registerAttentionRoutes } from './routes/attention.ts';
 import { registerConnectorRoutes } from './routes/connectors.ts';
+import { registerContractRoutes } from './routes/contracts.ts';
 import { registerHealthRoutes } from './routes/health.ts';
 import { registerIntakeRoutes } from './routes/intake.ts';
 import { registerOwnerRoutes } from './routes/owner.ts';
@@ -108,6 +109,10 @@ export async function buildApp(deps: AppDependencies): Promise<FastifyInstance> 
   registerHealthRoutes(app);
   registerOwnerRoutes(app, { config, controller, guard, now });
   registerProjectRoutes(app, { controller, guard, now });
+  // Registered after the project routes because these are nested under `/api/projects`:
+  // the project identity is part of every path here, so a request cannot be addressed without
+  // one (mvp-spec 3, F02-AC2).
+  registerContractRoutes(app, { controller, guard, now });
   registerProfileRoutes(app, { controller, guard, now });
   registerConnectorRoutes(app, { controller, guard, now });
   registerIntakeRoutes(app, { controller, guard, now });

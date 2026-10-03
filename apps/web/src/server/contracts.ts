@@ -1602,10 +1602,179 @@ export interface GenerationUseCases {
   listGenerations(ideaId: IdeaId): Promise<Result<readonly GenerationRunView[], DomainError>>;
 }
 
+/**
+ * One acceptance criterion of one contract revision (mvp-spec 3).
+ *
+ * `verificationType` decides who may settle it: `automated` by a check run, `owner_test` only
+ * by the owner acting. It is a closed vocabulary rather than free text, because a text field
+ * here is how "verified" comes to mean "someone read it".
+ */
+export interface ContractCriterionView {
+  readonly id: string;
+  readonly description: string;
+  readonly verificationType: 'automated' | 'owner_test';
+}
+
+/** One request as the transport reports it (mvp-spec 3). */
+export interface RequestView {
+  readonly requestId: string;
+  readonly projectId: string;
+  readonly title: string;
+  readonly description: string;
+  readonly sourceIdeaId: string | null;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+}
+
+/**
+ * One contract revision as the transport reports it (mvp-spec 3).
+ *
+ * `approvedAt` and `approvedBy` are nullable rather than nested in a status variant, because a
+ * revision's history is what a reader needs: an invalidated approval keeps its approver while
+ * `status` says it is no longer current. `answersCurrentRequest` is the layer's *report* that
+ * an approved revision no longer matches the request it answers - it does not demote it, since
+ * whether a request edit invalidates an agreement is the owner's call about scope.
+ */
+export interface ContractView {
+  readonly contractId: string;
+  readonly revision: number;
+  readonly projectId: string;
+  readonly requestId: string;
+  readonly status: 'draft' | 'approved' | 'stale';
+  readonly outcome: string;
+  readonly scope: readonly string[];
+  readonly outOfScope: readonly string[];
+  readonly acceptanceCriteria: readonly ContractCriterionView[];
+  readonly contentFingerprint: string;
+  readonly requestFingerprint: string;
+  readonly answersCurrentRequest: boolean;
+  readonly approvedAt: string | null;
+  readonly approvedBy: string | null;
+  readonly staleReason: string | null;
+  readonly supersededByRevision: number | null;
+  readonly sourceBriefId: string | null;
+  readonly sourceBriefVersion: number | null;
+  readonly createdBy: string;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+  /** Why this revision may not be measured against a candidate, or null when it may. */
+  readonly blockedBecause: string | null;
+}
+
+/** One request and the contract state that answers it (mvp-spec 3). */
+export interface RequestDetailView {
+  readonly request: RequestView;
+  readonly latestRevision: ContractView | null;
+  readonly approvedRevision: ContractView | null;
+  readonly revisions: readonly ContractView[];
+}
+
+/** The reasons an approval may be retired, as this transport names them (mvp-spec 3). */
+export const CONTRACT_STALE_REASONS = ['RequestChanged', 'SurroundingContextChanged', 'WithdrawnByOwner'] as const;
+export type ContractStaleReason = (typeof CONTRACT_STALE_REASONS)[number];
+
+/**
+ * The owner's request and the delivery contract that answers it (mvp-spec 3).
+ *
+ * `approveRevision` takes no approver parameter at all. The approver is read from the session,
+ * so a body cannot record an approval attributed to somebody else - the one thing an approval
+ * may never be (mvp-spec 3).
+ *
+ * Every command carries both a project and an identity, because neither alone addresses a row:
+ * a request id from another project is a `NotFound` here, not a read of this one's data
+ * (F02-AC2).
+ */
+export interface ContractUseCases {
+  createRequest(command: {
+    readonly projectId: string;
+    readonly title: string;
+    readonly description: string;
+    readonly actor: OwnerId;
+  }): Promise<Result<RequestView, DomainError>>;
+  getRequest(command: {
+    readonly projectId: string;
+    readonly requestId: string;
+    readonly actor: OwnerId;
+  }): Promise<Result<RequestDetailView, DomainError>>;
+  listRequests(command: {
+    readonly projectId: string;
+    readonly actor: OwnerId;
+  }): Promise<Result<readonly RequestView[], DomainError>>;
+  updateRequest(command: {
+    readonly projectId: string;
+    readonly requestId: string;
+    readonly title?: string;
+    readonly description?: string;
+    readonly expectedUpdatedAt: string;
+    readonly actor: OwnerId;
+  }): Promise<Result<RequestView, DomainError>>;
+  draftContract(command: {
+    readonly projectId: string;
+    readonly requestId: string;
+    readonly outcome: string;
+    readonly scope: readonly string[];
+    readonly outOfScope: readonly string[];
+    readonly acceptanceCriteria: readonly ContractCriterionView[];
+    readonly actor: OwnerId;
+  }): Promise<Result<ContractView, DomainError>>;
+  getContract(command: {
+    readonly projectId: string;
+    readonly contractId: string;
+    readonly revision: number;
+    readonly actor: OwnerId;
+  }): Promise<Result<ContractView, DomainError>>;
+  listContractRevisions(command: {
+    readonly projectId: string;
+    readonly requestId: string;
+    readonly actor: OwnerId;
+  }): Promise<Result<readonly ContractView[], DomainError>>;
+  listContractCriteria(command: {
+    readonly projectId: string;
+    readonly contractId: string;
+    readonly revision: number;
+    readonly actor: OwnerId;
+  }): Promise<Result<readonly ContractCriterionView[], DomainError>>;
+  editContract(command: {
+    readonly projectId: string;
+    readonly contractId: string;
+    readonly revision: number;
+    readonly outcome: string;
+    readonly scope: readonly string[];
+    readonly outOfScope: readonly string[];
+    readonly acceptanceCriteria: readonly ContractCriterionView[];
+    readonly expectedUpdatedAt: string;
+    readonly actor: OwnerId;
+  }): Promise<Result<ContractView, DomainError>>;
+  approveRevision(command: {
+    readonly projectId: string;
+    readonly contractId: string;
+    readonly revision: number;
+    readonly actor: OwnerId;
+  }): Promise<Result<ContractView, DomainError>>;
+  reviseContract(command: {
+    readonly projectId: string;
+    readonly contractId: string;
+    readonly revision: number;
+    readonly outcome: string;
+    readonly scope: readonly string[];
+    readonly outOfScope: readonly string[];
+    readonly acceptanceCriteria: readonly ContractCriterionView[];
+    readonly actor: OwnerId;
+  }): Promise<Result<ContractView, DomainError>>;
+  invalidateRevision(command: {
+    readonly projectId: string;
+    readonly contractId: string;
+    readonly revision: number;
+    readonly reason: ContractStaleReason;
+    readonly actor: OwnerId;
+  }): Promise<Result<ContractView, DomainError>>;
+}
+
 /** The whole injected surface. One argument, so a missing use case is a type error. */
 export interface ControllerSurface {
   readonly owners: OwnerUseCases;
   readonly projects: ProjectUseCases;
+  readonly contracts: ContractUseCases;
   readonly sessions: SessionUseCases;
   readonly profiles: ProfileUseCases;
   readonly connectors: ConnectorUseCases;
@@ -1622,6 +1791,20 @@ export interface ControllerSurface {
 const REQUIRED_METHODS = {
   owners: ['provision', 'signIn', 'describe', 'selectActiveProject'],
   projects: ['listProjects', 'createProject'],
+  contracts: [
+    'createRequest',
+    'getRequest',
+    'listRequests',
+    'updateRequest',
+    'draftContract',
+    'getContract',
+    'listContractRevisions',
+    'listContractCriteria',
+    'editContract',
+    'approveRevision',
+    'reviseContract',
+    'invalidateRevision',
+  ],
   sessions: ['loadByToken', 'create', 'revoke', 'touch'],
   profiles: ['saveVersion', 'currentVersion', 'listVersions'],
   connectors: ['register', 'listForProject', 'revoke'],
