@@ -193,11 +193,33 @@ export interface MvpDecisionView {
   readonly authorizesCurrentCandidate: boolean;
 }
 
+/**
+ * The three gates, kept distinct because the product keeps them distinct.
+ *
+ * `readyForOwnerReview` is F24-AC3's "ready for your test": required automated
+ * verification is current, and an outstanding owner test is offered as the owner's action
+ * rather than treated as a failure.
+ *
+ * `readyForAcceptance` is F24-AC3's "they must be satisfied before Accepted": every
+ * criterion, owner tests included. This is the gate `decide` asks before recording an
+ * acceptance, and it is the reason the three cannot collapse into one boolean.
+ *
+ * `readyForDelivery` adds the acceptance itself plus the delivery-only checks, so
+ * `verified is not accepted` and `accepted is not merged` are both visible as separate
+ * steps rather than one flag.
+ */
 export interface MvpEligibility {
   readonly readyForOwnerReview: boolean;
+  readonly readyForAcceptance: boolean;
   readonly readyForDelivery: boolean;
+  /** Why the candidate is not yet offered for owner review. */
   readonly blockingReasons: readonly string[];
+  /** What only the owner can do next. Never a fabricated automated success. */
   readonly ownerActions: readonly string[];
+  /** What stands between the current state and acceptance. Empty when acceptance is ready. */
+  readonly acceptanceBlockers: readonly string[];
+  /** What stands between acceptance and delivery. */
+  readonly deliveryBlockers: readonly string[];
 }
 
 export interface MvpReviewReadModel {
@@ -493,9 +515,31 @@ function eligibilityView(
   }
 
   const readyForOwnerReview = blockingReasons.length === 0;
-  const deliveryReasons: string[] = [];
+
+  /*
+   * Acceptance is a stricter gate than the review offer (F24-AC3: "they must be satisfied
+   * before Accepted"). It asks the question directly rather than reusing
+   * readyForOwnerReview, because a pending owner test is deliberately allowed through the
+   * review offer and deliberately not allowed through acceptance. Deriving one from the
+   * other is what would let a policy flag silently turn into a weaker acceptance gate.
+   */
+  const acceptanceBlockers: string[] = [];
+  for (const check of checks) {
+    if (!policy.requiredAutomatedCheckIds.includes(check.checkId)) continue;
+    if (check.result !== 'passed') {
+      acceptanceBlockers.push(`Required check "${check.checkId}" is ${check.result}, not passed. ${check.reason}`);
+    }
+  }
+  for (const criterion of criteria) {
+    if (criterion.state === 'passed') continue;
+    acceptanceBlockers.push(`Criterion "${criterion.criterionId}" is ${criterion.state}: ${criterion.reason}`);
+  }
+  const readyForAcceptance = acceptanceBlockers.length === 0;
+
+  const deliveryReasons: string[] = [...acceptanceBlockers];
   for (const check of checks) {
     if (!policy.deliveryRequiredCheckIds.includes(check.checkId)) continue;
+    if (policy.requiredAutomatedCheckIds.includes(check.checkId)) continue;
     if (check.result !== 'passed') {
       deliveryReasons.push(`Delivery check "${check.checkId}" is ${check.result}, not passed. ${check.reason}`);
     }
@@ -503,9 +547,10 @@ function eligibilityView(
   if (policy.ownerTestBlocksDelivery) {
     for (const criterion of criteria) {
       if (criterion.verificationType !== 'owner_test') continue;
-      if (criterion.state !== 'passed') {
-        deliveryReasons.push(`Owner test "${criterion.criterionId}" is ${criterion.state} (${criterion.reason})`);
-      }
+      if (criterion.state === 'passed') continue;
+      // Already named above when the criterion was not passed; kept explicit here so the
+      // delivery gate reads on its own rather than depending on the acceptance list.
+      deliveryReasons.push(`Owner test "${criterion.criterionId}" is ${criterion.state} (${criterion.reason})`);
     }
   }
   for (const stale of decision.staleDecisions) {
@@ -532,8 +577,11 @@ function eligibilityView(
 
   return {
     readyForOwnerReview,
-    readyForDelivery: readyForOwnerReview && deliveryReasons.length === 0,
+    readyForAcceptance,
+    readyForDelivery: deliveryReasons.length === 0,
     blockingReasons,
     ownerActions,
+    acceptanceBlockers,
+    deliveryBlockers: deliveryReasons,
   };
 }
