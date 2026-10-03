@@ -22,6 +22,7 @@ export * from './composition.ts';
 export * from './context-packet.ts';
 export * from './brief-generation.ts';
 export * from './connectors.ts';
+export * from './contracts.ts';
 export * from './delivery.ts';
 export * from './intake.ts';
 export * from './profiles.ts';

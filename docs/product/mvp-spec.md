@@ -598,6 +598,8 @@ The controller owns state transitions, authorization, managed external updates, 
 | Connector | Type, resource scope, credential reference, capability result, last successful health check |
 | Procedure/fact version | Scope, source, revision/time, content, approval/version |
 | Idea/brief/plan | Raw request, attachments, conversation, agreed brief, proposals, unresolved questions |
+| Request | Project-scoped title and description, owning idea, created/updated instants; a draft the owner may edit |
+| Delivery contract revision | Request, revision number, outcome, scope, out-of-scope, acceptance criteria with verification types, status, content fingerprint, request fingerprint, approver and instant, staleness reason and superseding revision |
 | Work mapping/snapshot | External issue ID, publication intent, immutable semantic scope snapshot and relationships |
 | Job/attempt | Mode, snapshot/profile versions, limits, execution state, lease/process identity, checkpoint |
 | Candidate | Head/base commits, component/artifact/deployment identities, environment/policy revision fingerprint |

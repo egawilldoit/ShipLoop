@@ -34,6 +34,25 @@ export type ReceiptId = ShipLoopId<'ReceiptId'>;
 export type AttentionItemId = ShipLoopId<'AttentionItemId'>;
 export type IdeaId = ShipLoopId<'IdeaId'>;
 
+/**
+ * A request for changed product behaviour (mvp-spec 3, MVP "Request").
+ *
+ * A separate brand from `IdeaId` on purpose: an intake idea and a delivery request
+ * are not interchangeable, and one string used for both would let a request be read
+ * through the idea pipeline - publication, work items, plans - that does not describe
+ * it. See `request.ts` for why both records exist.
+ */
+export type RequestId = ShipLoopId<'RequestId'>;
+
+/**
+ * One revision of a delivery contract (mvp-spec 3, MVP "Delivery Contract").
+ *
+ * The revision number is the identity a candidate and its evidence bind to, so it is
+ * carried alongside the id rather than derived from it: two revisions of one contract
+ * are different agreements, not two spellings of one.
+ */
+export type ContractId = ShipLoopId<'ContractId'>;
+
 const SHA40 = /^[0-9a-f]{40}$/;
 const SHA64 = /^[0-9a-f]{64}$/;
 

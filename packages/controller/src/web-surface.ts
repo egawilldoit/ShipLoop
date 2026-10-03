@@ -71,6 +71,7 @@ import type {
   ChangeSurface,
   CommitSha,
   ConnectorId,
+  ContractId,
   DomainError,
   Fingerprint,
   IdeaId,
@@ -86,6 +87,8 @@ import type {
   ProjectId,
   PublishableTicket,
   ReadinessObservation,
+  Request,
+  RequestId,
   Result,
   ScopeSnapshot,
   WorkItemId,
@@ -131,6 +134,7 @@ import { SqliteObservationJournal } from './verification.ts';
 import { PLAN_TASK_CONTENT_FIELDS } from '@shiploop/domain';
 import { blocked } from '@shiploop/domain';
 import type { ReconciliationOutcome, TicketPublication, TicketToPublish } from './publication.ts';
+import type { ContractContentInput, ContractView, RequestDetailView } from './contracts.ts';
 import type {
   BriefSectionsInput,
   BriefView,
@@ -161,6 +165,38 @@ export interface SurfaceStoredSession {
   readonly lastActivityAt: string | null;
 }
 
+/**
+ * The project the owner is acting in, or the state they are in when none is selected
+ * (F02-AC1, F02-AC2).
+ *
+ * A discriminated union rather than a nullable pair of fields, and that is the whole point.
+ * The defect this closes is a session response that carried no project identity at all, so
+ * the client reached for one it did not have and every project-scoped request went to a path
+ * spelled `/api/profiles/undefined`; the server's honest 404 was then reported as "that
+ * project has no saved profile yet", which is a different and wrong claim (F02-AC4).
+ *
+ * Two consequences of the union, both of which a nullable pair could not give:
+ *
+ *   - **`NoProjectSelected` is a real state with a count in it**, so an owner who has not
+ *     chosen yet is told what to do next rather than shown a blank field. No placeholder
+ *     project and no fabricated id appears anywhere: the only way to hold an
+ *     `activeProjectId` is to hold a `Selected` variant that names a project this store has.
+ *   - **The transport cannot pick the wrong variant.** Rendering `activeProjectName` from a
+ *     `NoProjectSelected` is unrepresentable rather than a bug someone has to remember to
+ *     avoid.
+ */
+export type SurfaceActiveProject =
+  | {
+      readonly state: 'Selected';
+      readonly activeProjectId: string;
+      readonly activeProjectName: string;
+    }
+  | {
+      readonly state: 'NoProjectSelected';
+      /** How many projects the owner could choose from, so onboarding can say "choose one". */
+      readonly selectableProjectCount: number;
+    };
+
 export interface SurfaceOwner {
   readonly ownerId: OwnerId;
   readonly displayName: string;
@@ -174,6 +210,15 @@ export interface SurfaceOwner {
    */
   readonly email: string | null;
   readonly createdAt: string;
+  /**
+   * Which project this session is acting in (F02-AC1).
+   *
+   * Part of the owner read rather than a separate call, because a client that has to make a
+   * second request to learn which project it is addressing has a window in which it
+   * addresses the previous one - and the previous one is what produced the defect this
+   * field exists to close.
+   */
+  readonly activeProject: SurfaceActiveProject;
 }
 
 /**
@@ -296,6 +341,20 @@ export interface SurfaceOwnerUseCases {
    * theirs (F01-AC1).
    */
   describe(command: { readonly ownerId: OwnerId }): Promise<Result<SurfaceOwner, DomainError>>;
+  /**
+   * Chooses which project every subsequent project-scoped call addresses (F02-AC1).
+   *
+   * A server-side write rather than a client-side value, for the reason above: a selection
+   * the client holds is a selection a re-established session does not have. `projectId: null`
+   * is refused rather than accepted, because "no project selected" is reached by never
+   * selecting one - the onboarding state - and a client that wanted to express it can simply
+   * not select.
+   */
+  selectActiveProject(command: {
+    readonly ownerId: OwnerId;
+    readonly projectId: string;
+    readonly at: string;
+  }): Promise<Result<SurfaceActiveProject, DomainError>>;
   signIn(command: {
     readonly identifier: string;
     readonly password: string;
@@ -1344,10 +1403,183 @@ export interface SurfaceGenerationUseCases {
   listGenerations(ideaId: IdeaId): Promise<Result<readonly SurfaceGenerationRun[], DomainError>>;
 }
 
+/** One request as the transport reports it (mvp-spec 3). */
+export interface SurfaceRequest {
+  readonly requestId: string;
+  readonly projectId: string;
+  readonly title: string;
+  readonly description: string;
+  readonly sourceIdeaId: string | null;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+}
+
+/** One acceptance criterion of one contract revision, as the transport reports it. */
+export interface SurfaceContractCriterion {
+  readonly id: string;
+  readonly description: string;
+  readonly verificationType: 'automated' | 'owner_test';
+}
+
+/**
+ * One contract revision as the transport reports it (mvp-spec 3).
+ *
+ * `approvedBy` and `approvedAt` travel as a nullable pair rather than being nested in a
+ * status variant, because a revision's *history* is what a reader needs: an invalidated
+ * approval keeps its approver (it is history, not a deletion) while `status` says it is no
+ * longer current, and a caller that has to reconstruct that from a variant would have to
+ * re-derive the whole lifecycle to answer "who agreed to this".
+ *
+ * `answersCurrentRequest` is a report rather than a state. The layer refuses to decide that a
+ * request edit invalidates an agreement about that request - that is the owner's call about
+ * scope - so it publishes the comparison instead (mvp-spec 3).
+ */
+export interface SurfaceContract {
+  readonly contractId: string;
+  readonly revision: number;
+  readonly projectId: string;
+  readonly requestId: string;
+  readonly status: 'draft' | 'approved' | 'stale';
+  readonly outcome: string;
+  readonly scope: readonly string[];
+  readonly outOfScope: readonly string[];
+  readonly acceptanceCriteria: readonly SurfaceContractCriterion[];
+  readonly contentFingerprint: string;
+  readonly requestFingerprint: string;
+  readonly answersCurrentRequest: boolean;
+  readonly approvedAt: string | null;
+  readonly approvedBy: string | null;
+  readonly staleReason: string | null;
+  readonly supersededByRevision: number | null;
+  readonly sourceBriefId: string | null;
+  readonly sourceBriefVersion: number | null;
+  readonly createdBy: string;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+  /** Why this revision may not be measured against a candidate, or null when it may. */
+  readonly blockedBecause: string | null;
+}
+
+/** One request and the contract state that answers it (mvp-spec 3). */
+export interface SurfaceRequestDetail {
+  readonly request: SurfaceRequest;
+  readonly latestRevision: SurfaceContract | null;
+  readonly approvedRevision: SurfaceContract | null;
+  readonly revisions: readonly SurfaceContract[];
+}
+
+/** The reasons an approval may be retired, as the transport names them (mvp-spec 3). */
+export const SURFACE_CONTRACT_STALE_REASONS = [
+  'RequestChanged',
+  'SurroundingContextChanged',
+  'WithdrawnByOwner',
+] as const;
+export type SurfaceContractStaleReason = (typeof SURFACE_CONTRACT_STALE_REASONS)[number];
+
+/**
+ * The owner's request and the agreement that answers it (mvp-spec 3).
+ *
+ * Every command carries `actor` and no `ownerId`, following the rule every other write in
+ * this file follows: the caller is proved, so the identity it acts as is not something a
+ * request body gets to choose. `approveRevision` in particular takes no approver parameter at
+ * all - the approver is read from the session - so a body cannot record an approval
+ * attributed to somebody else (mvp-spec 3).
+ *
+ * Project isolation is by command, not by convention: every method takes the project and the
+ * controller refuses a row that does not belong to it, so a request id from another project is
+ * a `NotFound` rather than a read of this one's data (F02-AC2).
+ */
+export interface SurfaceContractUseCases {
+  createRequest(command: {
+    readonly projectId: string;
+    readonly title: string;
+    readonly description: string;
+    readonly actor: string;
+  }): Promise<Result<SurfaceRequest, DomainError>>;
+  getRequest(command: {
+    readonly projectId: string;
+    readonly requestId: string;
+    readonly actor: string;
+  }): Promise<Result<SurfaceRequestDetail, DomainError>>;
+  listRequests(command: {
+    readonly projectId: string;
+    readonly actor: string;
+  }): Promise<Result<readonly SurfaceRequest[], DomainError>>;
+  updateRequest(command: {
+    readonly projectId: string;
+    readonly requestId: string;
+    readonly title?: string;
+    readonly description?: string;
+    readonly expectedUpdatedAt: string;
+    readonly actor: string;
+  }): Promise<Result<SurfaceRequest, DomainError>>;
+  draftContract(command: {
+    readonly projectId: string;
+    readonly requestId: string;
+    readonly outcome: string;
+    readonly scope: readonly string[];
+    readonly outOfScope: readonly string[];
+    readonly acceptanceCriteria: readonly SurfaceContractCriterion[];
+    readonly actor: string;
+  }): Promise<Result<SurfaceContract, DomainError>>;
+  getContract(command: {
+    readonly projectId: string;
+    readonly contractId: string;
+    readonly revision: number;
+    readonly actor: string;
+  }): Promise<Result<SurfaceContract, DomainError>>;
+  listContractRevisions(command: {
+    readonly projectId: string;
+    readonly requestId: string;
+    readonly actor: string;
+  }): Promise<Result<readonly SurfaceContract[], DomainError>>;
+  listContractCriteria(command: {
+    readonly projectId: string;
+    readonly contractId: string;
+    readonly revision: number;
+    readonly actor: string;
+  }): Promise<Result<readonly SurfaceContractCriterion[], DomainError>>;
+  editContract(command: {
+    readonly projectId: string;
+    readonly contractId: string;
+    readonly revision: number;
+    readonly outcome: string;
+    readonly scope: readonly string[];
+    readonly outOfScope: readonly string[];
+    readonly acceptanceCriteria: readonly SurfaceContractCriterion[];
+    readonly expectedUpdatedAt: string;
+    readonly actor: string;
+  }): Promise<Result<SurfaceContract, DomainError>>;
+  approveRevision(command: {
+    readonly projectId: string;
+    readonly contractId: string;
+    readonly revision: number;
+    readonly actor: string;
+  }): Promise<Result<SurfaceContract, DomainError>>;
+  reviseContract(command: {
+    readonly projectId: string;
+    readonly contractId: string;
+    readonly revision: number;
+    readonly outcome: string;
+    readonly scope: readonly string[];
+    readonly outOfScope: readonly string[];
+    readonly acceptanceCriteria: readonly SurfaceContractCriterion[];
+    readonly actor: string;
+  }): Promise<Result<SurfaceContract, DomainError>>;
+  invalidateRevision(command: {
+    readonly projectId: string;
+    readonly contractId: string;
+    readonly revision: number;
+    readonly reason: SurfaceContractStaleReason;
+    readonly actor: string;
+  }): Promise<Result<SurfaceContract, DomainError>>;
+}
+
 /** The whole injected surface. One argument, so a missing use case is a type error. */
 export interface ControllerSurface {
   readonly owners: SurfaceOwnerUseCases;
   readonly projects: SurfaceProjectUseCases;
+  readonly contracts: SurfaceContractUseCases;
   readonly sessions: SurfaceSessionUseCases;
   readonly profiles: SurfaceProfileUseCases;
   readonly connectors: SurfaceConnectorUseCases;
@@ -1401,8 +1633,130 @@ function toSurfaceProject(record: ProjectRecord): SurfaceProject {
   };
 }
 
+/**
+ * How many projects the owner could select, for the onboarding state.
+ *
+ * Counted rather than described, because "no project selected" is only actionable if the
+ * client can say whether to invite a choice or to invite a creation. Archived projects are
+ * counted: they are in the list the owner sees, and a selector that quietly dropped them
+ * would offer fewer choices than the store holds (F02-AC1).
+ */
+function noProjectSelected(root: CompositionRoot): SurfaceActiveProject {
+  const listed = root.projects.list();
+  return {
+    state: 'NoProjectSelected',
+    selectableProjectCount: listed.ok ? listed.value.length : 0,
+  };
+}
+
+/**
+ * The project this owner has selected, or the onboarding state when none is selected.
+ *
+ * A store that cannot be read reports the onboarding state rather than an invented
+ * selection: the alternative is refusing the whole session read because of a storage
+ * problem, which would sign the owner out for a fault they cannot see or fix (F02-AC1).
+ */
+function readActiveProject(root: CompositionRoot, ownerId: OwnerId): SurfaceActiveProject {
+  const selected = root.activeProjects.read(ownerId);
+  if (!selected.ok || selected.value === null) return noProjectSelected(root);
+  return {
+    state: 'Selected',
+    activeProjectId: String(selected.value.projectId),
+    activeProjectName: selected.value.name,
+  };
+}
+
 function toSurfaceSession(record: StoredSessionRecord): SurfaceStoredSession {
   return { ...record };
+}
+
+/**
+ * The actor the transport proved, as the use cases want it.
+ *
+ * `role: 'Owner'` unconditionally, because this layer is only reachable behind a session
+ * guard: the guard is what proves the caller, and a second capability decision here would be a
+ * second rule that could disagree with the first. `ownerId` is carried, so a use case that
+ * refuses an unattributable caller still refuses one (F01-AC1).
+ */
+function ownerActorFor(ownerId: string): Result<OwnerActor, DomainError> {
+  return ok({ actorId: ownerId, role: 'Owner', ownerId: ownerId as OwnerId, sessionId: null });
+}
+
+/** One request, projected for the transport. */
+function toSurfaceRequest(request: Request): SurfaceRequest {
+  return {
+    requestId: String(request.requestId),
+    projectId: String(request.projectId),
+    title: request.title,
+    description: request.description,
+    sourceIdeaId: request.sourceIdeaId,
+    createdAt: request.createdAt,
+    updatedAt: request.updatedAt,
+  };
+}
+
+/** One contract revision, projected for the transport. */
+function toSurfaceContract(contract: ContractView): SurfaceContract {
+  return {
+    contractId: contract.contractId,
+    revision: contract.revision,
+    projectId: contract.projectId,
+    requestId: contract.requestId,
+    status: contract.status,
+    outcome: contract.outcome,
+    scope: [...contract.scope],
+    outOfScope: [...contract.outOfScope],
+    acceptanceCriteria: contract.acceptanceCriteria.map((criterion) => ({ ...criterion })),
+    contentFingerprint: contract.contentFingerprint,
+    requestFingerprint: contract.requestFingerprint,
+    answersCurrentRequest: contract.answersCurrentRequest,
+    approvedAt: contract.approvedAt,
+    approvedBy: contract.approvedBy,
+    staleReason: contract.staleReason,
+    supersededByRevision: contract.supersededByRevision,
+    sourceBriefId: contract.sourceBriefId,
+    sourceBriefVersion: contract.sourceBriefVersion,
+    createdBy: contract.createdBy,
+    createdAt: contract.createdAt,
+    updatedAt: contract.updatedAt,
+    blockedBecause: contract.blockedBecause,
+  };
+}
+
+/** The request detail, projected for the transport. */
+function toSurfaceRequestDetail(detail: RequestDetailView): SurfaceRequestDetail {
+  return {
+    request: toSurfaceRequest(detail.request),
+    latestRevision: detail.latestRevision === null ? null : toSurfaceContract(detail.latestRevision),
+    approvedRevision: detail.approvedRevision === null ? null : toSurfaceContract(detail.approvedRevision),
+    revisions: detail.revisions.map(toSurfaceContract),
+  };
+}
+
+/**
+ * The content a command carries, in the domain's shape.
+ *
+ * A structural narrowing rather than a cast: the fields a command omits become empty lists and
+ * an empty outcome, which `createContractDraft` refuses by name. Handing the domain a value
+ * whose type merely *claims* to be `ContractContent` would move that refusal into the
+ * controller and duplicate the validation (F02-AC4).
+ */
+function contractContentOf(command: {
+  readonly outcome: string;
+  readonly scope: readonly string[];
+  readonly outOfScope: readonly string[];
+  readonly acceptanceCriteria: readonly SurfaceContractCriterion[];
+}): ContractContentInput {
+  return {
+    outcome: command.outcome,
+    scope: command.scope,
+    outOfScope: command.outOfScope,
+    acceptanceCriteria: command.acceptanceCriteria.map((criterion) => ({
+      id: criterion.id,
+      description: criterion.description,
+      verificationType: criterion.verificationType,
+    })),
+  };
 }
 
 /**
@@ -2274,6 +2628,10 @@ export function createControllerSurface(resolve: SurfaceRootResolver): Controlle
             // later session read cannot describe two different addresses (F01-AC1).
             email: readOwnerEmail(root, provisioned.value.ownerId),
             createdAt: provisioned.value.provisionedAt,
+            // A brand-new owner has selected nothing, and saying so is the honest answer. The
+            // alternative - defaulting to the first project in the store - would be handing a
+            // session an identity nobody chose (F02-AC1).
+            activeProject: noProjectSelected(root),
           });
         }),
 
@@ -2316,7 +2674,236 @@ export function createControllerSurface(resolve: SurfaceRootResolver): Controlle
             displayName: record.value.displayName,
             email: readOwnerEmail(root, record.value.ownerId),
             createdAt: record.value.createdAt,
+            // Read from the durable selection, not from anything the caller passed and not
+            // from the first project in the store. Both of those would answer "which project
+            // is this" with something the owner did not choose, which is the defect that
+            // produced `/api/profiles/undefined` in the first place (F02-AC1, F02-AC4).
+            activeProject: readActiveProject(root, record.value.ownerId),
           });
+        }),
+
+      /**
+       * Records which project this owner's subsequent calls address (F02-AC1).
+       *
+       * The write is durable rather than returned to the caller to hold, because a selection
+       * the client keeps is a selection a re-established session does not have. The repository
+       * refuses a project this store does not hold, so the only way to hold an
+       * `activeProjectId` is to have named a real one.
+       */
+      selectActiveProject: async (command) =>
+        use((root) => {
+          const selected = root.activeProjects.select(
+            command.ownerId,
+            command.projectId as ProjectId,
+            command.at,
+          );
+          if (!selected.ok) return err(selected.error);
+          return ok({
+            state: 'Selected' as const,
+            activeProjectId: selected.value.projectId,
+            activeProjectName: selected.value.name,
+          });
+        }),
+    },
+
+    /**
+     * The owner's request and the delivery contract that answers it (mvp-spec 3).
+     *
+     * The actor on every command is the identity the transport proved, converted once here
+     * rather than at each use case, and the project on every command is the project the
+     * request is filed under. Both are enforcement inputs, not labels: the use cases refuse a
+     * non-owner before reading a row, and address a row by `(project, identity)` so an
+     * identifier from another project is invisible rather than merely refused (F01-AC1, F02-AC2).
+     */
+    contracts: {
+      createRequest: async (command) =>
+        use((root) => {
+          const actor = ownerActorFor(command.actor);
+          if (!actor.ok) return err(actor.error);
+          const created = root.contractUseCases.createRequest(
+            {
+              projectId: command.projectId as ProjectId,
+              title: command.title,
+              description: command.description,
+            },
+            actor.value,
+          );
+          if (!created.ok) return err(created.error);
+          return ok(toSurfaceRequest(created.value));
+        }),
+
+      getRequest: async (command) =>
+        use((root) => {
+          const actor = ownerActorFor(command.actor);
+          if (!actor.ok) return err(actor.error);
+          const detail = root.contractUseCases.getRequest(
+            { projectId: command.projectId as ProjectId, requestId: command.requestId as RequestId, expectedUpdatedAt: '' },
+            actor.value,
+          );
+          if (!detail.ok) return err(detail.error);
+          return ok(toSurfaceRequestDetail(detail.value));
+        }),
+
+      listRequests: async (command) =>
+        use((root) => {
+          const actor = ownerActorFor(command.actor);
+          if (!actor.ok) return err(actor.error);
+          const listed = root.contractUseCases.listRequests(command.projectId as ProjectId, actor.value);
+          if (!listed.ok) return err(listed.error);
+          return ok(listed.value.map(toSurfaceRequest));
+        }),
+
+      updateRequest: async (command) =>
+        use((root) => {
+          const actor = ownerActorFor(command.actor);
+          if (!actor.ok) return err(actor.error);
+          const updated = root.contractUseCases.updateRequest(
+            {
+              projectId: command.projectId as ProjectId,
+              requestId: command.requestId as RequestId,
+              ...(command.title === undefined ? {} : { title: command.title }),
+              ...(command.description === undefined ? {} : { description: command.description }),
+              expectedUpdatedAt: command.expectedUpdatedAt,
+            },
+            actor.value,
+          );
+          if (!updated.ok) return err(updated.error);
+          return ok(toSurfaceRequest(updated.value));
+        }),
+
+      draftContract: async (command) =>
+        use((root) => {
+          const actor = ownerActorFor(command.actor);
+          if (!actor.ok) return err(actor.error);
+          const drafted = root.contractUseCases.draftContract(
+            {
+              projectId: command.projectId as ProjectId,
+              requestId: command.requestId as RequestId,
+              content: contractContentOf(command),
+            },
+            actor.value,
+          );
+          if (!drafted.ok) return err(drafted.error);
+          return ok(toSurfaceContract(drafted.value));
+        }),
+
+      getContract: async (command) =>
+        use((root) => {
+          const actor = ownerActorFor(command.actor);
+          if (!actor.ok) return err(actor.error);
+          const contract = root.contractUseCases.getContract(
+            {
+              projectId: command.projectId as ProjectId,
+              contractId: command.contractId as ContractId,
+              revision: command.revision,
+            },
+            actor.value,
+          );
+          if (!contract.ok) return err(contract.error);
+          return ok(toSurfaceContract(contract.value));
+        }),
+
+      listContractRevisions: async (command) =>
+        use((root) => {
+          const actor = ownerActorFor(command.actor);
+          if (!actor.ok) return err(actor.error);
+          const revisions = root.contractUseCases.listContractRevisions(
+            { projectId: command.projectId as ProjectId, requestId: command.requestId as RequestId },
+            actor.value,
+          );
+          if (!revisions.ok) return err(revisions.error);
+          return ok(revisions.value.map(toSurfaceContract));
+        }),
+
+      listContractCriteria: async (command) =>
+        use((root) => {
+          const actor = ownerActorFor(command.actor);
+          if (!actor.ok) return err(actor.error);
+          const criteria = root.contractUseCases.listContractCriteria(
+            {
+              projectId: command.projectId as ProjectId,
+              contractId: command.contractId as ContractId,
+              revision: command.revision,
+            },
+            actor.value,
+          );
+          if (!criteria.ok) return err(criteria.error);
+          return ok(criteria.value.map((criterion) => ({ ...criterion })));
+        }),
+
+      editContract: async (command) =>
+        use((root) => {
+          const actor = ownerActorFor(command.actor);
+          if (!actor.ok) return err(actor.error);
+          const edited = root.contractUseCases.editContract(
+            {
+              projectId: command.projectId as ProjectId,
+              contractId: command.contractId as ContractId,
+              revision: command.revision,
+              content: contractContentOf(command),
+              expectedUpdatedAt: command.expectedUpdatedAt,
+            },
+            actor.value,
+          );
+          if (!edited.ok) return err(edited.error);
+          return ok(toSurfaceContract(edited.value));
+        }),
+
+      /**
+       * Approves a revision, attributing it to the session rather than to the body.
+       *
+       * There is deliberately no approver parameter on this command: a body that could name
+       * one would be a body that could record an approval attributed to somebody else, and
+       * that is the one thing an approval may never be (mvp-spec 3).
+       */
+      approveRevision: async (command) =>
+        use((root) => {
+          const actor = ownerActorFor(command.actor);
+          if (!actor.ok) return err(actor.error);
+          const approved = root.contractUseCases.approveContract(
+            {
+              projectId: command.projectId as ProjectId,
+              contractId: command.contractId as ContractId,
+              revision: command.revision,
+            },
+            actor.value,
+          );
+          if (!approved.ok) return err(approved.error);
+          return ok(toSurfaceContract(approved.value));
+        }),
+
+      reviseContract: async (command) =>
+        use((root) => {
+          const actor = ownerActorFor(command.actor);
+          if (!actor.ok) return err(actor.error);
+          const revised = root.contractUseCases.reviseContract(
+            {
+              projectId: command.projectId as ProjectId,
+              contractId: command.contractId as ContractId,
+              revision: command.revision,
+              content: contractContentOf(command),
+            },
+            actor.value,
+          );
+          if (!revised.ok) return err(revised.error);
+          return ok(toSurfaceContract(revised.value));
+        }),
+
+      invalidateRevision: async (command) =>
+        use((root) => {
+          const actor = ownerActorFor(command.actor);
+          if (!actor.ok) return err(actor.error);
+          const stale = root.contractUseCases.invalidateContract(
+            {
+              projectId: command.projectId as ProjectId,
+              contractId: command.contractId as ContractId,
+              revision: command.revision,
+              reason: command.reason,
+            },
+            actor.value,
+          );
+          if (!stale.ok) return err(stale.error);
+          return ok(toSurfaceContract(stale.value));
         }),
     },
 

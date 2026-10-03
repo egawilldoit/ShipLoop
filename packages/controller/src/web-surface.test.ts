@@ -73,8 +73,22 @@ const FAST_PASSWORD_COST = { N: 1024, r: 8, p: 1, keyLength: 32, saltLength: 16 
  * the way the web server's own guard names it.
  */
 const REQUIRED_METHODS = {
-  owners: ['provision', 'signIn', 'describe'],
+  owners: ['provision', 'signIn', 'describe', 'selectActiveProject'],
   projects: ['listProjects', 'createProject'],
+  contracts: [
+    'createRequest',
+    'getRequest',
+    'listRequests',
+    'updateRequest',
+    'draftContract',
+    'getContract',
+    'listContractRevisions',
+    'listContractCriteria',
+    'editContract',
+    'approveRevision',
+    'reviseContract',
+    'invalidateRevision',
+  ],
   sessions: ['loadByToken', 'create', 'revoke', 'touch'],
   profiles: ['saveVersion', 'currentVersion', 'listVersions'],
   connectors: ['register', 'listForProject', 'revoke'],
@@ -625,6 +639,76 @@ test('an owner row with no activity instant is refused rather than read as no li
     const loaded = await surface.sessions.loadByToken(token);
     assert.equal(loaded.ok, false, 'a row the idle rule cannot be applied to must not authorize (F01-AC2)');
     if (!loaded.ok) assert.match(loaded.error.reason, /Malformed/);
+  });
+});
+
+// F02-AC1, F02-AC4: the session response is the answer to "which project is this session
+// addressing", so it is proved against the real store rather than against a double. The
+// historical defect was a session response with no project identity in it, which left the
+// client to reach for one it did not have - every project-scoped request went out for a
+// project literally named "undefined", and the server's honest 404 was reported as "that
+// project has no saved profile yet".
+test('the owner read carries the selected project, or the onboarding state (F02-AC1, F02-AC4)', async () => {
+  await withSurface(async (surface) => {
+    const provisioned = await surface.owners.provision({ displayName: DISPLAY_NAME, password: PASSWORD, at: NOW });
+    assert.ok(provisioned.ok);
+    const ownerId = provisioned.value.ownerId;
+
+    // A brand-new owner has selected nothing, and the answer says so with a count. No
+    // placeholder project and no fabricated id: the only way to hold an `activeProjectId` is
+    // to hold a `Selected` variant naming a project this store has.
+    const fresh = await surface.owners.describe({ ownerId });
+    assert.ok(fresh.ok);
+    assert.deepEqual(fresh.value.activeProject, { state: 'NoProjectSelected', selectableProjectCount: 0 });
+
+    const created = await surface.projects.createProject({ projectId: PROJECT_ID, name: 'Checkout', at: NOW });
+    assert.ok(created.ok, `a project must create: ${created.ok ? '' : created.error.reason}`);
+
+    // Creating does not select. A create that also switched context would silently redirect
+    // every other project-scoped page, which is a worse version of the same defect (F02-AC2).
+    const afterCreate = await surface.owners.describe({ ownerId });
+    assert.ok(afterCreate.ok);
+    assert.deepEqual(afterCreate.value.activeProject, { state: 'NoProjectSelected', selectableProjectCount: 1 });
+
+    const selected = await surface.owners.selectActiveProject({ ownerId, projectId: PROJECT_ID, at: NOW });
+    assert.ok(selected.ok, `a real project must be selectable: ${selected.ok ? '' : selected.error.reason}`);
+    assert.deepEqual(selected.value, {
+      state: 'Selected',
+      activeProjectId: PROJECT_ID,
+      activeProjectName: 'Checkout',
+    });
+
+    // And the next read agrees, which is the whole point: the answer is durable, so a
+    // re-established session addresses the same project rather than the previous one.
+    const reRead = await surface.owners.describe({ ownerId });
+    assert.ok(reRead.ok);
+    assert.deepEqual(reRead.value.activeProject, selected.value);
+
+    // The address is still read from the row rather than re-derived (F01-AC1).
+    assert.equal(reRead.value.email, provisioned.value.email);
+    assert.equal(reRead.value.displayName, DISPLAY_NAME);
+  });
+});
+
+test('selecting a project the store does not hold is refused, so a selection cannot be invented (F02-AC4)', async () => {
+  await withSurface(async (surface) => {
+    const provisioned = await surface.owners.provision({ displayName: DISPLAY_NAME, password: PASSWORD, at: NOW });
+    assert.ok(provisioned.ok);
+
+    const missing = await surface.owners.selectActiveProject({
+      ownerId: provisioned.value.ownerId,
+      projectId: 'no-such-project',
+      at: NOW,
+    });
+    assert.equal(missing.ok, false, 'selecting a project this store does not hold must be refused');
+    if (missing.ok) return;
+    assert.equal(missing.error.code, 'NotFound');
+
+    // The refusal changed nothing: the session still reads as the onboarding state rather
+    // than as a selection nobody made.
+    const described = await surface.owners.describe({ ownerId: provisioned.value.ownerId });
+    assert.ok(described.ok);
+    assert.equal(described.value.activeProject.state, 'NoProjectSelected');
   });
 });
 

@@ -2645,6 +2645,220 @@ function scopeProcedureVersionsBySubject(db: Database): void {
   );
 }
 
+/**
+ * Requests and delivery contracts (mvp-spec 3, MVP "Request" and "Delivery Contract").
+ *
+ * Two tables and the constraints that make the domain's rules true of the store rather
+ * than only of the code that writes it. The interesting decisions:
+ *
+ *   - **`requests.project_id` is NOT NULL.** A contract binds to a project and reads a
+ *     project's profile, recipe and checks, so a request with no project could not be
+ *     answered without inventing one. `ideas.project_id` is nullable because F06-AC3
+ *     makes capture succeed with whatever the owner has; that is a different promise
+ *     about a different record.
+ *   - **`delivery_contracts` is keyed by `(request_id, revision)` and the text lives in
+ *     canonical JSON columns, not a per-criterion child table.** A candidate and its
+ *     evidence bind to `contract_id` + `revision` (mvp-spec 3, ARCHITECTURE "Candidate
+ *     and decision rules"), and both travel together, so the criterion list is read as
+ *     part of the revision it belongs to. A child table would make it possible to
+ *     delete a criterion row and leave a revision whose stored fingerprint no longer
+ *     describes its own criteria.
+ *   - **`content_fingerprint` is re-derived on every read path that trusts it** by the
+ *     repository, and the CHECK below only fixes the format, not the correspondence.
+ *     What makes the correspondence hold is the immutability trigger: after approval the
+ *     frozen columns cannot change, so the fingerprint that was approved is still the
+ *     fingerprint of the text.
+ *   - **`UNIQUE (request_id, contract_id)`** is redundant but harmless; the load-bearing
+ *     constraint is the composite primary key on `(contract_id, revision)` plus the
+ *     partial unique index below.
+ *   - **At most one draft and at most one approved revision per request**, enforced by
+ *     partial unique indexes. Without them two drafts could exist for one request and
+ *     "the current contract" would be answerable two ways - the same defect class as the
+ *     `/api/profiles/undefined` session bug, one layer down.
+ *   - **An approved or stale revision is frozen by trigger**, mirroring
+ *     `scope_snapshots_immutable_update`. The domain already refuses the edit; the
+ *     trigger means a second writer, a restored backup or a hand-run `sqlite3` session
+ *     cannot make "an approved contract must never silently mutate" false either.
+ *   - **`requests.title` is mutable, `raw_request`-style immutability is deliberately
+ *     NOT applied here.** A request is a draft the owner edits (MVP: "update a draft
+ *     request"), and what freezes it is the contract revision that was written against
+ *     its fingerprint, not the request row.
+ */
+const MIGRATION_13_REQUESTS_AND_DELIVERY_CONTRACTS = `
+CREATE TABLE requests (
+  request_id      TEXT PRIMARY KEY,
+  project_id      TEXT NOT NULL REFERENCES projects(project_id) ON DELETE RESTRICT,
+  title           TEXT NOT NULL,
+  description     TEXT NOT NULL,
+  source_idea_id  TEXT REFERENCES ideas(idea_id) ON DELETE SET NULL,
+  created_at      TEXT NOT NULL,
+  updated_at      TEXT NOT NULL,
+  CHECK (length(trim(title)) > 0),
+  CHECK (length(trim(description)) > 0),
+  CHECK (updated_at >= created_at)
+);
+CREATE INDEX requests_by_project ON requests(project_id, created_at DESC, request_id);
+
+CREATE TABLE delivery_contracts (
+  contract_id               TEXT NOT NULL,
+  project_id                TEXT NOT NULL REFERENCES projects(project_id) ON DELETE RESTRICT,
+  request_id                TEXT NOT NULL REFERENCES requests(request_id) ON DELETE CASCADE,
+  revision                  INTEGER NOT NULL CHECK (revision > 0),
+  outcome                   TEXT NOT NULL CHECK (length(trim(outcome)) > 0),
+  scope_json                TEXT NOT NULL CHECK (json_valid(scope_json) AND json_type(scope_json) = 'array'),
+  out_of_scope_json         TEXT NOT NULL CHECK (json_valid(out_of_scope_json) AND json_type(out_of_scope_json) = 'array'),
+  acceptance_criteria_json  TEXT NOT NULL CHECK (json_valid(acceptance_criteria_json) AND json_type(acceptance_criteria_json) = 'array'),
+  status                    TEXT NOT NULL DEFAULT 'draft'
+                               CHECK (status IN ('draft', 'approved', 'stale')),
+  content_fingerprint       TEXT NOT NULL ${fingerprintCheck('content_fingerprint')},
+  request_fingerprint       TEXT NOT NULL ${fingerprintCheck('request_fingerprint')},
+  approved_by_owner_id      TEXT REFERENCES owners(owner_id) ON DELETE RESTRICT,
+  approved_at               TEXT,
+  stale_reason              TEXT,
+  superseded_by_revision    INTEGER,
+  -- Recorded provenance, deliberately without a foreign key to \`briefs\`. A brief is
+  -- cascade-deleted with its idea, and \`ON DELETE SET NULL\` would clear only the id and
+  -- leave a version behind, which the all-or-nothing CHECK below refuses - so the row
+  -- would become unwritable. Provenance is a fact about where the text came from, and a
+  -- fact does not need a foreign key to be true; the CHECK is what keeps it well-formed.
+  source_brief_id           TEXT,
+  source_brief_version      INTEGER,
+  created_by_owner_id       TEXT NOT NULL REFERENCES owners(owner_id) ON DELETE RESTRICT,
+  created_at                TEXT NOT NULL,
+  updated_at                TEXT NOT NULL,
+  PRIMARY KEY (contract_id, revision),
+  UNIQUE (request_id, revision),
+  CHECK (updated_at >= created_at),
+  -- The three states, spelled out together rather than as three independent rules,
+  -- because the interesting properties are the combinations:
+  --
+  --   - an approval is an owner decision with a recorded identity and an instant. Both
+  --     halves or neither: "approved, approved by nobody" is the state that would let
+  --     any writer claim an agreement it did not obtain (mvp-spec 3);
+  --   - a draft holds nothing that would claim an agreement;
+  --   - a stale revision says WHY it is stale, and a superseded one additionally says
+  --     WHICH revision replaced it. Superseded and invalidated are different facts
+  --     about the same terminal state, and a row that recorded neither would leave a
+  --     reader unable to tell a replaced agreement from an abandoned one.
+  CHECK (
+    (status = 'approved'
+      AND approved_by_owner_id IS NOT NULL
+      AND approved_at IS NOT NULL
+      AND stale_reason IS NULL
+      AND superseded_by_revision IS NULL)
+    OR (status = 'draft'
+      AND approved_by_owner_id IS NULL
+      AND approved_at IS NULL
+      AND stale_reason IS NULL
+      AND superseded_by_revision IS NULL)
+    OR (status = 'stale'
+      AND stale_reason IS NOT NULL
+      AND (
+        superseded_by_revision IS NULL
+        OR (approved_by_owner_id IS NOT NULL AND approved_at IS NOT NULL AND superseded_by_revision > revision)
+      ))
+  ),
+  -- Brief provenance is all-or-nothing: a half-recorded source would make a revision
+  -- look written from no brief, or from a version that does not exist (F07-AC3).
+  CHECK (
+    (source_brief_id IS NULL AND source_brief_version IS NULL)
+    OR (source_brief_id IS NOT NULL AND source_brief_version IS NOT NULL AND source_brief_version > 0)
+  )
+);
+CREATE INDEX delivery_contracts_by_request ON delivery_contracts(request_id, revision DESC);
+CREATE INDEX delivery_contracts_by_project ON delivery_contracts(project_id, request_id, revision DESC);
+
+-- One draft per request. Two drafts would make "the contract I am editing" ambiguous,
+-- which is how a revision gets approved while another text was on screen.
+CREATE UNIQUE INDEX delivery_contracts_one_draft_per_request
+  ON delivery_contracts(request_id) WHERE status = 'draft';
+-- One approved revision per request. Two approvals would mean two current agreements
+-- for one request, and a candidate could not say which one it was measured against.
+CREATE UNIQUE INDEX delivery_contracts_one_approved_per_request
+  ON delivery_contracts(request_id) WHERE status = 'approved';
+
+-- An approved or stale revision is frozen (mvp-spec 3: an approved contract must never
+-- silently mutate). Draft revisions stay editable, which is what makes "edit the draft"
+-- possible without an approval ever being rewritten. The frozen set is the material
+-- content, its fingerprint, and the request it answers: the last of these because a
+-- contract that answered a different request than the one it is filed under would be
+-- describing the wrong agreement.
+CREATE TRIGGER delivery_contracts_frozen_update
+BEFORE UPDATE ON delivery_contracts
+WHEN OLD.status <> 'draft'
+  AND (
+    NEW.outcome IS NOT OLD.outcome
+    OR NEW.scope_json IS NOT OLD.scope_json
+    OR NEW.out_of_scope_json IS NOT OLD.out_of_scope_json
+    OR NEW.acceptance_criteria_json IS NOT OLD.acceptance_criteria_json
+    OR NEW.content_fingerprint IS NOT OLD.content_fingerprint
+    OR NEW.request_id IS NOT OLD.request_id
+    OR NEW.project_id IS NOT OLD.project_id
+    OR NEW.request_fingerprint IS NOT OLD.request_fingerprint
+    OR NEW.revision IS NOT OLD.revision
+    OR NEW.contract_id IS NOT OLD.contract_id
+  )
+BEGIN
+  SELECT RAISE(ABORT, 'an approved or stale delivery contract revision is frozen: record a new revision instead (mvp-spec 3)');
+END;
+
+CREATE TRIGGER delivery_contracts_immutable_delete
+BEFORE DELETE ON delivery_contracts
+WHEN OLD.status <> 'draft'
+BEGIN
+  SELECT RAISE(ABORT, 'an approved or stale delivery contract revision is retained for history (mvp-spec 3)');
+END;
+
+-- A draft's own material content may change; its identity may not. Revision numbering is
+-- the whole of contract history, so an in-place revision rewrite would make every
+-- recorded reference to it mean something else (mvp-spec 7: identity is opaque).
+CREATE TRIGGER delivery_contracts_draft_identity_fixed
+BEFORE UPDATE ON delivery_contracts
+WHEN NEW.contract_id IS NOT OLD.contract_id
+   OR NEW.revision IS NOT OLD.revision
+   OR NEW.request_id IS NOT OLD.request_id
+   OR NEW.project_id IS NOT OLD.project_id
+   OR NEW.created_at IS NOT OLD.created_at
+   OR NEW.created_by_owner_id IS NOT OLD.created_by_owner_id
+BEGIN
+  SELECT RAISE(ABORT, 'a delivery contract revision keeps its identity for its whole life (mvp-spec 7)');
+END;
+`;
+
+/**
+ * The owner's selected project (F02-AC1, F02-AC2).
+ *
+ * One row per owner, and it exists because the project identity has to be *carried* rather
+ * than re-derived. The defect this table closes: every project-scoped route needed a project
+ * id, and nothing the client could read told it which project it was acting in, so a request
+ * went out for a project literally named "undefined" and the server's honest 404 ("no such
+ * project") was reported as "that project has no saved profile yet" - a different and wrong
+ * claim about a project's contents.
+ *
+ * The rules, in the schema where they can be:
+ *
+ *   - **Keyed by owner, not by session.** A re-established session therefore carries the same
+ *     project the owner selected before. Keying it on the session would make the answer depend
+ *     on which cookie the browser still held, so signing out and back in would silently change
+ *     what "the current project" addresses.
+ *   - **The foreign key to `projects` is what makes a selection real.** A selection is not a
+ *     string the client invents; it can only name a row this store holds. `ON DELETE CASCADE`
+ *     because a deleted project has nothing left to be the current one, and a selection pointing
+ *     at a project that no longer exists would address nothing while claiming to address
+ *     something.
+ *   - **No `active` flag anywhere else.** The project's own `archived_at` stays the only record
+ *     of whether a project is retired; a second flag here would be a second answer to "is this
+ *     project current" and the two could disagree.
+ */
+const MIGRATION_14_OWNER_ACTIVE_PROJECT = `
+CREATE TABLE owner_active_project (
+  owner_id    TEXT PRIMARY KEY REFERENCES owners(owner_id) ON DELETE CASCADE,
+  project_id  TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
+  selected_at TEXT NOT NULL
+);
+CREATE INDEX owner_active_project_by_project ON owner_active_project(project_id);
+`;
+
 const MIGRATIONS: readonly Migration[] = [
   {
     version: 1,
@@ -2754,6 +2968,20 @@ const MIGRATIONS: readonly Migration[] = [
     up: (db) => {
       db.exec(MIGRATION_12_PROCEDURE_VERSION_IDENTITY);
       scopeProcedureVersionsBySubject(db);
+    },
+  },
+  {
+    version: 13,
+    name: 'requests_and_delivery_contracts',
+    up: (db) => {
+      db.exec(MIGRATION_13_REQUESTS_AND_DELIVERY_CONTRACTS);
+    },
+  },
+  {
+    version: 14,
+    name: 'owner_active_project',
+    up: (db) => {
+      db.exec(MIGRATION_14_OWNER_ACTIVE_PROJECT);
     },
   },
 ];

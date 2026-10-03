@@ -14,12 +14,14 @@ import { mkdir, mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import type { CapabilityDeclaration, CapabilityKind, OwnerId, ProjectId } from '@shiploop/domain';
+import type { CapabilityDeclaration, CapabilityKind, ContractId, OwnerId, ProjectId } from '@shiploop/domain';
 import {
   ConnectorRepository,
+  ContractRepository,
   OwnerRepository,
   ProcedureRepository,
   ProjectProfileRepository,
+  RequestRepository,
   closeDatabase,
   migrate,
   openDatabase,
@@ -109,6 +111,25 @@ test('the root binds one repository of each kind and exposes the use cases (F02-
       assert.ok(root.value.profiles instanceof ProjectProfileRepository);
       assert.ok(root.value.connectors instanceof ConnectorRepository);
       assert.ok(root.value.procedures instanceof ProcedureRepository);
+      assert.ok(root.value.requests instanceof RequestRepository);
+      assert.ok(root.value.contracts instanceof ContractRepository);
+      for (const useCase of [
+        'createRequest',
+        'getRequest',
+        'listRequests',
+        'updateRequest',
+        'draftContract',
+        'getContract',
+        'listContractRevisions',
+        'listContractCriteria',
+        'editContract',
+        'approveContract',
+        'reviseContract',
+        'invalidateContract',
+        'supersedeContract',
+      ] as const) {
+        assert.equal(typeof root.value.contractUseCases[useCase], 'function', `${useCase} is exposed`);
+      }
       for (const useCase of [
         'provisionOwner',
         'authenticateOwner',
@@ -179,6 +200,50 @@ test('the root binds one repository of each kind and exposes the use cases (F02-
       );
       assert.ok(saved.ok, 'a profile saved through the bound repositories');
       assert.equal(saved.value.versionNumber, 1);
+
+      /**
+       * The MVP's first two steps, through the real root.
+       *
+       * Worth doing here rather than only in `contracts.test.ts` because it proves the
+       * bound repositories are the ones over the migrated schema and that no provider or
+       * engine had to be configured: this process registers none, and a request and an
+       * approval are still produced (mvp-spec 3, MVP: no AI engine may be required).
+       */
+      const request = root.value.contractUseCases.createRequest(
+        {
+          projectId: PROJECT_ID,
+          title: 'Checkout totals',
+          description: 'The order summary shows the pre-tax total.',
+        },
+        actor,
+      );
+      assert.ok(request.ok, `a request created through the bound repositories: ${request.ok ? '' : request.error.reason}`);
+
+      const draft = root.value.contractUseCases.draftContract(
+        {
+          projectId: PROJECT_ID,
+          requestId: request.value.requestId,
+          content: {
+            outcome: 'The order summary shows the total including tax.',
+            scope: ['Sum the line items before tax'],
+            outOfScope: ['Changing the tax rate'],
+            acceptanceCriteria: [
+              { id: 'AC1', description: 'The summary returns 200 and displays "Total: 12.00".', verificationType: 'automated' },
+            ],
+          },
+        },
+        actor,
+      );
+      assert.ok(draft.ok, `a contract drafted through the bound repositories: ${draft.ok ? '' : draft.error.reason}`);
+      assert.equal(draft.value.status, 'draft');
+
+      const approved = root.value.contractUseCases.approveContract(
+        { projectId: PROJECT_ID, contractId: draft.value.contractId as ContractId, revision: 1 },
+        actor,
+      );
+      assert.ok(approved.ok, `an approval recorded through the bound repositories: ${approved.ok ? '' : approved.error.reason}`);
+      assert.equal(approved.value.approvedBy, OWNER_ID);
+      assert.equal(approved.value.status, 'approved');
     } finally {
       assert.ok(root.value.close().ok, 'the root closed the database it opened');
       assert.ok(root.value.close().ok, 'closing twice is not an error');
