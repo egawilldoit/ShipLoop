@@ -2588,6 +2588,64 @@ ALTER TABLE work_items ADD COLUMN provider_revision TEXT;
  * swaps the parent and restores them in order, so `PRAGMA foreign_key_check`
  * stays empty (N08-AC3, ADR 0003).
  */
+/*
+ * The MVP candidate link.
+ *
+ * One row per *exact* candidate identity: a contract revision plus a full 40-character
+ * head commit. Three properties are structural here rather than left to a caller.
+ *
+ * 1. **The head SHA is a full commit and nothing shorter can be stored.** `commitShaCheck`
+ *    rejects an abbreviation at the column, so a candidate cannot exist in the database
+ *    whose identity is a prefix that may name a different commit tomorrow.
+ * 2. **The table is append-only.** A changed head is a new row with the next
+ *    `observation_sequence`, never an update. The earlier row stays readable, which is
+ *    what lets the verification layer show that evidence was collected for a superseded
+ *    commit, and an UPDATE or DELETE is aborted by trigger rather than by convention.
+ * 3. **"Current" is unambiguous.** `observation_sequence` is allocated per `request_id`
+ *    from the row count inside a bounded transaction, so the current candidate is the row
+ *    with the highest sequence and a reader cannot pick a different one by comparing
+ *    timestamps that two refreshes in the same millisecond would tie.
+ *
+ * The provider vocabulary is CHECKed in the column: `provider` is `github` and
+ * `pull_request_state` is one of the three states GitHub reports. A row that admitted a
+ * fourth state would be a lifecycle the rest of the product has no vocabulary for.
+ */
+const MIGRATION_13_MVP_CANDIDATE_LINKING = `
+CREATE TABLE delivery_candidates (
+  candidate_id          TEXT PRIMARY KEY,
+  project_id            TEXT NOT NULL REFERENCES projects(project_id) ON DELETE RESTRICT,
+  request_id            TEXT NOT NULL CHECK (length(request_id) > 0),
+  contract_id           TEXT NOT NULL CHECK (length(contract_id) > 0),
+  contract_revision     INTEGER NOT NULL CHECK (contract_revision > 0),
+  observation_sequence  INTEGER NOT NULL CHECK (observation_sequence > 0),
+  provider              TEXT NOT NULL CHECK (provider = 'github'),
+  repository            TEXT NOT NULL CHECK (length(repository) > 0),
+  pull_request_number   INTEGER NOT NULL CHECK (pull_request_number > 0),
+  pull_request_url      TEXT NOT NULL CHECK (length(pull_request_url) > 0),
+  base_branch           TEXT NOT NULL CHECK (length(base_branch) > 0),
+  base_sha              TEXT NOT NULL ${commitShaCheck('base_sha')},
+  head_branch           TEXT NOT NULL CHECK (length(head_branch) > 0),
+  head_sha              TEXT NOT NULL ${commitShaCheck('head_sha')},
+  head_repository       TEXT,
+  pull_request_state    TEXT NOT NULL CHECK (pull_request_state IN ('Open', 'Closed', 'Merged')),
+  draft                 INTEGER NOT NULL DEFAULT 0 CHECK (draft IN (0, 1)),
+  binding_fingerprint   TEXT NOT NULL ${fingerprintCheck('binding_fingerprint')},
+  observed_at           TEXT NOT NULL,
+  linked_at             TEXT NOT NULL DEFAULT ${NOW},
+  correlation_id        TEXT,
+  -- One row per exact identity, so re-linking the same contract revision at the same
+  -- head is idempotent at the schema and a second belief about the same commit cannot be
+  -- recorded beside the first.
+  UNIQUE (contract_id, contract_revision, head_sha),
+  -- Sequence is per request, so "the current candidate" is one row rather than an
+  -- ordering the reader has to guess at.
+  UNIQUE (request_id, observation_sequence)
+);
+CREATE INDEX delivery_candidates_by_request ON delivery_candidates(request_id, observation_sequence DESC);
+CREATE INDEX delivery_candidates_by_binding ON delivery_candidates(binding_fingerprint);
+CREATE INDEX delivery_candidates_by_contract ON delivery_candidates(contract_id, contract_revision);
+`;
+
 const MIGRATION_12_PROCEDURE_VERSION_IDENTITY = `
 CREATE TABLE procedure_versions_subject_scoped (
   procedure_version_id   TEXT PRIMARY KEY,
@@ -2754,6 +2812,22 @@ const MIGRATIONS: readonly Migration[] = [
     up: (db) => {
       db.exec(MIGRATION_12_PROCEDURE_VERSION_IDENTITY);
       scopeProcedureVersionsBySubject(db);
+    },
+  },
+  {
+    version: 13,
+    name: 'mvp_candidate_linking',
+    up: (db) => {
+      db.exec(MIGRATION_13_MVP_CANDIDATE_LINKING);
+      // Append-only by trigger, not by convention: a candidate row is a fact about one
+      // commit at one instant, and editing it would let a recorded identity stop meaning
+      // the commit it was recorded for.
+      for (const trigger of appendOnlyTriggers(
+        'delivery_candidates',
+        'delivery_candidates are retained: the head a piece of evidence was collected for is a fact about the past',
+      )) {
+        db.exec(trigger);
+      }
     },
   },
 ];
