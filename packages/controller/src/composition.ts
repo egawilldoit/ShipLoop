@@ -1419,12 +1419,22 @@ export function createCompositionRoot(config: CompositionRootConfig): Result<Com
   });
 
   /**
-   * The review card and the owner's decision, over the same four local stores.
+   * The review card, the owner's decision, and the two evidence paths, over the same four stores.
    *
    * Over the same handle as the review use cases above and the same request, contract and
-   * delivery-candidate rows the rest of this root reads, so a card cannot describe a
-   * candidate from one store and a decision from another. No provider is involved: the
-   * owner test is still `pending` because nothing in this phase records one (F24-AC3).
+   * delivery-candidate rows the rest of this root reads, so a card cannot describe a candidate from
+   * one store and a decision from another (F24-AC2).
+   *
+   * The live candidate read is handed in from `candidateLinkUseCases` rather than reaching for a
+   * git adapter itself, for two reasons. It reuses that module's one currency read - the same read
+   * the candidate route answers with, so verification and the candidate card cannot disagree about
+   * which commit is current - and it keeps this root's dependency on the provider to the narrow,
+   * read-only `CandidateGitPort` rather than the full git adapter, which carries merge, push,
+   * close and approve methods the MVP must not be able to reach from a verification pass (F03-AC5).
+   *
+   * It is `null` on a deployment that configured no git provider, and the verification path then
+   * refuses by name at the operation instead of recording a report that would read as "nothing
+   * failed" (F03-AC2, F20-AC2).
    */
   const mvpReviewCardUseCases = createMvpReviewCardUseCases({
     clock: config.clock,
@@ -1433,6 +1443,21 @@ export function createCompositionRoot(config: CompositionRootConfig): Result<Com
     candidates: new DeliveryCandidateRepository(database),
     review: new SqliteMvpReviewStore(database),
     newDecisionId: () => randomUUID(),
+    readLiveCandidate:
+      candidateLinkUseCases === null
+        ? null
+        : (input) =>
+            candidateLinkUseCases.readCandidate({
+              actor: {
+                actorId: input.ownerId,
+                role: 'Owner',
+                ownerId: input.ownerId,
+                sessionId: null,
+              },
+              projectId: input.projectId,
+              requestId: input.requestId,
+              correlationId: input.correlationId,
+            }),
   });
 
   const briefGenerationFor =

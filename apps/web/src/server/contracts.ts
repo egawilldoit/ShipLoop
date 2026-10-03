@@ -2070,13 +2070,21 @@ export interface ReviewOwnerTestView {
  * nothing, which is the only way this boundary can refuse to hand out the field that
  * makes a stale pass render green (mvp-review.md, "The read model").
  */
+/**
+ * The five outcomes an observation can carry, and the sixth a reader must not mistake for one.
+ *
+ * Named here so the card's evidence rows and the verification report's observations cannot drift
+ * into two spellings of "what the source observed" (F20-AC2, F23-AC5).
+ */
+export type ReviewEvidenceOutcome = 'passed' | 'failed' | 'waiting' | 'missing' | 'capture_failed';
+
 export interface ReviewEvidenceView {
   readonly evidenceId: string;
   readonly source: 'project_command' | 'github_check' | 'browser' | 'owner_test';
   readonly criterionId: string | null;
   readonly checkId: string | null;
-  readonly recordedOutcome: 'passed' | 'failed' | 'waiting' | 'missing' | 'capture_failed';
-  readonly currentOutcome: 'passed' | 'failed' | 'waiting' | 'missing' | 'capture_failed' | 'stale';
+  readonly recordedOutcome: ReviewEvidenceOutcome;
+  readonly currentOutcome: ReviewEvidenceOutcome | 'stale';
   readonly countsForCurrentCandidate: boolean;
   readonly staleReasons: readonly string[];
   readonly reason: string;
@@ -2185,16 +2193,123 @@ export interface RecordMvpOwnerDecisionCommand extends ReadMvpReviewCommand {
 }
 
 /**
- * The MVP review card and the owner's decision (F24, F25).
+ * One automated observation, as the transport reads it back (F20-AC3, F24-AC3).
  *
- * Two methods and nothing else: this group has no `merge`, no `deploy` and no provider
- * write, so "ShipLoop v0.1 ends at Accepted or Changes Requested" is a property of the
- * type rather than of a reviewer's memory. Both answer the whole card, so a decision
- * returns the state it produced rather than leaving the client to re-read.
+ * The same three-outcome shape the card's evidence rows use, and for the same reason: a client
+ * handed only `recordedOutcome` would render a stale pass in green. `recordedOutcome` is what the
+ * provider said at the time; `currentOutcome` and `countsForCurrentCandidate` are the answer to
+ * "may this be shown as this candidate's result" (F20-AC3).
+ */
+export interface MvpRecordedObservationView {
+  readonly evidenceId: string;
+  readonly checkId: string;
+  readonly recordedOutcome: ReviewEvidenceOutcome;
+  readonly currentOutcome: ReviewEvidenceOutcome | 'stale';
+  readonly countsForCurrentCandidate: boolean;
+  /** The commit the provider attributed the run to, or null when it attributed nothing. */
+  readonly observedHeadSha: string | null;
+  readonly observedContractRevision: number | null;
+  readonly observedAt: string | null;
+  readonly reason: string;
+}
+
+/**
+ * What one automated verification pass observed, and the card it produced (F20-AC2, F24-AC2).
+ *
+ * `candidateHeadSha` and `providerHeadSha` are both carried and are allowed to differ, because
+ * that difference is the finding: when the pull request has moved on, every check the provider
+ * attributed to the newer commit lands unbound and proves nothing about the candidate under
+ * review (F20-AC3, F24-AC4).
+ *
+ * `method` is the single literal `github_checks`, so a client cannot be handed a report whose
+ * source it cannot name (F20-AC2).
+ */
+export interface MvpVerificationReportView {
+  readonly projectId: string;
+  readonly candidateId: string;
+  readonly candidateHeadSha: string;
+  readonly providerHeadSha: string;
+  readonly contractId: string;
+  readonly contractRevision: number;
+  readonly method: 'github_checks';
+  readonly observedAt: string;
+  readonly recorded: readonly MvpRecordedObservationView[];
+  readonly review: MvpReviewCardView;
+}
+
+/**
+ * What the owner recorded, and the card it produced (F23-AC1, F25-AC4).
+ *
+ * `candidateHeadSha` is the commit the observation is bound to, reported so a client can see which
+ * build the owner's "passed" applies to rather than inferring it (F24-AC4, F25-AC3).
+ */
+export interface MvpOwnerTestReportView {
+  readonly projectId: string;
+  readonly candidateId: string;
+  readonly candidateHeadSha: string;
+  readonly contractId: string;
+  readonly contractRevision: number;
+  readonly criterionId: string;
+  readonly outcome: 'passed' | 'failed';
+  readonly evidenceId: string;
+  readonly observedAt: string;
+  readonly note: string | null;
+  readonly review: MvpReviewCardView;
+}
+
+/**
+ * Record the provider's check results for a candidate.
+ *
+ * `correlationId` is the only member about the call rather than about the candidate. There is
+ * deliberately **no result, no outcome, no check id and no commit SHA**: the server derives every
+ * one of them, so this port cannot be expressed as "the browser reports that criterion X passed"
+ * even by accident. A method added with such a member is the defect this shape prevents (F20-AC2,
+ * F23-AC1).
+ */
+export interface RecordMvpVerificationCommand {
+  readonly projectId: string;
+  readonly candidateId: string;
+  /** The owner the session proved. Never read from the body (F01-AC1). */
+  readonly actor: string;
+  readonly correlationId: string;
+}
+
+/**
+ * Record the owner's own test of one criterion (F23-AC1, F25-AC4).
+ *
+ * `outcome` is the one member a caller supplies a verdict through, and it is present because the
+ * owner's test is an observation rather than a measurement: there is no provider to read it from.
+ * The owner is the proved session rather than a body field, the instant is the controller's clock,
+ * and there is no commit SHA or verification type here - so a request cannot attribute the
+ * observation to somebody else, backdate it, or discharge an automated criterion (F01-AC1, F25-AC4).
+ */
+export interface RecordMvpOwnerTestCommand {
+  readonly projectId: string;
+  readonly candidateId: string;
+  readonly actor: string;
+  readonly criterionId: string;
+  readonly outcome: 'passed' | 'failed';
+  readonly note: string | null;
+}
+
+/**
+ * The MVP review card, the owner's decision, and the two evidence paths (F20, F23, F24, F25).
+ *
+ * Four methods and nothing else: this group has no `merge`, no `deploy` and no provider write, so
+ * "ShipLoop v0.1 ends at Accepted or Changes Requested" is a property of the type rather than of a
+ * reviewer's memory. All four answer the whole card, so a write returns the state it produced
+ * rather than leaving the client to re-read and disagree with itself (F24-AC2).
+ *
+ * The two evidence methods are separate rather than one `recordEvidence` with a flag, because
+ * automated evidence and owner evidence are separate facts with separate rules: one is derived by
+ * the server from a provider read, the other is the owner's own report and only the owner may file
+ * it (F20-AC2, F23-AC1, F25-AC4).
  */
 export interface MvpReviewUseCases {
   getReview(command: ReadMvpReviewCommand): Promise<Result<MvpReviewCardView, DomainError>>;
   decide(command: RecordMvpOwnerDecisionCommand): Promise<Result<MvpReviewCardView, DomainError>>;
+  recordVerification(command: RecordMvpVerificationCommand): Promise<Result<MvpVerificationReportView, DomainError>>;
+  recordOwnerTest(command: RecordMvpOwnerTestCommand): Promise<Result<MvpOwnerTestReportView, DomainError>>;
 }
 
 /** The whole injected surface. One argument, so a missing use case is a type error. */
@@ -2246,7 +2361,11 @@ const REQUIRED_METHODS = {
   // The review card and the owner decision, for the same reason `settings` is declared:
   // an MVP whose journey ends at Accept or Request Changes needs both methods reachable
   // from a shipped path (F24, F25).
-  mvpReview: ['getReview', 'decide'],
+  // The review card, the owner decision, and the two evidence paths. All four are declared for
+  // the same reason: a criterion that can never leave `unverified` or `pending` because no shipped
+  // path records an observation is the exact failure this guard exists to prevent (F20-AC2,
+  // F23-AC1, F25-AC2).
+  mvpReview: ['getReview', 'decide', 'recordVerification', 'recordOwnerTest'],
   sessions: ['loadByToken', 'create', 'revoke', 'touch'],
   profiles: ['saveVersion', 'currentVersion', 'listVersions'],
   connectors: ['register', 'listForProject', 'revoke'],

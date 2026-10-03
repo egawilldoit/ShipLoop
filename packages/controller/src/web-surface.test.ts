@@ -91,7 +91,11 @@ const REQUIRED_METHODS = {
     'invalidateRevision',
   ],
   handoff: ['buildHandoff'],
-  mvpReview: ['getReview', 'decide'],
+  // The two evidence paths are here for the same reason `decide` is: a criterion that can never
+  // leave `unverified` or `pending` because no shipped path records an observation is the exact
+  // failure this guard exists to prevent. `recordVerification` is the automated one and carries no
+  // result on its command; `recordOwnerTest` is the owner's own (F20-AC2, F23-AC1).
+  mvpReview: ['getReview', 'decide', 'recordVerification', 'recordOwnerTest'],
   sessions: ['loadByToken', 'create', 'revoke', 'touch'],
   profiles: ['saveVersion', 'currentVersion', 'listVersions'],
   connectors: ['register', 'listForProject', 'revoke'],
