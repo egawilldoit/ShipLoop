@@ -155,6 +155,8 @@ import type { CandidateLinkUseCases } from './candidate-linking.ts';
 import { createCandidateLinkUseCases } from './candidate-linking.ts';
 import type { MvpReviewUseCases } from './mvp-review.ts';
 import { createMvpReviewUseCases } from './mvp-review.ts';
+import type { MvpReviewCardUseCases } from './mvp-review-card.ts';
+import { createMvpReviewCardUseCases } from './mvp-review-card.ts';
 
 export interface CompositionRootConfig {
   readonly databasePath: string;
@@ -310,6 +312,16 @@ export interface CompositionRoot {
 
   /** Evidence, readiness, and the owner's Accept / Request Changes decision. */
   readonly mvpReviewUseCases: MvpReviewUseCases;
+  /**
+   * The whole review card, over the same local stores (F24, F25).
+   *
+   * Published rather than assembled by the transport because the card projects facts from
+   * four stores at once and refuses a candidate belonging to another project; a route that
+   * assembled it would be a use case wearing a transport's clothes. Built unconditionally
+   * over local state for the same reason `mvpReviewUseCases` is: the MVP journey must not
+   * depend on a configured provider.
+   */
+  readonly mvpReviewCardUseCases: MvpReviewCardUseCases;
   /** Run start, lifecycle transitions and owner limit decisions (F13, F17, F18). */
   readonly jobUseCases: JobUseCases;
   /** The attention dashboard and acknowledgement (F31). */
@@ -1406,6 +1418,23 @@ export function createCompositionRoot(config: CompositionRootConfig): Result<Com
     newDecisionId: () => randomUUID(),
   });
 
+  /**
+   * The review card and the owner's decision, over the same four local stores.
+   *
+   * Over the same handle as the review use cases above and the same request, contract and
+   * delivery-candidate rows the rest of this root reads, so a card cannot describe a
+   * candidate from one store and a decision from another. No provider is involved: the
+   * owner test is still `pending` because nothing in this phase records one (F24-AC3).
+   */
+  const mvpReviewCardUseCases = createMvpReviewCardUseCases({
+    clock: config.clock,
+    requests,
+    contracts,
+    candidates: new DeliveryCandidateRepository(database),
+    review: new SqliteMvpReviewStore(database),
+    newDecisionId: () => randomUUID(),
+  });
+
   const briefGenerationFor =
     configuredEngine === null
       ? null
@@ -1468,6 +1497,7 @@ export function createCompositionRoot(config: CompositionRootConfig): Result<Com
     settingsUseCases,
     candidateLinkUseCases,
     mvpReviewUseCases,
+    mvpReviewCardUseCases,
     jobUseCases,
     attentionUseCases,
     verificationUseCases,

@@ -129,6 +129,7 @@ import type {
   RunWriter,
 } from './jobs.ts';
 import type { ReviewCard } from './verification.ts';
+import type { MvpReviewCard } from './mvp-review-card.ts';
 import type { OwnerObservationRecord, OwnerObservationTarget, OwnerObservationUseCases } from './owner-tests.ts';
 import { SqliteOwnerObservationJournal, createOwnerObservationUseCases } from './owner-tests.ts';
 import { SqliteObservationJournal } from './verification.ts';
@@ -1715,12 +1716,51 @@ export interface SurfaceHandoffUseCases {
   }): Promise<Result<SurfaceHandoff, DomainError>>;
 }
 
+/**
+ * The review card, as the transport receives it.
+ *
+ * An alias rather than a third transcription: `apps/web/src/server/contracts.ts` declares
+ * `MvpReviewCardView` because the web server loads this package as external input and
+ * nothing in the compiler ties the two declarations together. Here the type is the
+ * controller's own, so the surface cannot answer with a card that differs from the one the
+ * use case computed. The wire-shape agreement the transport needs is asserted by
+ * `web-surface.test.ts` against both declarations, in the same way as the review-card
+ * criterion fields above it (F24-AC2, F24-AC3).
+ */
+export type SurfaceMvpReviewCard = MvpReviewCard;
+
+/**
+ * The MVP review card and the owner's Accept / Request Changes decision (F24, F25).
+ *
+ * Two methods, and no `merge`, `deploy` or provider write: the MVP ends at the owner
+ * decision, so this group is a read plus one owner-gated write. `actor` is the identity the
+ * transport proved, converted to the domain's actor union below, so a caller cannot name
+ * the owner a decision is attributed to (F01-AC1, F25-AC4).
+ */
+export interface SurfaceMvpReviewUseCases {
+  getReview(command: {
+    readonly projectId: string;
+    readonly candidateId: string;
+    readonly actor: string;
+  }): Promise<Result<SurfaceMvpReviewCard, DomainError>>;
+  decide(command: {
+    readonly projectId: string;
+    readonly candidateId: string;
+    readonly actor: string;
+    readonly decision: 'accepted' | 'changes_requested';
+    readonly expectedHeadSha: string;
+    readonly expectedContractRevision: number;
+    readonly feedback: string | null;
+  }): Promise<Result<SurfaceMvpReviewCard, DomainError>>;
+}
+
 /** The whole injected surface. One argument, so a missing use case is a type error. */
 export interface ControllerSurface {
   readonly owners: SurfaceOwnerUseCases;
   readonly projects: SurfaceProjectUseCases;
   readonly contracts: SurfaceContractUseCases;
   readonly handoff: SurfaceHandoffUseCases;
+  readonly mvpReview: SurfaceMvpReviewUseCases;
   readonly sessions: SurfaceSessionUseCases;
   readonly profiles: SurfaceProfileUseCases;
   readonly connectors: SurfaceConnectorUseCases;
@@ -3121,6 +3161,62 @@ export function createControllerSurface(resolve: SurfaceRootResolver): Controlle
           );
           if (!handoff.ok) return err(handoff.error);
           return ok(toSurfaceHandoff(handoff.value));
+        }),
+    },
+
+    /**
+     * The whole review card for one candidate, and the owner's decision on it (F24, F25).
+     *
+     * The card is the controller's own object, passed through with no reshaping: every
+     * element on it - the contract revision, the full head SHA, both evidence outcomes,
+     * the staleness list and the existing decision - was computed in one pass by the use
+     * case, and a second projection here would be the one place the two could disagree
+     * (F24-AC2).
+     *
+     * The actor is built from the identity the transport proved. It is always an owner,
+     * because this module is only reachable behind the session guard, and the domain
+     * refuses anything else: the non-owner variants carry no owner identity for a
+     * decision to borrow (F01-AC1, F25-AC4).
+     */
+    mvpReview: {
+      getReview: async (command) =>
+        use(async (root) => {
+          const actor = ownerActorFor(command.actor);
+          if (!actor.ok) return err(actor.error);
+          const card = await root.mvpReviewCardUseCases.getReview({
+            projectId: command.projectId,
+            candidateId: command.candidateId,
+            actor: { role: 'owner', ownerId: command.actor as OwnerId },
+          });
+          if (!card.ok) return err(card.error);
+          return ok(card.value);
+        }),
+
+      /**
+       * Accept, or Request Changes, bound to the exact commit the page was rendered
+       * against (F24-AC4, F25-AC3).
+       *
+       * The full SHA and the contract revision travel with the command, so a submission
+       * from an outdated card is a typed `Conflict` rather than a decision about whatever
+       * the candidate has become. The refusal and every outstanding-item name come from
+       * the use case unchanged, so what the owner is told cannot drift from what the
+       * domain decided (F23-AC1, F25-AC2).
+       */
+      decide: async (command) =>
+        use(async (root) => {
+          const actor = ownerActorFor(command.actor);
+          if (!actor.ok) return err(actor.error);
+          const decided = await root.mvpReviewCardUseCases.decide({
+            projectId: command.projectId,
+            candidateId: command.candidateId,
+            actor: { role: 'owner', ownerId: command.actor as OwnerId },
+            decision: command.decision,
+            expectedHeadSha: command.expectedHeadSha,
+            expectedContractRevision: command.expectedContractRevision,
+            feedback: command.feedback,
+          });
+          if (!decided.ok) return err(decided.error);
+          return ok(decided.value);
         }),
     },
 

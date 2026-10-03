@@ -52,6 +52,7 @@ import { createCompositionRoot } from './composition.ts';
 import type { CompositionRoot } from './composition.ts';
 import type { AdapterRegistry, ConnectorProbe } from './connectors.ts';
 import type { ControllerClock } from './profiles.ts';
+import type { MvpEvidenceProjection } from './mvp-review-card.ts';
 import type { ReviewCardCriterion } from './verification.ts';
 import type { ControllerSurface, SurfaceReviewCard } from './web-surface.ts';
 import { bindControllerSurface, createControllerSurface, resolveSurfaceRoot } from './web-surface.ts';
@@ -90,6 +91,7 @@ const REQUIRED_METHODS = {
     'invalidateRevision',
   ],
   handoff: ['buildHandoff'],
+  mvpReview: ['getReview', 'decide'],
   sessions: ['loadByToken', 'create', 'revoke', 'touch'],
   profiles: ['saveVersion', 'currentVersion', 'listVersions'],
   connectors: ['register', 'listForProject', 'revoke'],
@@ -201,6 +203,44 @@ type SurfaceCriterionMatch = [Exclude<SurfaceCriterionKey, ReviewCardCriterionKe
 
 const REVIEW_CARD_CRITERION_MATCHES: ReviewCardCriterionMatch & SurfaceCriterionMatch = true;
 
+/**
+ * `ReviewEvidenceView` from `apps/web/src/server/contracts.ts`, transcribed.
+ *
+ * This list exists for one reason: an evidence row carries two outcomes and only one of
+ * them may be shown as this candidate's result. `recordedOutcome` is what the source said
+ * and stays `passed` after a push; `currentOutcome` is `stale` once the binding no longer
+ * holds; `countsForCurrentCandidate` is the affirmative answer to "may this be shown as
+ * this candidate's result?". A bare `outcome` on the wire is the defect this guards,
+ * because a client that reaches for it renders a stale pass in green (F20-AC3, F24-AC3).
+ */
+const REVIEW_EVIDENCE_FIELDS = [
+  'evidenceId',
+  'source',
+  'criterionId',
+  'checkId',
+  'recordedOutcome',
+  'currentOutcome',
+  'countsForCurrentCandidate',
+  'staleReasons',
+  'reason',
+  'observedAt',
+  'candidateHeadSha',
+  'contractRevision',
+  'detail',
+  'artifactRef',
+] as const satisfies readonly (keyof MvpEvidenceProjection)[];
+
+/** The transcription and the projection must name the same fields, in both directions. */
+type MvpEvidenceKey = keyof MvpEvidenceProjection;
+type TranscribedEvidenceKey = (typeof REVIEW_EVIDENCE_FIELDS)[number];
+type ReviewEvidenceMatch = [Exclude<TranscribedEvidenceKey, MvpEvidenceKey>] extends [never]
+  ? [Exclude<MvpEvidenceKey, TranscribedEvidenceKey>] extends [never]
+    ? true
+    : never
+  : never;
+
+const REVIEW_EVIDENCE_MATCHES: ReviewEvidenceMatch = true;
+
 const DECLARED: Readonly<Record<'Ticket' | 'Git' | 'Deployment' | 'Engine', readonly CapabilityKind[]>> = {
   Ticket: ['Ticket:ReadScope', 'Ticket:UpdateManagedProgress'],
   Git: ['Git:ReadRepository', 'Git:ReadChecks', 'Git:PushBranch'],
@@ -291,6 +331,27 @@ test('the criterion the web contract declares is the criterion this projection e
       'verificationDetail',
     ],
     'the verification identity is three fields, and dropping any of them is the defect this guards',
+  );
+});
+
+// F20-AC3, F24-AC3: the two outcomes an evidence row carries must reach the browser under names
+// that cannot be confused, and no bare `outcome` may appear. The transport refuses a card whose
+// evidence rows disagree with themselves about staleness; this proves the shape it refuses
+// against, so a rename that reintroduces the ambiguous field fails here rather than in a client.
+test('the evidence row the web contract declares names both outcomes and no bare outcome (F20-AC3, F24-AC3)', () => {
+  assert.equal(
+    REVIEW_EVIDENCE_MATCHES,
+    true,
+    `the transcription and the projection disagree about an evidence field; transcribed: ${REVIEW_EVIDENCE_FIELDS.join(', ')}`,
+  );
+  assert.ok(
+    !REVIEW_EVIDENCE_FIELDS.includes('outcome' as (typeof REVIEW_EVIDENCE_FIELDS)[number]),
+    'a bare `outcome` is what a stale pass would be rendered from, so the wire must not carry one',
+  );
+  assert.deepEqual(
+    REVIEW_EVIDENCE_FIELDS.filter((field) => field.endsWith('Outcome') || field === 'countsForCurrentCandidate'),
+    ['recordedOutcome', 'currentOutcome', 'countsForCurrentCandidate'],
+    'the three fields that decide whether a result may be shown are the three that must travel',
   );
 });
 
