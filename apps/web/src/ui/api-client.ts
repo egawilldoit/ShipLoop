@@ -930,7 +930,17 @@ export interface ReviewCardCheck {
   readonly detail: string | null;
 }
 
-/** One acceptance criterion and the verdict recorded against it (F23-AC1, F24-AC3). */
+/**
+ * One acceptance criterion, the verdict recorded against it, and the identity of whatever
+ * verified it (F23-AC1, F24-AC3).
+ *
+ * The three `verification*` fields answer the question a status alone cannot: which check
+ * actually observed this criterion. `verificationCheckId` is the profile-visible check name —
+ * the same value the checks above carry in `checkId`, so a criterion can be compared with them
+ * — and it is null when no check is bound to the verdict. That combination (an automated
+ * method with no named check) means nothing here can be read as the criterion's verification,
+ * and the row says so rather than reading as complete (F23-AC1).
+ */
 export interface ReviewCardCriterion {
   readonly criterionId: string;
   readonly text: string;
@@ -939,6 +949,9 @@ export interface ReviewCardCriterion {
   readonly evidenceId: string | null;
   readonly observedAt: string | null;
   readonly detail: string | null;
+  readonly verificationCheckId: string | null;
+  readonly verificationEvidenceId: string | null;
+  readonly verificationDetail: string | null;
 }
 
 /**

@@ -2883,8 +2883,8 @@ test('F24-AC3: the review card names every check result and every reason it is n
       { checkId: 'chk_2', name: 'test', origin: 'LocalCheck', required: true, result: 'Failed', blocking: true, exitCode: 1, artifactRef: 'run-1/test.log', detail: 'one assertion failed' },
     ],
     criteria: [
-      { criterionId: 'AC1', text: 'A durable job row exists for the run.', methodKind: 'AutomatedCheck', status: 'Verified', evidenceId: 'ev_1', observedAt: START, detail: null },
-      { criterionId: 'AC2', text: 'The owner can pause the run.', methodKind: 'OwnerTest', status: 'PendingOwnerTest', evidenceId: null, observedAt: null, detail: null },
+      { criterionId: 'AC1', text: 'A durable job row exists for the run.', methodKind: 'AutomatedCheck', status: 'Verified', evidenceId: 'ev_1', observedAt: START, detail: null, verificationCheckId: 'typecheck', verificationEvidenceId: 'ev_1', verificationDetail: 'Verified by check "typecheck".' },
+      { criterionId: 'AC2', text: 'The owner can pause the run.', methodKind: 'OwnerTest', status: 'PendingOwnerTest', evidenceId: null, observedAt: null, detail: null, verificationCheckId: null, verificationEvidenceId: null, verificationDetail: null },
     ],
     pendingOwnerTestCriterionIds: ['AC2'],
     readyForOwnerTest: false,
@@ -2908,6 +2908,24 @@ test('F24-AC3: the review card names every check result and every reason it is n
   assert.equal(card.checks[1]?.blocking, true, 'a failing required check blocks, and the card says so (F20-AC2)');
   assert.equal(card.criteria.length, 2);
   assert.deepEqual(card.criteria.map((criterion) => criterion.status), ['Verified', 'PendingOwnerTest']);
+  // The verification identity travels with the criterion, so the browser can hold a criterion
+  // against the checks above it instead of assuming any green check covers it (F23-AC1).
+  assert.deepEqual(
+    card.criteria.map((criterion) => criterion.verificationCheckId),
+    ['typecheck', null],
+    'an automated criterion names its check and an owner-test criterion names none',
+  );
+  assert.deepEqual(
+    card.criteria.map((criterion) => criterion.verificationEvidenceId),
+    ['ev_1', null],
+    'the evidence row carrying the verdict travels with it',
+  );
+  assert.equal(
+    card.criteria[0]?.verificationDetail,
+    'Verified by check "typecheck".',
+    'the card states what verified the criterion rather than leaving it to be inferred',
+  );
+  assert.equal(card.criteria[1]?.verificationDetail, null, 'nothing has verified a pending owner test yet');
   assert.deepEqual(card.pendingOwnerTestCriterionIds, ['AC2']);
   assert.equal(card.readyForOwnerTest, false);
   assert.deepEqual(card.notReady, [

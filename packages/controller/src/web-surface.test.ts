@@ -52,7 +52,8 @@ import { createCompositionRoot } from './composition.ts';
 import type { CompositionRoot } from './composition.ts';
 import type { AdapterRegistry, ConnectorProbe } from './connectors.ts';
 import type { ControllerClock } from './profiles.ts';
-import type { ControllerSurface } from './web-surface.ts';
+import type { ReviewCardCriterion } from './verification.ts';
+import type { ControllerSurface, SurfaceReviewCard } from './web-surface.ts';
 import { bindControllerSurface, createControllerSurface, resolveSurfaceRoot } from './web-surface.ts';
 
 const NOW = '2026-10-01T09:00:00.000Z';
@@ -134,6 +135,52 @@ function satisfiesTranscribedPort(value: unknown): value is ControllerSurface {
   return true;
 }
 
+/**
+ * `ReviewCardCriterion`'s fields, transcribed from `apps/web/src/server/contracts.ts`.
+ *
+ * The web server loads this controller as external input and checks it structurally at run time,
+ * so nothing in the compiler ties the two declarations together: a criterion field added here
+ * and not there, or dropped there and kept here, would reach the browser as a silent mismatch
+ * rather than as a failure. `REVIEW_CARD_CRITERION_MATCHES` is the guard, and it is the same
+ * shape of guard as `satisfiesTranscribedPort` — the assertion states the rule and the types
+ * carry it (F23-AC1, F24-AC3).
+ *
+ * The three `verification*` fields are the ones this exists for. Without them the card reports a
+ * verdict per criterion and no identity for it, which is what lets a passing check read as the
+ * verification of a criterion it never observed.
+ */
+const REVIEW_CARD_CRITERION_FIELDS = [
+  'criterionId',
+  'text',
+  'methodKind',
+  'status',
+  'evidenceId',
+  'observedAt',
+  'detail',
+  'verificationCheckId',
+  'verificationEvidenceId',
+  'verificationDetail',
+] as const satisfies readonly (keyof SurfaceReviewCard['criteria'][number])[];
+
+/** The two declarations must name the same fields in both directions, or the guard is `never`. */
+type ReviewCardCriterionKey = keyof ReviewCardCriterion;
+type TranscribedCriterionKey = (typeof REVIEW_CARD_CRITERION_FIELDS)[number];
+type ReviewCardCriterionMatch = [Exclude<ReviewCardCriterionKey, TranscribedCriterionKey>] extends [never]
+  ? [Exclude<TranscribedCriterionKey, ReviewCardCriterionKey>] extends [never]
+    ? true
+    : never
+  : never;
+
+/** The surface projection carries the same fields as the card it transcribes, by construction. */
+type SurfaceCriterionKey = keyof SurfaceReviewCard['criteria'][number];
+type SurfaceCriterionMatch = [Exclude<SurfaceCriterionKey, ReviewCardCriterionKey>] extends [never]
+  ? [Exclude<ReviewCardCriterionKey, SurfaceCriterionKey>] extends [never]
+    ? true
+    : never
+  : never;
+
+const REVIEW_CARD_CRITERION_MATCHES: ReviewCardCriterionMatch & SurfaceCriterionMatch = true;
+
 const DECLARED: Readonly<Record<'Ticket' | 'Git' | 'Deployment' | 'Engine', readonly CapabilityKind[]>> = {
   Ticket: ['Ticket:ReadScope', 'Ticket:UpdateManagedProgress'],
   Git: ['Git:ReadRepository', 'Git:ReadChecks', 'Git:PushBranch'],
@@ -197,6 +244,34 @@ test('a real root answers the transcribed port, by type and at run time (F01-AC1
     const asPort: ControllerSurface = surface;
     assert.ok(satisfiesTranscribedPort(asPort), 'the transcribed port guard must accept the real surface');
   });
+});
+
+// F23-AC1, F24-AC3: the criterion the web contract declares and the criterion this projection
+// emits must be the same criterion. A field the projection drops is a verification identity the
+// browser never sees, and nothing else in the pipeline would notice.
+test('the criterion the web contract declares is the criterion this projection emits (F23-AC1, F24-AC3)', () => {
+  assert.equal(
+    REVIEW_CARD_CRITERION_MATCHES,
+    true,
+    `the transcription and the projection disagree about a criterion field; ` +
+      `transcribed: ${REVIEW_CARD_CRITERION_FIELDS.join(', ')}`,
+  );
+  assert.deepEqual(
+    [...REVIEW_CARD_CRITERION_FIELDS],
+    [
+      'criterionId',
+      'text',
+      'methodKind',
+      'status',
+      'evidenceId',
+      'observedAt',
+      'detail',
+      'verificationCheckId',
+      'verificationEvidenceId',
+      'verificationDetail',
+    ],
+    'the verification identity is three fields, and dropping any of them is the defect this guards',
+  );
 });
 
 test('the module the web server loads passes its own structural check (F01-AC1)', async () => {

@@ -61,6 +61,7 @@ import {
   type ApiFailure,
   type ReviewCard,
   type ReviewCardCheck,
+  type ReviewCardCriterion,
   type RunCheckpoint,
 } from '../api-client.ts';
 import { ArtifactLink } from '../components/ArtifactLink.tsx';
@@ -160,6 +161,32 @@ function previewAccessStatement(): string {
     'been verified against a deployed environment. Perform the step in your own environment and record that you did: ' +
     'the environment you select is stored with your observation, so local evidence stays labelled local and cannot ' +
     'satisfy a criterion that requires deployed behaviour (F22-AC1, F22-AC3, F23-AC4).'
+  );
+}
+
+/**
+ * What the criteria panel says about how much of the card can name its own verification (F23-AC1).
+ *
+ * The count of named checks is the whole sentence, and it is a separate line from the count of
+ * criteria because those are two different numbers. A card whose criteria all carry a verdict is
+ * not thereby covered by the checks above it, and a line that said only "every criterion has a
+ * verdict" would read as complete for criteria that name no check at all — which is the one state
+ * the specification forbids passing off as verified (F23-AC1, F24-AC3).
+ */
+function criteriaCoverageStatement(criteria: readonly ReviewCardCriterion[]): string {
+  const named = criteria.filter((criterion) => criterion.verificationCheckId !== null).length;
+  const unnamedAutomated = criteria.filter(
+    (criterion) => criterion.methodKind === 'AutomatedCheck' && criterion.verificationCheckId === null,
+  );
+  const summary =
+    `${String(named)} of ${String(criteria.length)} ` +
+    `${criteria.length === 1 ? 'criterion names' : 'criteria name'} the check or recorded step that verified ` +
+    `${criteria.length === 1 ? 'it' : 'them'}; no other check on this card is offered for the rest (F23-AC1).`;
+  if (unnamedAutomated.length === 0) return summary;
+  return (
+    `${summary} ${unnamedAutomated.map((criterion) => criterion.criterionId).join(', ')} ` +
+    `${unnamedAutomated.length === 1 ? 'is' : 'are'} verified by an automated check that this card cannot name, ` +
+    `so ${unnamedAutomated.length === 1 ? 'it is' : 'they are'} not ready however green the checks above look (F23-AC1).`
   );
 }
 
@@ -505,10 +532,15 @@ export function ReviewCardPage({ jobId, onBackToRuns, epoch }: ReviewCardPagePro
             <h3 className="panel__title" id="review-criteria-title">
               Acceptance criteria
             </h3>
-            <p className="state-line" role="status" data-state={card.criteria.length === 0 ? 'empty' : 'ready'}>
+            <p
+              className="state-line"
+              role="status"
+              data-state={card.criteria.length === 0 ? 'empty' : 'ready'}
+              data-testid="card-criteria-coverage"
+            >
               {card.criteria.length === 0
                 ? 'This candidate recorded no acceptance criteria, so nothing on it can be judged against one.'
-                : `${String(card.criteria.length)} ${card.criteria.length === 1 ? 'criterion has' : 'criteria have'} a recorded verdict, each with the method that verifies it.`}
+                : criteriaCoverageStatement(card.criteria)}
             </p>
             {card.criteria.length === 0 ? null : (
               <ul className="capability-list">

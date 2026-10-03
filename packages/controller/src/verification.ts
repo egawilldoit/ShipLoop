@@ -257,13 +257,29 @@ export type CriterionMethodKind = CriterionVerificationMethod['kind'];
  * check that produced it. The steps of an owner test are the criterion text the scope
  * snapshot captured: no separate instruction document is stored, and inventing one here
  * would be a claim no observation supports (F23-AC1).
+ *
+ * The check arrives as two fields because it has two identities and the card needs the one
+ * a reader can use: `checkId` is the `checks` row the verdict is bound to, and `checkName`
+ * is that row's own `name`, read through the foreign key. Nothing here reconstructs a name
+ * the schema does not hold, so a criterion can only ever name a check that really ran
+ * (F23-AC1).
  */
 export interface CriterionEvidenceRow {
   readonly evidenceId: EvidenceId;
   readonly criterionId: string;
   readonly methodKind: CriterionMethodKind;
   readonly status: CriterionStatus;
+  /** The per-execution `checks` row this verdict is bound to, or null when it is bound to none. */
   readonly checkId: string | null;
+  /**
+   * The profile-visible name of that bound check, read through the foreign key.
+   *
+   * `checkId` is a row identity no reader can present, so this is the name the profile's
+   * required set, the readiness rules and the card all speak in — and it is resolved from the
+   * row itself rather than from a name the writer supplied, so a verdict cannot claim a check
+   * that did not produce it (F23-AC1).
+   */
+  readonly checkName: string | null;
   readonly candidateFingerprint: Fingerprint;
   readonly scopeFingerprint: Fingerprint;
   readonly observedAt: string | null;
@@ -363,6 +379,20 @@ export interface ReviewCardCheck {
   readonly detail: string | null;
 }
 
+/**
+ * One criterion as the card states it, and the identity of whatever verified it (F23-AC1).
+ *
+ * The last three fields are the whole point of this shape. `evidenceId` alone says a verdict
+ * exists; it does not say *what* observed the criterion, and a card that cannot answer that
+ * lets any passing check on it read as the verification of any criterion. So an automated
+ * criterion names the check its verdict is bound to, the evidence row carries that verdict,
+ * and the detail says it in words. All three are null when nothing verified the criterion,
+ * which is a fact the card states rather than a gap it hides (F23-AC1, F24-AC3).
+ *
+ * `verificationCheckId` is the profile-visible check name — the same vocabulary
+ * `ReviewCardCheck.checkId` uses — rather than the per-execution row surrogate, because a
+ * surrogate would answer a question the owner did not ask (F20-AC3).
+ */
 export interface ReviewCardCriterion {
   readonly criterionId: string;
   readonly text: string;
@@ -371,6 +401,12 @@ export interface ReviewCardCriterion {
   readonly evidenceId: EvidenceId | null;
   readonly observedAt: string | null;
   readonly detail: string | null;
+  /** The check this verdict is bound to, or null when none is. */
+  readonly verificationCheckId: string | null;
+  /** The durable row this verdict was read from, the same row `evidenceId` names. */
+  readonly verificationEvidenceId: EvidenceId | null;
+  /** What verified it, in words; null when nothing has. */
+  readonly verificationDetail: string | null;
 }
 
 /**
@@ -929,14 +965,19 @@ export function createVerificationUseCases(deps: VerificationUseCaseDeps): Verif
     const criteria: ReviewCardCriterion[] = snapshot.acceptanceCriteria.map((criterion) => {
       const row = byCriterion.get(criterion.id);
       const methodKind = row?.methodKind ?? 'Untested';
+      const status = row?.status ?? UNOBSERVED_STATUS[methodKind];
+      const verificationCheckId = row?.checkName ?? null;
       return {
         criterionId: safe(criterion.id),
         text: safe(criterion.text),
         methodKind,
-        status: row?.status ?? UNOBSERVED_STATUS[methodKind],
+        status,
         evidenceId: row?.evidenceId ?? null,
         observedAt: row?.observedAt ?? null,
         detail: row === undefined ? safe(UNOBSERVED_DETAIL[methodKind]) : (row.detail ?? null),
+        verificationCheckId: verificationCheckId === null ? null : safe(verificationCheckId),
+        verificationEvidenceId: row?.evidenceId ?? null,
+        verificationDetail: verificationDetailFor(methodKind, status, verificationCheckId),
       };
     });
 
@@ -944,10 +985,18 @@ export function createVerificationUseCases(deps: VerificationUseCaseDeps): Verif
     const unmet = criteria.filter(
       (criterion) => criterion.status !== 'Verified' && criterion.status !== 'PendingOwnerTest',
     );
+    /** An automated criterion whose verdict names no check, so nothing here can be said to have verified it. */
+    const unnamedAutomated = criteria.filter(
+      (criterion) => criterion.methodKind === 'AutomatedCheck' && criterion.verificationCheckId === null,
+    );
     const notReady = [
       ...blockingChecks.map((check) => `Required check "${check.name}" is ${check.result}, not Passed.`),
       ...unmet.map(
         (criterion) => `Criterion "${criterion.criterionId}" is ${criterion.status}, with no verified observation.`,
+      ),
+      ...unnamedAutomated.map(
+        (criterion) =>
+          `Criterion "${criterion.criterionId}" is verified by an automated check, but no check is bound to its verdict, so no result on this card can be read as its verification (F23-AC1).`,
       ),
     ].map(safe);
 
@@ -1196,6 +1245,31 @@ function ownerTestEvidenceId(
 }
 
 /**
+ * What verified one criterion, in words (F23-AC1).
+ *
+ * Only the identity is stated, never a verdict: the status beside it already says what the
+ * observation concluded, and this says which check or which recorded step it came from. An
+ * automated criterion whose verdict names no check gets an explicit sentence rather than a
+ * null, because silence would let the checks above it read as its verification (F23-AC1,
+ * F24-AC3).
+ */
+function verificationDetailFor(
+  methodKind: CriterionMethodKind,
+  status: CriterionStatus,
+  checkName: string | null,
+): string | null {
+  if (methodKind === 'AutomatedCheck') {
+    if (checkName === null) {
+      return 'No check is bound to this criterion, so no check result can be read as its verification (F23-AC1).';
+    }
+    if (status === 'Verified') return `Verified by check "${checkName}".`;
+    return `Check "${checkName}" is bound to this criterion and recorded ${status}, so it has not verified it (F23-AC1).`;
+  }
+  if (status !== 'Verified') return null;
+  return `Verified by the recorded ${methodKind} step against this criterion.`;
+}
+
+/**
  * The domain criterion evidence a stored row carries.
  *
  * The method is reconstructed from the durable kind rather than restated, and the row's own
@@ -1214,10 +1288,17 @@ function criterionEvidenceFor(row: CriterionEvidenceRow, instructions: string): 
   };
 }
 
+/**
+ * The method a stored row states.
+ *
+ * An automated method names the *profile-visible* check name read from the bound `checks` row,
+ * not that row's surrogate identity: the name is what a policy, a readiness rule and a reader
+ * all speak in, and handing the surrogate back would name a check that cannot be run (F23-AC1).
+ */
 function methodFor(row: CriterionEvidenceRow, instructions: string): CriterionVerificationMethod {
   switch (row.methodKind) {
     case 'AutomatedCheck':
-      return { kind: 'AutomatedCheck', checkId: row.checkId ?? '' };
+      return { kind: 'AutomatedCheck', checkId: row.checkName ?? '' };
     case 'OwnerTest':
       return { kind: 'OwnerTest', instructions };
     case 'BrowserEvidence':
@@ -1236,8 +1317,27 @@ function methodFor(row: CriterionEvidenceRow, instructions: string): CriterionVe
 const CHECK_COLUMNS =
   'check_id, name, origin, required, result, not_applicable_approved_by_policy, candidate_fingerprint, started_at, ended_at, exit_code, artifact_ref, detail_redacted';
 
+/**
+ * The evidence columns, qualified by table.
+ *
+ * Qualified because the read joins `checks` for the bound check's name, and both tables carry
+ * `candidate_id` and `check_id`: an unqualified name would resolve to whichever table the
+ * planner picked rather than to the row the verdict belongs to (F23-AC1).
+ */
 const CRITERION_COLUMNS =
-  'evidence_id, criterion_id, method_kind, status, check_id, candidate_fingerprint, scope_fingerprint, observed_at, artifact_ref, detail_redacted';
+  'evidence.evidence_id, evidence.criterion_id, evidence.method_kind, evidence.status, evidence.check_id, evidence.candidate_fingerprint, evidence.scope_fingerprint, evidence.observed_at, evidence.artifact_ref, evidence.detail_redacted, checks.name AS bound_check_name';
+
+/**
+ * The read that carries a verdict together with the identity of the check behind it.
+ *
+ * The name is read through the foreign key from the `checks` row the verdict is bound to, not
+ * from the evidence row's own `check_name` column, so the criterion can only ever name a check
+ * that really ran. A verdict bound to no check — an owner test, or a captured-evidence
+ * criterion the schema forbids binding to one — reads `null`, which is the honest answer for
+ * "no check produced this" (F23-AC1).
+ */
+const CRITERION_FROM =
+  'FROM evidence LEFT JOIN checks ON checks.check_id = evidence.check_id';
 
 const CRITERION_STATUSES: readonly CriterionStatus[] = [
   'Verified',
@@ -1322,7 +1422,14 @@ function describe(error: unknown): string {
  *   - an `evidence` row is a verdict, keyed by the candidate, the criterion, the method and
  *     the identity. A later observation of the same criterion under the same identity
  *     replaces the verdict, so a corrected owner test converges rather than conflicting
- *     (F23-AC1, and operations that converge on the same end state across retries).
+ *     (F23-AC1, and operations that converge on the same end state across retries). The bound
+ *     `check_id` is deliberately *not* one of the columns that replace: the check a criterion
+ *     was verified by is part of what that verdict asserts, so a later write updates what the
+ *     verdict says and leaves what verified it alone. Within one candidate identity the
+ *     assignment cannot legitimately move anyway — it comes from the scope revision the
+ *     candidate was built against — so retaining the first binding is what keeps a caller that
+ *     disagrees with the captured scope from re-pointing a criterion at a check that merely
+ *     passed (F23-AC1).
  */
 
 /** The row identity one execution of one check owns. */
@@ -1404,9 +1511,9 @@ export class SqliteObservationJournal implements ObservationJournal {
       ok(
         this.connection
           .prepare(
-            `SELECT ${CRITERION_COLUMNS} FROM evidence
-               WHERE candidate_id = ? AND candidate_fingerprint = ?
-               ORDER BY criterion_id ASC`,
+            `SELECT ${CRITERION_COLUMNS} ${CRITERION_FROM}
+               WHERE evidence.candidate_id = ? AND evidence.candidate_fingerprint = ?
+               ORDER BY evidence.criterion_id ASC`,
           )
           .all(candidate.candidateId, currentCandidateFingerprint)
           .map(toCriterionRow),
@@ -1422,8 +1529,8 @@ export class SqliteObservationJournal implements ObservationJournal {
     return this.attempt('read criterion evidence', () => {
       const row = this.connection
         .prepare(
-          `SELECT ${CRITERION_COLUMNS} FROM evidence
-             WHERE candidate_id = ? AND candidate_fingerprint = ? AND criterion_id = ?`,
+          `SELECT ${CRITERION_COLUMNS} ${CRITERION_FROM}
+             WHERE evidence.candidate_id = ? AND evidence.candidate_fingerprint = ? AND evidence.criterion_id = ?`,
         )
         .get(candidate.candidateId, currentCandidateFingerprint, criterionId);
       return ok(row === undefined ? null : toCriterionRow(row));
@@ -1490,8 +1597,8 @@ export class SqliteObservationJournal implements ObservationJournal {
         );
       const read = this.connection
         .prepare(
-          `SELECT ${CRITERION_COLUMNS} FROM evidence
-             WHERE candidate_id = ? AND candidate_fingerprint = ? AND criterion_id = ?`,
+          `SELECT ${CRITERION_COLUMNS} ${CRITERION_FROM}
+             WHERE evidence.candidate_id = ? AND evidence.candidate_fingerprint = ? AND evidence.criterion_id = ?`,
         )
         .get(input.candidate.candidateId, input.bundleFingerprint, safe(record.criterionId));
       if (read === undefined) {
@@ -1574,6 +1681,7 @@ function toCriterionRow(row: SqlRow): CriterionEvidenceRow {
     methodKind: oneOf(requiredText(row, 'method_kind'), METHOD_KINDS, 'method_kind'),
     status: oneOf(requiredText(row, 'status'), CRITERION_STATUSES, 'status'),
     checkId: optionalText(row, 'check_id'),
+    checkName: optionalText(row, 'bound_check_name'),
     candidateFingerprint: requiredText(row, 'candidate_fingerprint') as Fingerprint,
     scopeFingerprint: requiredText(row, 'scope_fingerprint') as Fingerprint,
     observedAt: optionalText(row, 'observed_at'),

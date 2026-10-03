@@ -964,6 +964,17 @@ export interface ReviewCardView {
     readonly evidenceId: string | null;
     readonly observedAt: string | null;
     readonly detail: string | null;
+    /**
+     * The check this criterion's verdict is bound to, and the evidence row carrying it.
+     *
+     * Null means nothing verified the criterion. An automated criterion with a null
+     * `verificationCheckId` is not ready, and the card names that rather than letting the
+     * passing checks above it read as its verification (F23-AC1, F24-AC3).
+     */
+    readonly verificationCheckId: string | null;
+    readonly verificationEvidenceId: string | null;
+    /** What verified it, in words; null when nothing has. */
+    readonly verificationDetail: string | null;
   }[];
   readonly pendingOwnerTestCriterionIds: readonly string[];
   readonly readyForOwnerTest: boolean;

@@ -861,7 +861,7 @@ test.describe('what the card shows', () => {
     shipLoopServer,
   }) => {
     const store = openReviewCardStore(shipLoopServer);
-    await subjectWithCandidate(page, store, serverUrl, shipLoopServer.artifactDirectory);
+    const subject = await subjectWithCandidate(page, store, serverUrl, shipLoopServer.artifactDirectory);
 
     const passing = checkRow(page, PASSING_CHECK);
     await expect(passing).toContainText('Passed');
@@ -883,7 +883,27 @@ test.describe('what the card shows', () => {
     // The row states the reason out loud rather than leaving it to be inferred from the badge.
     await expect(
       page.getByTestId('criterion-method').filter({ hasText: 'AutomatedCheck' }),
-    ).toContainText('no check on this card is being offered as its verification');
+    ).toContainText('no other check on this card is being offered as its verification');
+
+    // It also names the check it *is* bound to, so the binding is visible rather than inferred,
+    // and says in the same breath that this check did not verify it (F23-AC1).
+    await expect(criterion).toHaveAttribute('data-verification-check', PASSING_CHECK);
+    await expect(criterion.locator('[data-testid="criterion-method"]')).toContainText(
+      `bound to check "${PASSING_CHECK}"`,
+    );
+    await expect(criterion.locator('[data-testid="criterion-verification"]')).toContainText(
+      `Check "${PASSING_CHECK}" is bound to this criterion and recorded Untested, so it has not verified it`,
+    );
+
+    // The failing check is not offered either, and the criteria panel states how much of the card
+    // can name its own verification rather than implying all of it (F23-AC1, F24-AC3).
+    const body = await page.locator('body').innerText();
+    expect(body, 'the failing check must not be offered as a criterion verification').not.toContain(
+      `Check "${FAILING_CHECK}" is bound`,
+    );
+    await expect(page.getByTestId('card-criteria-coverage')).toContainText('1 of 2 criteria name the check');
+    await expect(criterionRow(page, OWNER_TEST_CRITERION)).toHaveAttribute('data-verification-check', '');
+    expect(subject.passingCheckRowId.length, 'the fixture bound the criterion to a real check row').toBeGreaterThan(0);
   });
 
   // F01-AC1, F24-AC5, N02-AC2: an artifact is reachable only through the session-guarded path,

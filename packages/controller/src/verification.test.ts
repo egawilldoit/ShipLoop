@@ -50,7 +50,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import { canonicalize, err, fingerprint, isCommitSha, ok } from '@shiploop/domain';
+import { asCommitSha, canonicalize, err, fingerprint, isCommitSha, ok } from '@shiploop/domain';
 import type {
   CommitSha,
   DomainError,
@@ -134,6 +134,9 @@ const CRITERION_AUTOMATED = 'AC-1';
 const CRITERION_DEPLOYED = 'AC-2';
 const CRITERION_OWNER = 'AC-3';
 const CRITERION_UNASSIGNED = 'AC-4';
+
+/** A second full commit, so recording it produces a different candidate identity (F20-AC3). */
+const REPLACEMENT_HEAD_SHA = asCommitSha('3b7d1e0c9a5f2e8d4c6b0a1f3e7d9c5b2a8e4f60');
 
 /** A credential-shaped value assembled at runtime, so no tracked source holds one (N02-AC2). */
 const SEEDED_SECRET = ['sk', 'proj', 'shiploopseed', 'fixtureonly', 'aaaaaaaaaaaaaaaaaaaaaaaa'].join('-');
@@ -1387,6 +1390,322 @@ test('F23-AC5: a capture failure and a behaviour failure are recorded as differe
         captured.criterion.observedAt !== null,
         true,
         'a capture failure is still timestamped, so the owner can see the attempt happened',
+      );
+    },
+  );
+});
+
+/* -------------------------------------------------------------------------- */
+/* Criterion identity: which check verified it                                  */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * One criterion's line on the card, or a failed assertion.
+ *
+ * A helper because every test in this section asks the same question about a criterion and a
+ * null criterion would otherwise be asserted on as if it were a verdict (F24-AC3).
+ */
+function criterionOf(card: ReviewCard, criterionId: string): ReviewCard['criteria'][number] {
+  const criterion = card.criteria.find((entry) => entry.criterionId === criterionId);
+  assert.ok(criterion !== undefined, `the card must carry criterion ${criterionId}; it carries ${card.criteria.map((entry) => entry.criterionId).join(', ')}`);
+  return criterion;
+}
+
+// F23-AC1: the criterion names the check that produced its verdict, the name reaches the card
+// from the durable row rather than from the projection's own judgement, and no other check on
+// the card can stand in for it — however green it is.
+test('F23-AC1: a criterion names the check that produced its verdict, and no other check can be substituted for it', async () => {
+  await withHarness(
+    {
+      requiredChecks: [LOCAL_CHECK_NAME, PROVIDER_CHECK_NAME],
+      localCommands: [{ id: 'local-unit', name: LOCAL_CHECK_NAME, exitCode: 0 }],
+      provider: {
+        observations: [
+          script(PROVIDER_CHECK_NAME, 'Failed', 'the provider reported a failure for this commit'),
+          // A check that passed and that no criterion is bound to. If the projection reached for
+          // "the first passing check" this is the row it would have picked (F23-AC1).
+          script(EXTRA_CHECK_NAME, 'Passed', 'the provider reported a pass nobody linked to a criterion'),
+        ],
+        onBase: new Map(),
+      },
+    },
+    async (harness) => {
+      harness.setNow(T1);
+      unwrap(await runChecks(harness), 'run every required check');
+
+      unwrap(
+        harness.useCases.buildEvidencePack(
+          harness.candidate,
+          packRequest({
+            assignments: [
+              {
+                criterionId: CRITERION_AUTOMATED,
+                method: { kind: 'AutomatedCheck', checkId: LOCAL_CHECK_NAME },
+                requiresDeployedObservation: false,
+              },
+              {
+                criterionId: CRITERION_DEPLOYED,
+                method: { kind: 'AutomatedCheck', checkId: PROVIDER_CHECK_NAME },
+                requiresDeployedObservation: false,
+              },
+              {
+                criterionId: CRITERION_OWNER,
+                method: { kind: 'OwnerTest', instructions: 'Read the card and judge the wording' },
+                requiresDeployedObservation: false,
+              },
+            ],
+            observations: [
+              observationInput({
+                criterionId: CRITERION_AUTOMATED,
+                evidenceId: 'evid-unit' as EvidenceId,
+                detail: 'the local check observed the criterion',
+              }),
+              observationInput({
+                criterionId: CRITERION_DEPLOYED,
+                evidenceId: 'evid-provider' as EvidenceId,
+                observation: 'BehaviorFailed',
+                detail: 'the provider check disproved the criterion',
+              }),
+            ],
+          }),
+        ),
+        'bind one criterion to the passing check and one to the failing check',
+      );
+
+      const card = cardFor(harness);
+      assert.equal(
+        card.checks.find((check) => check.checkId === LOCAL_CHECK_NAME)?.result,
+        'Passed',
+        'the local check is on the card and green',
+      );
+      assert.equal(
+        card.checks.find((check) => check.checkId === EXTRA_CHECK_NAME)?.result,
+        'Passed',
+        'the unrelated passing check is on the card too, which is what makes it substitutable',
+      );
+
+      // The identity the card names is the one the durable row holds: same `checks` row, same
+      // `check_name`, resolved rather than restated (F23-AC1).
+      const stored = harness.database
+        .prepare('SELECT check_id, check_name FROM evidence WHERE criterion_id = ?')
+        .get(CRITERION_AUTOMATED);
+      const checkRow = harness.database
+        .prepare('SELECT check_id FROM checks WHERE candidate_id = ? AND name = ? ORDER BY started_at DESC LIMIT 1')
+        .get(harness.candidate.candidateId, LOCAL_CHECK_NAME);
+      assert.equal(stored?.['check_name'], LOCAL_CHECK_NAME, 'the durable row holds the check name');
+      assert.equal(
+        stored?.['check_id'],
+        checkRow?.['check_id'],
+        'the durable row is bound to the row of the check that actually ran',
+      );
+
+      const verified = criterionOf(card, CRITERION_AUTOMATED);
+      assert.equal(verified.status, 'Verified');
+      assert.equal(verified.methodKind, 'AutomatedCheck');
+      assert.equal(verified.verificationCheckId, LOCAL_CHECK_NAME, 'the criterion names the check that verified it');
+      assert.equal(verified.verificationEvidenceId, verified.evidenceId, 'the evidence row travels with the criterion');
+      assert.equal(
+        harness.database.prepare('SELECT evidence_id FROM evidence WHERE criterion_id = ?').get(CRITERION_AUTOMATED)?.[
+          'evidence_id'
+        ],
+        verified.verificationEvidenceId,
+        'and it is the durable verdict, not a fresh identity',
+      );
+      assert.equal(verified.verificationDetail, `Verified by check "${LOCAL_CHECK_NAME}".`);
+
+      // The reverse: a criterion bound to the failing check reads Failed, and the passing check
+      // that ran alongside it is not offered in its place (F23-AC1).
+      const failed = criterionOf(card, CRITERION_DEPLOYED);
+      assert.equal(failed.status, 'Failed', 'a criterion bound to a failing check reads Failed, not Passed');
+      assert.equal(failed.verificationCheckId, PROVIDER_CHECK_NAME, 'and it names that failing check');
+
+      assert.deepEqual(
+        card.criteria.map((criterion) => criterion.verificationCheckId),
+        [LOCAL_CHECK_NAME, PROVIDER_CHECK_NAME, null, null],
+        'each automated criterion names its own check, and no criterion names the unrelated pass',
+      );
+      assert.equal(
+        card.criteria.some((criterion) => criterion.verificationCheckId === EXTRA_CHECK_NAME),
+        false,
+        'a passing check no criterion is bound to verifies nothing (F23-AC1)',
+      );
+      assert.ok(
+        card.notReady.some((reason) => reason.includes(`Required check "${PROVIDER_CHECK_NAME}" is Failed`)),
+        `the failing required check is still named as not ready: ${card.notReady.join('; ')}`,
+      );
+    },
+  );
+});
+
+// F20-AC3, F23-AC1: a verdict belongs to the candidate identity it was recorded under, so a
+// replacement build starts with no verdict and no verification identity to inherit.
+test('F23-AC1: a changed candidate inherits neither the verdict nor the check that produced it', async () => {
+  await withHarness(
+    {
+      requiredChecks: [LOCAL_CHECK_NAME],
+      localCommands: [{ id: 'local-unit', name: LOCAL_CHECK_NAME, exitCode: 0 }],
+      provider: { observations: [], onBase: new Map() },
+    },
+    async (harness) => {
+      harness.setNow(T1);
+      unwrap(await runChecks(harness), 'run every required check');
+      unwrap(
+        harness.useCases.buildEvidencePack(
+          harness.candidate,
+          packRequest({
+            observations: [
+              observationInput({
+                criterionId: CRITERION_AUTOMATED,
+                evidenceId: 'evid-unit' as EvidenceId,
+                detail: 'the local check observed the criterion',
+              }),
+            ],
+          }),
+        ),
+        'verify the criterion on the first candidate',
+      );
+      const first = criterionOf(cardFor(harness), CRITERION_AUTOMATED);
+      assert.equal(first.status, 'Verified');
+      assert.equal(first.verificationCheckId, LOCAL_CHECK_NAME);
+
+      harness.setNow(T2);
+      const replacement = unwrap(
+        harness.candidates.record({
+          attemptId: null,
+          workItemId: harness.workItemId,
+          identity: { ...harness.candidate.identity, headSha: REPLACEMENT_HEAD_SHA },
+          pullRequestId: null,
+          targetBranch: 'main',
+          recordedAt: T2,
+          correlationId: 'correlation-verification',
+        }),
+        'record a replacement candidate',
+      );
+      assert.notEqual(
+        replacement.candidateFingerprint,
+        harness.candidate.candidateFingerprint,
+        'a changed head is a different candidate identity',
+      );
+
+      const inherited = criterionOf(cardFor(harness, replacement), CRITERION_AUTOMATED);
+      assert.equal(inherited.status, 'Untested', 'the replacement candidate starts with no verdict');
+      assert.equal(inherited.verificationCheckId, null, 'and names no check, because none ran against it');
+      assert.equal(inherited.verificationEvidenceId, null);
+      assert.equal(inherited.evidenceId, null);
+      assert.equal(inherited.verificationDetail, null);
+      assert.ok(
+        cardFor(harness, replacement).notReady.some((reason) => reason.includes(CRITERION_AUTOMATED)),
+        'the criterion it never verified is named as not ready on the new candidate',
+      );
+
+      // The old verdict is still on disk, bound to the identity that produced it: nothing was
+      // rewritten, it simply stopped describing this candidate (F20-AC3).
+      assert.equal(
+        harness.database
+          .prepare('SELECT COUNT(*) AS rows FROM evidence WHERE candidate_fingerprint = ?')
+          .get(harness.candidate.candidateFingerprint)?.['rows'],
+        4,
+        'the previous candidate keeps its four verdict rows',
+      );
+      assert.equal(
+        harness.database
+          .prepare('SELECT COUNT(*) AS rows FROM evidence WHERE candidate_fingerprint = ?')
+          .get(replacement.candidateFingerprint)?.['rows'],
+        0,
+        'the replacement candidate has none of its own',
+      );
+    },
+  );
+});
+
+// F23-AC1: a later write for the same criterion under the same identity updates what the verdict
+// says and keeps the check it was filed against, so a later write cannot re-point a criterion at
+// a check that merely passed.
+test('F23-AC1: a later write updates the verdict and keeps the check the criterion was bound to', async () => {
+  await withHarness(
+    {
+      requiredChecks: [LOCAL_CHECK_NAME, PROVIDER_CHECK_NAME],
+      localCommands: [{ id: 'local-unit', name: LOCAL_CHECK_NAME, exitCode: 0 }],
+      provider: {
+        observations: [script(PROVIDER_CHECK_NAME, 'Passed', 'the provider reported a pass')],
+        onBase: new Map(),
+      },
+    },
+    async (harness) => {
+      harness.setNow(T1);
+      unwrap(await runChecks(harness), 'run every required check');
+      unwrap(
+        harness.useCases.buildEvidencePack(
+          harness.candidate,
+          packRequest({
+            assignments: [
+              {
+                criterionId: CRITERION_AUTOMATED,
+                method: { kind: 'AutomatedCheck', checkId: LOCAL_CHECK_NAME },
+                requiresDeployedObservation: false,
+              },
+            ],
+            observations: [
+              observationInput({
+                criterionId: CRITERION_AUTOMATED,
+                evidenceId: 'evid-unit' as EvidenceId,
+                detail: 'the local check observed the criterion',
+              }),
+            ],
+          }),
+        ),
+        'bind the criterion to the local check and verify it',
+      );
+      const bound = criterionOf(cardFor(harness), CRITERION_AUTOMATED);
+      assert.equal(bound.verificationCheckId, LOCAL_CHECK_NAME);
+
+      // A later write for the same criterion under the same identity, this time naming the other
+      // check — which also passed — and recording a failure. Within one identity the assignment
+      // comes from the scope revision the candidate was built against and cannot legitimately
+      // move, so the journal keeps the first binding rather than trusting this one (F23-AC1).
+      harness.setNow(T2);
+      unwrap(
+        harness.useCases.buildEvidencePack(
+          harness.candidate,
+          packRequest({
+            assignments: [
+              {
+                criterionId: CRITERION_AUTOMATED,
+                method: { kind: 'AutomatedCheck', checkId: PROVIDER_CHECK_NAME },
+                requiresDeployedObservation: false,
+              },
+            ],
+            observations: [
+              observationInput({
+                criterionId: CRITERION_AUTOMATED,
+                evidenceId: 'evid-draft' as EvidenceId,
+                observation: 'BehaviorFailed',
+                detail: 'a later draft recorded a failure',
+              }),
+            ],
+          }),
+        ),
+        'write a later verdict naming the other check that passed',
+      );
+
+      const after = criterionOf(cardFor(harness), CRITERION_AUTOMATED);
+      assert.equal(after.status, 'Failed', 'the later verdict is what the card now reports');
+      assert.equal(
+        after.verificationCheckId,
+        LOCAL_CHECK_NAME,
+        'the bound check is retained, not re-pointed at the check that happened to pass (F23-AC1)',
+      );
+      assert.equal(
+        after.verificationEvidenceId,
+        bound.verificationEvidenceId,
+        'it is still the same durable verdict row, updated in place',
+      );
+      assert.equal(
+        harness.database.prepare('SELECT check_name FROM evidence WHERE criterion_id = ?').get(CRITERION_AUTOMATED)?.[
+          'check_name'
+        ],
+        LOCAL_CHECK_NAME,
+        'the durable row kept its binding as well',
       );
     },
   );

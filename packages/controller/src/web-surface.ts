@@ -768,6 +768,18 @@ export interface SurfaceReviewCard {
     readonly evidenceId: string | null;
     readonly observedAt: string | null;
     readonly detail: string | null;
+    /**
+     * The check this criterion's verdict is bound to, and the evidence row carrying it.
+     *
+     * Both are null when nothing verified the criterion. An automated criterion whose
+     * `verificationCheckId` is null has not been verified by anything this card can name, and
+     * the card says so in `notReady` rather than letting the checks above it stand in
+     * (F23-AC1, F24-AC3).
+     */
+    readonly verificationCheckId: string | null;
+    readonly verificationEvidenceId: string | null;
+    /** What verified it, in words; null when nothing has. */
+    readonly verificationDetail: string | null;
   }[];
   readonly pendingOwnerTestCriterionIds: readonly string[];
   readonly readyForOwnerTest: boolean;
@@ -3425,6 +3437,9 @@ function toSurfaceReviewCard(card: ReviewCard): SurfaceReviewCard {
     scopeRevision: card.scopeRevision,
     collectedAt: card.collectedAt,
     checks: card.checks.map((check) => ({ ...check, origin: check.origin === null ? null : String(check.origin) })),
+    // The criterion's verification identity travels with the criterion: a card that reports a
+    // verdict without naming what produced it would let any check above it read as the
+    // verification (F23-AC1).
     criteria: card.criteria.map((criterion) => ({ ...criterion })),
     pendingOwnerTestCriterionIds: [...card.pendingOwnerTestCriterionIds],
     readyForOwnerTest: card.readyForOwnerTest,
