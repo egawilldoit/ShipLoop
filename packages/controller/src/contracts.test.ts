@@ -62,8 +62,17 @@ const CONTENT: ContractContentInput = {
   scope: ['Sum the line items before tax', 'Apply the configured tax rate'],
   outOfScope: ['Changing the tax rate'],
   acceptanceCriteria: [
-    { id: 'AC1', description: 'The summary returns 200 and displays "Total: 12.00".', verificationType: 'automated' },
-    { id: 'AC2', description: 'The owner confirms the total matches the invoice they were sent.', verificationType: 'owner_test' },
+    {
+      id: 'AC1',
+      description: 'The summary returns 200 and displays "Total: 12.00".',
+      verificationType: 'automated',
+      verificationCheckId: 'unit-tests',
+    },
+    {
+      id: 'AC2',
+      description: 'The owner confirms the total matches the invoice they were sent.',
+      verificationType: 'owner_test',
+    },
   ],
 };
 
@@ -273,7 +282,25 @@ test('a draft revision carries the content, the criteria and no approval', async
     assert.equal(draft.outcome, CONTENT.outcome);
     assert.deepEqual(draft.scope, CONTENT.scope);
     assert.deepEqual(draft.outOfScope, CONTENT.outOfScope);
-    assert.deepEqual(draft.acceptanceCriteria, CONTENT.acceptanceCriteria);
+    assert.deepEqual(
+      draft.acceptanceCriteria.map((criterion) => ({
+        id: criterion.id,
+        description: criterion.description,
+        verificationType: criterion.verificationType,
+        submitted: (criterion as { verificationCheckId?: string | null }).verificationCheckId ?? null,
+      })),
+      CONTENT.acceptanceCriteria.map((criterion) => ({
+        id: criterion.id,
+        description: criterion.description,
+        verificationType: criterion.verificationType,
+        submitted: criterion.verificationCheckId ?? null,
+      })),
+    );
+    assert.deepEqual(
+      draft.acceptanceCriteria.map((criterion) => criterion.verificationCheckId),
+      ['unit-tests', null],
+      'a read-back always states each binding explicitly, so an omitted one reads as unbound rather than as a hole',
+    );
     // A draft may not be measured against a candidate, and says why.
     assert.match(draft.blockedBecause ?? '', /only an approved revision/);
     assert.equal(draft.answersCurrentRequest, true);
@@ -623,5 +650,181 @@ test('an unknown revision of a known contract is a NotFound naming the revision'
       'NotFound',
     );
     assert.match(refusal.reason, /#7/);
+  });
+});
+/* -------------------------------------------------------------------------- */
+/* The verification binding, refused server-side at approval                   */
+/* -------------------------------------------------------------------------- */
+
+const UNBOUND_AUTOMATED: ContractContentInput = {
+  ...CONTENT,
+  acceptanceCriteria: [
+    { id: 'AC1', description: 'The summary returns 200.', verificationType: 'automated' },
+    { id: 'AC2', description: 'The owner confirms the total.', verificationType: 'owner_test' },
+  ],
+};
+
+test('a draft whose automated criterion names no check may be written, because authoring is not agreeing', async () => {
+  await withHarness((harness) => {
+    const second = expectOk(
+      harness.useCases.createRequest({ projectId: PROJECT, title: 'Refunds', description: 'A refund is issued.' }, OWNER),
+    );
+    const draft = expectOk(
+      harness.useCases.draftContract(
+        { projectId: PROJECT, requestId: second.requestId, content: UNBOUND_AUTOMATED },
+        OWNER,
+      ),
+    );
+    assert.deepEqual(
+      draft.acceptanceCriteria.map((criterion) => criterion.verificationCheckId),
+      [null, null],
+      'an omitted binding is read back as unbound, which is the state the gate will refuse',
+    );
+  });
+});
+
+test('approving a revision whose automated criterion names no check is refused', async () => {
+  await withHarness((harness) => {
+    const second = expectOk(
+      harness.useCases.createRequest({ projectId: PROJECT, title: 'Refunds', description: 'A refund is issued.' }, OWNER),
+    );
+    const draft = expectOk(
+      harness.useCases.draftContract(
+        { projectId: PROJECT, requestId: second.requestId, content: UNBOUND_AUTOMATED },
+        OWNER,
+      ),
+    );
+
+    const refusal = expectError(
+      harness.useCases.approveContract(
+        { projectId: PROJECT, contractId: draft.contractId as ContractId, revision: 1 },
+        OWNER,
+      ),
+      'Invalid',
+    );
+    assert.match(refusal.reason, /automated criterion\(s\) name no check/);
+    assert.match(
+      refusal.code === 'Invalid' ? (refusal.fields ?? []).map((field) => field.path).join(' ') : '',
+      /acceptanceCriteria\.AC1\.verificationCheckId/,
+      'the refusal names the criterion the owner has to bind',
+    );
+    assert.equal(
+      expectOk(harness.useCases.getContract({ projectId: PROJECT, contractId: draft.contractId as ContractId, revision: 1 }, OWNER)).status,
+      'draft',
+      'and nothing was approved on the way to the refusal',
+    );
+  });
+});
+
+test('binding the check makes the same revision approvable', async () => {
+  await withHarness((harness) => {
+    const second = expectOk(
+      harness.useCases.createRequest({ projectId: PROJECT, title: 'Refunds', description: 'A refund is issued.' }, OWNER),
+    );
+    const draft = expectOk(
+      harness.useCases.draftContract(
+        { projectId: PROJECT, requestId: second.requestId, content: UNBOUND_AUTOMATED },
+        OWNER,
+      ),
+    );
+    const edited = expectOk(
+      harness.useCases.editContract(
+        {
+          projectId: PROJECT,
+          contractId: draft.contractId as ContractId,
+          revision: 1,
+          content: CONTENT,
+          expectedUpdatedAt: draft.updatedAt,
+        },
+        OWNER,
+      ),
+    );
+    const approved = expectOk(
+      harness.useCases.approveContract(
+        { projectId: PROJECT, contractId: draft.contractId as ContractId, revision: 1 },
+        OWNER,
+      ),
+    );
+    assert.equal(approved.status, 'approved');
+    assert.deepEqual(
+      approved.acceptanceCriteria.map((criterion) => criterion.verificationCheckId),
+      ['unit-tests', null],
+    );
+    assert.notEqual(edited.contentFingerprint, draft.contentFingerprint, 'the binding is part of the frozen content');
+  });
+});
+
+test('an owner test needs no binding, and one that names a check is refused by name', async () => {
+  await withHarness((harness) => {
+    // The seeded revision is approved with an automated criterion bound to `unit-tests` and an
+    // owner test left unbound, which is the shape an owner agrees to.
+    const criteria = expectOk(
+      harness.useCases.listContractCriteria(
+        { projectId: PROJECT, contractId: harness.contractId, revision: 1 },
+        OWNER,
+      ),
+    );
+    assert.deepEqual(
+      criteria.map((criterion) => criterion.verificationCheckId),
+      ['unit-tests', null],
+    );
+
+    const refusal = expectError(
+      harness.useCases.editContract(
+        {
+          projectId: PROJECT,
+          contractId: harness.contractId,
+          revision: 1,
+          content: {
+            ...CONTENT,
+            acceptanceCriteria: [
+              { id: 'AC1', description: 'The summary returns 200.', verificationType: 'automated', verificationCheckId: 'unit-tests' },
+              { id: 'AC2', description: 'The owner confirms the total.', verificationType: 'owner_test', verificationCheckId: 'unit-tests' },
+            ],
+          },
+          expectedUpdatedAt: expectOk(
+            harness.useCases.getContract({ projectId: PROJECT, contractId: harness.contractId, revision: 1 }, OWNER),
+          ).updatedAt,
+        },
+        OWNER,
+      ),
+      'Invalid',
+    );
+    assert.match(
+      refusal.code === 'Invalid' ? (refusal.fields ?? []).map((field) => field.message).join(' ') : '',
+      /only the owner can judge/,
+    );
+  });
+});
+
+test('a binding that is not text is refused rather than dropped', async () => {
+  await withHarness((harness) => {
+    const second = expectOk(
+      harness.useCases.createRequest({ projectId: PROJECT, title: 'Refunds', description: 'A refund is issued.' }, OWNER),
+    );
+    const refusal = expectError(
+      harness.useCases.draftContract(
+        {
+          projectId: PROJECT,
+          requestId: second.requestId,
+          content: {
+            ...CONTENT,
+            acceptanceCriteria: [
+              // The transport boundary is where untrusted JSON meets the domain's types, so a
+              // binding that is neither text nor null is refused here rather than coerced.
+              { id: 'AC1', description: 'It works.', verificationType: 'automated', verificationCheckId: 7 } as unknown as {
+                id: string;
+                description: string;
+                verificationType: 'automated';
+                verificationCheckId: string | null;
+              },
+            ],
+          },
+        },
+        OWNER,
+      ),
+      'Invalid',
+    );
+    assert.match(refusal.reason, /check name or absent/);
   });
 });

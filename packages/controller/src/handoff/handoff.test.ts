@@ -90,8 +90,18 @@ function contractView(overrides: Partial<ContractView> = {}): ContractView {
     scope: ['Sum the line items before tax', 'Apply the configured tax rate'],
     outOfScope: ['Changing the tax rate'],
     acceptanceCriteria: [
-      { id: 'AC1', description: 'The summary returns 200.', verificationType: 'automated' },
-      { id: 'AC2', description: 'The owner confirms the total.', verificationType: 'owner_test' },
+      {
+        id: 'AC1',
+        description: 'The summary returns 200.',
+        verificationType: 'automated',
+        verificationCheckId: 'unit-tests',
+      },
+      {
+        id: 'AC2',
+        description: 'The owner confirms the total.',
+        verificationType: 'owner_test',
+        verificationCheckId: null,
+      },
     ],
     contentFingerprint: 'fp_content',
     requestFingerprint: 'fp_request',
