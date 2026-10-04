@@ -77,6 +77,23 @@ export interface ContractCriterion {
   readonly id: string;
   readonly description: string;
   readonly verificationType: VerificationType;
+  /**
+   * The stable verification identity that decides an `automated` criterion.
+   *
+   * This is a *check name*, not a run: the same string for every run of the same check, so
+   * a re-run on a new commit re-verifies the criterion rather than invalidating the
+   * binding. The vocabulary is the project's own verification configuration - the
+   * `policy.requiredChecks` names in a project profile and the check ids a recipe or a
+   * provider projection reports under - because that is the only identity that already
+   * exists on both sides of the comparison. Nothing new is registered here.
+   *
+   * Null means unbound. An `automated` criterion may be drafted unbound - the owner is
+   * still writing it - but `approveContract` refuses to approve one that is, so no approved
+   * agreement exists whose automated criteria nothing can verify. An `owner_test` criterion
+   * must be null: naming a check for it would invite that check to discharge the owner's own
+   * step, which is the weaker verification the closed vocabulary exists to prevent (F23-AC1).
+   */
+  readonly verificationCheckId: string | null;
 }
 
 /** The contract's material content, which is what a revision freezes. */
@@ -158,6 +175,8 @@ export const MAXIMUM_SCOPE_ENTRY_LENGTH = 2_000;
 /** Bounds on criteria, the part a candidate is actually measured against. */
 export const MAXIMUM_CRITERIA = 100;
 export const MAXIMUM_CRITERION_DESCRIPTION_LENGTH = 2_000;
+/** Bounds on a check name. It names a configured check, so it is an identifier, not text. */
+export const MAXIMUM_VERIFICATION_CHECK_ID_LENGTH = 200;
 
 /**
  * The fingerprint of a revision's material content.
@@ -181,11 +200,18 @@ export function contractContentFingerprint(content: ContractContent): Fingerprin
     outOfScope: [...content.outOfScope],
     // Sorted by id: criteria are a set keyed by identity, and a reordering of the same
     // criteria is a display change, not a change to what must be satisfied.
+    //
+    // The verification binding is part of the material content, not a detail about it.
+    // Repointing a criterion at a different check changes what may declare it satisfied,
+    // so an approval sealed over one binding must not describe a revision that names
+    // another - which is exactly the "same PR number, different build" mistake the
+    // candidate rules exist to prevent, one level up.
     acceptanceCriteria: [...content.acceptanceCriteria]
       .map((criterion) => ({
         id: criterion.id,
         description: criterion.description,
         verificationType: criterion.verificationType,
+        verificationCheckId: criterion.verificationCheckId ?? null,
       }))
       .sort((left, right) => (left.id < right.id ? -1 : left.id > right.id ? 1 : 0)),
   });
@@ -262,6 +288,30 @@ function criterionErrors(criteria: readonly ContractCriterion[]): FieldError[] {
         message: `"${criterion.verificationType}" is not a verification type; use ${VERIFICATION_TYPES.join(' or ')}.`,
       });
     }
+
+    // The binding is checked for shape here and for presence at approval. A draft is
+    // allowed to be mid-authoring, but a binding that is present must be a usable check
+    // name - and an owner test must never carry one, because a named check is precisely
+    // the automated verification the owner test exists to replace (F23-AC1).
+    const checkId = criterion.verificationCheckId;
+    if (checkId !== null) {
+      if (typeof checkId !== 'string' || checkId.trim().length === 0) {
+        errors.push({
+          path: `${path}.verificationCheckId`,
+          message: 'An empty check name binds nothing. Name the check that verifies this criterion, or leave it unbound.',
+        });
+      } else if (checkId.trim().length > MAXIMUM_VERIFICATION_CHECK_ID_LENGTH) {
+        errors.push({
+          path: `${path}.verificationCheckId`,
+          message: `A check name may be at most ${MAXIMUM_VERIFICATION_CHECK_ID_LENGTH} characters.`,
+        });
+      } else if (criterion.verificationType === 'owner_test') {
+        errors.push({
+          path: `${path}.verificationCheckId`,
+          message: 'An owner test is the owner\'s own step; naming a check for it would let a green check discharge work only the owner can judge (F23-AC1).',
+        });
+      }
+    }
   }
   return errors;
 }
@@ -294,6 +344,11 @@ function normalizeContent(content: ContractContent): ContractContent {
           id: criterion.id.trim(),
           description: criterion.description.trim(),
           verificationType: criterion.verificationType,
+          // Normalised here rather than at each caller: a blank name means unbound, and an
+          // absent one - which a JSON body may well omit - has to reach the approval gate as
+          // the same `null` rather than reaching it as `undefined` and slipping past.
+          verificationCheckId:
+            typeof criterion.verificationCheckId === 'string' ? criterion.verificationCheckId.trim() : null,
         }),
       ),
     ),
@@ -440,33 +495,70 @@ function contractStatusRefusal(contract: DeliveryContract): string {
 }
 
 /**
+ * The automated criteria of a revision that name no check.
+ *
+ * The one question `approveContract` asks about bindings, extracted so the report the
+ * owner reads and the gate that refuses it cannot be two opinions about the same contract.
+ */
+export function unboundAutomatedCriteria(content: ContractContent): readonly ContractCriterion[] {
+  return content.acceptanceCriteria.filter(
+    (criterion) => criterion.verificationType === 'automated' && criterion.verificationCheckId === null,
+  );
+}
+
+/**
+ * The automated criteria of a revision that name a check, keyed by criterion id.
+ *
+ * One place that reads "what verifies this criterion", so a caller resolving a check's
+ * results for a criterion and a caller refusing an unbound contract cannot disagree about
+ * which criteria are bound (F23-AC1).
+ */
+export function automatedVerificationsOf(content: ContractContent): ReadonlyMap<string, string> {
+  const bound = new Map<string, string>();
+  for (const criterion of content.acceptanceCriteria) {
+    if (criterion.verificationType === 'automated' && criterion.verificationCheckId !== null) {
+      bound.set(criterion.id, criterion.verificationCheckId);
+    }
+  }
+  return bound;
+}
+
+/**
  * Records the owner's approval of a draft revision.
  *
- * The only function in this module that produces an approved revision, and it takes the
- * approver. Approval also re-derives the content fingerprint from the text being approved
- * rather than trusting the draft's stored one, so a fingerprint that drifted from its
- * content cannot be sealed into an agreement.
+ * The only function in this module that produces an approved revision, and it takes
+ * the approver. Approval also re-derives the content fingerprint from the text being
+ * approved rather than trusting the draft's stored one, so a fingerprint that drifted from
+ * its content cannot be sealed into an agreement.
  *
- * ## Why `expectedContentFingerprint` is required rather than optional
+ * It refuses on three counts, and the order is deliberate.
  *
- * An approval freezes a revision, and a revision's number outlives its text: two tabs
- * editing one draft both address `contractId` + `revision 1`, and only one of them is
- * looking at the text that is stored when the call lands. Without this argument the
- * approval still succeeds in that case, and the agreement the whole product rests on is
- * sealed over a scope its owner never read - the failure is invisible afterwards,
- * because the frozen revision reports itself as approved and nobody can tell which text
- * was approved.
+ * **An already-approved or stale revision is refused for what it is**, before either check
+ * below is consulted. "Revision 3 is already approved" is the more useful answer than
+ * "your fingerprint is stale", and it is the answer that stays true however the caller
+ * reached the call.
  *
- * So the caller states which draft it reviewed, by the fingerprint the read gave it, and
- * a mismatch is a `Conflict` rather than a warning. Text in a request body is a claim
- * about what was reviewed, not evidence of it, so nothing here compares a re-sent copy
- * of the contract; the caller's contribution is a single value the server derived and
- * the server checks.
+ * **An `automated` criterion that names no check is refused** (F23-AC1, F24-AC3). This is
+ * the gate that makes the binding load-bearing rather than advisory: without it an approved
+ * contract could hold an automated criterion that nothing can ever verify, that criterion
+ * would read `unverified` for the life of the product, and every acceptance of a contract
+ * containing one would be permanently refused with nothing the owner could act on. It lives
+ * here rather than in a route because "may this be agreed" is one question and every way in
+ * must answer it the same way.
  *
- * Ordering is deliberate: an already-approved or stale revision is refused for what it
- * is, before the fingerprint is consulted. "Revision 3 is already approved" is the more
- * useful answer than "your fingerprint is stale", and it is the answer that stays true
- * however the caller reached the call.
+ * **`expectedContentFingerprint` is required rather than optional.** An approval freezes a
+ * revision, and a revision's number outlives its text: two tabs editing one draft both
+ * address `contractId` + `revision 1`, and only one of them is looking at the text that is
+ * stored when the call lands. Without this argument the approval still succeeds in that
+ * case, and the agreement the whole product rests on is sealed over a scope its owner never
+ * read - a failure that is invisible afterwards, because the frozen revision reports itself
+ * as approved and nobody can tell which text was approved.
+ *
+ * So the caller states which draft it reviewed, by the fingerprint the read gave it, and a
+ * mismatch is a `Conflict` rather than a warning. Text in a request body is a claim about
+ * what was reviewed, not evidence of it, so nothing here compares a re-sent copy of the
+ * contract; the caller's contribution is a single value the server derived and the server
+ * checks.
  */
 export function approveContract(
   contract: DeliveryContract,
@@ -487,6 +579,19 @@ export function approveContract(
       expected: 'draft',
       actual: contract.status,
     });
+  }
+
+  const unbound = unboundAutomatedCriteria(contract);
+  if (unbound.length > 0) {
+    return err<DomainError>(
+      invalid(
+        `Revision ${contract.revision} cannot be approved: ${unbound.length} automated criterion(s) name no check that verifies them.`,
+        unbound.map((criterion) => ({
+          path: `acceptanceCriteria.${criterion.id}.verificationCheckId`,
+          message: `An automated criterion must name the check that verifies it. Nothing is bound to "${criterion.id}", so it could only ever read unverified and would block acceptance forever (F23-AC1, F24-AC3).`,
+        })),
+      ),
+    );
   }
 
   const content = normalizeContent(contract);
@@ -755,6 +860,15 @@ export function applyContractProposal(
       errors.push({
         path: `acceptanceCriteria[${index}]`,
         message: 'A criterion must carry string id, description and verificationType fields.',
+      });
+    }
+    // A proposal may omit the binding; it may not put a non-text one there. An absent
+    // binding reaches `approveContract` as `null` and is refused there, so a model cannot
+    // invent a check name that reads as though it were verified (F23-AC1).
+    if (criterion?.verificationCheckId !== undefined && criterion?.verificationCheckId !== null && typeof criterion?.verificationCheckId !== 'string') {
+      errors.push({
+        path: `acceptanceCriteria[${index}].verificationCheckId`,
+        message: 'A verification binding is text or absent; name a check or bind nothing.',
       });
     }
   }

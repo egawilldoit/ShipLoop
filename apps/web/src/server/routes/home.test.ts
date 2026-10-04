@@ -138,8 +138,8 @@ function contractView(seed: SeedRequest, revision: SeedRequest['revisions'][numb
     scope: ['The thing that changes'],
     outOfScope: ['Everything else'],
     acceptanceCriteria: [
-      { id: 'c-unit', description: 'The automated suite passes.', verificationType: 'automated' },
-      { id: 'c-owner', description: 'Sign in and see the dashboard.', verificationType: 'owner_test' },
+      { id: 'c-unit', description: 'The automated suite passes.', verificationType: 'automated', verificationCheckId: 'unit-tests' },
+      { id: 'c-owner', description: 'Sign in and see the dashboard.', verificationType: 'owner_test', verificationCheckId: null },
     ],
     contentFingerprint: `fp_content_${seed.requestId}_${revision.revision}`,
     requestFingerprint: `fp_request_${seed.requestId}`,

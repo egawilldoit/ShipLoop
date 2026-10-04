@@ -1714,6 +1714,17 @@ export interface ContractCriterionView {
   readonly id: string;
   readonly description: string;
   readonly verificationType: 'automated' | 'owner_test';
+  /**
+   * The check that verifies an automated criterion, or null when none is bound.
+   *
+   * Travels in both directions, and is always explicit rather than optional here: the route
+   * turns an omitted binding on an incoming body into `null` before it reaches the
+   * controller, so no caller downstream has to know whether the key was absent. A read
+   * reports it so a client can tell which check settles which criterion, and omitting it on
+   * an automated criterion is refused at approval rather than accepted as "any green check
+   * will do" (F23-AC1).
+   */
+  readonly verificationCheckId: string | null;
 }
 
 /** One request as the transport reports it (mvp-spec 3). */
@@ -2005,6 +2016,8 @@ export interface ReviewContractView {
   readonly acceptanceCriteria: readonly {
     readonly id: string;
     readonly verificationType: 'automated' | 'owner_test';
+    /** The check that verifies an automated criterion, or null when none is bound. */
+    readonly verificationCheckId: string | null;
   }[];
   readonly createdAt: string;
   readonly updatedAt: string;

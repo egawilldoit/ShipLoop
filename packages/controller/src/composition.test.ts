@@ -228,7 +228,15 @@ test('the root binds one repository of each kind and exposes the use cases (F02-
             scope: ['Sum the line items before tax'],
             outOfScope: ['Changing the tax rate'],
             acceptanceCriteria: [
-              { id: 'AC1', description: 'The summary returns 200 and displays "Total: 12.00".', verificationType: 'automated' },
+              {
+                id: 'AC1',
+                description: 'The summary returns 200 and displays "Total: 12.00".',
+                verificationType: 'automated',
+                // A check name, not a check run: approval refuses an automated criterion that
+                // names none, so a revision that is meant to be agreed has to say which check
+                // settles it (F23-AC1).
+                verificationCheckId: 'unit-tests',
+              },
             ],
           },
         },

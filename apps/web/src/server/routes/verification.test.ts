@@ -252,6 +252,12 @@ const AUTOMATED_CRITERION = {
   id: AUTOMATED_CRITERION_ID,
   description: 'The summary returns 200 and displays "Total: 12.00".',
   verificationType: 'automated',
+  // Bound, because approval refuses an automated criterion that names no check — and this
+  // fixture approves a revision in order to reach the evidence routes. Leaving it unbound would
+  // make every test here fail at the approval step for a reason that has nothing to do with
+  // what they are proving. The evidence routes read a check by identity against the live head;
+  // which identity they use is irrelevant to whether these paths accept a client-stated result.
+  verificationCheckId: 'unit-tests',
 } as const;
 
 const OWNER_CRITERION = {

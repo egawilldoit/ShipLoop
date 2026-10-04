@@ -76,15 +76,25 @@ const T0 = '2026-10-03T09:00:00Z';
 const T1 = '2026-10-03T09:30:00Z';
 const T2 = '2026-10-03T10:00:00Z';
 
+/**
+ * The criteria the seeded contract declares.
+ *
+ * AC1 names `unit-tests`: a check name from the project's verification configuration, not a
+ * check-run identity, so the same binding survives every re-run on a new commit. AC2 is the
+ * owner's own step and carries no binding, because naming a check for it would let that check
+ * discharge work only the owner can judge.
+ */
 const AUTOMATED_CRITERION = {
   id: 'AC1',
   description: 'The unit suite passes.',
   verificationType: 'automated' as const,
+  verificationCheckId: 'unit-tests' as string | null,
 };
 const OWNER_CRITERION = {
   id: 'AC2',
   description: 'Sign in and land on the dashboard.',
   verificationType: 'owner_test' as const,
+  verificationCheckId: null as string | null,
 };
 
 function expectOk<T>(result: Result<T, DomainError>): T {
@@ -123,7 +133,14 @@ function seed(
     readonly requestId: RequestId;
     readonly contractId: ContractId;
     readonly candidateId: CandidateId;
-    readonly criteria?: readonly { readonly id: string; readonly description: string; readonly verificationType: 'automated' | 'owner_test' }[];
+    readonly criteria?: readonly {
+      readonly id: string;
+      readonly description: string;
+      readonly verificationType: 'automated' | 'owner_test';
+      readonly verificationCheckId: string | null;
+    }[];
+    /** Leaves revision 1 a draft, so a case can write the row an older build would have. */
+    readonly approve?: boolean;
     readonly headSha?: typeof HEAD;
   },
 ): Seed {
@@ -169,19 +186,22 @@ function seed(
   );
   const contracts = new ContractRepository(db);
   expectOk(contracts.createDraft(draft));
-  const approved = expectOk(
-    approveContract(draft, {
-      approvedBy: OWNER_ID,
-      at: T0,
-      expectedContentFingerprint: draft.contentFingerprint,
-    }),
-  );
-  expectOk(
-    contracts.approve(approved, {
-      updatedAt: draft.updatedAt,
-      contentFingerprint: draft.contentFingerprint,
-    }),
-  );
+  // A caller can ask for the draft to stay a draft, which is the only way to reach the
+  // "stored by an older build" cases: an approved revision is frozen by the schema, so a
+  // fixture that needs a legacy row has to write it before the approval lands.
+  //
+  // When it does approve, it names the fingerprint it reviewed. An approval that did not would
+  // be refused by the CAS guard, and posting the old empty call would make this fixture stop
+  // exercising the approval path it exists to set up.
+  if (options.approve !== false) {
+    const reviewed = draft.contentFingerprint;
+    const approved = expectOk(
+      approveContract(draft, { approvedBy: OWNER_ID, at: T0, expectedContentFingerprint: reviewed }),
+    );
+    expectOk(
+      contracts.approve(approved, { updatedAt: draft.updatedAt, contentFingerprint: reviewed }),
+    );
+  }
 
   const head = options.headSha ?? HEAD;
   expectOk(
@@ -356,7 +376,7 @@ test('F24-AC2: the card carries the request, the contract revision, the candidat
   });
 });
 
-test('F23-AC1: an automated criterion with no assigned verifier reads unverified, not passed', async () => {
+test('F23-AC1: a bound automated criterion nothing has run yet reads unverified, not passed', async () => {
   await withCard(async (harness) => {
     const stored = seed(harness.db, {
       requestId: 'req-verifier' as RequestId,
@@ -370,7 +390,11 @@ test('F23-AC1: an automated criterion with no assigned verifier reads unverified
 
     const automated = card.criteria.find((criterion) => criterion.criterionId === 'AC1');
     assert.ok(automated !== undefined);
-    assert.equal(automated.verificationCheckId, null, 'no criterion is bound to a check by inference');
+    assert.equal(
+      automated.verificationCheckId,
+      'unit-tests',
+      'the criterion names the check the contract bound to it, not one inferred from a green result',
+    );
     assert.equal(automated.state, 'unverified');
     assert.notEqual(automated.state, 'passed');
     assert.ok(
@@ -773,5 +797,273 @@ test('F25-AC3: a decision that no longer describes the candidate is surfaced, no
     assert.ok(stale.reason.length > 0);
     assert.deepEqual(projected.staleness.staleDecisionIds, ['dec-superseded']);
     assert.equal(projected.eligibility.readyForDelivery, false);
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* The verification binding, resolved against the recorded results             */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Records one automated check result, the way a source would.
+ *
+ * Written through the store with the observation the provider reported, bound to one exact
+ * commit. `observedHeadSha` is the commit the run belongs to, which is what the projection
+ * compares: a caller cannot make a result count for a candidate it was not run against
+ * (F20-AC3, F23-AC1).
+ */
+function recordCheckResult(
+  harness: Harness,
+  input: {
+    readonly seed: Seed;
+    readonly evidenceId: string;
+    readonly checkId: string;
+    readonly outcome: 'passed' | 'failed' | 'waiting' | 'missing';
+    readonly headSha: string;
+    readonly at: string;
+  },
+): void {
+  const evidence = expectOk(
+    recordMvpEvidence({
+      evidenceId: input.evidenceId,
+      contractId: input.seed.contractId,
+      candidateId: input.seed.candidateId,
+      subject: { kind: 'check', checkId: input.checkId },
+      method: { kind: 'AutomatedCheck', checkId: input.checkId },
+      observation: { kind: 'provider_check', outcome: input.outcome },
+      observedHeadSha: input.headSha as typeof HEAD,
+      observedContractRevision: 1,
+      observedAt: input.at,
+      detail: null,
+      artifactRef: null,
+    }),
+  );
+  expectOk(
+    harness.review.recordEvidence({
+      evidence,
+      projectId: PROJECT,
+      requestId: input.seed.requestId,
+      candidateId: input.seed.candidateId,
+      candidateHeadSha: HEAD,
+      contractId: input.seed.contractId,
+      contractRevision: 1,
+      recordedAt: input.at,
+      correlationId: `corr-${input.evidenceId}`,
+      owner: null,
+    }),
+  );
+}
+
+const AUTOMATED_ONLY_SEED = {
+  requestId: 'req-binding' as RequestId,
+  contractId: 'contract-binding' as ContractId,
+  candidateId: 'cand-binding' as CandidateId,
+  criteria: [AUTOMATED_CRITERION],
+};
+
+const LEGACY_UNBOUND_SEED = {
+  requestId: 'req-legacy' as RequestId,
+  contractId: 'contract-legacy' as ContractId,
+  candidateId: 'cand-legacy' as CandidateId,
+  criteria: [AUTOMATED_CRITERION],
+  approve: false,
+};
+
+async function criterionState(
+  harness: Harness,
+  seedValue: Seed,
+): Promise<{ state: string; verificationCheckId: string | null; acceptanceReady: boolean; reason: string }> {
+  const card = expectOk(
+    await harness.card.getReview({ projectId: PROJECT, candidateId: seedValue.candidateId, actor: OWNER }),
+  );
+  const criterion = card.criteria.find((entry) => entry.criterionId === 'AC1');
+  assert.ok(criterion !== undefined, 'the seeded contract declares AC1');
+  return {
+    state: criterion.state,
+    verificationCheckId: criterion.verificationCheckId,
+    acceptanceReady: card.eligibility.readyForAcceptance,
+    reason: criterion.reason,
+  };
+}
+
+test('the bound check passing against this exact commit satisfies the criterion and opens acceptance', async () => {
+  await withCard(async (harness) => {
+    const stored = seed(harness.db, AUTOMATED_ONLY_SEED);
+    recordCheckResult(harness, {
+      seed: stored,
+      evidenceId: 'ev-pass',
+      checkId: 'unit-tests',
+      outcome: 'passed',
+      headSha: HEAD,
+      at: T1,
+    });
+
+    const read = await criterionState(harness, stored);
+    assert.equal(read.state, 'passed', 'the criterion is verified by the check its contract named');
+    assert.equal(read.verificationCheckId, 'unit-tests');
+    assert.equal(read.acceptanceReady, true, 'and acceptance is no longer blocked on it');
+
+    const card = expectOk(
+      await harness.card.getReview({ projectId: PROJECT, candidateId: stored.candidateId, actor: OWNER }),
+    );
+    const check = card.checks.find((entry) => entry.checkId === 'unit-tests');
+    assert.ok(check !== undefined, 'the check the criterion is bound to is listed on the card');
+    assert.equal(check.result, 'passed');
+  });
+});
+
+test('a different check passing does not satisfy the criterion', async () => {
+  await withCard(async (harness) => {
+    const stored = seed(harness.db, AUTOMATED_ONLY_SEED);
+    // `lint` is green. AC1 is bound to `unit-tests`, so this says nothing about it, and the
+    // criterion must not borrow it (F23-AC1).
+    recordCheckResult(harness, {
+      seed: stored,
+      evidenceId: 'ev-wrong-check',
+      checkId: 'lint',
+      outcome: 'passed',
+      headSha: HEAD,
+      at: T1,
+    });
+
+    const read = await criterionState(harness, stored);
+    assert.equal(read.state, 'unverified', 'only the bound check can verify this criterion');
+    assert.equal(read.acceptanceReady, false);
+  });
+});
+
+test('the bound check passing against an earlier commit does not satisfy the criterion', async () => {
+  await withCard(async (harness) => {
+    const stored = seed(harness.db, AUTOMATED_ONLY_SEED);
+    recordCheckResult(harness, {
+      seed: stored,
+      evidenceId: 'ev-old-sha',
+      checkId: 'unit-tests',
+      outcome: 'passed',
+      headSha: BASE_SHA,
+      at: T1,
+    });
+
+    const read = await criterionState(harness, stored);
+    assert.equal(read.state, 'stale', 'a pass for SHA A is history, not a verdict on SHA B');
+    assert.equal(read.acceptanceReady, false);
+    assert.match(read.reason, /different candidate|candidate SHA is now/);
+  });
+});
+
+test('a bound check that never ran leaves the criterion unverified', async () => {
+  await withCard(async (harness) => {
+    const stored = seed(harness.db, AUTOMATED_ONLY_SEED);
+    // `missing` is what a provider's `skipped` and `neutral` verdicts both become, and what a
+    // command that could not start becomes. None of them observed this candidate.
+    recordCheckResult(harness, {
+      seed: stored,
+      evidenceId: 'ev-skipped',
+      checkId: 'unit-tests',
+      outcome: 'missing',
+      headSha: HEAD,
+      at: T1,
+    });
+
+    const read = await criterionState(harness, stored);
+    assert.equal(read.state, 'unverified', 'a check that did not observe the work is not a pass (F20-AC2)');
+    assert.equal(read.acceptanceReady, false);
+    assert.match(read.reason, /never ran/);
+  });
+});
+
+test('a bound check still running leaves the criterion pending rather than passed', async () => {
+  await withCard(async (harness) => {
+    const stored = seed(harness.db, AUTOMATED_ONLY_SEED);
+    recordCheckResult(harness, {
+      seed: stored,
+      evidenceId: 'ev-running',
+      checkId: 'unit-tests',
+      outcome: 'waiting',
+      headSha: HEAD,
+      at: T1,
+    });
+
+    const read = await criterionState(harness, stored);
+    assert.equal(read.state, 'pending');
+    assert.equal(read.acceptanceReady, false);
+  });
+});
+
+test('a bound check failing leaves the criterion failed and acceptance refused', async () => {
+  await withCard(async (harness) => {
+    const stored = seed(harness.db, AUTOMATED_ONLY_SEED);
+    recordCheckResult(harness, {
+      seed: stored,
+      evidenceId: 'ev-failed',
+      checkId: 'unit-tests',
+      outcome: 'failed',
+      headSha: HEAD,
+      at: T1,
+    });
+
+    const read = await criterionState(harness, stored);
+    assert.equal(read.state, 'failed', 'the bound check speaks for the criterion, and it said no');
+    assert.equal(read.acceptanceReady, false);
+
+    const refused = expectErr(
+      await harness.card.decide({
+        projectId: PROJECT,
+        candidateId: stored.candidateId,
+        actor: OWNER,
+        decision: 'accepted',
+        expectedHeadSha: HEAD,
+        expectedContractRevision: 1,
+        feedback: null,
+      }),
+    );
+    assert.equal(refused.code, 'Blocked', 'a failing bound check is not accepted over');
+  });
+});
+
+test('a revision approved before bindings existed still reads unverified rather than passed', async () => {
+  await withCard(async (harness) => {
+    const stored = seed(harness.db, LEGACY_UNBOUND_SEED);
+    // A revision written before this field existed has no check named for AC1. Approval
+    // refuses that state today, but a stored row can predate the gate, so the projection's
+    // answer still has to be the truthful one: nothing is bound to AC1, so nothing verifies
+    // it - including the green `unit-tests` run below.
+    //
+    // Written while the row is a draft, because the schema refuses to rewrite an approved
+    // revision's material content, and then sealed by the same statement a pre-change build
+    // would have written. Going through SQL rather than the repository is the point: the
+    // repository cannot produce this row any more, which is the gate working.
+    const legacyCriteria = JSON.stringify([
+      { id: 'AC1', description: AUTOMATED_CRITERION.description, verificationType: 'automated' },
+    ]);
+    harness.db
+      .prepare(
+        `UPDATE delivery_contracts
+            SET acceptance_criteria_json = ?, content_fingerprint = ?, status = 'approved',
+                approved_by_owner_id = ?, approved_at = ?, updated_at = ?
+          WHERE contract_id = ? AND revision = ? AND status = 'draft'`,
+      )
+      .run(
+        legacyCriteria,
+        fingerprint({ outcome: 'Signing in lands the owner on the dashboard.', legacyCriteria }),
+        OWNER_ID,
+        T0,
+        T0,
+        stored.contractId,
+        1,
+      );
+    recordCheckResult(harness, {
+      seed: stored,
+      evidenceId: 'ev-unbound',
+      checkId: 'unit-tests',
+      outcome: 'passed',
+      headSha: HEAD,
+      at: T1,
+    });
+
+    const read = await criterionState(harness, stored);
+    assert.equal(read.verificationCheckId, null, 'the revision names no check, so the card names none');
+    assert.equal(read.state, 'unverified', 'a green check nobody bound cannot verify a criterion');
+    assert.equal(read.acceptanceReady, false);
   });
 });

@@ -72,6 +72,16 @@ export interface ContractCriterionInput {
   readonly id: string;
   readonly description: string;
   readonly verificationType: VerificationType;
+  /**
+   * The check that verifies an `automated` criterion, as a check name from the project's
+   * own verification configuration.
+   *
+   * Optional on submission because a draft may be mid-authoring: the binding is required
+   * at approval, not here, so an owner writing criteria one at a time is not refused while
+   * doing it. Absent means unbound, and `approveContract` refuses to agree an automated
+   * criterion in that state (F23-AC1, F24-AC3).
+   */
+  readonly verificationCheckId?: string | null;
 }
 
 /** The contract content as a caller submits it, on create and on edit alike. */
@@ -105,6 +115,14 @@ export interface ContractCriterionView {
   readonly id: string;
   readonly description: string;
   readonly verificationType: VerificationType;
+  /**
+   * The check that verifies an automated criterion, or null when none is bound.
+   *
+   * Reported rather than filled in from whichever check is green: a criterion with no bound
+   * verifier is `unverified`, and that is the honest reading rather than an inference
+   * (F23-AC1).
+   */
+  readonly verificationCheckId: string | null;
 }
 
 /** One contract revision as the transport reports it. */
@@ -268,6 +286,12 @@ function requestFingerprintOf(request: Request): Fingerprint {
  * JSON, and this is the boundary where an untrusted shape meets the domain's types. A
  * value outside the vocabulary is refused by name; it is never coerced to a default,
  * because defaulting a verification type would decide who may settle a criterion.
+ *
+ * The verification binding is read here too, for the same reason: a body may arrive with
+ * no `verificationCheckId` at all, and turning that absence into an explicit `null` is
+ * what lets the domain's approval gate see "unbound" rather than a hole in the shape.
+ * A binding that is present but is not text is refused by name, because the alternative
+ * - coercing it - would either invent a check or silently drop one the caller meant.
  */
 function toContractContent(input: ContractContentInput): Result<ContractContent, DomainError> {
   const criteria: ContractCriterion[] = [];
@@ -279,10 +303,28 @@ function toContractContent(input: ContractContentInput): Result<ContractContent,
         fields: [{ path: `acceptanceCriteria[${index}].verificationType`, message: 'Required.' }],
       });
     }
+    const checkId = criterion.verificationCheckId;
+    if (checkId !== undefined && checkId !== null && typeof checkId !== 'string') {
+      return err({
+        code: 'Invalid',
+        reason: 'A verification binding is a check name or absent.',
+        fields: [
+          {
+            path: `acceptanceCriteria[${index}].verificationCheckId`,
+            message: 'Name the check that verifies an automated criterion, or leave it unbound.',
+          },
+        ],
+      });
+    }
     criteria.push({
       id: typeof criterion.id === 'string' ? criterion.id : '',
       description: typeof criterion.description === 'string' ? criterion.description : '',
       verificationType: criterion.verificationType,
+      // Absent and blank both mean unbound, and both reach the domain as `null`. A blank
+      // name is not a check anybody configured, so reading it as unbound is the only
+      // honest reading - and the domain refuses to approve an automated criterion in that
+      // state, so nothing unverifiable can be agreed either way.
+      verificationCheckId: typeof checkId === 'string' && checkId.trim().length > 0 ? checkId : null,
     });
   }
 

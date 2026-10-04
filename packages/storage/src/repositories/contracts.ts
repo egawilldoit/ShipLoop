@@ -141,6 +141,15 @@ interface StoredCriterion {
   readonly id: string;
   readonly description: string;
   readonly verificationType: VerificationType;
+  /**
+   * The check that verifies an automated criterion, or null when none is bound.
+   *
+   * Optional on the wire because a revision written before this field existed has no key
+   * for it, and reading such a row as unbound is the truth about it rather than an
+   * invention. A present value that is neither text nor null is refused below, so a
+   * corrupt row is reported instead of read as "nothing is bound".
+   */
+  readonly verificationCheckId?: string | null;
 }
 
 /**
@@ -166,7 +175,20 @@ function toContract(row: SqlRow): Result<DeliveryContract> {
       ) {
         throw new Error('a stored criterion is missing id, description or verificationType');
       }
-      return Object.freeze({ ...criterion });
+      // Read explicitly rather than spread, so the criterion this build hands on is made of
+      // the fields it understands. A binding that is neither text nor null means the row
+      // cannot be interpreted, and an unreadable row is reported rather than turned into a
+      // criterion that claims nothing is bound to it.
+      const checkId = criterion.verificationCheckId ?? null;
+      if (checkId !== null && typeof checkId !== 'string') {
+        throw new Error('a stored criterion holds a verificationCheckId that is neither text nor null');
+      }
+      return Object.freeze({
+        id: criterion.id,
+        description: criterion.description,
+        verificationType: criterion.verificationType,
+        verificationCheckId: checkId,
+      });
     });
   } catch (error) {
     return err({

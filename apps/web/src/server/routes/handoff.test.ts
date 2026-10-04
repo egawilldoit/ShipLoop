@@ -94,6 +94,8 @@ interface ContractContent {
     readonly id: string;
     readonly description: string;
     readonly verificationType: 'automated' | 'owner_test';
+    /** The check that verifies an automated criterion; absent for an owner test. */
+    readonly verificationCheckId?: string | null;
   }[];
 }
 
@@ -102,7 +104,15 @@ const CONTRACT_CONTENT: ContractContent = {
   scope: ['Sum the line items before tax', 'Apply the configured tax rate'],
   outOfScope: ['Changing the tax rate'],
   acceptanceCriteria: [
-    { id: 'AC1', description: 'The summary returns 200 and displays "Total: 12.00".', verificationType: 'automated' },
+    {
+      id: 'AC1',
+      description: 'The summary returns 200 and displays "Total: 12.00".',
+      verificationType: 'automated',
+      // A check name, not a check run: the binding has to survive every re-run, or the
+      // criterion could never be verified after a push. Approval refuses an automated
+      // criterion without one, so the packet journey needs it here too.
+      verificationCheckId: 'unit-tests',
+    },
     { id: 'AC2', description: 'The owner confirms the total matches the invoice they were sent.', verificationType: 'owner_test' },
   ],
 };
@@ -507,7 +517,12 @@ test('credentials seeded into project data do not survive into the response (N02
     scope: [`Read the database at ${DATABASE_URL}`, `Present the header "${BEARER_HEADER}"`],
     outOfScope: [`Rotating ${GITHUB_TOKEN}`],
     acceptanceCriteria: [
-      { id: 'AC1', description: `The summary works with the token ${GITHUB_TOKEN}.`, verificationType: 'automated' },
+      {
+        id: 'AC1',
+        description: `The summary works with the token ${GITHUB_TOKEN}.`,
+        verificationType: 'automated',
+        verificationCheckId: 'unit-tests',
+      },
     ],
   };
 

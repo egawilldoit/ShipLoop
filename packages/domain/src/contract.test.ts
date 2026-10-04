@@ -26,13 +26,31 @@ const REQUEST = 'req_1' as RequestId;
 const OWNER = 'own_1' as OwnerId;
 const REQUEST_FINGERPRINT = fingerprint({ title: 'Checkout totals' });
 
+/**
+ * The fixture every other test in this file builds on.
+ *
+ * AC1 is bound to `unit-tests`, a check name rather than a check run: the binding has to
+ * survive every re-run of that check, or a criterion would need rebinding each time the
+ * candidate changed. AC2 is the owner's own step and carries no binding at all, because
+ * naming a check for it would let that check discharge work only the owner can judge.
+ */
 const BASE: ContractContent = {
   outcome: 'The order summary shows the total including tax.',
   scope: ['Sum line items before tax', 'Apply the configured tax rate'],
   outOfScope: ['Changing the tax rate'],
   acceptanceCriteria: [
-    { id: 'AC1', description: 'The summary returns 200 and displays "Total: 12.00".', verificationType: 'automated' },
-    { id: 'AC2', description: 'The owner confirms the total matches the invoice they were sent.', verificationType: 'owner_test' },
+    {
+      id: 'AC1',
+      description: 'The summary returns 200 and displays "Total: 12.00".',
+      verificationType: 'automated',
+      verificationCheckId: 'unit-tests',
+    },
+    {
+      id: 'AC2',
+      description: 'The owner confirms the total matches the invoice they were sent.',
+      verificationType: 'owner_test',
+      verificationCheckId: null,
+    },
   ],
 };
 
@@ -98,7 +116,7 @@ test('a criterion with an unknown verification type is refused', () => {
     revision: 1,
     content: {
       ...BASE,
-      acceptanceCriteria: [{ id: 'AC1', description: 'It works.', verificationType: 'vibes' as 'automated' }],
+      acceptanceCriteria: [{ id: 'AC1', description: 'It works.', verificationType: 'vibes' as 'automated', verificationCheckId: null }],
     },
     requestFingerprint: REQUEST_FINGERPRINT,
     createdBy: OWNER,
@@ -120,8 +138,8 @@ test('a duplicate criterion id is refused, because evidence binds to that id', (
     content: {
       ...BASE,
       acceptanceCriteria: [
-        { id: 'AC1', description: 'One.', verificationType: 'automated' },
-        { id: 'AC1', description: 'Two.', verificationType: 'automated' },
+        { id: 'AC1', description: 'One.', verificationType: 'automated', verificationCheckId: 'unit-tests' },
+        { id: 'AC1', description: 'Two.', verificationType: 'automated', verificationCheckId: 'unit-tests' },
       ],
     },
     requestFingerprint: REQUEST_FINGERPRINT,

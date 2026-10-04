@@ -80,11 +80,18 @@ const AUTOMATED_CRITERION = {
   id: 'AC1',
   description: 'The unit suite passes.',
   verificationType: 'automated' as const,
+  // An automated criterion names the check that verifies it. Unbound is legal in a draft and
+  // refused at approval, so this fixture carries a real binding rather than a null that would
+  // make the approval it sets up fail for an unrelated reason.
+  verificationCheckId: 'unit-tests',
 };
 const OWNER_CRITERION = {
   id: 'AC2',
   description: 'Sign in and land on the dashboard.',
   verificationType: 'owner_test' as const,
+  // Explicitly unbound, not merely absent: an owner test names no check, and saying so keeps the
+  // fixture honest about which half of the vocabulary it is exercising.
+  verificationCheckId: null,
 };
 
 function expectOk<T>(result: Result<T, DomainError>): T {
