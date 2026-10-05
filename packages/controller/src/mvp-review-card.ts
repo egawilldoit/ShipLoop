@@ -27,10 +27,15 @@
  *     the domain's `MvpActor`, whose non-owner variants carry no owner identity, and it is
  *     narrowed before any candidate is read, so an agent, a webhook or an engine completion
  *     event learns nothing about the candidate even from the refusal (F25-AC4).
- *   - **No submission is re-pointed.** Every decision names the full SHA and the contract
- *     revision it was prepared against, and the domain compares both against the live
- *     candidate. An acceptance of SHA A therefore refuses to become an acceptance of SHA B
- *     (F24-AC4, F25-AC3).
+ *   - **No submission is re-pointed, and none is applied to a superseded build.** Every
+ *     decision names the full SHA and the contract revision it was prepared against, and the
+ *     domain compares both against the live candidate. An acceptance of SHA A therefore
+ *     refuses to become an acceptance of SHA B (F24-AC4, F25-AC3). The other half of the
+ *     same rule is this module's: a decision naming SHA A is also refused once the *request*
+ *     has moved on to SHA B, because comparing the submission against SHA A's own row answers
+ *     "is this the commit I was shown?" and never "is this still the build under review?".
+ *     Both halves are refused before readiness is evaluated, so the owner is told the ground
+ *     moved rather than sent to discharge requirements on a build that will not ship.
  *
  * ## The two evidence paths, and why they are two
  *
@@ -55,8 +60,12 @@
  */
 
 import { createHash, randomUUID } from 'node:crypto';
-import { isCommitSha, requireMvpOwner } from '@shiploop/domain';
-import { MvpDefaultVerificationPolicy } from '@shiploop/domain';
+import {
+  err,
+  isCommitSha,
+  MvpDefaultVerificationPolicy,
+  requireMvpOwner,
+} from '@shiploop/domain';
 import type {
   CandidateCheckStatus,
   CandidateId,
@@ -487,7 +496,14 @@ export interface MvpReviewCardDeps {
   readonly clock: ControllerClock;
   readonly requests: Pick<RequestStore, 'read'>;
   readonly contracts: Pick<ContractStore, 'read'>;
-  readonly candidates: Pick<CandidateLinkStore, 'get'>;
+  /**
+   * `currentForRequest` is here for the supersession guard in `decide`, not for the card.
+   *
+   * `get` alone cannot answer "is this still the candidate under review?", and that question is
+   * the one a decision turns on: a candidate row is history once the request's newest row
+   * supersedes it, and the row itself still reports the commit it was recorded at (F25-AC3).
+   */
+  readonly candidates: Pick<CandidateLinkStore, 'get' | 'currentForRequest'>;
   readonly review: MvpReviewStore;
   /** Injected so a recorded decision replays identically in a test. */
   readonly newDecisionId?: () => string;
@@ -614,6 +630,47 @@ function verificationPolicyFor(
       requiredAutomatedCheckIds: ids,
       deliveryRequiredCheckIds: ids,
     },
+  };
+}
+
+/**
+ * F24-AC4, F25-AC3: the refusal a decision earns against a candidate the request has moved past.
+ *
+ * `staleSubmission` inside the review use cases compares the submitted commit against *this
+ * candidate's own* recorded head, and on a superseded candidate that comparison always succeeds:
+ * the row still carries SHA A, so SHA A is what the owner was shown and SHA A is what is compared.
+ * What is missing is the other half of the question — whether SHA A is still the build under
+ * review — and that is a question about the request, not about the candidate, so it is answered
+ * here from `currentForRequest` rather than from the row.
+ *
+ * Without it the acceptance of a push lands. The decision binds SHA A honestly, so nothing
+ * downstream misreads it as permission for SHA B, and SHA B's own card still reports no decision.
+ * But the owner is told they accepted work, `authorizesCurrentCandidate` is true on SHA A's card,
+ * and SHA B — the build that will actually ship — is authorised by nothing. An acceptance is a
+ * statement that what the owner looked is what they are shipping, and that statement is false
+ * once a newer commit exists (F25-AC3, F27-AC3).
+ *
+ * This is the same rule `owner-tests.ts` and `acceptance.ts` already apply to the other two
+ * owner-write paths; without it the three disagree about what "current" means, which is the one
+ * outcome a shared vocabulary exists to prevent.
+ *
+ * Deliberately *not* applied to `getReview`: a card for a superseded candidate is history the
+ * owner is entitled to read, and the push must not retract the acceptance they made against it.
+ * Only the write is refused (F25-AC2).
+ */
+function supersededCandidate(
+  deps: MvpReviewCardDeps,
+  candidate: DeliveryCandidateRecord,
+): DomainError | null {
+  const current = deps.candidates.currentForRequest(candidate.requestId);
+  if (!current.ok) return current.error;
+  const newest = current.value;
+  if (newest === null || newest.candidateId === candidate.candidateId) return null;
+  return {
+    code: 'Conflict',
+    reason: `This was decided for candidate ${candidate.candidateId} at ${candidate.headSha}, which is no longer the candidate this request offers; the request now holds ${newest.headSha}. An acceptance of a superseded build authorises nothing, so nothing was recorded (F25-AC3, F24-AC4).`,
+    expected: candidate.headSha,
+    actual: newest.headSha,
   };
 }
 
@@ -936,6 +993,15 @@ export function createMvpReviewCardUseCases(deps: MvpReviewCardDeps): MvpReviewC
      * Accept is additionally refused while the projection says a criterion is outstanding, with
      * every outstanding item named, and Request Changes stays available either way (F23-AC1,
      * F24-AC3, F25-AC2).
+     *
+     * Supersession is refused here, before the domain is asked, and for both kinds of decision.
+     * The order is the argument: a submission naming a candidate the request has moved past is
+     * answered with the fact that moved, rather than with a readiness report about a build the
+     * owner is no longer being asked about — which would send them to discharge requirements on
+     * a commit that is not going to ship, and would never mention the push (F24-AC4, F25-AC3).
+     * Change requests are included because a change request is feedback for the build under
+     * review, and feedback filed against a superseded one is feedback a fix pass will never read
+     * (F25-AC2).
      */
     decide: async (command: RecordMvpOwnerDecisionCommand): Promise<Result<MvpReviewCard, DomainError>> => {
       const owner = requireMvpOwner(
@@ -946,6 +1012,9 @@ export function createMvpReviewCardUseCases(deps: MvpReviewCardDeps): MvpReviewC
 
       const facts = readFacts(deps, command);
       if (!facts.ok) return facts;
+
+      const superseded = supersededCandidate(deps, facts.value.candidate);
+      if (superseded !== null) return err(superseded);
 
       const decided = await useCases.decide({
         projectId: command.projectId,
