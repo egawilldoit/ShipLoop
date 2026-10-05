@@ -1129,15 +1129,22 @@ export function setCsrfToken(token: string | null): void {
 }
 
 /**
- * The token a state-changing call must present, or null when there is none.
+ * The token a state-changing request has to carry, or null when this session has none.
  *
- * Additive read access to the same module state `setCsrfToken` writes, so a caller that
- * sends its own header — the owner flow's own client module, which will be replaced by
- * this one — reads the token this session established rather than keeping a second copy
- * that could disagree with it. Null means this session has no token, which is a sign-in
- * problem rather than something to retry (F01-AC4).
+ * An accessor rather than a second store, because a second store is a second answer to "which
+ * token does this client hold" and the two would disagree the moment a sign-out cleared one of
+ * them. Both the owner flow's client module and the MVP transport module send requests of their
+ * own, so both read the token here rather than keeping a copy. Signing out still leaves nothing
+ * behind that could authorize a later call (F01-AC2, F01-AC5).
+ *
+ * Returns null rather than a placeholder so the caller can name the remedy — reload and sign in
+ * again — instead of sending a request that is certain to be refused (N03-AC3).
+ *
+ * One name, not two. Two agents each added an accessor here in parallel, and two spellings of one
+ * accessor is two answers to the same question wearing different names; the second caller was
+ * repointed rather than the second function kept.
  */
-export function getCsrfToken(): string | null {
+export function csrfTokenForRequests(): string | null {
   return csrfToken;
 }
 

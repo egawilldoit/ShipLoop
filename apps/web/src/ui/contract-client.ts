@@ -69,7 +69,7 @@ import {
   type ApiErrorCode,
   type ApiFailure,
   type ApiFieldError,
-  getCsrfToken,
+  csrfTokenForRequests,
 } from './api-client.ts';
 
 /* -------------------------------------------------------------------------- */
@@ -327,7 +327,7 @@ async function send(path: string, options: SendOptions): Promise<SendOutcome> {
   const headers: Record<string, string> = { accept: 'application/json' };
   if (options.body !== undefined) headers['content-type'] = 'application/json';
   if (options.csrf) {
-    const token = getCsrfToken();
+    const token = csrfTokenForRequests();
     if (token === null) return { kind: 'offline' };
     headers[CSRF_HEADER] = token;
   }
