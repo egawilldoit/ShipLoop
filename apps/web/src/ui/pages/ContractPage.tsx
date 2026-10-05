@@ -53,6 +53,7 @@ import {
   draftFromContract,
   draftFromRequest,
   draftProblems,
+  isStaleRefusal,
   verificationChoices,
   type ContractDraft,
   type ContractState,
@@ -92,19 +93,15 @@ interface Failure {
 /**
  * A refusal, in the terms this page acts on.
  *
- * `stale` is the one distinction the page cannot infer from a code alone, and it decides
- * the remedy: a `Conflict` means the text moved and the answer is to read the current
- * version, while every other refusal means an input is wrong and the answer is to correct
- * it. Both keep what the owner typed; they differ in what is offered next.
- *
- * A field path naming `expectedUpdatedAt` is the same fact arriving on a body whose schema
- * refused the compare-and-set instant, so it is treated identically rather than as a plain
- * input error — otherwise a stale save would tell the owner to retype a value they cannot
- * type (F24-AC4).
+ * `stale` is the one distinction the page cannot infer from a code alone, and it decides the
+ * remedy — read the current version, or correct one input. The rule lives in
+ * `isStaleRefusal` so it is tested once rather than re-guessed in a component, because
+ * guessing it wrong would tell the owner to retype a value only the server can issue
+ * (mvp-spec 7, F24-AC4).
  */
 function failureOf(failure: ContractApiFailure): Failure {
   const paths = failure.fields.map((field) => field.path);
-  const stale = failure.code === 'Conflict' || paths.includes('expectedUpdatedAt');
+  const stale = isStaleRefusal(failure.code, paths);
   return {
     reason: failure.reason,
     code: failure.code,
@@ -876,7 +873,7 @@ function ContractWorkbench(props: WorkbenchProps): ReactElement {
               criterion={criterion}
               index={index}
               choices={choices}
-              ownProblems={ownProblemsFor(draft, criterion)}
+              ownProblems={ownProblemsFor(criterion)}
               serverProblems={serverProblemsFor(criterion)}
               disabled={readOnly}
               canRemove={draft.acceptanceCriteria.length > 1}
@@ -929,11 +926,12 @@ function ContractWorkbench(props: WorkbenchProps): ReactElement {
 /**
  * This row's own validation problems.
  *
- * Derived by validating a one-criterion draft, so the row and the whole-contract check can
+ * Derived by validating a one-criterion draft, so a row and the whole-contract check can
  * never disagree about whether a criterion is complete — one implementation of the rules,
- * called twice.
+ * called twice. The outcome is a placeholder that is never inspected: `draftProblems` is being
+ * asked about one criterion, not about a whole contract.
  */
-function ownProblemsFor(draft: ContractDraft, criterion: DraftCriterion): readonly DraftProblem[] {
+function ownProblemsFor(criterion: DraftCriterion): readonly DraftProblem[] {
   const single = draftProblems({ outcome: 'a placeholder outcome', scope: [], outOfScope: [], acceptanceCriteria: [criterion] });
   return [...(single.criteria[criterion.key] ?? []), ...(single.bindings[criterion.key] ?? [])];
 }

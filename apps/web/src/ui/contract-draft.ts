@@ -436,12 +436,26 @@ export function criterionIdsInRefusal(
   return found;
 }
 
-/** The draft row a refused criterion id belongs to, or null when the id is not in the draft. */
-export function rowForRefusedCriterion(
-  draft: ContractDraft,
-  criterionId: string,
-): DraftCriterion | null {
-  return draft.acceptanceCriteria.find((criterion) => criterion.id === criterionId) ?? null;
+/**
+ * Whether a refusal means the text moved under the owner, rather than that an input is wrong.
+ *
+ * This is the decision the 409 requirement turns on, so it is derived once, here, rather than
+ * re-guessed inside a component: getting it wrong sends the owner to retype something they
+ * cannot type, and — worse — could let a page imply an approval landed when it did not.
+ *
+ * Two spellings count as stale, and both are the same fact:
+ *
+ *   - a `Conflict`, which is how the domain refuses an approval or a save whose text no longer
+ *     matches the fingerprint or instant it was measured against;
+ *   - a field path naming `expectedUpdatedAt`, which is that refusal arriving on a body whose
+ *     *schema* rejected the compare-and-set instant before the domain was reached. Reading it
+ *     as a plain input error would tell the owner to retype a value only the server issues.
+ *
+ * Everything else is a correctable input: the owner fixes one field and submits again, and
+ * their typing is worth keeping.
+ */
+export function isStaleRefusal(code: string, paths: readonly string[]): boolean {
+  return code === 'Conflict' || paths.includes('expectedUpdatedAt');
 }
 
 /* -------------------------------------------------------------------------- */

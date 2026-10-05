@@ -18,6 +18,7 @@ import {
   draftFromRequest,
   draftProblems,
   emptyDraft,
+  isStaleRefusal,
   nextCriterionId,
   verificationChoices,
   type ContractDraft,
@@ -245,6 +246,30 @@ describe('reading a refusal the server named', () => {
 
   it('returns nothing for a path it cannot attribute, so the message is not pinned to a wrong row', () => {
     assert.deepEqual(criterionIdsInRefusal(['outcome', 'body', 'acceptanceCriteria[0].description']), []);
+  });
+});
+
+describe('telling a stale refusal from a correctable one', () => {
+  it('treats a Conflict as stale, because the text moved and no field will fix it', () => {
+    // This is the 409 the approval guard raises. Getting it wrong means telling the owner to
+    // retype a value only the server issues, or implying an approval landed when it did not.
+    assert.equal(isStaleRefusal('Conflict', []), true);
+  });
+
+  it('treats a refused compare-and-set instant as the same fact it is', () => {
+    // The schema rejects the instant before the domain is reached, so the refusal arrives as
+    // a field error rather than a Conflict code. It is still "the text moved".
+    assert.equal(isStaleRefusal('Invalid', ['expectedUpdatedAt']), true);
+  });
+
+  it('treats every other refusal as a correctable input, so the owner keeps what they typed', () => {
+    assert.equal(isStaleRefusal('Invalid', ['acceptanceCriteria.AC1.verificationCheckId']), false);
+    assert.equal(isStaleRefusal('Blocked', []), false);
+    assert.equal(isStaleRefusal('NotFound', []), false);
+  });
+
+  it('does not treat a merely similar field name as stale', () => {
+    assert.equal(isStaleRefusal('Invalid', ['expectedUpdatedAtHint']), false);
   });
 });
 
