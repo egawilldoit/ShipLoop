@@ -1,7 +1,7 @@
 /**
- * What this flow's transport is allowed to send, and how it reads an answer.
+ * What the remaining transport in this directory is allowed to send, and how it reads an answer.
  *
- * These tests read the source of `transport.ts`, because the two claims worth protecting are not
+ * These tests read the source of `transport.ts`, because the claims worth protecting are not
  * observable from a rendered page — they are claims about what leaves the browser:
  *
  *   1. **The verification call states no verdict.** `routes/verification.ts` accepts a `strictObject`
@@ -13,6 +13,9 @@
  *   2. **Every path is project-scoped.** The previous wave's shipped defect was a UI built against
  *      spellings the backend did not have. "Does the URL begin with /api/projects/<id>/" is therefore a
  *      test rather than a convention (F02-AC2).
+ *   3. **No handoff spelling survives here.** The handoff half of this flow now reads through
+ *      `../mvp-client/index.ts`, so the old packet types and reader are asserted gone rather than
+ *      quietly left beside the new ones (mvp-spec 7, N02-AC2).
  */
 
 import assert from 'node:assert/strict';
@@ -22,6 +25,18 @@ import { fileURLToPath } from 'node:url';
 
 const SOURCE = fileURLToPath(new URL('./transport.ts', import.meta.url));
 const source = await readFile(SOURCE, 'utf8');
+
+/**
+ * The source with its comments removed.
+ *
+ * The header deliberately *names* what was deleted and where it moved, so the "no handoff here" test
+ * below has to read code rather than prose — otherwise this file's own explanation of the migration
+ * would fail the assertion that performs it (mvp-spec 7).
+ */
+const code = source
+  .replace(/\/\*[\s\S]*?\*\//g, ' ')
+  .replace(/^\s*\/\/[^\n]*$/gm, ' ')
+  .replace(/\/\/[^\n]*/g, ' ');
 
 /**
  * The members `routes/verification.ts` refuses by name.
@@ -113,17 +128,34 @@ test('the settings save sends exactly `t3Url`, and it is nullable', () => {
   assert.match(source, /\{ t3Url \}/);
 });
 
-test('the transport applies no transform to the packet bytes on the way out', () => {
-  // One approved contract must render one document. Anything that trimmed, re-wrapped or re-escaped the
-  // bytes would make two packets differ for a reason nobody chose (N02-AC2, mvp-spec 7). The copy itself
-  // happens in `HandoffPage`; what matters here is that nothing transforms the text in between.
-  assert.doesNotMatch(source, /\.markdown\.(trim|replace|split|normalize)/);
+test('this module holds no handoff route, reader or type any more', () => {
+  // The handoff half was re-pointed at `../mvp-client/index.ts`, which owns `fetchHandoff`, the
+  // `HandoffView` read model and the URL gate. Leaving the old spellings here would leave two
+  // definitions of one wire shape, and the second is free to drift from the route with nothing
+  // noticing (mvp-spec 7, N02-AC2). Asserted here so a later re-add is a visible edit to a list of
+  // forbidden things rather than an accident.
+  for (const name of [
+    'fetchHandoff',
+    'interface Handoff',
+    'HandoffPacket',
+    'HandoffExternalTool',
+    'HandoffPrerequisite',
+    '/handoff',
+  ]) {
+    assert.equal(
+      code.includes(name),
+      false,
+      `${name} belongs to ../mvp-client/index.ts; this module must not carry a second spelling of it`,
+    );
+  }
 });
 
-test('the transport refuses a configured external address it cannot verify, rather than passing it on', () => {
-  // The check happens where the value is read, not where it is rendered, so there is one gate and no
-  // second caller that skips it (L02-AC2, N02-AC2).
-  assert.match(source, /isHttpUrl\(url\)/);
+test('the header names the two surfaces that still read this module', () => {
+  // What remains here belongs to `CandidatePage.tsx` and `ExternalToolSetting.tsx`, which have not been
+  // re-pointed. The header says so, and this fails if the file grows a route that comment does not
+  // mention — which is the moment this module should have been deleted instead (mvp-spec 7).
+  assert.match(source, /CandidatePage\.tsx/);
+  assert.match(source, /ExternalToolSetting\.tsx/);
 });
 
 test('a state-changing call carries the session token, and says so when it cannot', () => {

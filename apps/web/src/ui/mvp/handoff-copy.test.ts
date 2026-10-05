@@ -68,6 +68,51 @@ const FORBIDDEN: readonly { readonly word: RegExp; readonly claims: string }[] =
 
 const visibleCopy = copy;
 
+/**
+ * The same source with only the comments removed, for claims about which module a call came from.
+ *
+ * `visibleCopy` also strips class names, test hooks and the import block, which is right for a rule
+ * about wording and wrong for a rule about wiring — "does not import the local transport" is exactly
+ * a statement about the import block (mvp-spec 3).
+ */
+const code = page
+  .replace(/\/\*[\s\S]*?\*\//g, ' ')
+  .replace(/^\s*\/\/[^\n]*$/gm, ' ')
+  .replace(/\/\/[^\n]*/g, ' ');
+
+test('the page names the revision it read and the fingerprint of the text that was approved', () => {
+  // An approval seals one exact text, and the owner can only tell that it is the text they reviewed
+  // if the page names it: the revision number, the approved text's `contentFingerprint`, and the
+  // packet's own fingerprint. Two digests of two different things, which is why the copy labels them
+  // rather than printing both as one value (mvp-spec 7, N02-AC2).
+  assert.match(page, /getContract/);
+  assert.match(visibleCopy, /Revision \$\{revision\}/);
+  assert.match(visibleCopy, /content fingerprint \$\{contentFingerprint\}/i);
+  assert.match(visibleCopy, /this packet has fingerprint/);
+});
+
+test('the packet is shown even when the approved text could not be read', () => {
+  // Two facts, two reads. The content fingerprint is what ties the packet to the sealed text, but the
+  // packet is the product: losing it because a second read failed would replace a usable handoff with
+  // an error over a value the owner does not need in order to paste the document (L02-AC3).
+  assert.match(
+    visibleCopy,
+    /The approved contract text could not be read/,
+    'a failed content read must be stated, and the packet must still render',
+  );
+  assert.match(page, /contract\.ok \? contract\.value\.contentFingerprint : null/);
+});
+
+test('the page reads the packet through the shared typed client, not a second transport', () => {
+  // Two fetchers for one route is how two answers to one question come to exist. The typed client owns
+  // the URL, the CSRF header and the refusal envelope; this page must add no path of its own
+  // (mvp-spec 3, F02-AC2).
+  assert.match(page, /from '\.\.\/mvp-client\/index\.ts'/);
+  assert.doesNotMatch(code, /from '\.\/transport\.ts'/);
+  assert.doesNotMatch(code, /\/api\/projects/, 'no page may assemble a project-scoped URL itself (F02-AC2)');
+  assert.doesNotMatch(code, /\bfetch\(/, 'no page may call fetch directly (mvp-spec 3)');
+});
+
 test('no piece of copy claims ShipLoop started, connected to, or is watching anything in T3', () => {
   for (const { word, claims } of FORBIDDEN) {
     assert.equal(

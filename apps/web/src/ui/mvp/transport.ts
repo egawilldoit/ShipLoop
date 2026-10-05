@@ -1,19 +1,27 @@
 /**
- * The HTTP boundary for the post-approval flow: implementation packet, GitHub candidate,
- * refresh, and verification.
+ * The HTTP boundary for the post-approval flow: GitHub candidate, refresh, verification and project
+ * settings.
  *
- * ## REPLACE THIS MODULE WITH F1's CLIENT
+ * ## PARTLY REPLACED BY `../mvp-client/index.ts` — WHAT REMAINS HERE, AND WHY
  *
- * This is a single local stand-in, written because F1's browser client is being built in
- * parallel and is therefore absent from this worktree. It exists so this flow has exactly one
- * place where a URL string or a request body is written, rather than a `fetch` per component.
- * When F1's module lands, delete this file and re-point the four importers named below; nothing
- * else in the flow holds a URL, a method, or a body shape.
+ * This module was a single local stand-in, written because the MVP browser client is being built in
+ * parallel. The handoff half of this flow no longer needs it: `HandoffPage.tsx` now reads the packet
+ * through `fetchHandoff` and the approved text's fingerprint through `getContract` from
+ * `../mvp-client/index.ts`, and the handoff types and reader this file carried are deleted rather than
+ * left behind as a second spelling of the same wire shapes (mvp-spec 7, N02-AC2).
  *
- * Importers to re-point:
- *   - `apps/web/src/ui/mvp/HandoffPage.tsx`
- *   - `apps/web/src/ui/mvp/CandidatePage.tsx`
- *   - `apps/web/src/ui/mvp/transport.test.ts`
+ * What is still here is the part another surface owns and has not re-pointed:
+ *
+ *   - `CandidatePage.tsx` — the GitHub candidate link, read, refresh and verification calls;
+ *   - `ExternalToolSetting.tsx` — the project's settings read and the `t3Url` save;
+ *   - `ObservationRow.tsx` / `observation-standing.ts` — the `RecordedObservation` type, which is a
+ *     response shape only.
+ *
+ * Those three are not re-pointed in the work that re-pointed the handoff, so deleting the file now
+ * would break them. The migration is therefore: the next change to this file re-points
+ * `CandidatePage.tsx` and `ExternalToolSetting.tsx` at `../mvp-client/index.ts`, and then this module
+ * is deleted outright. Nothing below this line holds a URL, a method, or a body shape outside these
+ * calls, so the remaining migration is an import rewrite and a delete.
  *
  * ## The routes, and the handler each answer came from
  *
@@ -21,11 +29,6 @@
  * `apps/web/src/server/routes/` that define the handler, and each entry states the property of
  * that handler this module depends on — not a restatement of it (mvp-spec 7).
  *
- *   GET   /api/projects/:projectId/contracts/:contractId/:revision/handoff
- *         → `routes/handoff.ts`. Answers `{ handoff }` with the controller's packet bytes
- *           untouched plus `t3` as one of three states. `GET`, not `POST`: nothing is written
- *           and nothing is decided, so the same approved contract renders the same document
- *           twice.
  *   POST  /api/projects/:projectId/candidates
  *         → `routes/candidates.ts`. Body is exactly `requestId`, `contractId`,
  *           `contractRevision`, `pullRequestUrl` under `strictObject`. There is no head-SHA
@@ -60,7 +63,6 @@
  */
 
 import { CSRF_HEADER, csrfTokenForRequests, type ApiFailure, type ApiFieldError, type ApiPrerequisite } from '../api-client.ts';
-import { isHttpUrl } from './external-url.ts';
 
 /* -------------------------------------------------------------------------- */
 /* Result                                                                     */
@@ -98,54 +100,6 @@ function notReached(reason: string): TransportOutcome<never> {
 /* -------------------------------------------------------------------------- */
 /* The server's wire shapes                                                    */
 /* -------------------------------------------------------------------------- */
-
-/**
- * The handoff packet, as `routes/handoff.ts` carries it.
- *
- * `markdown` is the controller's bytes and nothing in this layer reformats, trims or re-escapes
- * them: one approved contract must produce one document, and a transport that tidied the text
- * would make two packets differ for a reason nobody chose (N02-AC2). `fingerprint` is the digest of
- * those bytes, so the page can show what proves the clipboard holds the same document.
- */
-export interface HandoffPacket {
-  readonly markdown: string;
-  readonly fingerprint: string;
-}
-
-/**
- * Where the browser may be sent to open the external tool, if anywhere.
- *
- * Three states because a nullable URL cannot tell them apart, and the difference changes what the
- * owner is told: nothing configured is normal and the packet works anyway, while a configured
- * value the server would not use is an operator error with a different remedy. No state
- * reproduces a value other than the configured URL itself.
- */
-export type HandoffExternalTool =
-  | { readonly state: 'Configured'; readonly url: string }
-  | {
-      readonly state: 'NotConfigured';
-      readonly reason: string;
-      readonly prerequisites: readonly HandoffPrerequisite[];
-    }
-  | {
-      readonly state: 'Unusable';
-      readonly reason: string;
-      readonly prerequisites: readonly HandoffPrerequisite[];
-    };
-
-/** One unmet prerequisite with the remedy the owner can act on (F04-AC3). */
-export interface HandoffPrerequisite {
-  readonly name: string;
-  readonly detail: string;
-  readonly remedy: string;
-}
-
-export interface Handoff {
-  readonly contractId: string;
-  readonly revision: number;
-  readonly packet: HandoffPacket;
-  readonly t3: HandoffExternalTool;
-}
 
 /** A commit at full length. The route refuses anything shorter before it answers. */
 export type CommitSha = string;
@@ -533,91 +487,12 @@ function segment(value: string, what: string): TransportOutcome<string> {
   return answered(encodeURIComponent(trimmed));
 }
 
-/* -------------------------------------------------------------------------- */
-/* Handoff                                                                     */
-/* -------------------------------------------------------------------------- */
-
-/**
- * The implementation packet for one approved revision of one project.
- *
- * A read, so it is safe to call again: the same approved contract renders the same bytes both
- * times, and the fingerprint is what lets a reader compare the two instead of trusting either
- * (mvp-spec 7, N02-AC2).
+/*
+ * The handoff half of this module was re-pointed at `../mvp-client/index.ts` and removed:
+ * `fetchHandoff`, `Handoff`, `HandoffPacket`, `HandoffExternalTool`, `HandoffPrerequisite` and the
+ * readers above. Keeping them would have left two spellings of the same wire shapes on disk, and the
+ * second one would be free to drift from the route without any test noticing (mvp-spec 7, N02-AC2).
  */
-export async function fetchHandoff(
-  projectId: string,
-  contractId: string,
-  revision: number,
-): Promise<TransportOutcome<Handoff>> {
-  const project = await segment(projectId, 'A project');
-  if (!project.ok) return project;
-  const contract = await segment(contractId, 'A contract');
-  if (!contract.ok) return contract;
-  if (!Number.isInteger(revision) || revision < 1) {
-    return refused({
-      code: 'Invalid',
-      reason: 'A revision number starts at 1, and nothing is rendered for one that is not a whole revision.',
-      fields: [],
-      prerequisites: [],
-    });
-  }
-  const outcome = await send(
-    'GET',
-    `/api/projects/${project.value}/contracts/${contract.value}/${String(revision)}/handoff`,
-  );
-  const body = envelope<unknown>(outcome, 'handoff');
-  if (!body.ok) return body;
-  return readHandoff(body.value);
-}
-
-function readHandoff(value: unknown): TransportOutcome<Handoff> {
-  if (!isRecord(value)) return malformed('handoff');
-  const contractId = str(value['contractId']);
-  const revision = value['revision'];
-  const packet = value['packet'];
-  const t3 = value['t3'];
-  if (contractId === null || typeof revision !== 'number' || !isRecord(packet) || !isRecord(t3)) {
-    return malformed('handoff');
-  }
-  const markdown = str(packet['markdown']);
-  const fingerprint = str(packet['fingerprint']);
-  if (markdown === null || fingerprint === null) return malformed('handoff');
-  const externalTool = readExternalTool(t3);
-  if (externalTool === null) return malformed('handoff');
-  return answered({
-    contractId,
-    revision,
-    packet: { markdown, fingerprint },
-    t3: externalTool,
-  });
-}
-
-function readPrerequisites(value: unknown): readonly HandoffPrerequisite[] {
-  return records(value).flatMap((entry) => {
-    const name = str(entry['name']);
-    if (name === null) return [];
-    return [{ name, detail: str(entry['detail']) ?? '', remedy: str(entry['remedy']) ?? '' }];
-  });
-}
-
-function readExternalTool(value: Record<string, unknown>): HandoffExternalTool | null {
-  const state = str(value['state']);
-  if (state === 'Configured') {
-    const url = str(value['url']);
-    // A configured URL is not rendered as a link unless it is one this browser can open. The
-    // server already refuses a non-http(s) or credential-bearing value, so reaching here means
-    // something upstream changed; refusing to link is the safe reading, and the packet does not
-    // depend on it (L02-AC2, N02-AC2).
-    if (url === null || !isHttpUrl(url)) return null;
-    return { state: 'Configured', url };
-  }
-  if (state === 'NotConfigured' || state === 'Unusable') {
-    const reason = str(value['reason']);
-    if (reason === null) return null;
-    return { state, reason, prerequisites: readPrerequisites(value['prerequisites']) };
-  }
-  return null;
-}
 
 /* -------------------------------------------------------------------------- */
 /* Candidate                                                                   */
