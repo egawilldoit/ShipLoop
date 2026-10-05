@@ -23,9 +23,8 @@
  */
 
 import { useState, type ReactElement } from 'react';
-import type { ReviewOwnerTestView } from '../../server/contracts.ts';
+import type { MvpFailure, ReviewOwnerTestView } from '../mvp-client/index.ts';
 import { formatTimestamp } from '../api-client.ts';
-import type { MvpFailure } from './mvp-client.ts';
 import { domId, ownerTestNote, readOwnerTestControls, readOwnerTestRefusal } from './review-model.ts';
 
 export interface OwnerTestControlsProps {

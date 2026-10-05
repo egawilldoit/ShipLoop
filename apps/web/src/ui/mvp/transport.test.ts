@@ -1,17 +1,24 @@
 /**
- * What this flow's transport is allowed to send, and how it reads an answer.
+ * What the remaining stand-in transport is allowed to send, and how it reads an answer.
  *
- * These tests read the source of `transport.ts`, because the two claims worth protecting are not
- * observable from a rendered page — they are claims about what leaves the browser:
+ * **The candidate journey left this file.** `linkCandidate`, `fetchCandidate`, `refreshCandidate` and
+ * `runVerification` are gone from `transport.ts`, and so are the four cases that asserted what they
+ * sent. Those assertions now live where the candidate screen can be held to them: in
+ * `apps/web/src/ui/mvp-client/client.test.ts`, which drives `linkCandidate`, `readCandidate`,
+ * `refreshCandidate`, `verifyCandidate` and `decideCandidate` against a recording `fetch` and reads
+ * the method and body off the wire (F20-AC2, F23-AC1).
  *
- *   1. **The verification call states no verdict.** `routes/verification.ts` accepts a `strictObject`
- *      with one optional member and refuses `result`, `outcome`, `checkId`, `criterionId` and
- *      `headSha` by name. A client that grew one of those would be refused, and worse, a client that
- *      *tried* to would be trying. So the body is asserted to be exactly `{ method }`, and the test
- *      names every field that must never appear, so adding one is a visible edit to a list of
- *      forbidden things (F20-AC2, F23-AC1).
+ * What remains here is the handoff and settings transport, still imported by two files owned by
+ * other work (`HandoffPage.tsx` and `ExternalToolSetting.tsx`), and these cases are the rules that
+ * transport is still held to. Two are worth keeping because the claims are not observable from a
+ * rendered page — they are claims about what leaves the browser:
+ *
+ *   1. **No forbidden verdict member appears in any body this module builds.** The list is kept
+ *      even though this transport no longer has a candidate call, because the rule is about the
+ *      module rather than about the call that happened to be removed, and a later call could
+ *      reintroduce one without noticing (F20-AC2, F23-AC1).
  *   2. **Every path is project-scoped.** The previous wave's shipped defect was a UI built against
- *      spellings the backend did not have. "Does the URL begin with /api/projects/<id>/" is therefore a
+ *      spellings the backend did not have, so "does the URL begin with /api/projects/<id>/" is a
  *      test rather than a convention (F02-AC2).
  */
 
@@ -41,26 +48,6 @@ const FORBIDDEN_IN_A_BODY: readonly string[] = [
   'evidenceId',
 ];
 
-test('the verification call sends `method` and nothing else', () => {
-  // The body is written inline at the call site, so the assertion is on the source rather than on a
-  // parsed request: this cannot be satisfied by a helper that happens to strip extra fields at runtime,
-  // because there is nothing to strip — the object literal is the whole body.
-  const call = /send\('POST', `\$\{path\.value\}\/verify`, \{([^}]*)\}\)/.exec(source);
-  assert.notEqual(call, null, 'the verify call must send an explicit body, not rely on an absent one');
-  const body = call?.[1] ?? '';
-  assert.deepEqual(
-    [...body.matchAll(/([A-Za-z_][A-Za-z0-9_]*)\s*:/g)].map((match) => match[1]),
-    ['method'],
-    `the verify body must carry exactly one member and it must be method, found: ${body}`,
-  );
-});
-
-test('the verification call names the one method this deployment runs', () => {
-  // The route's enum has a single case, `github_checks`. Naming it is the client being clear about where
-  // a verdict will come from rather than letting the server guess (F20-AC2).
-  assert.match(source, /\{ method: 'github_checks' \}/);
-});
-
 test('no forbidden verdict member appears in any request body this module builds', () => {
   for (const member of FORBIDDEN_IN_A_BODY) {
     const inNamedBody = new RegExp(`body: \\{[^}]*\\b${member}\\s*:`);
@@ -71,25 +58,6 @@ test('no forbidden verdict member appears in any request body this module builds
       `"${member}" must never be sent as part of a request body; the server derives it (F20-AC2, F23-AC1)`,
     );
   }
-});
-
-test('the refresh sends no body at all', () => {
-  // `routes/candidates.ts` types the refresh body as `strictObject({}).nullish`, and a body that tried
-  // to say what changed would be refused rather than dropped. So there is nothing to send and the call
-  // passes only a path (mvp-spec F20-AC3).
-  assert.match(source, /send\('POST', `\$\{path\.value\}\/refresh`\)/);
-});
-
-test('the link body carries exactly the four fields the route accepts', () => {
-  // `linkCandidateBody` in `routes/candidates.ts` is `strictObject` with `requestId`, `contractId`,
-  // `contractRevision` and `pullRequestUrl`. There is no head-SHA field, no branch field and no
-  // pull-request-number field to send, because identity is the provider's to state (mvp-spec 3).
-  const body = /send\('POST', `\/api\/projects\/\$\{project\.value\}\/candidates`, \{([\s\S]*?)\}\);/.exec(
-    source,
-  );
-  assert.notEqual(body, null, 'the link body must be written at the call site so it can be read');
-  const members = [...(body?.[1] ?? '').matchAll(/([A-Za-z_][A-Za-z0-9_]*):/g)].map((match) => match[1]);
-  assert.deepEqual(members, ['requestId', 'contractId', 'contractRevision', 'pullRequestUrl']);
 });
 
 test('every route this module calls is project-scoped', () => {

@@ -1,39 +1,42 @@
 /**
- * The HTTP boundary for the MVP review and settings surfaces — TEMPORARY.
+ * The HTTP boundary for project settings — PARTIAL, and marked for deletion.
  *
- * **This module should be deleted and replaced by F1's browser client.** It exists only
- * because F1 owns the shared client in parallel and this branch does not have it yet. It
- * is deliberately one file with every `fetch` in it, so the replacement is a delete and an
- * import rewrite rather than a hunt: no component below `apps/web/src/ui/mvp/` calls `fetch`
- * or names a URL.
+ * **This module should be deleted and replaced by the shipped client in
+ * `apps/web/src/ui/mvp-client/`.** It was one stand-in transport for the whole review and settings
+ * surface. Everything the candidate and review screens use has been re-pointed at the shipped
+ * client, and the functions that carried it are gone:
  *
- * What it does not do, on purpose:
+ *   - `readReviewCard` -> `mvp-client`'s `fetchReview`;
+ *   - `recordOwnerTest` -> `mvp-client`'s `recordOwnerTest`;
+ *   - `recordDecision` -> `mvp-client`'s `decideCandidate`;
+ *   - `readProviderChecks` -> `mvp-client`'s `verifyCandidate`, which sends no body at all rather
+ *     than `{ method }`, because the browser may not state a method where it could state a result
+ *     (F20-AC2, F23-AC1).
  *
- *   - **No invented routes.** Every path here is one of the five the MVP namespace actually
- *     registers, and every path is project-scoped (`/api/projects/:projectId/...`). An
- *     unscoped spelling must never appear in this file; the historical defect this UI keeps
- *     being rebuilt after is a request for `/api/profiles/undefined` (F02-AC1, F02-AC4).
- *   - **No client-side judgement about the product.** This module reads refusals off the
- *     server's envelope and returns them. It does not decide whether a candidate is eligible,
- *     what an observation means, or whether a decision may be made; those are the server's
- *     (F23-AC1, F25-AC3).
- *   - **No invented verdict vocabulary.** A body here carries only what the route's own zod
- *     schema accepts. `POST .../verify` sends at most `{ method }` and never a result,
- *     because the browser is not allowed to state what a check concluded (F20-AC2).
+ * What remains is `readProjectSettings`, `writeProjectSettings` and the `MvpResult` /
+ * `MvpFailure` types, because `apps/web/src/ui/mvp/SettingsScreen.tsx` imports them and that file
+ * belongs to another piece of work. Its replacement already exists: `fetchSettings` and
+ * `updateSettings` in `mvp-client` (L02-AC2, L02-AC3). When SettingsScreen is re-pointed, this
+ * module goes too.
  *
- * The wire types are imported from the server's own contract module with `import type`, so
- * they are erased at build time and never reach the browser bundle — `@shiploop/domain`
- * reaches for `node:crypto` and cannot be bundled — while a change to the server's view
- * still fails this application's type check instead of silently desynchronising (F24-AC2).
+ * What it still does, on purpose:
+ *
+ *   - **No invented routes.** Every path here is one the MVP namespace actually registers, and
+ *     every path is project-scoped (`/api/projects/:projectId/...`). An unscoped spelling must
+ *     never appear in this file; the historical defect this UI keeps being rebuilt after is a
+ *     request for `/api/profiles/undefined` (F02-AC1, F02-AC4).
+ *   - **No client-side judgement about the product.** This module reads refusals off the server's
+ *     envelope and returns them. It does not decide whether a candidate is eligible, what an
+ *     observation means, or whether a decision may be made; those are the server's (F23-AC1,
+ *     F25-AC3).
+ *
+ * The wire types are imported from the server's own contract module with `import type`, so they
+ * are erased at build time and never reach the browser bundle — `@shiploop/domain` reaches for
+ * `node:crypto` and cannot be bundled — while a change to the server's view still fails this
+ * application's type check instead of silently desynchronising (F24-AC2).
  */
 
-import type {
-  MvpOwnerTestReportView,
-  MvpReviewCardView,
-  MvpVerificationReportView,
-  ProjectSettingsView,
-  ReviewDecisionKind,
-} from '../../server/contracts.ts';
+import type { ProjectSettingsView } from '../../server/contracts.ts';
 
 /** Header carrying the derived CSRF token; the cookie itself is HttpOnly (F01-AC4). */
 export const CSRF_HEADER = 'x-shiploop-csrf';
@@ -300,113 +303,6 @@ async function request<T>(path: string, options: SendOptions): Promise<MvpResult
  */
 function segment(value: string): string {
   return encodeURIComponent(value);
-}
-
-function candidateRoot(projectId: string, candidateId: string): string {
-  return `/api/projects/${segment(projectId)}/candidates/${segment(candidateId)}`;
-}
-
-/* -------------------------------------------------------------------------- */
-/* The review card                                                              */
-/* -------------------------------------------------------------------------- */
-
-/**
- * The whole card for one candidate, read once.
- *
- * `GET /api/projects/:projectId/candidates/:candidateId/review`. Read rather than assembled
- * from two calls, because the card's criterion states, evidence rows and decision are
- * computed in one pass and a client that stitched them together from separate reads could
- * show a state the server would never return (F24-AC2).
- */
-export function readReviewCard(projectId: string, candidateId: string): Promise<MvpResult<MvpReviewCardView>> {
-  return request<{ readonly review: MvpReviewCardView }>(`${candidateRoot(projectId, candidateId)}/review`, {
-    method: 'GET',
-    csrf: false,
-  }).then(unwrap('review'));
-}
-
-/**
- * Accept, or Request Changes, bound to the commit the page was rendered against.
- *
- * `POST .../decision` with `expectedHeadSha` and `expectedContractRevision` **required**. They
- * are what turn a decision taken from an outdated card into a `Conflict` instead of a
- * decision about whatever the candidate has become, so they are taken from the card on
- * screen at the moment of pressing, never from a value cached before it (F24-AC4, F25-AC3).
- *
- * The card the server answers with is returned unwrapped, but the screen still re-reads the
- * card afterwards rather than trusting it: the card is the authority, and a write response is
- * a state the client did not ask for as its next fact (F24-AC2).
- */
-export function recordDecision(input: {
-  readonly projectId: string;
-  readonly candidateId: string;
-  readonly decision: ReviewDecisionKind;
-  readonly expectedHeadSha: string;
-  readonly expectedContractRevision: number;
-  readonly feedback: string | null;
-}): Promise<MvpResult<MvpReviewCardView>> {
-  return request<{ readonly review: MvpReviewCardView }>(
-    `${candidateRoot(input.projectId, input.candidateId)}/decision`,
-    {
-      method: 'POST',
-      csrf: true,
-      body: {
-        decision: input.decision,
-        expectedHeadSha: input.expectedHeadSha,
-        expectedContractRevision: input.expectedContractRevision,
-        feedback: input.feedback,
-      },
-    },
-  ).then(unwrap('review'));
-}
-
-/**
- * The owner's own result for one owner-test criterion.
- *
- * `POST .../candidates/:candidateId/criteria/:criterionId/owner-test` with `result` and an
- * optional `note`, and nothing else. There is deliberately no `ownerId`, no `observedAt` and
- * no `headSha` in the body: the owner is the proved session, the instant is the controller's
- * clock and the commit is the stored candidate's, so a request cannot attribute an observation
- * to somebody else, backdate it, or claim it for another build (F01-AC1, F25-AC4).
- *
- * The criterion is in the path because it is the thing the owner acted on, and the endpoint
- * refuses a criterion the contract does not declare `owner_test` — which is why the screen
- * offers these controls on owner tests and only on owner tests (F23-AC1).
- */
-export function recordOwnerTest(input: {
-  readonly projectId: string;
-  readonly candidateId: string;
-  readonly criterionId: string;
-  readonly result: 'passed' | 'failed';
-  readonly note: string | null;
-}): Promise<MvpResult<MvpOwnerTestReportView>> {
-  const path = `${candidateRoot(input.projectId, input.candidateId)}/criteria/${segment(input.criterionId)}/owner-test`;
-  return request<{ readonly ownerTest: MvpOwnerTestReportView }>(path, {
-    method: 'POST',
-    csrf: true,
-    body: { result: input.result, note: input.note },
-  }).then(unwrap('ownerTest'));
-}
-
-/**
- * Ask the server to re-read the provider's checks.
- *
- * `POST .../verify` with at most `{ method }`. There is no `result`, `checkId` or `headSha` on
- * this body and none may be added: the server derives every verdict from the provider read,
- * and a member through which the browser could state a result is the defect this boundary
- * exists to prevent (F20-AC2, F23-AC1).
- *
- * A provider failure answers 503 and records nothing, so a caller must not read the absence
- * of new rows as "nothing failed" (F03-AC2).
- */
-export function readProviderChecks(input: {
-  readonly projectId: string;
-  readonly candidateId: string;
-}): Promise<MvpResult<MvpVerificationReportView>> {
-  return request<{ readonly verification: MvpVerificationReportView }>(
-    `${candidateRoot(input.projectId, input.candidateId)}/verify`,
-    { method: 'POST', csrf: true, body: { method: 'github_checks' } },
-  ).then(unwrap('verification'));
 }
 
 /* -------------------------------------------------------------------------- */

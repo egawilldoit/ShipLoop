@@ -16,15 +16,14 @@
  */
 
 import { useState, type ReactElement } from 'react';
-import type { MvpReviewCardView, ReviewOwnerTestView } from '../../server/contracts.ts';
+import type { MvpFailure, ReviewCardView, ReviewOwnerTestView } from '../mvp-client/index.ts';
 import { formatTimestamp } from '../api-client.ts';
 import { StatusBadge } from '../components/StatusBadge.tsx';
-import type { MvpFailure } from './mvp-client.ts';
 import { readCriterion } from './review-model.ts';
 import { OwnerTestControls } from './OwnerTestControls.tsx';
 
 export interface CriteriaPanelProps {
-  readonly card: MvpReviewCardView;
+  readonly card: ReviewCardView;
   readonly projectId: string;
   readonly candidateId: string;
   /**

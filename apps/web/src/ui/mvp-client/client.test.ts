@@ -24,6 +24,8 @@
  *   - `verifyCandidate` sends no body by default and no result ever; `refreshCandidate` sends no
  *     body at all, because `routes/candidates.ts` and `routes/verification.ts` parse
  *     `strictObject` bodies that refuse a client trying to name a result (F20-AC2);
+ *   - `linkCandidate` sends the request, contract, revision and pull-request URL and no head SHA or
+ *     branch, because the provider owns the candidate's identity (mvp-spec 3);
  *   - `recordOwnerTest` sends `result` and `note` and nothing else — no owner, no instant, no
  *     commit (F01-AC1, F25-AC4);
  *   - a project id carrying `..` or a separator is refused before a URL is built (F06-AC1);
@@ -544,6 +546,51 @@ test('the evidence writes submit what the routes accept and nothing more', async
       assert.ok(call !== undefined);
       assert.equal(call.method, 'POST');
       assert.equal(call.path, '/api/projects/demo/candidates/cand_1/refresh');
+      assert.equal(call.hasBody, false);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await t.test('the link body carries exactly the four fields the route accepts', async () => {
+    // `linkCandidateBody` in `routes/candidates.ts` is `strictObject` with `requestId`, `contractId`,
+    // `contractRevision` and `pullRequestUrl`. There is no head-SHA field, no branch field and no
+    // pull-request-number field to send, because identity is the provider's to state (mvp-spec 3).
+    recordFetch();
+    setMvpCsrfToken('token-under-test');
+    try {
+      answer(200, { candidate: {} });
+      await linkCandidate(SCOPE, {
+        requestId: 'req_1',
+        contractId: 'con_1',
+        contractRevision: 1,
+        pullRequestUrl: 'https://github.com/o/r/pull/1',
+      });
+      const call = calls[0];
+      assert.ok(call !== undefined);
+      assert.equal(call.method, 'POST');
+      assert.equal(call.path, '/api/projects/demo/candidates');
+      assert.deepEqual(Object.keys(call.body as Record<string, unknown>).sort(), [
+        'contractId',
+        'contractRevision',
+        'pullRequestUrl',
+        'requestId',
+      ]);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await t.test('a candidate read asks for one candidate and sends nothing', async () => {
+    recordFetch();
+    setMvpCsrfToken('token-under-test');
+    try {
+      answer(200, { candidate: {} });
+      await readCandidate(SCOPE, 'cand_1');
+      const call = calls[0];
+      assert.ok(call !== undefined);
+      assert.equal(call.method, 'GET');
+      assert.equal(call.path, '/api/projects/demo/candidates/cand_1');
       assert.equal(call.hasBody, false);
     } finally {
       restoreFetch();

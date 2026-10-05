@@ -18,8 +18,8 @@ import {
   attributedToCandidate,
   standingOf,
   type ObservationStanding,
+  type RecordedObservation,
 } from './observation-standing.ts';
-import type { RecordedObservation } from './transport.ts';
 
 /** Two commits that are not fixtures the code under test produced. */
 const HEAD = 'a1b2c3d4e5f60718293a4b5c6d7e8f9012345678';
@@ -39,7 +39,6 @@ function observation(overrides: Partial<RecordedObservation>): RecordedObservati
     currentOutcome: 'passed',
     countsForCurrentCandidate: true,
     observedHeadSha: HEAD,
-    observedContractRevision: 2,
     observedAt: '2026-05-01T10:00:00.000Z',
     reason: '',
     ...overrides,

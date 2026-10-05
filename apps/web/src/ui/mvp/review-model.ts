@@ -1,22 +1,31 @@
 /**
- * What the review screen says, derived from what the backend said.
+ * What the candidate and review screens say, derived from what the backend said.
  *
- * Every judgement the Review screen makes about wording, tone and what may be pressed lives
- * here, as a pure function of the server's own projection. That is not tidiness: the one rule
- * this file exists to make unreachable is *rendering a stale pass in green*, and a rule that
- * lives inside JSX is a rule nobody can test without a browser (F20-AC3, F24-AC3).
+ * Every judgement the two screens make about wording, tone and what may be pressed lives here,
+ * as a pure function of the server's own projection. That is not tidiness: the one rule this file
+ * exists to make unreachable is *rendering a stale pass in green*, and a rule that lives inside
+ * JSX is a rule nobody can test without a browser (F20-AC3, F24-AC3).
  *
- * The three rules that carry the product:
+ * The rules that carry the product:
  *
  *   - **`currentOutcome` is what counts; `recordedOutcome` is history.** `readEvidence` derives
  *     one boolean, `counts`, from *both* `countsForCurrentCandidate` and whether `currentOutcome`
  *     still says so, and then reads the verdict off that. A row that disagrees with itself is
  *     treated as not counting, so the client defends the same line the server enforces: a
  *     `passed` on screen always names an observation of the commit on screen.
+ *   - **The commit decides before the result does.** `readCandidateCheck` asks whether the
+ *     provider attributed the run to the commit on screen *first*, and a `Passed` it attributed
+ *     elsewhere is not a pass here. This is the same ordering as `readEvidence`, applied to the
+ *     candidate card's own check list, which the server reports in the domain's six-state
+ *     vocabulary rather than the card's (F20-AC3, F24-AC3).
+ *   - **A state this build cannot read is reported as unread.** `readProviderState` never maps
+ *     an unrecognised pull request state onto `Open` or `Closed`: presenting withdrawn work as
+ *     reviewable, or asserting a conclusion nobody read, are both worse than saying the word is
+ *     unfamiliar (mvp-spec F20-AC2).
  *   - **A pending owner test is the owner's own outstanding step.** It reads as waiting, never
  *     as passed, and the controls for recording it are offered per criterion and only per
  *     criterion (F23-AC1, F25-AC4).
- *   - **A refusal records nothing.** `readDecisionRefusal` has no branch that can produce a
+ *   - **A refusal records nothing.** `readDecisionOutcome` has no branch that can produce a
  *     wording claiming success, and a `Conflict` says which fact moved so the owner knows to
  *     re-read the card before deciding again (F24-AC4, F25-AC3).
  *
@@ -27,6 +36,9 @@
 
 import type { StatusTone } from '../components/StatusBadge.tsx';
 import type {
+  CandidateCheckReport,
+  RecordedObservationView,
+  ReviewCardView,
   ReviewCheckView,
   ReviewCriterionView,
   ReviewDecisionView,
@@ -34,7 +46,351 @@ import type {
   ReviewEvidenceView,
   ReviewOwnerTestView,
   ReviewStaleDecisionView,
-} from '../../server/contracts.ts';
+} from '../mvp-client/index.ts';
+import type { DecideCandidateOutcome } from '../mvp-client/index.ts';
+
+/* -------------------------------------------------------------------------- */
+/* The candidate card                                                           */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * How the candidate card's own check vocabulary reads.
+ *
+ * The six words are the domain's, in the domain's casing, and they are *not* the card's
+ * lowercase spelling. The two spellings exist because they are two projections of the same six
+ * states, and a screen that translated between them would be the second place the vocabulary is
+ * stated — which is how a `Passed` and a `passed` stop meaning the same thing (F20-AC2).
+ */
+const CANDIDATE_CHECK_LABELS: Readonly<Record<string, string>> = {
+  Passed: 'Passed',
+  Failed: 'Failed',
+  Waiting: 'Still running — nothing concluded',
+  Missing: 'Never ran — proves nothing',
+  Stale: 'Stale — about another commit',
+  NotApplicable: 'Not applicable',
+};
+
+/**
+ * Tones, with `Passed` as the only healthy one.
+ *
+ * `Stale` and `NotApplicable` take a non-healthy tone deliberately. `NotApplicable` is a claim
+ * about the *check* rather than about the product, and rendering it as anything better than
+ * neutral is how a waived gate comes to read as a green one (F20-AC5).
+ */
+const CANDIDATE_CHECK_TONES: Readonly<Record<string, StatusTone>> = {
+  Passed: 'healthy',
+  Failed: 'revoked',
+  Waiting: 'pending',
+  Missing: 'degraded',
+  Stale: 'degraded',
+  NotApplicable: 'unconfigured',
+};
+
+/** One sentence per state, saying what it means for the commit on screen. */
+const CANDIDATE_CHECK_STANDINGS: Readonly<Record<string, string>> = {
+  Passed: 'The provider reported this check passing against the commit on screen.',
+  Failed: 'The provider ran this check against the commit on screen and it failed.',
+  Waiting: 'The provider is still running this. Nothing has concluded, and a running check is not a pass.',
+  Missing: 'The provider reported no result for this at all, so nothing is known about what it would find.',
+  Stale: 'This result was attributed to a commit that is not the one on screen, so it proves nothing about this candidate.',
+  NotApplicable: 'The provider reported this check as not applicable. That is a claim about the check, not a pass.',
+};
+
+/** What one candidate-card check reads as, and whether it is about the commit on screen. */
+export interface CandidateCheckReading {
+  readonly result: string;
+  readonly label: string;
+  readonly tone: StatusTone;
+  readonly standing: string;
+  /**
+   * Whether this row may be read as the candidate on screen's result.
+   *
+   * False whenever the provider attributed the run to another commit *or* to none. It is the
+   * affirmative answer, and it is what a `Passed` must be gated on (F20-AC3).
+   */
+  readonly countsForCandidate: boolean;
+  /** The commit the provider said it ran against, for display beside the badge. */
+  readonly observedCommit: string | null;
+  /** True when this build has no word for the result at all (F20-AC2). */
+  readonly unread: boolean;
+}
+
+/**
+ * One candidate-card check, with its result admitted as the word that arrived.
+ *
+ * `CandidateCheckReport.result` is `ProviderCheckResult`, a six-member union, but the client reads
+ * a response body by member name rather than by parsing each field (`envelope` in
+ * `mvp-client/transport.ts`), so a server that grows a seventh result would put it on screen while
+ * the type still said six. That gap is exactly what the `unread` branch below exists to report, so
+ * the parameter admits the wider word rather than leaving a branch no value can ever reach
+ * (F20-AC2).
+ */
+export interface CandidateCheckInput extends Omit<CandidateCheckReport, 'result'> {
+  readonly result: string;
+}
+
+/**
+ * Reads one check from the candidate card.
+ *
+ * The ordering is the whole argument, and it is the same one `readEvidence` uses: **the commit
+ * is consulted before the result.** A provider that reports `Passed` for a commit other than the
+ * one on screen has proved something — just not about this candidate — and reading the result
+ * first would find `Passed` before the condition that invalidates it was ever looked at. So:
+ *
+ *   1. attribution first. A row naming another commit, or no commit, does not count;
+ *   2. then the result, mapped to a label and a tone;
+ *   3. an unrecognised result is reported as unread rather than mapped onto a state.
+ *
+ * `blocking` is *not* read here. It is the route's own answer, computed with the domain's
+ * `isBlocking`, and re-deriving it here would be a second opinion about what gates a candidate
+ * (F20-AC2, F24-AC3).
+ */
+export function readCandidateCheck(check: CandidateCheckInput, candidateHeadSha: string): CandidateCheckReading {
+  const observed = check.observedHeadSha;
+  const countsForCandidate = observed !== null && observed === candidateHeadSha;
+  const unread = !(check.result in CANDIDATE_CHECK_LABELS);
+
+  if (!countsForCandidate) {
+    // A row that does not count is described as such, whatever it recorded. The word "Passed" is
+    // not shown for it: showing it and then explaining it away is how a stale pass reaches a
+    // reader who skims (F20-AC3, F24-AC3).
+    const where =
+      observed === null
+        ? 'The provider attributed this run to no commit, so it is evidence for no candidate (F20-AC3).'
+        : `The provider attributed this run to ${observed}, which is not the commit on screen, so it proves nothing about this candidate however its result reads (F20-AC3, F24-AC3).`;
+    return {
+      result: check.result,
+      label: countsForCandidate ? (CANDIDATE_CHECK_LABELS[check.result] ?? '') : 'Not about the commit on screen',
+      tone: 'degraded',
+      standing: where,
+      countsForCandidate,
+      observedCommit: observed,
+      unread,
+    };
+  }
+
+  return {
+    result: check.result,
+    label: unread ? `Unread: ${truncateWord(check.result)}` : CANDIDATE_CHECK_LABELS[check.result] ?? '',
+    tone: unread ? 'neutral' : CANDIDATE_CHECK_TONES[check.result] ?? 'neutral',
+    standing: unread
+      ? 'This check came back as a result this build has no word for, so nothing is claimed about it. An unreadable result is not a pass (F20-AC2).'
+      : CANDIDATE_CHECK_STANDINGS[check.result] ?? '',
+    countsForCandidate,
+    observedCommit: observed,
+    unread,
+  };
+}
+
+/**
+ * The pull request states this build has words for, and what each one means.
+ *
+ * A closed vocabulary rather than a string switch at the call site, because a state outside it
+ * has to be reported rather than guessed at. `Unknown` is a member of the domain's vocabulary and
+ * is deliberately *not* `Open`: it means the provider reported something this product cannot
+ * classify, and reading it as reviewable would present withdrawn work as open (mvp-spec F20-AC2).
+ */
+const PROVIDER_STATES: Readonly<Record<string, { readonly label: string; readonly tone: StatusTone; readonly standing: string }>> = {
+  Open: {
+    label: 'Open',
+    tone: 'healthy',
+    standing: 'The provider reports this pull request as open, so there is a change proposed.',
+  },
+  Closed: {
+    label: 'Closed',
+    tone: 'unconfigured',
+    standing: 'The provider reports this pull request as closed. It is readable, and there is no open change to decide on.',
+  },
+  Merged: {
+    label: 'Merged',
+    tone: 'unconfigured',
+    standing: 'The provider reports this pull request as merged, so the change has already landed.',
+  },
+  Unknown: {
+    label: 'Unknown',
+    tone: 'degraded',
+    standing:
+      'The provider reported a state this product does not classify, so it is reported as unknown rather than read as open or closed (mvp-spec F20-AC2).',
+  },
+};
+
+/** What the pull request's state reads as, and whether this build could read it at all. */
+export interface ProviderStateReading {
+  readonly state: string;
+  readonly label: string;
+  readonly tone: StatusTone;
+  readonly standing: string;
+  /**
+   * False for a state outside the product's vocabulary.
+   *
+   * False means *unread*, not closed and not open: the client says so rather than picking one of
+   * the states it does have words for (mvp-spec F20-AC2).
+   */
+  readonly recognised: boolean;
+}
+
+/**
+ * Reads a pull request state for display.
+ *
+ * An unrecognised value is reported as unread and never mapped onto `Open` or `Closed`. Both of
+ * those would be a claim: `Open` would present withdrawn work as reviewable, and `Closed` would
+ * assert a conclusion the provider never stated. The route refuses such a value before it can
+ * reach a response, so this branch is the client's own defence of the same line rather than a
+ * case the browser is expected to see (mvp-spec F20-AC2).
+ */
+export function readProviderState(state: string): ProviderStateReading {
+  const known = PROVIDER_STATES[state];
+  if (known !== undefined) {
+    return { state, label: known.label, tone: known.tone, standing: known.standing, recognised: true };
+  }
+  return {
+    state,
+    label: `Unread: ${truncateWord(state)}`,
+    tone: 'neutral',
+    standing:
+      'The provider reported a pull request state this build has no word for, so nothing is claimed about it. It is reported as unread rather than read as open or closed (mvp-spec F20-AC2).',
+    recognised: false,
+  };
+}
+
+/** Bounds a value quoted from something this build could not read (N02-AC2). */
+function truncateWord(value: string): string {
+  return value.length > 40 ? `${value.slice(0, 40)}…` : value;
+}
+
+/* -------------------------------------------------------------------------- */
+/* The verification report's observations                                      */
+/* -------------------------------------------------------------------------- */
+
+/** How one observation from a verification pass reads, as a badge and a sentence. */
+export interface VerifyObservationReading {
+  /** A closed key, so a reader or a test can tell the standings apart without parsing prose. */
+  readonly key: 'stale' | 'unattributed' | 'passed' | 'failed' | 'running' | 'never-ran' | 'capture-failed' | 'unread';
+  readonly tone: StatusTone;
+  readonly label: string;
+  readonly standing: string;
+  /**
+   * Whether this observation may be read as a result for the commit on screen.
+   *
+   * This is the affirmative answer the display gates on, and it is the answer that keeps a
+   * `recordedOutcome: 'passed'` for an earlier commit out of a success colour (F20-AC3, F24-AC3).
+   */
+  readonly countsForCandidate: boolean;
+}
+
+/** What each outcome in the verification report's vocabulary reads as. */
+const VERIFY_OUTCOMES: Readonly<
+  Record<
+    string,
+    { readonly key: VerifyObservationReading['key']; readonly tone: StatusTone; readonly label: string; readonly standing: string }
+  >
+> = {
+  passed: {
+    key: 'passed',
+    tone: 'healthy',
+    label: 'Passed on this commit',
+    standing:
+      'The provider reported this check passing, and this observation counts for the commit on screen, so it is evidence about the code under review (F20-AC2, F24-AC3).',
+  },
+  failed: {
+    key: 'failed',
+    tone: 'revoked',
+    label: 'Failed on this commit',
+    standing:
+      'The provider reported this check failing, and it counts for the commit on screen. A failure is a result about the product, not the absence of one (F20-AC2).',
+  },
+  waiting: {
+    key: 'running',
+    tone: 'pending',
+    label: 'Still running — nothing concluded',
+    standing:
+      'The provider reports this check as still running. Nothing is known about what it will conclude, and nothing here is treated as a pass while it runs (F20-AC2, F24-AC3).',
+  },
+  missing: {
+    key: 'never-ran',
+    tone: 'degraded',
+    label: 'Never ran — proves nothing',
+    standing:
+      'No run of this check was observed, so nothing is known about what it would have found. A required check that never ran is not a pass, and it blocks until it runs (F20-AC2, F20-AC5).',
+  },
+  capture_failed: {
+    key: 'capture-failed',
+    tone: 'degraded',
+    label: 'Evidence was never captured',
+    standing:
+      'The evidence for this check was never captured. That is not a statement about the product: it can neither confirm a criterion nor report the behaviour as broken, and the criterion stays unverified (F23-AC5).',
+  },
+};
+
+/**
+ * Reads one observation from a verification pass.
+ *
+ * Staleness is decided **before** the recorded outcome is consulted, and that ordering is the
+ * property rather than an incidental detail: if `recordedOutcome` were consulted first, a stale
+ * pass would find its green badge before the condition that invalidates it was ever read, and the
+ * label would then be correct only by accident. So:
+ *
+ *   1. `countsForCurrentCandidate` and `currentOutcome: 'stale'` are checked first, and a stale
+ *      observation is never shown as a pass whatever it recorded;
+ *   2. then the attribution is re-checked against the commit on screen, because an observation
+ *      that names another commit — or none — is evidence for no candidate (F20-AC3, F24-AC3);
+ *   3. then the current outcome is mapped, with an unrecognised one reported as unread rather
+ *      than coerced onto a state (F20-AC2).
+ */
+
+/**
+ * One verification observation, with its outcomes admitted as the words that arrived.
+ *
+ * Widened for the same reason as `CandidateCheckInput`, and the `unread` branch above is where the
+ * extra width is spent: `RecordedObservationView` declares five outcomes plus `stale`, and a body
+ * read by member name rather than by parsing each field is not proof that only those six will ever
+ * arrive (F20-AC2).
+ */
+export interface VerifyObservationInput extends Omit<RecordedObservationView, 'recordedOutcome' | 'currentOutcome'> {
+  readonly recordedOutcome: string;
+  readonly currentOutcome: string;
+}
+export function readVerifyObservation(
+  observation: VerifyObservationInput,
+  candidateHeadSha: string,
+): VerifyObservationReading {
+  const stale = !observation.countsForCurrentCandidate || observation.currentOutcome === 'stale';
+  if (stale) {
+    return {
+      key: 'stale',
+      tone: 'degraded',
+      label: 'Stale — about another commit',
+      standing:
+        'This observation does not count for the commit on screen. It was recorded for something else, so it proves nothing about the code now under review, and no readiness carried forward from it survives (F20-AC3, F24-AC4).',
+      countsForCandidate: false,
+    };
+  }
+
+  if (observation.observedHeadSha === null || observation.observedHeadSha !== candidateHeadSha) {
+    return {
+      key: 'unattributed',
+      tone: 'degraded',
+      label: 'Counts, but names no matching commit',
+      standing:
+        'This observation is marked as counting for the candidate while naming no commit, or naming a commit other than the one on screen. A result recorded for one commit cannot prove another, and an observation that attributes itself to nothing is evidence for no candidate, so neither reading is rendered as a verdict (F20-AC3, F24-AC3).',
+      countsForCandidate: false,
+    };
+  }
+
+  const known = VERIFY_OUTCOMES[observation.currentOutcome];
+  if (known === undefined) {
+    return {
+      key: 'unread',
+      tone: 'neutral',
+      label: `Unread: ${truncateWord(observation.currentOutcome)}`,
+      standing:
+        'This observation came back as a result this build has no word for, so nothing is claimed about it. An unreadable result is not a pass (F20-AC2).',
+      countsForCandidate: false,
+    };
+  }
+
+  return { ...known, countsForCandidate: true };
+}
 
 /* -------------------------------------------------------------------------- */
 /* Vocabulary                                                                    */
@@ -290,11 +646,17 @@ export interface CheckReading {
  * where it does not — so nothing here re-tests that. What the row must add is *which* check
  * the criterion is bound to, which is why the caller passes the policy's required ids: a green
  * required check that no criterion names verified nothing, however green it is (F23-AC1).
+ *
+ * A result outside the vocabulary is reported as unread rather than mapped onto a state. The card's
+ * `result` is transcribed as a `string` on the wire, so the closed union above is the *product's*
+ * vocabulary rather than a guarantee about the bytes, and a client that indexed the maps directly
+ * would render `undefined` for a word it does not know (F20-AC2).
  */
 export function readCheck(check: ReviewCheckView, requiredCheckIds: readonly string[]): CheckReading {
+  const known = CHECK_LABELS[check.result] !== undefined;
   return {
-    label: CHECK_LABELS[check.result],
-    tone: CHECK_TONES[check.result],
+    label: known ? CHECK_LABELS[check.result] ?? '' : `Unread: ${truncateWord(check.result)}`,
+    tone: known ? CHECK_TONES[check.result] ?? 'neutral' : 'neutral',
     standing: check.reason,
     requiredByPolicy: requiredCheckIds.includes(check.checkId),
   };
@@ -511,6 +873,64 @@ export function readStaleDecisions(decisions: readonly ReviewStaleDecisionView[]
   }));
 }
 
+/**
+ * What the client's decision call came back with, as the screen reads it.
+ *
+ * The typed client answers a decision with a discriminated union rather than a boolean, because
+ * the four refusals need different remedies and a single "it failed" would tell the owner none of
+ * them. This function is the one place that union becomes wording, and it has exactly two shapes:
+ *
+ *   - `recorded`, which happens only for `decided`. It carries no wording at all: the card is
+ *     re-read afterwards and the server's own card is what says what was recorded, so this
+ *     cannot claim an acceptance the server did not make (F24-AC2, F25-AC3).
+ *   - `refused`, which carries a reading whose headline denies that anything was recorded, plus
+ *     whether the card on screen is known to be out of date.
+ */
+export type DecisionOutcomeReading =
+  | { readonly kind: 'recorded'; readonly review: ReviewCardView }
+  | { readonly kind: 'refused'; readonly reading: RefusalReading };
+
+/**
+ * Reads a decision outcome.
+ *
+ * There is no third shape, and that is the property worth stating: this function cannot produce
+ * a wording that reports success for anything other than a `decided` answer. `superseded-commit`
+ * and `superseded-revision` both become a `Conflict`-shaped reading naming the two values, so
+ * the owner learns which build they decided about and which one the server holds — and both set
+ * `mustReloadCard`, because a submission prepared against facts that have moved cannot be
+ * applied to the card on screen (F24-AC4, F25-AC3).
+ *
+ * `not-eligible` keeps the server's prerequisites, so the outstanding requirements are shown
+ * rather than summarised as "not eligible" (F23-AC1, F24-AC3).
+ */
+export function readDecisionOutcome(outcome: DecideCandidateOutcome): DecisionOutcomeReading {
+  if (outcome.kind === 'decided') return { kind: 'recorded', review: outcome.review };
+  if (outcome.kind === 'superseded-commit' || outcome.kind === 'superseded-revision') {
+    return {
+      kind: 'refused',
+      reading: readDecisionRefusal({
+        code: 'Conflict',
+        reason: outcome.reason,
+        fields: [],
+        prerequisites: [],
+        expected: outcome.expected,
+        actual: outcome.actual,
+      }),
+    };
+  }
+  return {
+    kind: 'refused',
+    reading: readDecisionRefusal({
+      code: outcome.kind === 'not-eligible' ? 'Blocked' : 'Unavailable',
+      reason: outcome.failure.reason,
+      fields: outcome.failure.fields,
+      prerequisites: outcome.failure.prerequisites,
+      expected: outcome.failure.expected,
+      actual: outcome.failure.actual,
+    }),
+  };
+}
+
 /* -------------------------------------------------------------------------- */
 /* Refusals                                                                      */
 /* -------------------------------------------------------------------------- */
@@ -565,7 +985,10 @@ const FULL_SHA = /^[0-9a-f]{40}$/;
 const REVISION = /^\d+$/;
 
 /**
- * Reads a refused decision.
+ * Reads a refused decision from a refusal-shaped value.
+ *
+ * `readDecisionOutcome` is what a screen calls; this is the rule underneath it, exported for the
+ * owner-test write and for the tests that assert the headline directly.
  *
  * Two properties hold for every code, and the first is the one that matters:
  *
