@@ -54,7 +54,40 @@
  */
 
 import type { StatusTone } from '../components/StatusBadge.tsx';
-import type { RecordedObservation } from './transport.ts';
+
+/**
+ * What this module needs from one recorded observation.
+ *
+ * Declared here, structurally, rather than imported from a transport module. Two reasons, and both
+ * are about what this file is for:
+ *
+ *   - it is the file that must be able to read a word it has no name for, so its input cannot be a
+ *     closed union of known outcomes. `currentOutcome` and `recordedOutcome` are `string` here for
+ *     that reason alone, and narrowing them at the type level would delete the `unread` standing
+ *     this module exists to produce (F20-AC2);
+ *   - it is a pure model, and a model that reaches into an HTTP layer to name its input is a model
+ *     whose tests would need that layer to mean anything (F20-AC3, F24-AC3).
+ *
+ * The five fields a standing is derived from are listed first, and no standing reads any of the
+ * others. The identities and the instant travel because `ObservationRow` presents the same row, and
+ * it is better for a presenter and a model to agree on one shape than for the presenter to widen a
+ * second copy of it — but they are marked so that a future standing cannot come to depend on one by
+ * accident.
+ */
+export interface RecordedObservation {
+  /** Carried for display. No standing reads it. */
+  readonly evidenceId: string;
+  /** Carried for display. No standing reads it. */
+  readonly checkId: string;
+  readonly recordedOutcome: string;
+  readonly currentOutcome: string;
+  readonly countsForCurrentCandidate: boolean;
+  /** The full commit the source attributed the run to, or null when it attributed none. */
+  readonly observedHeadSha: string | null;
+  readonly reason: string;
+  /** Carried for display. No standing reads it. */
+  readonly observedAt: string | null;
+}
 
 /**
  * The standings an observation can be rendered in.

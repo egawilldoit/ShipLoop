@@ -27,7 +27,7 @@ import type { ReactElement } from 'react';
 import { StatusBadge } from '../components/StatusBadge.tsx';
 import { CommitSha } from './CommitSha.tsx';
 import { attributedToCandidate, standingOf, truncate } from './observation-standing.ts';
-import type { RecordedObservation } from './transport.ts';
+import type { RecordedObservation } from './observation-standing.ts';
 
 export interface ObservationRowProps {
   readonly observation: RecordedObservation;

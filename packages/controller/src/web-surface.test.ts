@@ -138,7 +138,31 @@ const REQUIRED_METHODS = {
     'requestAdoptedEvaluation',
   ],
   generation: ['startBriefGeneration', 'startPlanGeneration', 'getGeneration', 'listGenerations'],
-} as const satisfies Record<keyof ControllerSurface, readonly string[]>;
+} as const;
+
+/**
+ * Every group the web package requires is a group this surface declares.
+ *
+ * A `satisfies Record<keyof ControllerSurface, ...>` would assert the two sets are *equal*,
+ * and they deliberately are not: this surface also carries `candidates`, which the web package
+ * resolves at run time through `candidateUseCasesOf` rather than requiring at startup — a
+ * deployment composed without a git provider must start and then be told so by name, not fail
+ * to boot (F02-AC4). So the relation worth proving is the one that directionally holds: a group
+ * the transport needs cannot be missing here.
+ */
+type TranscribedGroupMissingFromSurface = Exclude<keyof typeof REQUIRED_METHODS, keyof ControllerSurface>;
+const EVERY_TRANSCRIBED_GROUP_IS_DECLARED: TranscribedGroupMissingFromSurface extends never ? true : never = true;
+assert.equal(EVERY_TRANSCRIBED_GROUP_IS_DECLARED, true, 'a group the transport requires must be declared here');
+
+/**
+ * The candidate port, as the transport's route declares it.
+ *
+ * Not in the transcription above, for the reason just stated: the web package resolves it
+ * optionally so a deployment without a git provider can still start. It is listed here because
+ * *this* surface always carries it — the refusal a provider-less deployment gets is a stated
+ * `Unavailable` from the adapter, not an absent port (F03-AC2, F02-AC4).
+ */
+const CANDIDATE_METHODS = ['linkCandidate', 'readCandidate'] as const;
 
 /**
  * The web package's own structural guard, transcribed.
@@ -307,6 +331,13 @@ test('a real root answers the transcribed port, by type and at run time (F01-AC1
     // `ControllerSurface` would not typecheck here. The run-time half follows.
     const asPort: ControllerSurface = surface;
     assert.ok(satisfiesTranscribedPort(asPort), 'the transcribed port guard must accept the real surface');
+    // The candidate port is the group that was registered but never wired: the route resolved it
+    // optionally, so nothing failed until an owner opened a candidate and got a `503` from a
+    // deployment that had a git provider configured. Asserted here rather than left to a route
+    // test, because this is the surface's shape and the shape is what was missing (F11-AC1).
+    for (const method of CANDIDATE_METHODS) {
+      assert.equal(typeof surface.candidates[method], 'function', `candidates.${method} must exist`);
+    }
   });
 });
 
