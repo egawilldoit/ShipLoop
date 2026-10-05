@@ -1128,6 +1128,21 @@ export function setCsrfToken(token: string | null): void {
   csrfToken = token;
 }
 
+/**
+ * The token a state-changing request has to carry, or null when this session has none.
+ *
+ * An accessor rather than a second store, because a second store is a second answer to "which
+ * token does this client hold" and the two would disagree the moment a sign-out cleared one of
+ * them. A transport module that needs to send a request of its own reads the token here, so
+ * signing out still leaves nothing behind that could authorize a later call (F01-AC2, F01-AC5).
+ *
+ * Returns null rather than a placeholder so the caller can name the remedy — reload and sign in
+ * again — instead of sending a request that is certain to be refused (N03-AC3).
+ */
+export function csrfTokenForRequests(): string | null {
+  return csrfToken;
+}
+
 export function subscribeToConnection(listener: (state: ConnectionState) => void): () => void {
   connectionListeners.add(listener);
   return () => {
