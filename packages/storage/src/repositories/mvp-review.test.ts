@@ -182,6 +182,34 @@ test('an owner test row without an owner identity is refused before it is writte
   });
 });
 
+/**
+ * A stored row must name the method that made the observation.
+ *
+ * `Untested` is the absence of a method, and this table has no column for an absence. A write
+ * that stored it anyway would have to invent one — and the only invention available produced a
+ * row claiming a check identity of the empty string, which no projection can ever match, filed as
+ * though it were an observation. Refusing keeps that at the boundary where a caller can be told,
+ * rather than as a durable row nobody can account for (F23-AC1).
+ *
+ * The domain accepts the value, so this is genuinely the store's rule and not the domain's: the
+ * fixture builds the row with `recordMvpEvidence` first, which is the only exported constructor
+ * for one.
+ */
+test('an observation with no assigned method is refused rather than stored under an invented one', async () => {
+  await withStore((store) => {
+    const untested = evidence({
+      evidenceId: 'evid-untested',
+      method: { kind: 'Untested', reason: 'No verification method is assigned to "AC-unassigned".' },
+    });
+    assert.equal(untested.method.kind, 'Untested', 'the domain does accept the value, so the store is the gate');
+
+    const error = expectErr(store.recordEvidence(evidenceInput(untested)));
+    assert.equal(error.code, 'Invalid');
+    assert.match(error.reason, /must name the method that observed it/);
+    assert.equal(expectOk(store.readProjection(PROJECTION)).evidence.length, 0, 'and nothing was written');
+  });
+});
+
 test('the schema refuses an abbreviated candidate SHA on an evidence row', async () => {
   await withStore((store, db) => {
     expectOk(store.recordEvidence(evidenceInput(evidence())));
