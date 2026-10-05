@@ -36,6 +36,15 @@ browser prerequisites, and SSH access. Do not invent commands absent from packag
    lifecycle rules in the domain, and privileged side effects in the controller.
    Add narrower agent guides when real packages exist; do not create empty scaffolds.
 
+## Code style
+
+- `scripts/` are dependency-free Node ESM tools with no runtime dependencies;
+  keep them that way — see [scripts](scripts/AGENTS.md).
+- Small typed modules; validate external input at adapter/API boundaries.
+- Prefer explicit behavior over clever abstractions. This repository is a
+  foundation, not a framework — do not build generic machinery for
+  hypothetical reuse.
+
 ## Work through verification
 
 - Normal implementation, debugging, testing, and scoped fixes already authorized
@@ -62,6 +71,8 @@ browser prerequisites, and SSH access. Do not invent commands absent from packag
 ## Review, merge, and completion
 
 Follow [CONTRIBUTING.md](CONTRIBUTING.md) and [review/release](docs/runbooks/review-release.md).
+Use a Conventional Commit title (`feat:`, `fix:`, `docs:`, …) and stage only
+intended files.
 A request to implement permits a reviewable branch/draft PR when appropriate.
 Merge or production release needs the owner's authorization for that candidate.
 Recheck current refs, checks, deployment identity, and provider policy at the action.
