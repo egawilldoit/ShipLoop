@@ -882,6 +882,129 @@ test('F24-AC2: the card carries every element, with the full commit SHA verbatim
   assert.deepEqual(card.staleness.reasons, []);
 });
 
+/**
+ * F24-AC2: every element the review card is required to carry, on a card that has them.
+ *
+ * The test above proves the elements exist on an *empty* candidate, which is the easy half:
+ * an absent list and a list with nothing in it are the same shape, so a projection that
+ * dropped a populated collection would still pass it. This one records an observation and an
+ * owner test and a decision first, then asserts each required element is present *with its
+ * content*, so a projection that returned the key and dropped the facts cannot pass.
+ *
+ * It asserts against the card the shipped entrypoint served, not against a fixture this file
+ * assembled: the eleven elements are the transport's contract, and a mock that agreed with
+ * itself would prove nothing about whether the real route serves them (mvp-spec 3, F24-AC2).
+ */
+test('F24-AC2: the review response carries all eleven required elements, with content', async (t) => {
+  const h = await harness();
+  t.after(() => h.close());
+
+  // Give the card something to carry: an owner observation bound to this exact commit, and a
+  // recorded decision. Without these, `evidence` and `decision` are legitimately empty and
+  // "present" would mean only "the key exists".
+  h.recordOwnerTest({ evidenceId: 'evid-owner-pass', headSha: HEAD });
+  const decided = await h.decide(decisionBody());
+  assert.equal(decided.status, 200, decided.body);
+
+  const { status, card, raw } = await h.review();
+  assert.equal(status, 200, raw);
+  assert.ok(card !== null, raw);
+
+  // 1. The request the work answers.
+  assert.equal(card.request.requestId, h.seed.requestId);
+  assert.equal(card.request.projectId, PROJECT_ID);
+  assert.equal(card.request.title, REQUEST_TITLE);
+
+  // 2. The contract, and 3. the revision every criterion and decision binds to.
+  assert.equal(card.contract.contractId, h.seed.contractId);
+  assert.equal(card.contract.revision, 1);
+  assert.equal(card.contract.status, 'approved');
+  assert.deepEqual(
+    card.contract.acceptanceCriteria.map((criterion) => criterion.id).sort(),
+    [AUTOMATED_CRITERION_ID, OWNER_CRITERION_ID],
+  );
+
+  // 4. The criteria, each with a state rather than as a bare list of ids.
+  assert.deepEqual(card.criteria.map((criterion) => criterion.criterionId).sort(), [AUTOMATED_CRITERION_ID, OWNER_CRITERION_ID]);
+  for (const criterion of card.criteria) {
+    assert.ok(criterion.state.length > 0, `${criterion.criterionId} carries a state`);
+    assert.ok(criterion.reason.length > 0, `${criterion.criterionId} says why`);
+  }
+
+  // 5. The candidate, and 6. its full 40-character commit SHA - never abbreviated, never null.
+  assert.equal(card.candidate.candidateId, CANDIDATE_ID);
+  assert.equal(card.candidate.headSha, HEAD, 'the full SHA reaches the wire verbatim');
+  assert.equal(card.candidate.headSha.length, 40, 'an abbreviation is not an identity (mvp-spec 3)');
+  assert.match(card.candidate.headSha, /^[0-9a-f]{40}$/);
+
+  // 7. The GitHub/check facts, passed through and never inferred (mvp-spec 3).
+  assert.equal(card.candidate.pullRequestState, 'Open');
+  assert.equal(card.candidate.pullRequestNumber, 42);
+  assert.equal(card.candidate.repository, 'octopus/shop');
+  assert.ok(Array.isArray(card.checks), 'the check list is an element, not an absence');
+  assert.ok(Array.isArray(card.policy.requiredAutomatedCheckIds));
+
+  // 8. The verification evidence, with content and with the three outcomes kept distinct.
+  const ownerRow = card.evidence.find((row) => row.source === 'owner_test');
+  assert.ok(ownerRow !== undefined, `the recorded observation must be on the card: ${raw}`);
+  assert.equal(ownerRow.evidenceId, 'evid-owner-pass');
+  assert.equal(ownerRow.recordedOutcome, 'passed');
+  assert.equal(ownerRow.currentOutcome, 'passed');
+  assert.equal(ownerRow.countsForCurrentCandidate, true, 'bound to this commit, so it counts');
+  assert.equal(ownerRow.candidateHeadSha, HEAD, 'the row names the full commit it observed');
+  assert.ok(
+    !('outcome' in ownerRow),
+    'there is no bare `outcome` to reach for by mistake, which is how a stale pass renders green (F20-AC3)',
+  );
+
+  // 9. The owner-test evidence, as its own list, carrying the owner's own step.
+  const ownerTest = card.ownerTests.find((criterion) => criterion.criterionId === OWNER_CRITERION_ID);
+  assert.ok(ownerTest !== undefined);
+  assert.equal(ownerTest.state, 'passed', 'the owner recorded this test against this commit');
+  assert.equal(ownerTest.evidenceId, 'evid-owner-pass', 'the owner test points at the owner observation');
+
+  // 10. The stale states, as a stated answer rather than an empty list to interpret.
+  assert.equal(card.staleness.stale, false);
+  assert.ok(Array.isArray(card.staleness.staleEvidenceIds));
+  assert.ok(Array.isArray(card.staleness.staleDecisionIds));
+
+  // 11. Eligibility, as separate gates.
+  assert.equal(typeof card.eligibility.readyForOwnerReview, 'boolean');
+  assert.equal(typeof card.eligibility.readyForAcceptance, 'boolean');
+  assert.equal(typeof card.eligibility.readyForDelivery, 'boolean');
+
+  // 12. The current owner decision, with its full binding rather than a bare outcome string.
+  assert.equal(card.decision.outcome, 'changes_requested');
+  const decision = card.decision.decision;
+  assert.ok(decision !== null);
+  assert.equal(decision.kind, 'changes_requested');
+  assert.equal(decision.candidateHeadSha, HEAD, 'the decision names the exact commit it was made against');
+  assert.equal(decision.candidateHeadSha.length, 40);
+  assert.equal(decision.candidateId, CANDIDATE_ID);
+  assert.equal(decision.requestId, h.seed.requestId);
+  assert.equal(decision.contractId, h.seed.contractId);
+  assert.equal(decision.contractRevision, 1);
+  assert.ok(decision.ownerId.length > 0, 'the decision names the owner who made it (F01-AC1)');
+  assert.ok(decision.decidedAt.length > 0);
+
+  // Every required element is a real top-level member of the served object, so a client cannot
+  // be handed a card that satisfies this test only by reaching through another one.
+  for (const element of [
+    'request',
+    'contract',
+    'candidate',
+    'checks',
+    'criteria',
+    'evidence',
+    'ownerTests',
+    'staleness',
+    'decision',
+    'eligibility',
+  ]) {
+    assert.ok(Object.hasOwn(card, element), `the served card must carry ${element}: ${Object.keys(card).join(', ')}`);
+  }
+});
+
 test('mvp-spec 3: the provider state reaches the card verbatim, never normalised into open or closed', async (t) => {
   const h = await harness();
   t.after(() => h.close());
@@ -1322,6 +1445,121 @@ test('mvp-spec 3: only accepted and changes_requested are decidable', async (t) 
   assert.equal(unchanged.card?.decision.outcome, 'none');
 });
 
+/**
+ * F24-AC4: a conflict names the fact that actually moved.
+ *
+ * The status alone is not enough to pin this, because both failures answer 409 and the two
+ * differ only in what the owner is told to go and look at. The interesting case is the one
+ * where the commit did *not* move: naming the commit then reports `expected` and `actual` as
+ * the same 40-character SHA, which is a conflict describing nothing, and sends the owner to
+ * investigate a push that never happened while the revision that did move goes unmentioned.
+ *
+ * Both decisions are exercised, because the acceptance path reads the card before it reaches
+ * the use case and the change-request path does not, so the two refusals are produced by
+ * different code and either one could name the wrong fact alone.
+ */
+test('F24-AC4: a conflict names the fact that moved, not the one that stayed', async (t) => {
+  const h = await harness({ content: OWNER_ONLY_CONTENT });
+  t.after(() => h.close());
+
+  // The commit on screen is current; only the revision named is not. The refusal must say so.
+  const revisionOnly = await h.decide(
+    decisionBody({ decision: 'accepted', expectedContractRevision: 2, feedback: null }),
+  );
+  assert.equal(revisionOnly.status, 409, revisionOnly.body);
+  const revisionProblem = problemOf(revisionOnly.body);
+  assert.equal(revisionProblem.error.code, 'Conflict');
+  assert.equal(revisionProblem.error.expected, '2', 'the revision submitted is named as expected');
+  assert.equal(revisionProblem.error.actual, '1', 'and the revision that is current as actual');
+  assert.ok(
+    /contract revision 2/.test(revisionProblem.error.message),
+    `a moved revision must be named as such: ${revisionProblem.error.message}`,
+  );
+  assert.ok(
+    !revisionProblem.error.message.includes(HEAD),
+    `a refusal about the revision must not also claim the commit moved, which it did not: ${revisionProblem.error.message}`,
+  );
+
+  // The same submission as Request Changes, which reaches no card read and so is refused by
+  // the use case instead. Both paths must agree on what the conflict says.
+  const changesRevisionOnly = await h.decide(decisionBody({ expectedContractRevision: 2 }));
+  assert.equal(changesRevisionOnly.status, 409, changesRevisionOnly.body);
+  const changesProblem = problemOf(changesRevisionOnly.body);
+  assert.equal(changesProblem.error.expected, '2');
+  assert.equal(changesProblem.error.actual, '1');
+
+  // And the commit case still names the commit, with the two identities actually differing -
+  // the property the revision case above would have broken.
+  const commitOnly = await h.decide(decisionBody({ decision: 'accepted', expectedHeadSha: OLD_HEAD, feedback: null }));
+  assert.equal(commitOnly.status, 409, commitOnly.body);
+  const commitProblem = problemOf(commitOnly.body);
+  assert.equal(commitProblem.error.expected, OLD_HEAD);
+  assert.equal(commitProblem.error.actual, HEAD);
+  assert.notEqual(commitProblem.error.expected, commitProblem.error.actual);
+
+  // Nothing above was recorded: a conflict is a refusal, not a decision.
+  const unchanged = await h.review();
+  assert.equal(unchanged.card?.decision.outcome, 'none');
+  assert.deepEqual(unchanged.card?.decision.staleDecisions, []);
+});
+
+/**
+ * F24-AC4: a decision bound to one commit is refused after the candidate moves to another.
+ *
+ * Asserted as the *sequence* rather than as one submission, because the two halves fail
+ * differently and a test that only submits the stale SHA never reaches the state the first
+ * half creates. A decision is a claim about one exact build, so an owner who accepted SHA A
+ * cannot have that acceptance read as an acceptance of SHA B (F24-AC4, F25-AC3, F27-AC3).
+ */
+test('F24-AC4, F25-AC3: a decision bound to SHA A is refused once the candidate is at SHA B', async (t) => {
+  const h = await harness({ content: OWNER_ONLY_CONTENT });
+  t.after(() => h.close());
+
+  // The owner renders an eligible card and accepts the build on screen.
+  h.recordOwnerTest({ evidenceId: 'evid-owner-pass', headSha: HEAD });
+  const rendered = await h.review();
+  assert.equal(rendered.card?.candidate.headSha, HEAD, 'the card names the build it was rendered against');
+  assert.equal(rendered.card?.eligibility.readyForAcceptance, true);
+
+  const accepted = await h.decide(decisionBody({ decision: 'accepted', expectedHeadSha: HEAD, feedback: null }));
+  assert.equal(accepted.status, 200, accepted.body);
+  const bound = parse<{ review: MvpReviewCardView }>({ body: accepted.body }).review;
+  assert.equal(bound.decision.decision?.candidateHeadSha, HEAD);
+  assert.equal(bound.decision.authorizesCurrentCandidate, true);
+
+  // The push lands. The same pull request, a new candidate identity, a new commit.
+  h.push({ candidateId: 'cand-checkout-pushed', headSha: PUSHED_HEAD });
+
+  // The decision the owner would now be submitting is the one bound to SHA A, and it is
+  // refused against SHA B rather than applied to it.
+  const stale = await h.decideOn(
+    'cand-checkout-pushed',
+    decisionBody({ decision: 'accepted', expectedHeadSha: HEAD, feedback: null }),
+  );
+  assert.equal(stale.status, 409, `an acceptance of SHA A must not become an acceptance of SHA B: ${stale.body}`);
+  const problem = problemOf(stale.body);
+  assert.equal(problem.error.code, 'Conflict');
+  assert.equal(problem.error.expected, HEAD, 'the refusal names the commit the submission was prepared against');
+  assert.equal(problem.error.actual, PUSHED_HEAD, 'and the commit the candidate is actually on');
+  assert.deepEqual(
+    problem.error.prerequisites ?? [],
+    [],
+    'a conflict carries no eligibility report, so it cannot be mistaken for a readiness answer',
+  );
+
+  // Nothing was decided on the new commit, and the acceptance of SHA A did not migrate to it.
+  const moved = await h.reviewFor('cand-checkout-pushed');
+  assert.equal(moved.card?.decision.outcome, 'none', 'a refused decision records nothing against SHA B');
+  assert.equal(moved.card?.decision.decision, null);
+  assert.equal(moved.card?.decision.authorizesCurrentCandidate, false, 'and SHA B is authorised by nothing');
+
+  // SHA A still carries its own acceptance, on its own card: the push moved the ground under
+  // the decision rather than retracting it (F25-AC3).
+  const original = await h.review();
+  assert.equal(original.card?.decision.decision?.candidateHeadSha, HEAD);
+  assert.equal(original.card?.decision.authorizesCurrentCandidate, true);
+});
+
 test('F23-AC1, F25-AC2: Accept is gated on the card\'s own eligibility, and Request Changes is always permitted', async (t) => {
   const h = await harness({ content: OWNER_ONLY_CONTENT });
   t.after(() => h.close());
@@ -1385,6 +1623,107 @@ test('F23-AC1, F25-AC2: Accept is gated on the card\'s own eligibility, and Requ
 /* -------------------------------------------------------------------------- */
 /* Authorization                                                              */
 /* -------------------------------------------------------------------------- */
+
+/**
+ * F23-AC1, F24-AC3: readiness cannot be bypassed, and the refusal is the product's answer.
+ *
+ * The transport gate and the use-case gate are two refusals for one rule, and the risk is
+ * that one of them is not there: an acceptance that reached the store on an ineligible card
+ * would be a recorded acceptance of work nobody verified, which no later check can undo. So
+ * this asserts both — that the HTTP answer is 422 with the outstanding requirements named, and
+ * that nothing was written — and then asserts the eligibility *itself* says the card is not
+ * ready, so a client cannot read `readyForAcceptance` as a hint the 422 contradicts.
+ *
+ * Every path that could plausibly carry an acceptance around the gate is driven: the direct
+ * accept, the accept of a candidate whose commit never had an observation, and the accept of a
+ * card whose criteria are unmet in the other direction (F25-AC2).
+ */
+test('F23-AC1, F24-AC3: an acceptance on unmet criteria is refused, and readiness is not bypassed', async (t) => {
+  const h = await harness();
+  t.after(() => h.close());
+
+  // The card says so itself, before anything is submitted. A 422 that contradicted the card's
+  // own `readyForAcceptance` would leave the client unable to know which one to believe.
+  const card = await h.review();
+  assert.equal(card.card?.eligibility.readyForAcceptance, false, 'the card declares itself not eligible');
+  assert.ok(
+    card.card?.eligibility.acceptanceBlockers.some((reason) => reason.includes(AUTOMATED_CRITERION_ID)),
+    `the unmet criterion is named on the card: ${JSON.stringify(card.card?.eligibility.acceptanceBlockers)}`,
+  );
+
+  const refused = await h.decide(decisionBody({ decision: 'accepted', feedback: null }));
+  assert.equal(refused.status, 422, `an acceptance on unmet criteria must be refused: ${refused.body}`);
+  const problem = problemOf(refused.body);
+  assert.equal(problem.error.code, 'Blocked');
+  assert.ok(
+    (problem.error.prerequisites ?? []).some((entry) => entry.detail.includes(AUTOMATED_CRITERION_ID)),
+    `the 422 names what to discharge, so readiness is a direction and not a wall: ${refused.body}`,
+  );
+
+  // Nothing was written: a refused acceptance must not leave a decision the owner did not make.
+  const unchanged = await h.review();
+  assert.equal(unchanged.card?.decision.outcome, 'none', 'the refused acceptance recorded nothing');
+  assert.equal(unchanged.card?.decision.decision, null);
+  assert.deepEqual(unchanged.card?.decision.staleDecisions, []);
+  assert.equal(unchanged.card?.decision.authorizesCurrentCandidate, false, 'and nothing was authorised');
+
+  // The same card accepts once the criterion it names is satisfied, which is what makes the
+  // refusal above about readiness rather than about acceptance being unavailable (F25-AC1).
+  h.recordOwnerTest({ evidenceId: 'evid-owner-pass', headSha: HEAD });
+  const stillBlocked = await h.review();
+  assert.equal(
+    stillBlocked.card?.eligibility.readyForAcceptance,
+    false,
+    'the automated criterion is still unmet: satisfying only the owner test does not open acceptance',
+  );
+  const stillRefused = await h.decide(decisionBody({ decision: 'accepted', feedback: null }));
+  assert.equal(stillRefused.status, 422, stillRefused.body);
+});
+
+/**
+ * F24-AC4, F25-AC3: a change request against a stale commit is refused.
+ *
+ * Request Changes is always permitted, which is exactly why its staleness handling has to be
+ * asserted separately: a change request that was allowed to ride a moved ground would record
+ * feedback against a build the owner was no longer looking at, and the next fix pass would be
+ * working from an instruction about the wrong commit (F25-AC2).
+ *
+ * Both facts are exercised — the commit and the revision — because they are two comparisons,
+ * and "stale" being refused in general does not show either one is checked.
+ */
+test('F24-AC4, F25-AC3: a change request against a stale commit or revision is refused', async (t) => {
+  const h = await harness({ content: OWNER_ONLY_CONTENT });
+  t.after(() => h.close());
+
+  const staleCommit = await h.decide(decisionBody({ expectedHeadSha: OLD_HEAD }));
+  assert.equal(staleCommit.status, 409, `a change request for an earlier commit must conflict: ${staleCommit.body}`);
+  const commitProblem = problemOf(staleCommit.body);
+  assert.equal(commitProblem.error.code, 'Conflict');
+  assert.equal(commitProblem.error.expected, OLD_HEAD);
+  assert.equal(commitProblem.error.actual, HEAD);
+  assert.notEqual(commitProblem.error.expected, commitProblem.error.actual);
+
+  const staleRevision = await h.decide(decisionBody({ expectedContractRevision: 3 }));
+  assert.equal(staleRevision.status, 409, staleRevision.body);
+  const revisionProblem = problemOf(staleRevision.body);
+  assert.equal(revisionProblem.error.code, 'Conflict');
+  assert.equal(revisionProblem.error.expected, '3');
+  assert.equal(revisionProblem.error.actual, '1');
+
+  // Neither recorded anything, so the refusals above did not decide on the way out.
+  const unchanged = await h.review();
+  assert.equal(unchanged.card?.decision.outcome, 'none', 'a stale change request records nothing');
+  assert.deepEqual(unchanged.card?.decision.staleDecisions, []);
+
+  // And the current submission of the same kind is recorded, so the refusals are about
+  // staleness rather than about Request Changes being unavailable (F25-AC2).
+  const current = await h.decide(decisionBody());
+  assert.equal(current.status, 200, current.body);
+  const card = parse<{ review: MvpReviewCardView }>({ body: current.body }).review;
+  assert.equal(card.decision.outcome, 'changes_requested');
+  assert.equal(card.decision.decision?.candidateHeadSha, HEAD);
+  assert.equal(card.decision.authorizesCurrentCandidate, false, 'a change request authorises nothing (F27-AC3)');
+});
 
 test('F02-AC2: a candidate is addressed by its own project, never by id alone', async (t) => {
   const h = await harness();

@@ -42,6 +42,7 @@ import type {
   ControllerSurface,
   MvpReviewCardView,
   ReviewEvidenceView,
+  ReviewOwnerDecisionView,
   SessionUseCases,
   StoredSessionRecord,
 } from '../contracts.ts';
@@ -556,6 +557,76 @@ test('F25-AC3: an acceptance that authorises the candidate while naming another 
   };
   await withCard(card, async (h) => {
     await refuses(h, 'an acceptance of another commit reported as authorising this one');
+  });
+});
+
+test('F02-AC2, F25-AC2: a decision naming another request, contract or candidate is refused rather than returned', async () => {
+  const base = consistentCard();
+  const recorded: ReviewOwnerDecisionView = {
+    decisionId: 'dec-1',
+    kind: 'changes_requested',
+    ownerId: OWNER_ID,
+    decidedAt: LATER,
+    requestId: REQUEST_ID,
+    contractId: CONTRACT_ID,
+    contractRevision: 1,
+    candidateId: CANDIDATE_ID,
+    candidateHeadSha: HEAD,
+    feedback: 'The total is wrong.',
+  };
+
+  // Each case changes exactly one identity, and leaves every other fact correct - including
+  // the commit, which still names the candidate on screen. So the only thing a refusal can be
+  // about is the identity that was changed, which is what makes each refusal specific.
+  for (const [what, identity] of [
+    ['request', { requestId: 'req-somewhere-else' }],
+    ['contract', { contractId: 'dc_somewhere_else' }],
+    ['candidate', { candidateId: 'cand-somewhere-else' }],
+  ] as const) {
+    const card: MvpReviewCardView = {
+      ...base,
+      decision: {
+        outcome: 'changes_requested',
+        decision: { ...recorded, ...identity },
+        staleDecisions: [],
+        authorizesCurrentCandidate: false,
+      },
+    };
+    await withCard(card, async (h) => {
+      const response = await h.decide();
+      assert.notEqual(
+        response.status,
+        200,
+        `a decision about another ${what} must not be answered as this request's decision: ${response.body}`,
+      );
+      assert.equal(
+        response.status,
+        503,
+        `a decision naming another ${what} must be refused as unverifiable: ${response.body}`,
+      );
+      const problem = JSON.parse(response.body) as Problem;
+      assert.equal(problem.error.code, 'Unavailable');
+      assert.ok(
+        problem.error.message.includes(`names ${what} `),
+        `the refusal must name the ${what} that does not belong: ${problem.error.message}`,
+      );
+    });
+  }
+
+  // The same decision with every identity correct is recorded, so the three refusals above are
+  // about the identity and not about a decision being impossible to return.
+  const honest: MvpReviewCardView = {
+    ...base,
+    decision: {
+      outcome: 'changes_requested',
+      decision: recorded,
+      staleDecisions: [],
+      authorizesCurrentCandidate: false,
+    },
+  };
+  await withCard(honest, async (h) => {
+    const response = await h.decide();
+    assert.equal(response.status, 200, `a decision bound to this candidate must be returned: ${response.body}`);
   });
 });
 

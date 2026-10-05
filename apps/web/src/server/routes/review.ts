@@ -228,9 +228,13 @@ export function registerReviewRoutes(app: FastifyInstance, options: ReviewRouteO
     // another: reading the current card's blockers and returning them as the reason an
     // acceptance of SHA A failed tells the owner to go and discharge requirements on a
     // build they never looked at, and never mentions that a push moved the ground. The
-    // domain refuses in this order too - `staleSubmission` runs before the acceptance gate
-    // in `decide` - so the transport and the use case agree on what a stale submission is
-    // rather than answering the same command two different ways (F24-AC4, F25-AC3).
+    // domain refuses in this order too: `staleSubmission` runs at the top of `decide`,
+    // before the acceptance gate that reads `eligibility.readyForAcceptance` off the freshly
+    // projected card. Verified rather than assumed — the ordering is what lets the transport and
+    // the use case agree on what a stale submission is, rather than answering the same command
+    // two different ways. That agreement was the point of the check, and it did not hold: the
+    // transport refused with the wrong identity (see `staleCard`), so a submission the domain
+    // called a moved revision was answered by this layer as a moved commit (F24-AC4, F25-AC3).
     if (body.value.decision === 'accepted') {
       const current = await options.controller.mvpReview.getReview({
         projectId: params.value.projectId,
@@ -240,11 +244,27 @@ export function registerReviewRoutes(app: FastifyInstance, options: ReviewRouteO
       if (!current.ok) return sendProblem(reply, problemFor(current.error));
       const card = checkedCard(current.value, params.value.projectId, params.value.candidateId, reply);
       if (card === null) return reply;
-      if (
-        card.value.candidate.headSha !== body.value.expectedHeadSha ||
-        card.value.contract.revision !== body.value.expectedContractRevision
-      ) {
-        return sendProblem(reply, problemFor(staleCard(body.value.expectedHeadSha, card.value)));
+      // Which of the two facts moved is decided here, from the two comparisons, rather than
+      // re-derived from the card below. The card's own `contract.revision` and
+      // `candidate.contractRevision` are equal by construction - both come from one read of the
+      // revision the candidate is bound to - so asking the card which one is wrong always answers
+      // "neither", and a submission refused for a revision that moved was reported as a commit
+      // that moved. Naming `expected` as the submitted commit and `actual` as the same commit
+      // back is a conflict that describes nothing: the owner is sent to re-render without ever
+      // being told the ground that moved was the revision (F24-AC4).
+      const revisionMoved = card.value.contract.revision !== body.value.expectedContractRevision;
+      const commitMoved = card.value.candidate.headSha !== body.value.expectedHeadSha;
+      if (revisionMoved || commitMoved) {
+        return sendProblem(
+          reply,
+          problemFor(
+            staleCard(
+              { headSha: body.value.expectedHeadSha, contractRevision: body.value.expectedContractRevision },
+              card.value,
+              revisionMoved,
+            ),
+          ),
+        );
       }
       if (!card.value.eligibility.readyForAcceptance) {
         return sendProblem(
@@ -294,23 +314,39 @@ export function registerReviewRoutes(app: FastifyInstance, options: ReviewRouteO
   });
 }
 
-/** The conflict a submission prepared against facts that have moved earns (F24-AC4). */
+/**
+ * The conflict a submission prepared against facts that have moved earns (F24-AC4).
+ *
+ * `revisionMoved` is a parameter rather than something derived from `card`, and the reason is
+ * that the card cannot answer the question. Its `contract.revision` and
+ * `candidate.contractRevision` are the same number by construction — both are read from the one
+ * revision the candidate is bound to — so a card inspected for a disagreement between them is
+ * always found consistent, and the wrong branch is the one that would have answered correctly.
+ * The caller has already compared both submitted facts against both current ones, so it knows
+ * which moved; this function only says so.
+ *
+ * The revision is reported first when it moved, because a decision names two facts and the
+ * commit is the one a reader compares against a build. If both moved, saying the revision
+ * leads is right: re-rendering resolves both, and naming only the commit would leave the owner
+ * to discover the second on the next submission.
+ */
 function staleCard(
-  expectedHeadSha: string,
+  submitted: { readonly headSha: string; readonly contractRevision: number },
   card: MvpReviewCardView,
+  revisionMoved: boolean,
 ): { readonly code: 'Conflict'; readonly reason: string; readonly expected: string; readonly actual: string } {
-  if (card.contract.revision !== card.candidate.contractRevision) {
+  if (revisionMoved) {
     return {
       code: 'Conflict',
-      reason: `This submission was prepared against contract revision ${card.candidate.contractRevision}, but revision ${card.contract.revision} is current. Re-render and submit again (F24-AC4).`,
-      expected: String(card.candidate.contractRevision),
+      reason: `This submission was prepared against contract revision ${submitted.contractRevision}, but revision ${card.contract.revision} is current. Re-render and submit again (F24-AC4).`,
+      expected: String(submitted.contractRevision),
       actual: String(card.contract.revision),
     };
   }
   return {
     code: 'Conflict',
-    reason: `This submission was prepared against candidate ${expectedHeadSha}, but the candidate on screen is ${card.candidate.headSha}. Evidence and decisions from the earlier commit do not describe this one (F24-AC4, F25-AC3).`,
-    expected: expectedHeadSha,
+    reason: `This submission was prepared against candidate ${submitted.headSha}, but the candidate on screen is ${card.candidate.headSha}. Evidence and decisions from the earlier commit do not describe this one (F24-AC4, F25-AC3).`,
+    expected: submitted.headSha,
     actual: card.candidate.headSha,
   };
 }
@@ -554,10 +590,18 @@ function isStaleConsistent(evidence: MvpReviewCardView['evidence'][number], head
 /**
  * Checks that the decision on the card is the decision this call made.
  *
- * Four facts, each of which a response could otherwise get wrong: the kind, the full commit
- * and the contract revision it binds, and the owner it is attributed to. The owner is
- * compared against the proved session, so a decision recorded under somebody else's
- * identity is refused rather than returned (F01-AC1, F24-AC4, F25-AC3).
+ * Seven facts, each of which a response could otherwise get wrong: the kind, the owner it is
+ * attributed to, the request and the contract it belongs to, the candidate it names, the full
+ * commit and the contract revision it binds. All seven are compared, because the decision is
+ * the one object on the card that is returned as *this call's* answer, and a card carrying a
+ * decision about another candidate would otherwise be answered with it (F02-AC2, F24-AC4,
+ * F25-AC2, F25-AC3).
+ *
+ * The owner is compared against the proved session, so a decision recorded under somebody
+ * else's identity is refused rather than returned (F01-AC1, F25-AC4). The request, contract and
+ * candidate are compared against the card's own, which the path proved above: a decision naming
+ * a candidate this path never addressed is the cross-project boundary failing one layer later
+ * than it is checked (F02-AC2).
  */
 function checkDecisionBinding(
   card: MvpReviewCardView,
@@ -583,6 +627,26 @@ function checkDecisionBinding(
       `The card reports a ${submitted.decision} decision and carries no decision to show, so nothing is returned that would let it read as recorded (F25-AC2).`,
     );
     return null;
+  }
+  // The three identities a decision is *about*, before the commit it is bound to. Checked
+  // here rather than left to `checkedCard` because `checkedCard` proves the card's candidate
+  // and the path agree, which says nothing about the decision nested inside it: a card about
+  // `cand-checkout` carrying a decision about `cand-checkout-other` is a card whose two halves
+  // contradict each other, and returning it answers this call with another candidate's decision.
+  // A decision is refused rather than corrected, because a response that reports a decision
+  // other than the one recorded is worse than no response (F02-AC2, F25-AC2).
+  for (const [what, recorded, expected] of [
+    ['request', decision.requestId, card.request.requestId],
+    ['contract', decision.contractId, card.contract.contractId],
+    ['candidate', decision.candidateId, card.candidate.candidateId],
+  ] as const) {
+    if (recorded !== expected) {
+      refuse(
+        reply,
+        `The recorded decision names ${what} ${recorded} rather than ${expected}, which is the one this request was about, so the response is not returned as this request's decision (F02-AC2, F25-AC2).`,
+      );
+      return null;
+    }
   }
   if (decision.candidateHeadSha !== submitted.headSha) {
     refuse(
