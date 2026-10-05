@@ -401,21 +401,24 @@ export async function listContractCriteria(
  * `PATCH /api/projects/:projectId/contracts/:contractId/:revision` — edits a draft revision in
  * place. Read in `routes/contracts.ts`.
  *
- * `expectedUpdatedAt` is required by the route, and a stale editor is a `Conflict` rather than an
- * overwrite. An approved revision answers 400 here; `reviseContract` is the way forward
- * (mvp-spec 3, F24-AC4).
+ * `expectedContentFingerprint` is required by the route, and a stale editor is a `Conflict`
+ * rather than an overwrite. It is the `contentFingerprint` of the read that was rendered, the
+ * same value `approveContract` sends, because it is the only token that identifies the text
+ * this call is about: a revision number outlives its text and two writes can share a
+ * millisecond, so an instant would let the second of two tabs land over the first. An approved
+ * revision answers 400 here; `reviseContract` is the way forward (mvp-spec 3, F24-AC4).
  */
 export async function editContract(
   scope: ProjectScope,
   contractId: string,
   revision: number,
-  content: ContractContentInput & { readonly expectedUpdatedAt: string },
+  content: ContractContentInput & { readonly expectedContentFingerprint: string },
 ): Promise<MvpResult<ContractView>> {
   const body = await scopedSend<{ readonly contract: ContractView }>(
     scope,
     'PATCH',
     `/contracts/${idSegment(contractId)}/${revisionSegment(revision)}`,
-    { ...content, expectedUpdatedAt: content.expectedUpdatedAt },
+    { ...content, expectedContentFingerprint: content.expectedContentFingerprint },
   );
   if (!body.ok) return body;
   return envelope<ContractView>(body.value, 'contract', CONTRACT_ROUTE);

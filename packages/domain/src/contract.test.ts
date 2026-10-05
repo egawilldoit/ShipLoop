@@ -15,6 +15,7 @@ import {
   supersedeContract,
   type ContractContent,
   type ContractId,
+  type Fingerprint,
   type OwnerId,
   type ProjectId,
   type RequestId,
@@ -169,7 +170,7 @@ test('editing a draft keeps its revision number and moves updatedAt', () => {
   const edited = editContract(
     draft,
     { ...BASE, scope: [...BASE.scope, 'Show the currency code'] },
-    { expectedUpdatedAt: draft.updatedAt, at: '2026-03-01T10:30:00.000Z', editedBy: OWNER },
+    { expectedContentFingerprint: draft.contentFingerprint, at: '2026-03-01T10:30:00.000Z', editedBy: OWNER },
   );
   assert.ok(edited.ok, edited.ok ? '' : edited.error.reason);
   assert.equal(edited.value.revision, 1);
@@ -179,23 +180,55 @@ test('editing a draft keeps its revision number and moves updatedAt', () => {
   assert.equal(draft.scope.length, 2, 'the prior value is untouched');
 });
 
-test('editing against a stale read is a conflict carrying both instants', () => {
+test('editing against a stale read is a conflict naming the fingerprint it found', () => {
   const draft = draftAt();
+  // A fingerprint of text this revision does not hold: a tab that read some other draft, or
+  // one whose read has since been overtaken.
   const conflicted = editContract(draft, { ...BASE, outcome: 'Changed.' }, {
-    expectedUpdatedAt: '2026-02-01T00:00:00.000Z',
+    expectedContentFingerprint: fingerprint({ outcome: 'Some scope nobody edited here.' }),
     at: '2026-03-01T10:30:00.000Z',
     editedBy: OWNER,
   });
   assert.ok(!conflicted.ok);
   assert.equal(conflicted.error.code, 'Conflict');
   if (conflicted.error.code !== 'Conflict') return;
-  assert.equal(conflicted.error.actual, draft.updatedAt);
+  assert.equal(conflicted.error.actual, draft.contentFingerprint);
+  assert.match(conflicted.error.reason, /Revision 1 changed after it was loaded/);
+});
+
+test('F24-AC4: two tabs writing in the same millisecond, the second is refused and the first survives', () => {
+  // Both tabs read the draft at the same instant, so both hold the same `updatedAt` and the
+  // same fingerprint. Every write below happens at that instant too: this is the case an
+  // instant-locked edit cannot see, because after tab A's write the stored `updatedAt` is
+  // byte-identical to the one tab B is still holding.
+  const instant = '2026-03-01T10:30:00.000Z';
+  const loaded = draftAt({ at: instant });
+  const tabA: Fingerprint = loaded.contentFingerprint;
+  const tabB: Fingerprint = loaded.contentFingerprint;
+  assert.equal(tabA, tabB, 'both tabs read the same draft');
+
+  const A: ContractContent = { ...BASE, outcome: 'The summary shows the total and the currency code.' };
+  const B: ContractContent = { ...BASE, outcome: 'The summary shows the total and the shipping total.' };
+  const written = editContract(loaded, A, { expectedContentFingerprint: tabA, at: instant, editedBy: OWNER });
+  assert.ok(written.ok, written.ok ? '' : written.error.reason);
+  assert.equal(written.value.updatedAt, instant, 'the instant is the one tab B still holds');
+
+  // Tab B, holding text the store has since replaced, is refused even though nothing it
+  // sends has changed.
+  const stale = editContract(written.value, B, { expectedContentFingerprint: tabB, at: instant, editedBy: OWNER });
+  assert.ok(!stale.ok, 'a same-millisecond edit is a lost update, not a save');
+  assert.equal(stale.error.code, 'Conflict');
+  if (stale.error.code !== 'Conflict') return;
+  assert.equal(stale.error.expected, tabB);
+  assert.equal(stale.error.actual, written.value.contentFingerprint);
+  assert.notEqual(written.value.contentFingerprint, tabA, 'and the text did move');
+  assert.equal(written.value.outcome, A.outcome, "tab A's text is what is stored");
 });
 
 test('an edit that changes nothing is refused rather than reported as a save', () => {
   const draft = draftAt();
   const noop = editContract(draft, BASE, {
-    expectedUpdatedAt: draft.updatedAt,
+    expectedContentFingerprint: draft.contentFingerprint,
     at: '2026-03-01T10:30:00.000Z',
     editedBy: OWNER,
   });
@@ -215,7 +248,7 @@ test('approval records the owner and the instant, and reseals the fingerprint', 
 test('an approved revision cannot be edited: the way forward is a new revision', () => {
   const sealed = approved();
   const edited = editContract(sealed, { ...BASE, outcome: 'Something else entirely.' }, {
-    expectedUpdatedAt: sealed.updatedAt,
+    expectedContentFingerprint: sealed.contentFingerprint,
     at: '2026-03-02T10:00:00.000Z',
     editedBy: OWNER,
   });
@@ -229,7 +262,7 @@ test('a stale revision cannot be edited either', () => {
   const stale = invalidateContract(sealed, { reason: 'The owner changed the scope.', at: '2026-03-02T10:00:00.000Z' });
   assert.ok(stale.ok, stale.ok ? '' : stale.error.reason);
   const edited = editContract(stale.value, { ...BASE, outcome: 'Rewritten.' }, {
-    expectedUpdatedAt: stale.value.updatedAt,
+    expectedContentFingerprint: stale.value.contentFingerprint,
     at: '2026-03-02T11:00:00.000Z',
     editedBy: OWNER,
   });
@@ -273,7 +306,7 @@ test('an approval naming text the caller did not review is refused, and nothing 
   // What the stale tab holds: the fingerprint of the text as it read before an edit.
   const reviewed = draft.contentFingerprint;
   const edited = editContract(draft, { ...BASE, outcome: 'The summary shows the total with shipping.' }, {
-    expectedUpdatedAt: draft.updatedAt,
+    expectedContentFingerprint: draft.contentFingerprint,
     at: '2026-03-01T10:30:00.000Z',
     editedBy: OWNER,
   });
@@ -344,7 +377,7 @@ test('approval re-derives the fingerprint it seals, so a drifted draft cannot be
 test('a no-op edit does not move the lock, so it cannot invalidate a page that read the draft', () => {
   const draft = draftAt();
   const noop = editContract(draft, { ...BASE }, {
-    expectedUpdatedAt: draft.updatedAt,
+    expectedContentFingerprint: draft.contentFingerprint,
     at: '2026-03-01T10:30:00.000Z',
     editedBy: OWNER,
   });
@@ -363,7 +396,7 @@ test('a no-op edit does not move the lock, so it cannot invalidate a page that r
 test('a reordering of the same criteria is not material, and leaves the lock alone', () => {
   const draft = draftAt();
   const reordered = editContract(draft, { ...BASE, acceptanceCriteria: [...BASE.acceptanceCriteria].reverse() }, {
-    expectedUpdatedAt: draft.updatedAt,
+    expectedContentFingerprint: draft.contentFingerprint,
     at: '2026-03-01T10:30:00.000Z',
     editedBy: OWNER,
   });

@@ -1632,7 +1632,13 @@ export interface SurfaceContractUseCases {
     readonly scope: readonly string[];
     readonly outOfScope: readonly string[];
     readonly acceptanceCriteria: readonly SurfaceContractCriterion[];
-    readonly expectedUpdatedAt: string;
+    /**
+     * The `contentFingerprint` of the revision as the owner read it, sent back by the
+     * client, and required. An edit writes over text, so it names that text the way an
+     * approval does - the instant cannot, because two writes can share a millisecond
+     * (mvp-spec 3, mvp-spec 7).
+     */
+    readonly expectedContentFingerprint: string;
     readonly actor: string;
   }): Promise<Result<SurfaceContract, DomainError>>;
   approveRevision(command: {
@@ -3117,6 +3123,15 @@ export function createControllerSurface(resolve: SurfaceRootResolver): Controlle
           return ok(criteria.value.map((criterion) => ({ ...criterion })));
         }),
 
+      /**
+       * Edits a draft, naming the text it replaces.
+       *
+       * The fingerprint the client read comes straight through rather than being
+       * re-derived here: it is a reference to a value the read returned, and the use case
+       * checks it against the fingerprint the domain derives from the stored text. An edit
+       * and an approval therefore name their text the same way, which is what stops the two
+       * from holding two different opinions about when a draft has moved (mvp-spec 3).
+       */
       editContract: async (command) =>
         use((root) => {
           const actor = ownerActorFor(command.actor);
@@ -3127,7 +3142,7 @@ export function createControllerSurface(resolve: SurfaceRootResolver): Controlle
               contractId: command.contractId as ContractId,
               revision: command.revision,
               content: contractContentOf(command),
-              expectedUpdatedAt: command.expectedUpdatedAt,
+              expectedContentFingerprint: command.expectedContentFingerprint,
             },
             actor.value,
           );

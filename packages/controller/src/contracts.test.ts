@@ -123,7 +123,22 @@ function steppedClock(): ControllerClock {
   };
 }
 
-async function withHarness(body: (harness: Harness) => Promise<void> | void): Promise<void> {
+/**
+ * A clock that does not move.
+ *
+ * Two tabs whose reads and whose writes all land in one millisecond is the case a timestamp
+ * lock cannot see, and it cannot be reached by waiting for a real clock to be slow: it has to
+ * be arranged. `TESTING.md` asks for injected clocks for exactly this reason, so the race is
+ * a fact of the fixture rather than a hope about the host (mvp-spec 7).
+ */
+function frozenClock(at = '2026-10-02T09:00:00.000Z'): ControllerClock {
+  return { now: () => at };
+}
+
+async function withHarness(
+  body: (harness: Harness) => Promise<void> | void,
+  clock: ControllerClock = steppedClock(),
+): Promise<void> {
   const directory = await mkdtemp(join(tmpdir(), 'shiploop-controller-contracts-'));
   const opened = openDatabase(join(directory, 'shiploop.sqlite'));
   assert.ok(opened.ok, `the database could not be opened: ${opened.ok ? '' : opened.error.reason}`);
@@ -136,7 +151,7 @@ async function withHarness(body: (harness: Harness) => Promise<void> | void): Pr
 
     const requests = new RequestRepository(opened.value);
     const contracts = new ContractRepository(opened.value);
-    const useCases = createContractUseCases({ clock: steppedClock(), requests, contracts });
+    const useCases = createContractUseCases({ clock, requests, contracts });
 
     const request = expectOk(
       useCases.createRequest(
@@ -212,7 +227,7 @@ test('every use case refuses a coding agent before it reads a project-scoped row
       expectError(harness.useCases.updateRequest({ projectId: PROJECT, requestId: harness.requestId, expectedUpdatedAt: 'x' }, CODING_AGENT), 'Forbidden'),
       expectError(harness.useCases.getContract({ projectId: PROJECT, contractId: harness.contractId, revision: 1 }, CODING_AGENT), 'Forbidden'),
       expectError(harness.useCases.listContractCriteria({ projectId: PROJECT, contractId: harness.contractId, revision: 1 }, CODING_AGENT), 'Forbidden'),
-      expectError(harness.useCases.editContract({ projectId: PROJECT, contractId: harness.contractId, revision: 1, content: CONTENT, expectedUpdatedAt: 'x' }, CODING_AGENT), 'Forbidden'),
+      expectError(harness.useCases.editContract({ projectId: PROJECT, contractId: harness.contractId, revision: 1, content: CONTENT, expectedContentFingerprint: 'fp_00000000000000000000000000000000' }, CODING_AGENT), 'Forbidden'),
       expectError(
         harness.useCases.approveContract(
           { projectId: PROJECT, contractId: harness.contractId, revision: 1, expectedContentFingerprint: 'fp_00000000000000000000000000000000' },
@@ -366,7 +381,7 @@ test('editing a draft moves its content and keeps its revision number', async ()
     const before = expectOk(harness.useCases.getContract({ projectId: PROJECT, contractId: harness.contractId, revision: 1 }, OWNER));
     const edited = expectOk(
       harness.useCases.editContract(
-        { projectId: PROJECT, contractId: harness.contractId, revision: 1, content: CHANGED, expectedUpdatedAt: before.updatedAt },
+        { projectId: PROJECT, contractId: harness.contractId, revision: 1, content: CHANGED, expectedContentFingerprint: before.contentFingerprint },
         OWNER,
       ),
     );
@@ -377,16 +392,107 @@ test('editing a draft moves its content and keeps its revision number', async ()
   });
 });
 
+test('the edit answer carries the fingerprint the next edit and the approval need', async () => {
+  await withHarness((harness) => {
+    const before = expectOk(harness.useCases.getContract({ projectId: PROJECT, contractId: harness.contractId, revision: 1 }, OWNER));
+    const edited = expectOk(
+      harness.useCases.editContract(
+        { projectId: PROJECT, contractId: harness.contractId, revision: 1, content: CHANGED, expectedContentFingerprint: before.contentFingerprint },
+        OWNER,
+      ),
+    );
+    // The value the answer reports is the value the row now holds, so a client that renders
+    // this answer can edit or approve without a second round trip - and cannot be holding a
+    // lock that already describes replaced text.
+    const reread = expectOk(
+      harness.useCases.getContract({ projectId: PROJECT, contractId: harness.contractId, revision: 1 }, OWNER),
+    );
+    assert.equal(edited.contentFingerprint, reread.contentFingerprint);
+
+    const second = expectOk(
+      harness.useCases.editContract(
+        {
+          projectId: PROJECT,
+          contractId: harness.contractId,
+          revision: 1,
+          content: { ...CHANGED, outcome: 'A second edit, sent back with the first answer.' },
+          expectedContentFingerprint: edited.contentFingerprint,
+        },
+        OWNER,
+      ),
+    );
+    assert.notEqual(second.contentFingerprint, edited.contentFingerprint);
+    expectOk(
+      harness.useCases.approveContract(
+        { projectId: PROJECT, contractId: harness.contractId, revision: 1, expectedContentFingerprint: second.contentFingerprint },
+        OWNER,
+      ),
+    );
+  });
+});
+
 test('an edit that changes nothing is refused rather than reported as a save', async () => {
   await withHarness((harness) => {
     const before = expectOk(harness.useCases.getContract({ projectId: PROJECT, contractId: harness.contractId, revision: 1 }, OWNER));
     expectError(
       harness.useCases.editContract(
-        { projectId: PROJECT, contractId: harness.contractId, revision: 1, content: CONTENT, expectedUpdatedAt: before.updatedAt },
+        { projectId: PROJECT, contractId: harness.contractId, revision: 1, content: CONTENT, expectedContentFingerprint: before.contentFingerprint },
         OWNER,
       ),
       'Invalid',
     );
+  });
+});
+
+test('an edit has to name the text it replaces, so a body cannot save over whatever is stored', async () => {
+  await withHarness((harness) => {
+    const unnamed = expectError(
+      harness.useCases.editContract(
+        { projectId: PROJECT, contractId: harness.contractId, revision: 1, content: CHANGED, expectedContentFingerprint: '' },
+        OWNER,
+      ),
+      'Invalid',
+    );
+    assert.equal(
+      unnamed.code === 'Invalid' ? unnamed.fields[0]?.path : null,
+      'expectedContentFingerprint',
+      'the refusal names the field the owner has to send',
+    );
+    const nonsense = expectError(
+      harness.useCases.editContract(
+        { projectId: PROJECT, contractId: harness.contractId, revision: 1, content: CHANGED, expectedContentFingerprint: 'fp_not-a-fingerprint' },
+        OWNER,
+      ),
+      'Invalid',
+    );
+    assert.equal(nonsense.code === 'Invalid' ? nonsense.fields[0]?.path : null, 'expectedContentFingerprint');
+    assert.equal(expectOk(harness.useCases.getContract({ projectId: PROJECT, contractId: harness.contractId, revision: 1 }, OWNER)).outcome, CONTENT.outcome);
+  });
+});
+
+test('an approved revision cannot be edited, whichever fingerprint it is sent', async () => {
+  await withHarness((harness) => {
+    const read = expectOk(harness.useCases.getContract({ projectId: PROJECT, contractId: harness.contractId, revision: 1 }, OWNER));
+    const approved = expectOk(approveAsRead(harness));
+    // The refusal is about the status and not about the lock, so it is the same whether the
+    // fingerprint is current, stale, or invented.
+    for (const expectedContentFingerprint of [read.contentFingerprint, fingerprint({ outcome: 'Nothing stored.' })]) {
+      const refused = expectError(
+        harness.useCases.editContract(
+          { projectId: PROJECT, contractId: harness.contractId, revision: 1, content: CHANGED, expectedContentFingerprint },
+          OWNER,
+        ),
+        'Invalid',
+      );
+      assert.match(
+        refused.code === 'Invalid' ? refused.fields.map((field) => field.message).join(' ') : '',
+        /approved revision is frozen/,
+      );
+    }
+    const sealed = expectOk(harness.useCases.getContract({ projectId: PROJECT, contractId: harness.contractId, revision: 1 }, OWNER));
+    assert.equal(sealed.outcome, CONTENT.outcome, 'and the approved text is unchanged');
+    assert.equal(sealed.contentFingerprint, read.contentFingerprint);
+    assert.equal(sealed.approvedAt, approved.approvedAt);
   });
 });
 
@@ -475,7 +581,7 @@ test('two tabs: the second edit is refused against a stale read, and the owner i
 
     const written = expectOk(
       harness.useCases.editContract(
-        { projectId: PROJECT, contractId: harness.contractId, revision: 1, content: CHANGED, expectedUpdatedAt: tabB.updatedAt },
+        { projectId: PROJECT, contractId: harness.contractId, revision: 1, content: CHANGED, expectedContentFingerprint: tabB.contentFingerprint },
         OWNER,
       ),
     );
@@ -485,16 +591,68 @@ test('two tabs: the second edit is refused against a stale read, and the owner i
     // text tab B just wrote: two tabs cannot both believe they saved the draft.
     const refused = expectError(
       harness.useCases.editContract(
-        { projectId: PROJECT, contractId: harness.contractId, revision: 1, content: CONTENT, expectedUpdatedAt: tabA.updatedAt },
+        { projectId: PROJECT, contractId: harness.contractId, revision: 1, content: CONTENT, expectedContentFingerprint: tabA.contentFingerprint },
         OWNER,
       ),
       'Conflict',
     );
     assert.match(refused.reason, /Reload it before saving again/);
+    assert.equal(refused.code === 'Conflict' ? refused.expected : null, tabA.contentFingerprint);
+    assert.equal(refused.code === 'Conflict' ? refused.actual : null, written.contentFingerprint);
     const stored = expectOk(harness.useCases.getContract({ projectId: PROJECT, contractId: harness.contractId, revision: 1 }, OWNER));
     assert.equal(stored.outcome, CHANGED.outcome, "tab B's write is what survived");
     assert.equal(stored.scope.length, CHANGED.scope.length);
   });
+});
+
+test('F24-AC4: two tabs writing in the same millisecond, the loser is refused and the winner is stored intact', async () => {
+  // Every instant in this case is the same one. Two tabs read the draft, the first tab saves,
+  // and the second tab saves within the same millisecond - so after the first write the
+  // stored `updated_at` is byte-identical to the one the second tab is still holding, and a
+  // write locked on the instant has nothing left to notice. Real repositories, real SQLite,
+  // a clock that does not move.
+  await withHarness(
+    (harness) => {
+      const instant = '2026-10-02T09:00:00.000Z';
+      const tabA = expectOk(harness.useCases.getContract({ projectId: PROJECT, contractId: harness.contractId, revision: 1 }, OWNER));
+      const tabB = expectOk(harness.useCases.getContract({ projectId: PROJECT, contractId: harness.contractId, revision: 1 }, OWNER));
+      assert.equal(tabA.updatedAt, tabB.updatedAt);
+      assert.equal(tabA.contentFingerprint, tabB.contentFingerprint);
+
+      const fromA: ContractContentInput = { ...CHANGED, outcome: 'The summary shows the total and the shipping total.' };
+      const fromB: ContractContentInput = { ...CHANGED, outcome: 'The summary shows the total and the currency code.' };
+
+      const winner = expectOk(
+        harness.useCases.editContract(
+          { projectId: PROJECT, contractId: harness.contractId, revision: 1, content: fromA, expectedContentFingerprint: tabA.contentFingerprint },
+          OWNER,
+        ),
+      );
+      assert.equal(winner.updatedAt, instant, 'the first write did not move the clock, so the instant cannot be the lock');
+
+      // The defect this closes: before the fingerprint lock, this call succeeded and the
+      // draft ended up holding tab B's text with both tabs reporting a save.
+      const loser = expectError(
+        harness.useCases.editContract(
+          { projectId: PROJECT, contractId: harness.contractId, revision: 1, content: fromB, expectedContentFingerprint: tabB.contentFingerprint },
+          OWNER,
+        ),
+        'Conflict',
+      );
+      assert.match(loser.reason, /changed after it was loaded/);
+      assert.equal(loser.code === 'Conflict' ? loser.expected : null, tabB.contentFingerprint, 'the refusal names what the tab read');
+      assert.equal(loser.code === 'Conflict' ? loser.actual : null, winner.contentFingerprint, 'and what is stored');
+
+      // Nothing of the losing write landed, and the winner is readable as it was answered.
+      const stored = expectOk(harness.useCases.getContract({ projectId: PROJECT, contractId: harness.contractId, revision: 1 }, OWNER));
+      assert.equal(stored.outcome, fromA.outcome);
+      assert.deepEqual([...stored.scope], [...fromA.scope]);
+      assert.equal(stored.contentFingerprint, winner.contentFingerprint);
+      assert.equal(stored.updatedAt, instant, 'no clock moved, so nothing here can be attributed to a later write');
+      assert.equal(stored.status, 'draft', 'and the draft was never sealed over either text');
+    },
+    frozenClock(),
+  );
 });
 
 test('two tabs: the first approval is refused because it names text the owner never saw', async () => {
@@ -503,10 +661,10 @@ test('two tabs: the first approval is refused because it names text the owner ne
     const tabA = expectOk(harness.useCases.getContract({ projectId: PROJECT, contractId: harness.contractId, revision: 1 }, OWNER));
     assert.equal(tabA.status, 'draft');
 
-    // Tab B edits it, which is legitimate: it read the same instant tab A did.
+    // Tab B edits it, which is legitimate: it read the same draft tab A did.
     const edited = expectOk(
       harness.useCases.editContract(
-        { projectId: PROJECT, contractId: harness.contractId, revision: 1, content: CHANGED, expectedUpdatedAt: tabA.updatedAt },
+        { projectId: PROJECT, contractId: harness.contractId, revision: 1, content: CHANGED, expectedContentFingerprint: tabA.contentFingerprint },
         OWNER,
       ),
     );
@@ -600,7 +758,7 @@ test('a refused no-op edit does not invalidate the page that read the draft', as
     // save attempt would refuse an owner who had not been lied to.
     expectError(
       harness.useCases.editContract(
-        { projectId: PROJECT, contractId: harness.contractId, revision: 1, content: CONTENT, expectedUpdatedAt: read.updatedAt },
+        { projectId: PROJECT, contractId: harness.contractId, revision: 1, content: CONTENT, expectedContentFingerprint: read.contentFingerprint },
         OWNER,
       ),
       'Invalid',
@@ -617,7 +775,7 @@ test('an approved revision cannot be edited: a new revision is the way forward',
     const approved = expectOk(approveAsRead(harness));
     const refusal = expectError(
       harness.useCases.editContract(
-        { projectId: PROJECT, contractId: harness.contractId, revision: 1, content: CHANGED, expectedUpdatedAt: approved.updatedAt },
+        { projectId: PROJECT, contractId: harness.contractId, revision: 1, content: CHANGED, expectedContentFingerprint: approved.contentFingerprint },
         OWNER,
       ),
       'Invalid',
@@ -956,7 +1114,7 @@ test('binding the check makes the same revision approvable', async () => {
           contractId: draft.contractId as ContractId,
           revision: 1,
           content: CONTENT,
-          expectedUpdatedAt: draft.updatedAt,
+          expectedContentFingerprint: draft.contentFingerprint,
         },
         OWNER,
       ),
@@ -1012,9 +1170,9 @@ test('an owner test needs no binding, and one that names a check is refused by n
               { id: 'AC2', description: 'The owner confirms the total.', verificationType: 'owner_test', verificationCheckId: 'unit-tests' },
             ],
           },
-          expectedUpdatedAt: expectOk(
+          expectedContentFingerprint: expectOk(
             harness.useCases.getContract({ projectId: PROJECT, contractId: harness.contractId, revision: 1 }, OWNER),
-          ).updatedAt,
+          ).contentFingerprint,
         },
         OWNER,
       ),

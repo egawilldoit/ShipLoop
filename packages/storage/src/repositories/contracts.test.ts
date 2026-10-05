@@ -85,6 +85,12 @@ const CHANGED: ContractContent = {
   scope: [...CONTENT.scope, 'Show the currency code'],
 };
 
+/** Text no stored revision holds, for the case of a caller naming something else entirely. */
+const NOT_STORED: ContractContent = {
+  ...CONTENT,
+  outcome: 'Text no tab ever saved.',
+};
+
 function expectOk<T>(result: Result<T, DomainError>): T {
   if (!result.ok) assert.fail(`expected success but received ${result.error.code}: ${result.error.reason}`);
   return result.value;
@@ -387,13 +393,14 @@ test('editing a stored draft moves the content and the fingerprint together', as
   await withDatabase((context) => {
     const stored = storedDraft(context);
     const edited = expectOk(
-      editContract(stored, CHANGED, { expectedUpdatedAt: stored.updatedAt, at: T1, editedBy: OWNER }),
+      editContract(stored, CHANGED, { expectedContentFingerprint: stored.contentFingerprint, at: T1, editedBy: OWNER }),
     );
-    const written = expectOk(context.contracts.editDraft(edited, stored.updatedAt));
+    const written = expectOk(context.contracts.editDraft(edited, stored.contentFingerprint));
 
     assert.equal(written.outcome, CHANGED.outcome);
     assert.deepEqual(written.scope, CHANGED.scope);
     assert.equal(written.contentFingerprint, contractContentFingerprint(CHANGED));
+    assert.notEqual(written.contentFingerprint, stored.contentFingerprint, 'the lock moves with the text');
     assert.equal(written.updatedAt, T1);
     assert.equal(written.revision, 1);
     assert.equal(written.status, 'draft');
@@ -404,18 +411,75 @@ test('an edit against a stale read is a conflict, and the stored draft is unchan
   await withDatabase((context) => {
     const stored = storedDraft(context);
     const first = expectOk(
-      editContract(stored, CHANGED, { expectedUpdatedAt: stored.updatedAt, at: T1, editedBy: OWNER }),
+      editContract(stored, CHANGED, { expectedContentFingerprint: stored.contentFingerprint, at: T1, editedBy: OWNER }),
     );
-    expectOk(context.contracts.editDraft(first, stored.updatedAt));
+    expectOk(context.contracts.editDraft(first, stored.contentFingerprint));
 
     const THIRD: ContractContent = { ...CONTENT, outcome: 'A third outcome, from the tab that loaded first.' };
     const stale = expectOk(
-      editContract(stored, THIRD, { expectedUpdatedAt: stored.updatedAt, at: T2, editedBy: OWNER }),
+      editContract(stored, THIRD, { expectedContentFingerprint: stored.contentFingerprint, at: T2, editedBy: OWNER }),
     );
-    const refused = expectError(context.contracts.editDraft(stale, stored.updatedAt), 'Conflict');
-    assert.equal(refused.code === 'Conflict' ? refused.expected : null, `draft@${T0}`);
-    assert.equal(refused.code === 'Conflict' ? refused.actual : null, `draft@${T1}`);
-    assert.equal(expectOk(context.contracts.read(PROJECT, CONTRACT, 1)).outcome, CHANGED.outcome);
+    // The refusal names the two fingerprints, so a client can tell "you read older text" from
+    // "you sent nonsense" without a second round trip.
+    const refused = expectError(context.contracts.editDraft(stale, stored.contentFingerprint), 'Conflict');
+    assert.equal(refused.code === 'Conflict' ? refused.expected : null, stored.contentFingerprint);
+    assert.equal(refused.code === 'Conflict' ? refused.actual : null, first.contentFingerprint);
+    const after = expectOk(context.contracts.read(PROJECT, CONTRACT, 1));
+    assert.equal(after.outcome, CHANGED.outcome);
+    assert.equal(after.contentFingerprint, first.contentFingerprint);
+  });
+});
+
+test('F24-AC4: two writes in one millisecond, the second changes zero rows and the first survives intact', async () => {
+  await withDatabase((context) => {
+    // The draft is drafted at T1 and both tabs read it there, so every value they hold is
+    // identical - including `updated_at`, which is the point: a store that keyed this write
+    // on the instant would find it unchanged either side of the first write.
+    const stored = storedDraft(context, { at: T1 });
+    const tabA = stored.contentFingerprint;
+    const tabB = stored.contentFingerprint;
+    assert.equal(tabA, tabB);
+
+    const A: ContractContent = { ...CONTENT, outcome: 'The summary shows the total including tax and shipping.' };
+    const B: ContractContent = { ...CONTENT, outcome: 'The summary shows the total including tax and currency.' };
+    const first = expectOk(
+      editContract(stored, A, { expectedContentFingerprint: tabA, at: T1, editedBy: OWNER }),
+    );
+    const won = expectOk(context.contracts.editDraft(first, tabA));
+    assert.equal(won.updatedAt, T1, 'and the stored instant is the one tab B is still holding');
+
+    // Tab B's write, carrying the expectation tab B read. The value is written out rather
+    // than produced by `editContract` because the domain is handed the row the caller read,
+    // and cannot see that the store has since moved - which is why the controller re-reads,
+    // and why this layer still has to refuse the write itself. `editContract` of the row as
+    // it now reads would produce exactly this value, and the statement refuses that too.
+    const tabBWrite: DeliveryContract = {
+      ...stored,
+      ...B,
+      contentFingerprint: contractContentFingerprint(B),
+      updatedAt: T1,
+    };
+    const refused = expectError(context.contracts.editDraft(tabBWrite, tabB), 'Conflict');
+    assert.equal(refused.code === 'Conflict' ? refused.expected : null, tabB);
+    assert.equal(refused.code === 'Conflict' ? refused.actual : null, won.contentFingerprint);
+
+    // Byte-identical, not "the outcome happens to match": nothing of the losing write landed.
+    const after = expectOk(context.contracts.read(PROJECT, CONTRACT, 1));
+    assert.deepEqual(after, won);
+    assert.equal(after.updatedAt, stored.updatedAt, 'and no clock moved');
+  });
+});
+
+test('the store refuses an edit whose fingerprint does not describe the row, even past the domain', async () => {
+  await withDatabase((context) => {
+    const stored = storedDraft(context);
+    const edited = expectOk(
+      editContract(stored, CHANGED, { expectedContentFingerprint: stored.contentFingerprint, at: T1, editedBy: OWNER }),
+    );
+    // A caller that reached past the domain and named some other text: the guard is the
+    // statement's, so it refuses a write the row's own fingerprint does not authorise.
+    expectError(context.contracts.editDraft(edited, contractContentFingerprint(NOT_STORED)), 'Conflict');
+    assert.equal(expectOk(context.contracts.read(PROJECT, CONTRACT, 1)).outcome, CONTENT.outcome);
   });
 });
 
@@ -451,12 +515,14 @@ test('an approved revision cannot be edited through the repository either', asyn
     expectOk(context.contracts.approve(approve(stored), guard(stored)));
 
     // The domain refuses first, and that refusal is what the test asserts: the store has
-    // no path that would produce an edited approved revision.
-    const editAttempt = editContract(
-      expectOk(context.contracts.read(PROJECT, CONTRACT, 1)),
-      CHANGED,
-      { expectedUpdatedAt: T1, at: T2, editedBy: OWNER },
-    );
+    // no path that would produce an edited approved revision. The fingerprint the caller
+    // sends is the sealed revision's own, so nothing but the status can refuse this.
+    const sealed = expectOk(context.contracts.read(PROJECT, CONTRACT, 1));
+    const editAttempt = editContract(sealed, CHANGED, {
+      expectedContentFingerprint: sealed.contentFingerprint,
+      at: T2,
+      editedBy: OWNER,
+    });
     expectError(editAttempt, 'Invalid');
     assert.equal(expectOk(context.contracts.read(PROJECT, CONTRACT, 1)).outcome, CONTENT.outcome);
   });
@@ -468,9 +534,9 @@ test('approving text the owner did not review is a conflict, and the draft is le
     // What the stale tab holds: the fingerprint from before the other tab's edit.
     const reviewed = stored.contentFingerprint;
     const edited = expectOk(
-      editContract(stored, CHANGED, { expectedUpdatedAt: stored.updatedAt, at: T1, editedBy: OWNER }),
+      editContract(stored, CHANGED, { expectedContentFingerprint: stored.contentFingerprint, at: T1, editedBy: OWNER }),
     );
-    expectOk(context.contracts.editDraft(edited, stored.updatedAt));
+    expectOk(context.contracts.editDraft(edited, stored.contentFingerprint));
 
     const refused = expectError(
       context.contracts.approve(approve(edited), { updatedAt: edited.updatedAt, contentFingerprint: reviewed }),
@@ -499,14 +565,14 @@ test('the approval guard moves even when two edits share one instant', async () 
     // tell the two edits apart. The fingerprint can, which is why the guard carries it:
     // a store that relied on the instant alone would let this approval through.
     const first = expectOk(
-      editContract(stored, CHANGED, { expectedUpdatedAt: stored.updatedAt, at: T1, editedBy: OWNER }),
+      editContract(stored, CHANGED, { expectedContentFingerprint: stored.contentFingerprint, at: T1, editedBy: OWNER }),
     );
-    expectOk(context.contracts.editDraft(first, stored.updatedAt));
+    expectOk(context.contracts.editDraft(first, stored.contentFingerprint));
     const THIRD: ContractContent = { ...CHANGED, outcome: 'A third outcome, written in the same millisecond.' };
     const second = expectOk(
-      editContract(first, THIRD, { expectedUpdatedAt: first.updatedAt, at: T1, editedBy: OWNER }),
+      editContract(first, THIRD, { expectedContentFingerprint: first.contentFingerprint, at: T1, editedBy: OWNER }),
     );
-    expectOk(context.contracts.editDraft(second, first.updatedAt));
+    expectOk(context.contracts.editDraft(second, first.contentFingerprint));
 
     assert.equal(second.updatedAt, first.updatedAt, 'the instant is the same for both edits');
     assert.notEqual(second.contentFingerprint, reviewed, 'and the text is not');

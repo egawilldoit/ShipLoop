@@ -202,7 +202,18 @@ export interface EditContractCommand {
   readonly contractId: ContractId;
   readonly revision: number;
   readonly content: ContractContentInput;
-  readonly expectedUpdatedAt: string;
+  /**
+   * The fingerprint the read returned, sent back by the caller, and required.
+   *
+   * It is the same value `ApproveContractCommand` requires, because it is the same question:
+   * a revision number outlives its text, so two tabs on one draft both address
+   * `contracts/:id/1` and only the fingerprint the caller's page was rendered against says
+   * which text this call is about. It is also the only token that survives a same-millisecond
+   * race: two writes inside one millisecond leave `updatedAt` byte-identical after the first
+   * as it was before it, so a draft edit locked on the instant would let the second write
+   * land over the first (mvp-spec 3, mvp-spec 7 "Reject stale requests").
+   */
+  readonly expectedContentFingerprint: string;
 }
 
 /**
@@ -604,6 +615,14 @@ export function createContractUseCases(deps: ContractUseCaseDeps) {
    * Refused for an approved or stale revision by the domain, which is what makes "an
    * approved contract never silently mutates" a property of the API rather than a rule
    * every caller is trusted to follow (mvp-spec 3).
+   *
+   * The caller's fingerprint is checked twice, for the same reason an approval's is. The
+   * domain refuses one that does not describe the draft this call loaded, and the store's
+   * WHERE clause refuses to write when the row has moved since - so the two-tab case is
+   * refused whether the other tab's edit landed before this call was made or between the read
+   * and the write. Nothing here compares a copy of the contract sent in the command: text in
+   * a body is a claim about what was reviewed, not evidence of it, so the caller's
+   * contribution is the one value the server derived (mvp-spec 7, "Reject stale requests").
    */
   const editContractUseCase = (
     command: EditContractCommand,
@@ -612,6 +631,22 @@ export function createContractUseCases(deps: ContractUseCaseDeps) {
     const owner = requireContractOwner(actor);
     if (!owner.ok) return err(owner.error);
 
+    if (!isFingerprint(command.expectedContentFingerprint)) {
+      return err({
+        code: 'Invalid',
+        reason:
+          'An edit must name the draft text it replaces, so a draft is saved from what its owner read rather than over whatever is stored now.',
+        fields: [
+          {
+            path: 'expectedContentFingerprint',
+            message:
+              'Send the contentFingerprint the revision carried when it was read. A value that is not a fingerprint describes no draft.',
+          },
+        ],
+      });
+    }
+    const loaded = command.expectedContentFingerprint;
+
     const contract = requireContract(command.projectId, command.contractId, command.revision);
     if (!contract.ok) return err(contract.error);
 
@@ -619,13 +654,13 @@ export function createContractUseCases(deps: ContractUseCaseDeps) {
     if (!content.ok) return err(content.error);
 
     const edited = editContract(contract.value, content.value, {
-      expectedUpdatedAt: command.expectedUpdatedAt,
+      expectedContentFingerprint: loaded,
       at: deps.clock.now(),
       editedBy: owner.value,
     });
     if (!edited.ok) return err(edited.error);
 
-    const written = deps.contracts.editDraft(edited.value, command.expectedUpdatedAt);
+    const written = deps.contracts.editDraft(edited.value, loaded);
     if (!written.ok) return err(written.error);
 
     const request = requireRequest(command.projectId, written.value.requestId);
