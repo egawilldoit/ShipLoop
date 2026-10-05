@@ -1,11 +1,27 @@
 import { useState, type FormEvent, type ReactElement } from 'react';
-import { fieldMessages, type ApiFailure } from '../api-client.ts';
+import type { MvpFailure } from '../mvp-client/index.ts';
 import { Field } from '../components/Field.tsx';
 import { useSession } from '../session.tsx';
 
 type SignInState = 'idle' | 'submitting' | 'failed';
 
-function describeFailure(failure: ApiFailure): string {
+/**
+ * Per-field messages from a refusal, keyed by the field they belong to.
+ *
+ * Local rather than imported from the legacy `api-client.ts`, which this screen no longer uses
+ * for anything: sign-in travels through the MVP transport, and keeping an import of the old
+ * client alive only to group two arrays would keep two transports reachable from one form
+ * (F01-AC1).
+ */
+function messagesByField(failure: MvpFailure): Readonly<Record<string, string>> {
+  const grouped: Record<string, string> = {};
+  for (const field of failure.fields) {
+    if (grouped[field.path] === undefined) grouped[field.path] = field.message;
+  }
+  return grouped;
+}
+
+function describeFailure(failure: MvpFailure): string {
   switch (failure.code) {
     case 'Invalid':
       return 'Sign-in was refused. Correct the highlighted fields and try again.';
@@ -59,7 +75,7 @@ export function SignInPage(): ReactElement {
     setSummary(null);
     const failure = await signIn({ email: email.trim(), password });
     if (failure !== null) {
-      setErrors(fieldMessages(failure));
+      setErrors(messagesByField(failure));
       setSummary(describeFailure(failure));
       setState('failed');
       return;

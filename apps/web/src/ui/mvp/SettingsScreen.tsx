@@ -23,16 +23,21 @@
  */
 
 import { useCallback, useEffect, useState, type ReactElement } from 'react';
-import type { ProjectSettingsView } from '../../server/contracts.ts';
 import { formatTimestamp } from '../api-client.ts';
 import { StatusBadge, type StatusTone } from '../components/StatusBadge.tsx';
-import { readProjectSettings, writeProjectSettings, type MvpFailure } from './mvp-client.ts';
+import {
+  fetchSettings,
+  updateSettings,
+  type MvpFailure,
+  type ProjectSettingsView,
+} from '../mvp-client/index.ts';
 import { domId } from './review-model.ts';
+import type { ProjectScope } from '../mvp-client/index.ts';
 
 export interface SettingsScreenProps {
-  /** The session's active project, or null when the owner has chosen none (F02-AC1). */
-  readonly projectId: string | null;
-  /** Bumped by the shell when the owner asks everything to reload. */
+  /** The project this screen addresses, or null when the owner has chosen none (F02-AC1). */
+  readonly scope: ProjectScope | null;
+  /** Bumped by the shell when the connection state changes. */
   readonly epoch?: number;
 }
 
@@ -48,7 +53,7 @@ interface SaveRefusal {
   readonly failure: MvpFailure;
 }
 
-export function SettingsScreen({ projectId, epoch = 0 }: SettingsScreenProps): ReactElement {
+export function SettingsScreen({ scope, epoch = 0 }: SettingsScreenProps): ReactElement {
   const [state, setState] = useState<SettingsState>({ kind: 'loading' });
   const [refusal, setRefusal] = useState<SaveRefusal | null>(null);
   const [saving, setSaving] = useState(false);
@@ -69,14 +74,14 @@ export function SettingsScreen({ projectId, epoch = 0 }: SettingsScreenProps): R
   }, []);
 
   const load = useCallback(async () => {
-    if (projectId === null) {
+    if (scope === null) {
       setState({ kind: 'no-project' });
       return;
     }
-    const result = await readProjectSettings(projectId);
+    const result = await fetchSettings(scope);
     if (result.ok) adopt(result.value);
-    else setState({ kind: 'refused', failure: result.error });
-  }, [adopt, projectId]);
+    else setState({ kind: 'refused', failure: result.failure });
+  }, [adopt, scope]);
 
   useEffect(() => {
     setRefusal(null);
@@ -93,7 +98,7 @@ export function SettingsScreen({ projectId, epoch = 0 }: SettingsScreenProps): R
    */
   const save = useCallback(
     async (action: 'save' | 'clear', typed: string) => {
-      if (projectId === null) return;
+      if (scope === null) return;
       setSaving(true);
       setRefusal(null);
       setNotice(null);
@@ -102,10 +107,10 @@ export function SettingsScreen({ projectId, epoch = 0 }: SettingsScreenProps): R
       // first one is sayable at all (L02-AC3).
       const trimmed = typed.trim();
       const t3Url = action === 'clear' || trimmed === '' ? null : trimmed;
-      const result = await writeProjectSettings({ projectId, t3Url });
+      const result = await updateSettings(scope, { t3Url });
       setSaving(false);
       if (!result.ok) {
-        setRefusal({ action, failure: result.error });
+        setRefusal({ action, failure: result.failure });
         return;
       }
       // The server's own answer becomes the screen's state. A success and a refusal are therefore
@@ -117,12 +122,16 @@ export function SettingsScreen({ projectId, epoch = 0 }: SettingsScreenProps): R
           : 'The T3 deployment URL was saved, as the server reports it above.',
       );
     },
-    [adopt, projectId],
+    [adopt, scope],
   );
 
   const settings = state.kind === 'ready' ? state.settings : null;
-  const unreachable = state.kind === 'refused' && !state.failure.reachable;
-  const urlId = domId('t3-url', projectId ?? 'project');
+  // The MVP transport names an unreachable server in its own vocabulary rather than as a
+  // boolean, so the wording below is chosen from the code instead of inferred.
+  const unreachable =
+    state.kind === 'refused' &&
+    (state.failure.code === 'Disconnected' || state.failure.code === 'Unavailable');
+  const urlId = domId('t3-url', scope?.kind === 'project' ? scope.projectId : 'project');
 
   return (
     <div className="page" data-testid="settings-screen">

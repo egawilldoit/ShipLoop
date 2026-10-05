@@ -696,3 +696,101 @@ li {
     transition: none;
   }
 }
+
+/* --------------------------------------------------------------------------
+   Home and the not-yet-wired slots
+   --------------------------------------------------------------------------
+   Home is a list of things the owner may have to act on, so an entry is laid out
+   as a button followed by two sentences: the kind as a heading, then why it is
+   here and what happens next. The two sentences are stacked rather than merged
+   because they answer different questions — "why is this on my screen" and "who
+   moves it forward" — and collapsing them is how an owner ends up reading
+   "waiting on verification" as though they were the blocker (F24-AC3).
+   -------------------------------------------------------------------------- */
+
+.home__project {
+  color: var(--ink-soft);
+  margin-block: 0 1rem;
+}
+
+.home-group {
+  border-top: 1px solid var(--line);
+  padding-block-start: 1rem;
+  margin-block-end: 1.5rem;
+}
+
+.home-group__title {
+  margin-block-end: 0.25rem;
+}
+
+.home-group__description {
+  color: var(--ink-soft);
+  margin-block: 0 0.75rem;
+}
+
+.home-group__list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 0.75rem;
+}
+
+.home-entry {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 0.75rem;
+  background: var(--paper);
+}
+
+.home-entry__button {
+  display: grid;
+  gap: 0.15rem;
+  width: 100%;
+  text-align: start;
+  align-items: start;
+}
+
+.home-entry__kind {
+  font-size: 0.8rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--ink-soft);
+}
+
+.home-entry__title {
+  font-weight: 600;
+}
+
+.home-entry__sha,
+.home-entry__revision,
+.home-entry__criteria {
+  font-size: 0.85rem;
+  color: var(--ink-soft);
+}
+
+.home-entry__reason,
+.home-entry__next {
+  margin-block: 0.5rem 0;
+}
+
+.home-entry__next {
+  color: var(--ink-soft);
+}
+
+.slot__belongs {
+  margin-block-end: 0.25rem;
+}
+
+.slot__list {
+  margin-block-start: 0;
+  color: var(--ink-soft);
+}
+
+/* A refusal that names its prerequisites: the acceptance gate lists what is
+   outstanding, and suppressing that sends the owner away without saying what to
+   do about it (F24-AC3). */
+.screen-failure__list {
+  margin-block: 0.5rem 0;
+  padding-inline-start: 1.25rem;
+}

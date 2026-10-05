@@ -1,100 +1,50 @@
-import { useState, type FormEvent, type ReactElement } from 'react';
-import { createProject, type ProjectSummary } from './api-client.ts';
+/**
+ * The owner shell: four primary areas, one project, one transport.
+ *
+ * ## Why this is four sections and not nine
+ *
+ * The shell this replaces offered Profiles, Connectors, Intake, Brief, Runs, Review card, Needs
+ * you, Plan and Publication. Eight of those nine are surfaces for orchestrating a coding agent:
+ * starting runs, watching them, publishing plans. ShipLoop's product contract puts coding
+ * execution outside the product, so an owner looking at "Runs" would be looking at a console for a
+ * system ShipLoop does not claim to run and cannot report on truthfully. The remaining area —
+ * reviewing what came back — is the product.
+ *
+ * So the primary navigation is exactly four areas, and Home is where it starts. The legacy pages
+ * are **not deleted**: they are proven subsystems and the orchestration path still exists behind
+ * them. They are simply no longer what the owner is shown by default, because the product decision
+ * was that the primary experience should read as a delivery and attention surface rather than an
+ * agent console (mvp-spec 3).
+ *
+ * ## What the shell decides
+ *
+ * Only two things: which project is active, and which of the four areas is showing. Every product
+ * judgement — is this eligible, what does this evidence mean, may this be accepted — belongs to
+ * the backend, and each area below reflects those answers rather than recomputing them (F24-AC3).
+ */
+
+import { useState, type ReactElement } from 'react';
+
 import { ConnectionBanner } from './components/ConnectionBanner.tsx';
-import { BriefPage } from './pages/BriefPage.tsx';
-import { ConnectorsPage } from './pages/ConnectorsPage.tsx';
-import { DashboardPage } from './pages/DashboardPage.tsx';
-import { IntakePage } from './pages/IntakePage.tsx';
-import { PlanPage } from './pages/PlanPage.tsx';
-import { ProfilesPage } from './pages/ProfilesPage.tsx';
-import { PublicationPage } from './pages/PublicationPage.tsx';
-import { ReviewCardPage } from './pages/ReviewCardPage.tsx';
-import { RunPage } from './pages/RunPage.tsx';
+import { DEFAULT_SECTION, PRIMARY_SECTIONS, type PrimarySection } from './navigation.ts';
+import { HomeScreen } from './mvp/HomeScreen.tsx';
+import type { HomeTarget } from './mvp/home-model.ts';
+import { SettingsScreen } from './mvp/SettingsScreen.tsx';
+import { NewRequestSlot, ReviewSlot } from './mvp/slots.tsx';
 import { SignInPage } from './pages/SignInPage.tsx';
 import { SessionProvider, useSession } from './session.tsx';
 
-type Section =
-  | 'profiles'
-  | 'connectors'
-  | 'intake'
-  | 'brief'
-  | 'runs'
-  | 'review'
-  | 'dashboard'
-  | 'plan'
-  | 'publication';
-
-const SECTIONS: readonly { readonly id: Section; readonly label: string }[] = [
-  { id: 'profiles', label: 'Profiles' },
-  { id: 'connectors', label: 'Connectors' },
-  { id: 'intake', label: 'Intake' },
-  { id: 'brief', label: 'Brief' },
-  { id: 'runs', label: 'Runs' },
-  { id: 'review', label: 'Review card' },
-  { id: 'dashboard', label: 'Needs you' },
-  { id: 'plan', label: 'Plan' },
-  { id: 'publication', label: 'Publication' },
-];
 
 /**
- * Which project every project-scoped screen addresses (F02-AC1).
+ * Which project every project-scoped screen addresses.
  *
- * This component exists because project identity was previously absent rather than chosen.
- * The session response carried no project, the pages took an empty string, and every request
- * they built from it went to `/api/profiles/undefined` — a project literally named
- * "undefined" — which answered 404 and was reported as "that project has no saved profile
- * yet". A selector plus an explicit "no project selected" state means a page either has a
- * project to ask about or says it has none, and neither case is a request for a name that
- * does not exist (F02-AC1, F02-AC4).
- *
- * Creation is offered here because it is the only project write that needs no configured
- * provider: a profile save, a connector registration and a procedure append all refuse by
- * name when no adapter declares the capability they need, so an owner who has configured
- * nothing would otherwise have no project to select at all (F03-AC2).
+ * This exists because project identity must be *chosen*, not defaulted. The shell offers the
+ * projects this owner actually has, and the "no project selected" state is a real state rather than
+ * an invitation to guess: the historical defect was a request to `/api/profiles/undefined`, which
+ * answered 404 and was reported as "that project has no saved profile yet" (F02-AC1, F02-AC4).
  */
-function ProjectSelector({
-  projects,
-  selectedProjectId,
-  onSelect,
-  onCreated,
-}: {
-  readonly projects: readonly ProjectSummary[];
-  readonly selectedProjectId: string | null;
-  readonly onSelect: (projectId: string | null) => void;
-  readonly onCreated: () => void;
-}): ReactElement {
-  const [creating, setCreating] = useState(false);
-  const [projectId, setProjectId] = useState('');
-  const [name, setName] = useState('');
-  const [error, setError] = useState<string | null>(null);
-  const [saving, setSaving] = useState(false);
-
-  const submit = (event: FormEvent<HTMLFormElement>): void => {
-    event.preventDefault();
-    if (saving) return;
-    if (projectId.trim() === '') {
-      setError('A project needs an id. It is the name every request for that project uses.');
-      return;
-    }
-    if (name.trim() === '') {
-      setError('A project needs a name, so the selector does not offer the owner a bare id.');
-      return;
-    }
-    setSaving(true);
-    setError(null);
-    void createProject({ projectId: projectId.trim(), name: name.trim() }).then((result) => {
-      setSaving(false);
-      if (!result.ok) {
-        setError(result.error.reason);
-        return;
-      }
-      setProjectId('');
-      setName('');
-      setCreating(false);
-      onCreated();
-      onSelect(result.value.project.projectId);
-    });
-  };
+function ProjectSelector({ onNewProject }: { readonly onNewProject: () => void }): ReactElement {
+  const { scope, projects, selectProject } = useSession();
 
   return (
     <div className="project-selector">
@@ -104,8 +54,10 @@ function ProjectSelector({
       <select
         id="project-select"
         className="project-selector__select"
-        value={selectedProjectId ?? ''}
-        onChange={(event) => onSelect(event.target.value === '' ? null : event.target.value)}
+        value={scope?.kind === 'project' ? scope.projectId : ''}
+        onChange={(event) => {
+          void selectProject(event.target.value === '' ? null : event.target.value);
+        }}
       >
         {/* The empty option is a real state, not a placeholder: it is what "no project is
             selected" means, and it is the state a signed-in owner with no project is in. */}
@@ -116,102 +68,22 @@ function ProjectSelector({
           </option>
         ))}
       </select>
-      {creating ? (
-        <form className="project-selector__form" onSubmit={submit} noValidate>
-          <label className="project-selector__label" htmlFor="project-id">
-            Project id
-          </label>
-          <input
-            id="project-id"
-            className="project-selector__input"
-            value={projectId}
-            onChange={(event) => setProjectId(event.target.value)}
-            placeholder="one-word-id, no slashes"
-            disabled={saving}
-          />
-          <label className="project-selector__label" htmlFor="project-name">
-            Project name
-          </label>
-          <input
-            id="project-name"
-            className="project-selector__input"
-            value={name}
-            onChange={(event) => setName(event.target.value)}
-            placeholder="What this project is called"
-            disabled={saving}
-          />
-          {error !== null && (
-            <p className="state-line state-line--error" role="alert" data-state="failed">
-              {error}
-            </p>
-          )}
-          <div className="project-selector__actions">
-            <button className="button" type="submit" disabled={saving}>
-              {saving ? 'Creating…' : 'Create project'}
-            </button>
-            <button
-              className="button button--secondary"
-              type="button"
-              disabled={saving}
-              onClick={() => {
-                setCreating(false);
-                setError(null);
-              }}
-            >
-              Cancel
-            </button>
-          </div>
-        </form>
-      ) : (
-        <button
-          className="button button--secondary"
-          type="button"
-          onClick={() => {
-            setCreating(true);
-            setError(null);
-          }}
-        >
-          New project
-        </button>
-      )}
+      {/* Creation lives in the New Request area, where a request belongs to a project. A create
+          form here would be a second place that decides what a project is, and the two would
+          disagree the moment one of them validated differently. This button therefore navigates
+          rather than opening a second form — a control that changes nothing is worse than no
+          control (F02-AC1). */}
+      <button className="button button--secondary" type="button" onClick={onNewProject}>
+        New project
+      </button>
     </div>
   );
 }
 
 function Shell(): ReactElement {
-  const {
-    status,
-    owner,
-    selectedProjectId,
-    selectProject,
-    projects,
-    reloadProjects,
-    connection,
-    connectionEpoch,
-    signOut,
-    retry,
-  } = useSession();
-  const [section, setSection] = useState<Section>('intake');
-  const [activeProfileId, setActiveProfileId] = useState('');
-  const [activeProfileLabel, setActiveProfileLabel] = useState('');
-  const [activeIdeaId, setActiveIdeaId] = useState('');
-  const [activeJobId, setActiveJobId] = useState('');
-  /**
-   * The plan the plan and publication screens are looking at.
-   *
-   * Held here rather than in either page because the two are two views of one plan, in
-   * the same way the intake and brief screens are two views of one captured request: a
-   * per-page selection would let publication act on a plan the plan screen is not
-   * showing, which is exactly the case where an owner creates an issue at a provider
-   * for work they were not reviewing (F10-AC1).
-   */
-  const [activePlanId, setActivePlanId] = useState('');
+  const { status, owner, scope, epoch, connection, signOut, retry, failure } = useSession();
+  const [section, setSection] = useState<PrimarySection>(DEFAULT_SECTION);
   const [signingOut, setSigningOut] = useState(false);
-
-  const selectProfile = (profileId: string, label: string): void => {
-    setActiveProfileId(profileId);
-    setActiveProfileLabel(label);
-  };
 
   if (status === 'checking') {
     return (
@@ -224,9 +96,30 @@ function Shell(): ReactElement {
     );
   }
 
+  // "The server could not be reached" is not "you are signed out". Rendering the sign-in form for
+  // an unreachable server tells an owner with a live session to sign in again, which is a false
+  // statement about their own state and an action that cannot succeed (N03-AC3).
+  if (status === 'unreachable') {
+    return (
+      <main className="page page--narrow" id="main">
+        <h1 className="page__title">ShipLoop</h1>
+        <p className="state-line state-line--error" role="alert" data-state="failed">
+          {failure?.reason ?? 'The server could not be reached, so ShipLoop cannot tell whether you are signed in.'}
+        </p>
+        <button className="button" type="button" onClick={retry}>
+          Try again
+        </button>
+      </main>
+    );
+  }
+
   if (status === 'signed-out' || owner === null) {
     return <SignInPage />;
   }
+
+  const open = (target: HomeTarget): void => {
+    setSection(target);
+  };
 
   return (
     <>
@@ -236,24 +129,14 @@ function Shell(): ReactElement {
       <header className="app__header">
         <div className="app__identity">
           <h1 className="app__title">ShipLoop</h1>
-          {/*
-            The address is rendered from what the server sent, and its absence is stated
-            rather than rendered as an empty pair of parentheses. The header used to show
-            `Signed in as <name> () for ` because the session response carried no address and
-            this template interpolated one anyway, so a missing fact read as a rendering fault
-            in a field the owner had never filled in (F01-AC1).
-          */}
+          {/* The address is rendered from what the server sent, and its absence is stated rather
+              than rendered as an empty pair of parentheses (F01-AC1). */}
           <p className="app__owner">
             Signed in as {owner.displayName}
             {owner.email === null ? ' (this owner has no sign-in address)' : ` (${owner.email})`}
           </p>
         </div>
-        <ProjectSelector
-          projects={projects}
-          selectedProjectId={selectedProjectId}
-          onSelect={selectProject}
-          onCreated={reloadProjects}
-        />
+        <ProjectSelector onNewProject={() => setSection('request')} />
         <button
           className="button button--secondary"
           type="button"
@@ -269,9 +152,9 @@ function Shell(): ReactElement {
 
       <ConnectionBanner connection={connection} onRetry={retry} />
 
-      <nav className="app__nav" aria-label="Owner sections">
+      <nav className="app__nav" aria-label="Primary sections">
         <ul className="app__nav-list">
-          {SECTIONS.map((entry) => (
+          {PRIMARY_SECTIONS.map((entry) => (
             <li key={entry.id}>
               <button
                 className="button button--tab"
@@ -286,82 +169,15 @@ function Shell(): ReactElement {
         </ul>
       </nav>
 
-      {/*
-        Intake, brief, plan and publication share one selected request and one selected
-        plan rather than each holding their own copies: they are four views of one
-        captured request moving towards a ticket, and a per-page selection would let the
-        publication screen act on a plan the plan screen is not showing (F10-AC1).
-        The run and its review card share one selected run for the same reason: a card is
-        evidence about a run, and a card for a different run than the one on screen would
-        be a card about nothing (F24-AC2).
-      */}
       <main className="app__main" id="main">
-        {section === 'profiles' ? (
-          <ProfilesPage
-            projectId={selectedProjectId}
-            activeProfileId={activeProfileId}
-            onSelectProfile={selectProfile}
-            epoch={connectionEpoch}
-          />
-        ) : section === 'connectors' ? (
-          <ConnectorsPage
-            projectId={selectedProjectId}
-            profileId={activeProfileId}
-            profileName={activeProfileLabel}
-            epoch={connectionEpoch}
-          />
-        ) : section === 'intake' ? (
-          <IntakePage
-            selectedIdeaId={activeIdeaId}
-            selectedProjectId={selectedProjectId}
-            onSelectIdea={setActiveIdeaId}
-            onOpenBrief={(ideaId) => {
-              setActiveIdeaId(ideaId);
-              setSection('brief');
-            }}
-            epoch={connectionEpoch}
-          />
-        ) : section === 'runs' ? (
-          <RunPage
-            selectedJobId={activeJobId}
-            onSelectJob={setActiveJobId}
-            onOpenReviewCard={(jobId) => {
-              setActiveJobId(jobId);
-              setSection('review');
-            }}
-            epoch={connectionEpoch}
-          />
+        {section === 'home' ? (
+          <HomeScreen scope={scope} epoch={epoch} onOpen={open} />
+        ) : section === 'request' ? (
+          <NewRequestSlot scope={scope} epoch={epoch} />
         ) : section === 'review' ? (
-          <ReviewCardPage
-            jobId={activeJobId}
-            onBackToRuns={() => setSection('runs')}
-            epoch={connectionEpoch}
-          />
-        ) : section === 'dashboard' ? (
-          <DashboardPage epoch={connectionEpoch} />
-        ) : section === 'brief' ? (
-          <BriefPage
-            ideaId={activeIdeaId}
-            onBackToIntake={() => setSection('intake')}
-            epoch={connectionEpoch}
-          />
-        ) : section === 'plan' ? (
-          <PlanPage
-            ideaId={activeIdeaId}
-            onOpenPublication={(planId) => {
-              setActivePlanId(planId);
-              setSection('publication');
-            }}
-            epoch={connectionEpoch}
-          />
+          <ReviewSlot scope={scope} epoch={epoch} />
         ) : (
-          <PublicationPage
-            planId={activePlanId}
-            ideaId={activeIdeaId}
-            projectId={selectedProjectId}
-            onBackToPlan={() => setSection('plan')}
-            epoch={connectionEpoch}
-          />
+          <SettingsScreen scope={scope} epoch={epoch} />
         )}
       </main>
     </>
@@ -371,11 +187,10 @@ function Shell(): ReactElement {
 /**
  * The owner shell.
  *
- * The signed-out branch returns before any private view is created, and signing out clears
- * the owner, the project context and the CSRF token together, so a client that has lost its
- * session is not left holding the previous owner's cached facts from which it might appear
- * to authorize delivery (F01-AC5). Nothing about the previous session survives in this
- * component's state: the pages that held it are unmounted, not hidden.
+ * The signed-out branch returns before any private view is created, and signing out clears the
+ * owner, the project scope and the CSRF token together, so a client that has lost its session is
+ * not left holding the previous owner's cached facts from which it might appear to authorize
+ * delivery (F01-AC5).
  */
 export function App(): ReactElement {
   return (

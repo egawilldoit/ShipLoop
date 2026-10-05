@@ -1,8 +1,9 @@
 import { useEffect, useState, type ReactElement } from 'react';
-import { formatRelativeTime, formatTimestamp, type ConnectionState } from '../api-client.ts';
+import { formatRelativeTime, formatTimestamp } from '../api-client.ts';
+import type { MvpConnectionState } from '../mvp-client/index.ts';
 
 export interface ConnectionBannerProps {
-  readonly connection: ConnectionState;
+  readonly connection: MvpConnectionState;
   readonly onRetry: () => void;
 }
 
@@ -28,7 +29,7 @@ export function ConnectionBanner({ connection, onRetry }: ConnectionBannerProps)
     return () => clearInterval(timer);
   }, []);
 
-  const updated = connection.lastUpdateAt;
+  const updated = connection.lastSuccessAt;
   const lastUpdate =
     updated === null ? (
       'No successful update has been received yet.'
