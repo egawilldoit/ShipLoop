@@ -275,6 +275,20 @@ li {
   color: var(--stop-ink);
 }
 
+/*
+ * A reading that is true but old.
+ *
+ * Deliberately weaker than the refusal treatment and separated from it by border style as
+ * well as colour, because "this was read a while ago" is not "this failed" and must not look
+ * like it (N03-AC1).
+ */
+.state-line--warn {
+  border-style: dashed;
+  border-color: var(--warn-ink);
+  background: var(--warn-fill);
+  color: var(--warn-ink);
+}
+
 .banner {
   display: flex;
   flex-wrap: wrap;
