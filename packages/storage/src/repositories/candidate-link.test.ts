@@ -413,3 +413,20 @@ test('an unknown candidate id is NotFound rather than an empty candidate', async
     assert.equal(expectOk(store.currentForRequest('request-with-no-candidate')), null);
   });
 });
+
+test('a provider state this build cannot read is stored as unreadable, not refused', async () => {
+  // The adapter reports `Unknown` when GitHub says something this build has no word for, and the
+  // domain and the schema both have room for it. Storage kept its own three-item vocabulary, so
+  // that honest reading was refused here — at the last step before the row — and the owner was told
+  // nothing about a state the provider had actually reported. The list is now derived from the domain,
+  // so this test fails if that derivation is ever replaced by another literal list.
+  await withDatabase((_db, store) => {
+    expectOk(store.record(candidateInput({ pullRequestState: 'Unknown' })));
+    const row = expectOk(store.currentForRequest('request-01'));
+    assert.equal(row?.pullRequestState, 'Unknown', 'the unreadable state did not survive the round trip');
+    assert.equal(recordOf(store)?.pullRequestState, 'Unknown');
+
+    // And it is still distinguishable from a real closure, which is the whole reason it exists.
+    assert.notEqual(row?.pullRequestState, 'Closed');
+  });
+});

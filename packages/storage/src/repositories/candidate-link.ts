@@ -41,7 +41,7 @@
  * request and a contract revision and needs none of the run-scoped parents.
  */
 
-import { candidateBindingFingerprint, err, invalid, ok } from '@shiploop/domain';
+import { PULL_REQUEST_STATES as DOMAIN_PULL_REQUEST_STATES, candidateBindingFingerprint, err, invalid, ok } from '@shiploop/domain';
 import type { CandidateId, CommitSha, DomainError, ProjectId, PullRequestState, Result } from '@shiploop/domain';
 
 import type { Database } from '../db.ts';
@@ -71,7 +71,17 @@ const COLUMNS = [
   'correlation_id',
 ].join(', ');
 
-const PULL_REQUEST_STATES: readonly PullRequestState[] = ['Open', 'Closed', 'Merged'];
+/**
+ * The pull-request states this store accepts, derived from the domain rather than restated.
+ *
+ * This used to be its own three-item list. That was a third copy of one vocabulary — the domain
+ * and the `delivery_candidates` CHECK had already been widened to admit `Unknown`, so an unrecognised
+ * provider state was legal everywhere and refused only here, at the last step before storage. The
+ * consequence was precise and bad: the adapter reported a state it could not read, the schema had a
+ * column for it, and the repository threw it away, so the honest reading never reached a row. A
+ * derived list cannot drift from the domain, which is the only thing that should decide the vocabulary.
+ */
+const PULL_REQUEST_STATES: readonly PullRequestState[] = DOMAIN_PULL_REQUEST_STATES;
 
 /** A candidate row exactly as it is stored and returned. */
 export interface DeliveryCandidateRecord {
