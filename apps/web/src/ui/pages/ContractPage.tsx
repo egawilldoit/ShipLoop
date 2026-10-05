@@ -54,6 +54,7 @@ import {
   draftFromRequest,
   draftProblems,
   isStaleRefusal,
+  MAXIMUM_TITLE_LENGTH,
   verificationChoices,
   type ContractDraft,
   type ContractState,
@@ -611,7 +612,7 @@ function NewRequestForm({
         id={titleId}
         className="field__input"
         value={value.title}
-        maxLength={200}
+        maxLength={MAXIMUM_TITLE_LENGTH}
         disabled={creating}
         aria-invalid={titleError !== undefined || undefined}
         aria-describedby={titleError !== undefined ? `${titleId}-error` : undefined}
@@ -987,7 +988,7 @@ function RequestSummary({
         id="request-title"
         className="field__input"
         value={title}
-        maxLength={200}
+        maxLength={MAXIMUM_TITLE_LENGTH}
         onChange={(event) => setTitle(event.target.value)}
       />
       <label className="field__label" htmlFor="request-description">

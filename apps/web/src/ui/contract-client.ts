@@ -25,7 +25,7 @@
  * | `createRequest` | `POST /api/projects/:projectId/requests` | `contracts.ts` — 201 `{ request }`; body is a strict `{ title, description }` |
  * | `fetchRequestDetail` | `GET /api/projects/:projectId/requests/:requestId` | `contracts.ts` — answers `RequestDetailView` **unwrapped**, with `request`, `latestRevision`, `approvedRevision`, `revisions` |
  * | `updateRequest` | `PATCH /api/projects/:projectId/requests/:requestId` | `contracts.ts` — body requires `expectedUpdatedAt`; 409 when the instant moved |
- * | `fetchContractRevisions` | `GET /api/projects/:projectId/requests/:requestId/contracts` | `contracts.ts` — answers `{ contracts }`, oldest first |
+ * | `fetchContractRevisions` (not called) | `GET /api/projects/:projectId/requests/:requestId/contracts` | `contracts.ts` — answers `{ contracts }`, oldest first |
  * | `draftContract` | `POST /api/projects/:projectId/requests/:requestId/contracts` | `contracts.ts` — 201 `{ contract }` |
  * | `fetchContractRevision` | `GET /api/projects/:projectId/contracts/:contractId/:revision` | `contracts.ts` — answers `{ contract }`; carries `contentFingerprint` and `updatedAt` |
  * | `saveContractDraft` | `PATCH /api/projects/:projectId/contracts/:contractId/:revision` | `contracts.ts` — body requires `expectedUpdatedAt`; an approved revision answers 400 |
@@ -393,7 +393,16 @@ export function updateRequest(
   });
 }
 
-/** Every revision of this request, oldest first (mvp-spec 3). */
+/**
+ * Every revision of this request, oldest first (mvp-spec 3).
+ *
+ * Deliberately not called by this flow. `GET /api/projects/:projectId/requests/:requestId`
+ * already answers `revisions` alongside `latestRevision` and `approvedRevision`, so a second
+ * read for the same history would be a round trip whose two answers could describe different
+ * moments — and the page needs the detail anyway. It is here because it is a real route in the
+ * same namespace and its shape was read while establishing the transport; delete it with the
+ * rest of this module when F1's client lands.
+ */
 export function fetchContractRevisions(
   projectId: string,
   requestId: string,

@@ -55,7 +55,14 @@ export interface ContractDraft {
   readonly acceptanceCriteria: readonly DraftCriterion[];
 }
 
-/** Longest title the route accepts; a title is a label, not a document. */
+/**
+ * Longest title the route accepts; a title is a label, not a document.
+ *
+ * Exported so the two title inputs use one number rather than each carrying a literal. It
+ * mirrors `routes/contracts.ts`; the route is still the authority, and a title over the bound
+ * is refused there — the attribute here stops the owner reaching that point, not the check
+ * itself.
+ */
 export const MAXIMUM_TITLE_LENGTH = 200;
 
 /** Longest criterion id the route accepts. */
