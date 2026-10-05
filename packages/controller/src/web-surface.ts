@@ -49,6 +49,7 @@ import {
   err,
   fingerprint,
   invalid,
+  isBlocking,
   isCommitSha,
   ok,
   orderedAreas,
@@ -69,6 +70,7 @@ import type {
   CandidateId,
   ChangeShape,
   ChangeSurface,
+  CheckResult,
   CommitSha,
   ConnectorId,
   ContractId,
@@ -86,6 +88,7 @@ import type {
   ProfileVersionId,
   ProjectId,
   PublishableTicket,
+  PullRequestState,
   ReadinessObservation,
   Request,
   RequestId,
@@ -110,6 +113,15 @@ import type {
 } from '@shiploop/storage';
 import type { GitRepositoryRef, TicketState } from '@shiploop/adapters';
 import { createGitTransport } from '@shiploop/adapters';
+import { DeliveryCandidateRepository } from '@shiploop/storage';
+import type { CandidateLinkStore } from '@shiploop/storage';
+import type { CandidateBinding, CandidateCheckStatus, DeliveryCandidate } from '@shiploop/domain';
+import type {
+  CandidateLinkUseCases,
+  CandidateView,
+  LinkedCandidate,
+  LiveCandidateFacts,
+} from './candidate-linking.ts';
 import type { CompositionRoot, GenerationRunView, GenerationWorkspaceReader } from './composition.ts';
 import { createCompositionRoot, taskWorkItemId } from './composition.ts';
 import type { IdeaDraft } from '@shiploop/domain';
@@ -1824,12 +1836,216 @@ export interface SurfaceMvpReviewUseCases {
   }): Promise<Result<SurfaceMvpOwnerTestReport, DomainError>>;
 }
 
+/* -------------------------------------------------------------------------- */
+/* The candidate port                                                          */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The recorded candidate, as `routes/candidates.ts` reports it.
+ *
+ * Both SHAs travel at full length, and `pullRequestState` is the domain's own
+ * `PullRequestState` rather than free text: the transport narrows the value against
+ * `PULL_REQUEST_STATES` before it can reach a response, and this declaration is the same
+ * union rather than a second spelling of it (mvp-spec 3, F20-AC2).
+ */
+export interface SurfaceRecordedCandidateReport {
+  readonly candidateId: string;
+  readonly projectId: string;
+  readonly requestId: string;
+  readonly contractId: string;
+  readonly contractRevision: number;
+  readonly provider: string;
+  readonly repository: string;
+  readonly pullRequestNumber: number;
+  readonly pullRequestUrl: string;
+  readonly baseBranch: string;
+  readonly baseSha: string;
+  readonly headBranch: string;
+  /** The candidate's identity. Never an abbreviation, a branch or a pull request number. */
+  readonly headSha: string;
+  readonly pullRequestState: PullRequestState;
+  readonly draft: boolean;
+  readonly observedAt: string;
+  readonly linkedAt: string;
+}
+
+/** What the provider said during this read, beside the row ShipLoop holds. */
+export interface SurfaceLiveCandidateReport {
+  readonly provider: string;
+  readonly repository: string;
+  readonly pullRequestNumber: number;
+  readonly pullRequestUrl: string;
+  readonly baseBranch: string;
+  readonly baseSha: string;
+  readonly headBranch: string;
+  readonly headSha: string;
+  /** A fork's name when the provider reports one; null when it reported none. */
+  readonly headRepository: string | null;
+  readonly pullRequestState: PullRequestState;
+  readonly draft: boolean;
+  readonly observedAt: string;
+}
+
+/** The `(contract revision, head SHA)` pair every piece of evidence must name (F20-AC3). */
+export interface SurfaceCandidateBindingReport {
+  readonly contractId: string;
+  readonly contractRevision: number;
+  readonly headSha: string;
+}
+
+/** What this read observed about the difference between the record and the provider. */
+export interface SurfaceCandidateChangeReport {
+  readonly kind: string;
+  readonly changed: readonly string[];
+  readonly changedAnything: boolean;
+  readonly previousHeadSha: string | null;
+  readonly currentHeadSha: string;
+  readonly priorEvidenceStale: boolean;
+  readonly detail: string;
+}
+
+/**
+ * Whether evidence recorded against an earlier head still describes this one.
+ *
+ * `priorReadinessPreserved` is the literal `false` on every value this adapter produces:
+ * nothing here holds a stored readiness, so a ready status cannot cross a force push
+ * (F24-AC4, F25-AC3). `status` follows the same read's `priorEvidenceStale`, which is the
+ * only signal a controller can report about it.
+ */
+export interface SurfaceEvidenceStandingReport {
+  readonly status: 'Current' | 'Stale';
+  readonly priorReadinessPreserved: false;
+  readonly priorCandidateId: string | null;
+  readonly priorHeadSha: string | null;
+  readonly detail: string;
+}
+
+/**
+ * One provider check, with `blocking` computed by the domain's own `isBlocking`.
+ *
+ * The domain's `CandidateCheckStatus` carries no `blocking` member, and the transport's view
+ * declares one. It is filled here with `isBlocking(result, notApplicableApprovedByPolicy)` —
+ * the same domain function the transport re-derives it with — rather than with a second
+ * opinion about what blocks. The transport overwrites the value on the way out regardless, so
+ * the honest thing here is to be right rather than to be silent (F20-AC2, F20-AC5).
+ */
+export interface SurfaceCandidateCheckReport {
+  readonly name: string;
+  readonly result: CheckResult;
+  readonly required: boolean;
+  readonly blocking: boolean;
+  readonly notApplicableApprovedByPolicy: boolean;
+  readonly observedHeadSha: string | null;
+  readonly startedAt: string | null;
+  readonly endedAt: string | null;
+  readonly artifactUrl: string | null;
+  readonly detail: string | null;
+}
+
+/** Whether this candidate can be decided on, with every reason when it cannot (F24-AC3). */
+export interface SurfaceCandidateReadinessReport {
+  readonly ready: boolean;
+  readonly reasons: readonly string[];
+}
+
+/** What a successful link established. Carries no readiness answer at all. */
+export interface SurfaceLinkedCandidateReport {
+  readonly candidate: SurfaceRecordedCandidateReport;
+  readonly live: SurfaceLiveCandidateReport;
+  readonly binding: SurfaceCandidateBindingReport;
+  readonly bindingFingerprint: string;
+  readonly alreadyRecorded: boolean;
+  readonly observedAt: string;
+  /** Always false: the port this is built on holds no provider write (mvp-spec F03-AC5). */
+  readonly providerWritePerformed: false;
+}
+
+/** One candidate as the owner reads it, from one live read (F20-AC3, F24-AC4). */
+export interface SurfaceCandidateReport {
+  readonly candidate: SurfaceRecordedCandidateReport;
+  readonly live: SurfaceLiveCandidateReport;
+  readonly binding: SurfaceCandidateBindingReport;
+  readonly bindingFingerprint: string;
+  readonly change: SurfaceCandidateChangeReport;
+  readonly evidence: SurfaceEvidenceStandingReport;
+  readonly supersededCandidateIds: readonly string[];
+  readonly checks: readonly SurfaceCandidateCheckReport[];
+  readonly checksReady: boolean;
+  readonly blockingChecks: readonly string[];
+  readonly reviewReadiness: SurfaceCandidateReadinessReport;
+  readonly observedAt: string;
+  /** Always false: nothing on this path merges, closes, approves or re-protects (F03-AC5). */
+  readonly providerWritePerformed: false;
+}
+
+/**
+ * Link the pull request the owner named.
+ *
+ * The body carries no head SHA, no branch and no pull request number, because identity is read
+ * from the provider and is not the caller's to assert: a command that could name one would make
+ * "PR 7" recordable as the candidate (mvp-spec 3, SHARED.md "Candidate").
+ */
+export interface SurfaceLinkCandidateCommand {
+  readonly projectId: string;
+  readonly requestId: string;
+  readonly contractId: string;
+  readonly contractRevision: number;
+  readonly pullRequestUrl: string;
+  /** The transport always sends null: what the project expects is profile configuration. */
+  readonly expectedBaseBranch: string | null;
+  readonly correlationId: string;
+  /** The owner the session proved. Never read from the body (F01-AC1). */
+  readonly actor: OwnerId;
+}
+
+/**
+ * Read one candidate by its own identity, inside one project.
+ *
+ * The identity is the **candidate**, and the controller's currency read is keyed by the
+ * **request** a candidate belongs to. Resolving one from the other is the adapter's job — see
+ * `candidates.readCandidate` below — because a transport that invented a request id would be
+ * reading whatever candidate that request happens to hold (F02-AC2, F24-AC4).
+ */
+export interface SurfaceReadCandidateCommand {
+  readonly projectId: string;
+  readonly candidateId: string;
+  readonly correlationId: string;
+  readonly actor: OwnerId;
+}
+
+/**
+ * The whole candidate port: two reads and one durable write, and no provider write at all.
+ *
+ * `mergePullRequest`, `closePullRequest`, `approve` and `setBranchProtection` are absent from
+ * the type because the use cases underneath hold a `CandidateGitPort`, which has two reads and
+ * nothing else to call (mvp-spec F03-AC5).
+ */
+export interface SurfaceCandidateUseCases {
+  linkCandidate(
+    command: SurfaceLinkCandidateCommand,
+  ): Promise<Result<SurfaceLinkedCandidateReport, DomainError>>;
+  readCandidate(command: SurfaceReadCandidateCommand): Promise<Result<SurfaceCandidateReport, DomainError>>;
+}
+
 /** The whole injected surface. One argument, so a missing use case is a type error. */
 export interface ControllerSurface {
   readonly owners: SurfaceOwnerUseCases;
   readonly projects: SurfaceProjectUseCases;
   readonly contracts: SurfaceContractUseCases;
   readonly handoff: SurfaceHandoffUseCases;
+  /**
+   * The GitHub candidate port (mvp-spec MVP "GitHub Candidate").
+   *
+   * Declared on the surface rather than left optional, and that is the whole fix: the routes
+   * were registered, the use cases existed on the composition root, and nothing connected them,
+   * so every candidate request answered `503` on a deployment that had a git provider
+   * configured. A group a route has to discover at runtime is the same invisibility that left
+   * generation implemented and unreachable (F11-AC1, F02-AC4).
+   *
+   * A deployment that composed no git provider still gets a stated refusal — from the adapter,
+   * at the operation, with the missing wiring named — rather than a port that is quietly absent.
+   */
+  readonly candidates: SurfaceCandidateUseCases;
   readonly mvpReview: SurfaceMvpReviewUseCases;
   readonly sessions: SurfaceSessionUseCases;
   readonly profiles: SurfaceProfileUseCases;
@@ -1949,6 +2165,182 @@ function toSurfaceHandoff(handoff: ImplementationHandoff): SurfaceHandoff {
     revision: handoff.revision,
     packet: { markdown: handoff.packet.markdown, fingerprint: handoff.packet.fingerprint },
     t3: handoff.t3,
+  };
+}
+
+/* -------------------------------------------------------------------------- */
+/* Candidate projection                                                        */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The candidate-linking use cases, or the refusal a deployment without them earns.
+ *
+ * `Unavailable`, mirroring `recordVerification`'s refusal for a null `readLiveCandidate`: the
+ * deployment is missing a capability, so the honest answer names it at the operation rather than
+ * throwing or reporting a provider read that never happened (F03-AC2, F20-AC2).
+ */
+function candidateLinkOf(root: CompositionRoot): Result<CandidateLinkUseCases, DomainError> {
+  if (root.candidateLinkUseCases === null) {
+    return err({
+      code: 'Unavailable',
+      reason:
+        'This deployment composed no GitHub candidate port, so no candidate can be linked, read or refreshed. Nothing was read from GitHub and nothing was recorded (F03-AC2, F02-AC4).',
+    });
+  }
+  return ok(root.candidateLinkUseCases);
+}
+
+/**
+ * The delivery-candidate rows, over the handle this root already holds.
+ *
+ * The same store the composition root hands to `candidateLinkUseCases`, reached here only to
+ * resolve a candidate identity to the request its own row names. Read-only in use: `get` is the
+ * only member called (F02-AC2).
+ */
+function deliveryCandidates(root: CompositionRoot): Pick<CandidateLinkStore, 'get'> {
+  return new DeliveryCandidateRepository(root.database);
+}
+
+/** The recorded candidate, field by field, with both SHAs at full length. */
+function toSurfaceRecordedCandidate(candidate: DeliveryCandidate): SurfaceRecordedCandidateReport {
+  return {
+    candidateId: String(candidate.candidateId),
+    projectId: String(candidate.projectId),
+    requestId: candidate.requestId,
+    contractId: candidate.contractId,
+    contractRevision: candidate.contractRevision,
+    provider: candidate.provider,
+    repository: candidate.repository,
+    pullRequestNumber: candidate.pullRequestNumber,
+    pullRequestUrl: candidate.pullRequestUrl,
+    baseBranch: candidate.baseBranch,
+    baseSha: String(candidate.baseSha),
+    headBranch: candidate.headBranch,
+    headSha: String(candidate.headSha),
+    pullRequestState: candidate.pullRequestState,
+    draft: candidate.draft,
+    observedAt: candidate.observedAt,
+    linkedAt: candidate.linkedAt,
+  };
+}
+
+/** What the provider reported during this read, field by field. */
+function toSurfaceLiveCandidate(live: LiveCandidateFacts): SurfaceLiveCandidateReport {
+  return {
+    provider: live.provider,
+    repository: live.repository,
+    pullRequestNumber: live.pullRequestNumber,
+    pullRequestUrl: live.pullRequestUrl,
+    baseBranch: live.baseBranch,
+    baseSha: String(live.baseSha),
+    headBranch: live.headBranch,
+    headSha: String(live.headSha),
+    headRepository: live.headRepository,
+    pullRequestState: live.pullRequestState,
+    draft: live.draft,
+    observedAt: live.observedAt,
+  };
+}
+
+/** The `(contract id, revision, head SHA)` triple, which is the controller's own value. */
+function toSurfaceCandidateBinding(binding: CandidateBinding): SurfaceCandidateBindingReport {
+  return {
+    contractId: binding.contractId,
+    contractRevision: binding.contractRevision,
+    headSha: String(binding.headSha),
+  };
+}
+
+/**
+ * One provider check, with `blocking` from the domain's own `isBlocking`.
+ *
+ * The controller's `CandidateCheckStatus` deliberately carries no `blocking` member and the
+ * transport's view does, so it is computed here with the same domain function the transport
+ * re-derives it with. Deriving it any other way would make this file a second opinion about
+ * what blocks, which is the one thing the six-state vocabulary exists to prevent (F20-AC2,
+ * F20-AC5).
+ */
+function toSurfaceCandidateCheck(check: CandidateCheckStatus): SurfaceCandidateCheckReport {
+  return {
+    name: check.name,
+    result: check.result,
+    required: check.required,
+    blocking: isBlocking(check.result, check.notApplicableApprovedByPolicy),
+    notApplicableApprovedByPolicy: check.notApplicableApprovedByPolicy,
+    observedHeadSha: check.observedHeadSha === null ? null : String(check.observedHeadSha),
+    startedAt: check.startedAt,
+    endedAt: check.endedAt,
+    artifactUrl: check.artifactUrl,
+    detail: check.detail,
+  };
+}
+
+/**
+ * A link, projected. Carries no readiness answer, because the controller's answer carries none.
+ */
+function toSurfaceLinkedCandidate(linked: LinkedCandidate): SurfaceLinkedCandidateReport {
+  return {
+    candidate: toSurfaceRecordedCandidate(linked.candidate),
+    live: toSurfaceLiveCandidate(linked.live),
+    binding: toSurfaceCandidateBinding(linked.binding),
+    bindingFingerprint: String(linked.bindingFingerprint),
+    alreadyRecorded: linked.alreadyRecorded,
+    observedAt: linked.observedAt,
+    // The literal is a fact about the port rather than a claim about this call: the use cases
+    // underneath hold a `CandidateGitPort`, which exposes two reads and no write to call, so
+    // there is no path from here to a merge, a close or a protection change (mvp-spec F03-AC5).
+    providerWritePerformed: false,
+  };
+}
+
+/**
+ * One live read, projected for the transport.
+ *
+ * Every member is the controller's own answer carried across: `checksReady`, `blockingChecks`
+ * and `reviewReadiness` were computed inside the read from the provider facts it just read, and
+ * re-deriving them here would be the second opinion F24-AC3 refuses. The one thing this adds is
+ * the shape of the change and evidence pair, which flattens the view's `priorEvidenceStale` and
+ * its `previousCandidateId`/`previousHeadSha` into the three fields the transport renders — the
+ * same facts, named as that transport names them (F20-AC3, F24-AC4).
+ */
+function toSurfaceCandidateRead(view: CandidateView): SurfaceCandidateReport {
+  const stale = view.priorEvidenceStale;
+  return {
+    candidate: toSurfaceRecordedCandidate(view.candidate),
+    live: toSurfaceLiveCandidate(view.live),
+    binding: toSurfaceCandidateBinding(view.binding),
+    bindingFingerprint: String(view.bindingFingerprint),
+    change: {
+      kind: view.change.kind,
+      changed: [...view.change.changed],
+      changedAnything: view.change.changedAnything,
+      previousHeadSha: view.change.previousHeadSha === null ? null : String(view.change.previousHeadSha),
+      currentHeadSha: String(view.change.currentHeadSha),
+      priorEvidenceStale: view.change.priorEvidenceStale,
+      detail: view.change.detail,
+    },
+    evidence: {
+      status: stale ? 'Stale' : 'Current',
+      // The literal is a statement about what this layer holds: it holds no stored readiness, so
+      // there is none to preserve across a force push (F24-AC4, F25-AC3).
+      priorReadinessPreserved: false,
+      priorCandidateId: stale && view.previousCandidateId !== null ? String(view.previousCandidateId) : null,
+      priorHeadSha: stale && view.previousHeadSha !== null ? String(view.previousHeadSha) : null,
+      // The read's own explanation, verbatim. The transport replaces this with its own wording
+      // when nothing moved, so this only ever reaches a reader alongside a moved fact — which is
+      // exactly the case the change's detail was written for (F24-AC4).
+      detail: view.change.detail,
+    },
+    supersededCandidateIds: view.supersededCandidates.map((candidateId) => String(candidateId)),
+    checks: view.checks.map(toSurfaceCandidateCheck),
+    checksReady: view.checksReady,
+    blockingChecks: [...view.blockingChecks],
+    reviewReadiness: {
+      ready: view.reviewReadiness.ready,
+      reasons: [...view.reviewReadiness.reasons],
+    },
+    observedAt: view.observedAt,
+    providerWritePerformed: false,
   };
 }
 
@@ -3249,6 +3641,84 @@ export function createControllerSurface(resolve: SurfaceRootResolver): Controlle
           );
           if (!handoff.ok) return err(handoff.error);
           return ok(toSurfaceHandoff(handoff.value));
+        }),
+    },
+
+    /**
+     * The GitHub candidate port: link a pull request the owner named, and read the current
+     * candidate live from the provider (mvp-spec MVP "GitHub Candidate", F11-AC2, F24-AC1).
+     *
+     * Both members delegate to `candidateLinkUseCases`, which is the only place the currency
+     * read exists. Nothing here re-derives a fact about the provider and nothing here adds a
+     * rule: each answer is the controller's own, re-expressed in the narrower vocabulary the
+     * transport declares (F02-AC1, F24-AC2).
+     *
+     * `candidateLinkUseCases` is `null` on a deployment that configured no git provider. Both
+     * methods answer that with a stated `Unavailable` naming the missing wiring, the same way
+     * `recordVerification` refuses when `readLiveCandidate` is null — never a throw, and never
+     * a fabricated report that would read as "nothing failed" (F03-AC2, F20-AC2).
+     */
+    candidates: {
+      linkCandidate: async (command) =>
+        use(async (root) => {
+          const candidates = candidateLinkOf(root);
+          if (!candidates.ok) return err(candidates.error);
+          const actor = ownerActorFor(command.actor);
+          if (!actor.ok) return err(actor.error);
+          const linked = await candidates.value.linkPullRequest({
+            actor: actor.value,
+            projectId: command.projectId as ProjectId,
+            requestId: command.requestId,
+            contractId: command.contractId,
+            contractRevision: command.contractRevision,
+            pullRequestUrl: command.pullRequestUrl,
+            // Carried through rather than re-decided here: the transport always sends null, and
+            // an expected base branch is project configuration, not something a request may
+            // assert for itself (mvp-spec 3, F02-AC2).
+            expectedBaseBranch: command.expectedBaseBranch,
+            correlationId: command.correlationId,
+          });
+          if (!linked.ok) return err(linked.error);
+          return ok(toSurfaceLinkedCandidate(linked.value));
+        }),
+
+      /**
+       * The live read, addressed by the candidate the transport named.
+       *
+       * The controller's read is keyed by **request**, because it answers "what does the
+       * provider say about this request's candidate right now?" and a force push makes that a
+       * different candidate. The transport is addressed by **candidate**, because that is the
+       * identity a card is rendered against. The two are reconciled by reading the named
+       * candidate's own row first: it carries both its request and its project, so a candidate
+       * belonging to another project is refused here rather than answered from that project's
+       * request.
+       *
+       * One row and one project comparison, done here because no candidate use case takes a
+       * candidate id — `mvp-review-card.ts` resolves the same way, from the same repository,
+       * for the same reason (F02-AC2, F24-AC4).
+       */
+      readCandidate: async (command) =>
+        use(async (root) => {
+          const candidates = candidateLinkOf(root);
+          if (!candidates.ok) return err(candidates.error);
+          const actor = ownerActorFor(command.actor);
+          if (!actor.ok) return err(actor.error);
+          const stored = deliveryCandidates(root).get(command.candidateId as CandidateId);
+          if (!stored.ok) return err(stored.error);
+          if (String(stored.value.projectId) !== command.projectId) {
+            return err({
+              code: 'NotFound',
+              reason: `This project holds no candidate ${command.candidateId}. A candidate is addressed inside its own project, so one project's identifier cannot read another's candidate (F02-AC2).`,
+            });
+          }
+          const read = await candidates.value.readCandidate({
+            actor: actor.value,
+            projectId: command.projectId as ProjectId,
+            requestId: stored.value.requestId,
+            correlationId: command.correlationId,
+          });
+          if (!read.ok) return err(read.error);
+          return ok(toSurfaceCandidateRead(read.value));
         }),
     },
 
