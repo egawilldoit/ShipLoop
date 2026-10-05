@@ -56,6 +56,7 @@
 
 import { createHash, randomUUID } from 'node:crypto';
 import { isCommitSha, requireMvpOwner } from '@shiploop/domain';
+import { MvpDefaultVerificationPolicy } from '@shiploop/domain';
 import type {
   CandidateCheckStatus,
   CandidateId,
@@ -75,6 +76,7 @@ import type {
   MvpRecordedEvidence,
   MvpReviewReadModel,
   MvpRequestView,
+  MvpVerificationPolicy,
   OwnerId,
   ProjectId,
   Request,
@@ -498,6 +500,28 @@ export interface MvpReviewCardDeps {
    * handed a use case that presents as a configured capability it cannot use (F03-AC2).
    */
   readonly readLiveCandidate?: MvpLiveCandidateReader | null;
+  /**
+   * The automated check identities this project's saved profile requires.
+   *
+   * **This is the policy F24-AC3 and F20-AC5 name, and the card cannot decide it for itself.**
+   * `MvpDefaultVerificationPolicy` requires no check, so a card built without this fact judges
+   * readiness against the criteria alone — and a project's own declared gate then becomes
+   * advisory: a required check that is red, missing or stale blocks the *candidate* surface
+   * (which reads the same list through `requiredCheckNames`) while the acceptance gate the
+   * owner submits against reports the work as ready. Two surfaces, one project, one set of
+   * provider facts, and no way for either to be wrong about what the project required.
+   *
+   * Read per read rather than cached, because a profile is versioned: a name added or removed
+   * has to move the gate with the same read that renders the card, or the card would gate on a
+   * requirement the project has already changed (F20-AC5).
+   *
+   * Absent means "this deployment supplies no policy", answered with the shipped default rather
+   * than a refusal: a project that has saved no profile has declared no required gate, and the
+   * MVP journey has to work with none (mvp-spec MVP). A *refusal* is not treated that way —
+   * failing to read the policy fails the read, because a gate that quietly opens when the store
+   * cannot answer is the wrong direction to fail in (F24-AC3).
+   */
+  readonly requiredCheckIds?: (projectId: ProjectId) => Result<readonly string[], DomainError>;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -544,9 +568,52 @@ function readFacts(
   );
   if (!contract.ok) return contract;
 
+  // Read after the project's own rows and before the projection, because it is the last fact the
+  // projection needs and a refusal here must stop the read rather than produce a card judged
+  // under a policy nobody can name (F24-AC3).
+  const policy = verificationPolicyFor(deps, command.projectId as ProjectId);
+  if (!policy.ok) return policy;
+
   return {
     ok: true,
-    value: { facts: toFacts(request.value, contract.value, candidate.value), candidate: candidate.value, contract: contract.value },
+    value: {
+      facts: { ...toFacts(request.value, contract.value, candidate.value), policy: policy.value },
+      candidate: candidate.value,
+      contract: contract.value,
+    },
+  };
+}
+
+/**
+ * The verification policy this project's saved profile states.
+ *
+ * The project's own list is the whole of the automated gate, and it becomes *both* the review
+ * gate and the delivery gate: the profile states one list of required check identities, so
+ * reading it as "required for review but optional for delivery" would invent a second policy the
+ * project never chose. `MvpDefaultVerificationPolicy`'s owner-test answers carry through
+ * unchanged - a pending owner test is the owner's own action at the review offer and a blocker
+ * before delivery (F24-AC3).
+ *
+ * A project whose profile requires nothing is answered with the shipped default rather than an
+ * equivalent hand-built policy, so "no profile" and "a profile that requires nothing" are the
+ * same fact expressed by the same value (F20-AC5).
+ */
+function verificationPolicyFor(
+  deps: MvpReviewCardDeps,
+  projectId: ProjectId,
+): Result<MvpVerificationPolicy, DomainError> {
+  if (deps.requiredCheckIds === undefined) return { ok: true, value: MvpDefaultVerificationPolicy };
+  const declared = deps.requiredCheckIds(projectId);
+  if (!declared.ok) return declared;
+  const ids = [...new Set(declared.value)];
+  if (ids.length === 0) return { ok: true, value: MvpDefaultVerificationPolicy };
+  return {
+    ok: true,
+    value: {
+      ...MvpDefaultVerificationPolicy,
+      requiredAutomatedCheckIds: ids,
+      deliveryRequiredCheckIds: ids,
+    },
   };
 }
 
