@@ -16,6 +16,39 @@ or acceptance.
 Tested revision for every row: `1556c83` on the Oracle ARM64 VM, clean tree.
 `pnpm verify:app` passes all twelve commands at that revision.
 
+## Backend lifecycle gate (M0)
+
+`LIFECYCLE_PROVEN_SHA=1434b5042670444ae692e1eb261942621d2b6dfe`
+
+The lifecycle the M0 milestone set out to close is proven on that one commit, over the shipped
+composition root, the real HTTP stack and a real migrated SQLite file:
+
+```text
+automated criterion → stable binding → exact-SHA evidence → Passed
+owner_test criterion → owner evidence → Passed
+all required current criteria → eligible
+eligible exact current SHA → Accept succeeds
+candidate SHA changes → prior automated evidence stale, prior owner evidence stale,
+                        prior acceptance not current, stale Accept refused
+```
+
+This **does not** move any row to `Proven` on its own, and deliberately so. The register's own
+definition requires a real provider, browser, engine or process; the provider in these tests is a
+scripted read-only port behind the production wiring, so the live-provider and live-browser legs
+are still outstanding. What changed is the strength of the proof, not its kind: these rows move
+from *no biting test of the chain at all* to *the chain asserted end to end against the shipped
+process with a scripted provider*. The rows this applies to are the ones whose requirement is
+about binding, currency and refusal rather than about live integration — F20-AC2, F20-AC3, F20-AC5,
+F23-AC1, F24-AC3, F25-AC4, F27-AC3 — and each stays `Implemented, unproven` until its live leg runs.
+
+Two facts recorded here because they bound what a green run means:
+
+- The candidate port is registered on the HTTP surface but is not carried by the shipped
+  `ControllerSurface`, so `GET /api/projects/:id/candidates/:id` answers a stated 503. The
+  lifecycle reaches the same use case through the composition root, so the chain is unaffected.
+- Nothing here was proven against GitHub, a browser, a deployment, or a merge, because none of
+  those were exercised. A green backend gate is not a product acceptance.
+
 | Criterion | Status | Requirement | Implementation / proof |
 | --- | --- | --- | |
 | F01-AC1 | Proven | :** An unauthenticated request cannot read private ideas, profiles, run details, artifacts, or invoke owner actions; it receives a sign-in response or | implementation + real evidence |
