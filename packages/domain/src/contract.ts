@@ -481,30 +481,15 @@ function contractStatusRefusal(contract: DeliveryContract): string {
 /**
  * The automated criteria of a revision that name no check.
  *
- * The one question `approveContract` asks about bindings, extracted so the report the
- * owner reads and the gate that refuses it cannot be two opinions about the same contract.
+ * The one question `approveContract` asks about bindings, named so the question has one
+ * answer in this module rather than one in the gate and another in a caller that reports
+ * the same thing to the owner. Deliberately private: a caller that needs to know which
+ * criteria are bound already holds the criteria.
  */
-export function unboundAutomatedCriteria(content: ContractContent): readonly ContractCriterion[] {
+function unboundAutomatedCriteria(content: ContractContent): readonly ContractCriterion[] {
   return content.acceptanceCriteria.filter(
     (criterion) => criterion.verificationType === 'automated' && criterion.verificationCheckId === null,
   );
-}
-
-/**
- * The automated criteria of a revision that name a check, keyed by criterion id.
- *
- * One place that reads "what verifies this criterion", so a caller resolving a check's
- * results for a criterion and a caller refusing an unbound contract cannot disagree about
- * which criteria are bound (F23-AC1).
- */
-export function automatedVerificationsOf(content: ContractContent): ReadonlyMap<string, string> {
-  const bound = new Map<string, string>();
-  for (const criterion of content.acceptanceCriteria) {
-    if (criterion.verificationType === 'automated' && criterion.verificationCheckId !== null) {
-      bound.set(criterion.id, criterion.verificationCheckId);
-    }
-  }
-  return bound;
 }
 
 /**

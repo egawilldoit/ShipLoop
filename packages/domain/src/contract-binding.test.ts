@@ -2,12 +2,10 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   approveContract,
-  automatedVerificationsOf,
   contractContentFingerprint,
   createContractDraft,
   editContract,
   fingerprint,
-  unboundAutomatedCriteria,
   type ContractContent,
   type ContractId,
   type OwnerId,
@@ -92,11 +90,10 @@ function approve(draft: ReturnType<typeof draftOf>) {
 
 test('an automated criterion may be drafted unbound, because the owner is still writing it', () => {
   const draft = draftOf(UNBOUND);
-  assert.equal(draft.acceptanceCriteria[0]?.verificationCheckId, null);
   assert.deepEqual(
-    unboundAutomatedCriteria(draft).map((criterion) => criterion.id),
-    ['AC1'],
-    'the unbound automated criteria are named, not merely absent',
+    draft.acceptanceCriteria.map((criterion) => [criterion.id, criterion.verificationCheckId]),
+    [['AC1', null], ['AC2', null]],
+    'the binding is stated as unbound rather than absent, so nothing downstream has to ask',
   );
 });
 
@@ -124,7 +121,6 @@ test('an automated criterion that names a check is approved, and the owner test 
     ['unit-tests', null],
     'the owner test is approved with no binding, which is the only correct value for it',
   );
-  assert.deepEqual([...automatedVerificationsOf(approvedValue.value).entries()], [['AC1', 'unit-tests']]);
 });
 
 test('an owner test that names a check is refused, because a check must not discharge the owner\'s own step', () => {

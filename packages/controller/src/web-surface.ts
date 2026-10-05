@@ -1965,8 +1965,9 @@ function contractContentOf(command: {
       id: criterion.id,
       description: criterion.description,
       verificationType: criterion.verificationType,
-      // Absent stays absent here and becomes an explicit unbound criterion below, which is
-      // what the domain's approval gate is written against.
+      // `?? null` is a guard, not a coercion: the type says the binding is stated, and a
+      // runtime `undefined` from a hand-built body still has to reach the approval gate as
+      // the unbound case rather than as a hole in the shape.
       verificationCheckId: criterion.verificationCheckId ?? null,
     })),
   };
