@@ -1,11 +1,40 @@
-import { useState, type FormEvent, type ReactElement } from 'react';
-import { createProject, type ProjectSummary } from './api-client.ts';
+/**
+ * The owner shell: identity, navigation, and the one place a surface is chosen.
+ *
+ * Four things this component decides, and the reason each is here rather than on a page:
+ *
+ *   - **Which project every screen addresses** (F02-AC1). It comes from
+ *     `session.owner.activeProject`, read through `mvp-client.ts`, and it is either a project
+ *     this deployment holds or the explicit `NoProjectSelected` state. When it is the latter,
+ *     the shell renders an onboarding screen *instead of* the requested surface, because all
+ *     four primary surfaces are project-scoped: there is nothing truthful to render without a
+ *     project, and rendering something anyway is how this product once ended up asking about
+ *     a project named `undefined` and reporting the server's honest 404 as "that project has
+ *     no saved profile yet" (F02-AC4).
+ *   - **The four primary surfaces**: Home, New Request, Review, Settings. Home is the default,
+ *     because the first question after signing in is what needs the owner, and that is a
+ *     reading rather than a configuration task.
+ *   - **Where the advanced screens went.** Profiles, Connectors, Brief, Runs, the old
+ *     Needs-you board, Plan and Publication are working screens that the MVP cut takes out of
+ *     the primary path. They are *hidden*, not deleted: each keeps its own label and its own
+ *     routes, and they stay reachable below the primary row so nothing that works becomes
+ *     unreachable. This is the escape hatch the MVP promised them.
+ *   - **The states that are not pages.** A signed-out client gets sign-in; a client that
+ *     cannot read its session gets the server's own reason and a re-read, which is a different
+ *     thing from a session that ended and must not borrow its wording (N03-AC1).
+ */
+
+import { useState, type ReactElement } from 'react';
 import { ConnectionBanner } from './components/ConnectionBanner.tsx';
+import { ProjectSelector } from './components/ProjectSelector.tsx';
+import { DEFAULT_SURFACE, LEGACY_SURFACES, PRIMARY_SURFACES, type PrimarySurfaceId, type SurfaceId } from './navigation.ts';
 import { BriefPage } from './pages/BriefPage.tsx';
 import { ConnectorsPage } from './pages/ConnectorsPage.tsx';
 import { DashboardPage } from './pages/DashboardPage.tsx';
+import { HomePage } from './pages/HomePage.tsx';
 import { IntakePage } from './pages/IntakePage.tsx';
 import { PlanPage } from './pages/PlanPage.tsx';
+import { NoProjectState, SettingsSurface } from './pages/ProjectContext.tsx';
 import { ProfilesPage } from './pages/ProfilesPage.tsx';
 import { PublicationPage } from './pages/PublicationPage.tsx';
 import { ReviewCardPage } from './pages/ReviewCardPage.tsx';
@@ -13,185 +42,31 @@ import { RunPage } from './pages/RunPage.tsx';
 import { SignInPage } from './pages/SignInPage.tsx';
 import { SessionProvider, useSession } from './session.tsx';
 
-type Section =
-  | 'profiles'
-  | 'connectors'
-  | 'intake'
-  | 'brief'
-  | 'runs'
-  | 'review'
-  | 'dashboard'
-  | 'plan'
-  | 'publication';
+const PRIMARY_IDS: ReadonlySet<string> = new Set(PRIMARY_SURFACES.map((surface) => surface.id));
 
-const SECTIONS: readonly { readonly id: Section; readonly label: string }[] = [
-  { id: 'profiles', label: 'Profiles' },
-  { id: 'connectors', label: 'Connectors' },
-  { id: 'intake', label: 'Intake' },
-  { id: 'brief', label: 'Brief' },
-  { id: 'runs', label: 'Runs' },
-  { id: 'review', label: 'Review card' },
-  { id: 'dashboard', label: 'Needs you' },
-  { id: 'plan', label: 'Plan' },
-  { id: 'publication', label: 'Publication' },
-];
-
-/**
- * Which project every project-scoped screen addresses (F02-AC1).
- *
- * This component exists because project identity was previously absent rather than chosen.
- * The session response carried no project, the pages took an empty string, and every request
- * they built from it went to `/api/profiles/undefined` — a project literally named
- * "undefined" — which answered 404 and was reported as "that project has no saved profile
- * yet". A selector plus an explicit "no project selected" state means a page either has a
- * project to ask about or says it has none, and neither case is a request for a name that
- * does not exist (F02-AC1, F02-AC4).
- *
- * Creation is offered here because it is the only project write that needs no configured
- * provider: a profile save, a connector registration and a procedure append all refuse by
- * name when no adapter declares the capability they need, so an owner who has configured
- * nothing would otherwise have no project to select at all (F03-AC2).
- */
-function ProjectSelector({
-  projects,
-  selectedProjectId,
-  onSelect,
-  onCreated,
-}: {
-  readonly projects: readonly ProjectSummary[];
-  readonly selectedProjectId: string | null;
-  readonly onSelect: (projectId: string | null) => void;
-  readonly onCreated: () => void;
-}): ReactElement {
-  const [creating, setCreating] = useState(false);
-  const [projectId, setProjectId] = useState('');
-  const [name, setName] = useState('');
-  const [error, setError] = useState<string | null>(null);
-  const [saving, setSaving] = useState(false);
-
-  const submit = (event: FormEvent<HTMLFormElement>): void => {
-    event.preventDefault();
-    if (saving) return;
-    if (projectId.trim() === '') {
-      setError('A project needs an id. It is the name every request for that project uses.');
-      return;
-    }
-    if (name.trim() === '') {
-      setError('A project needs a name, so the selector does not offer the owner a bare id.');
-      return;
-    }
-    setSaving(true);
-    setError(null);
-    void createProject({ projectId: projectId.trim(), name: name.trim() }).then((result) => {
-      setSaving(false);
-      if (!result.ok) {
-        setError(result.error.reason);
-        return;
-      }
-      setProjectId('');
-      setName('');
-      setCreating(false);
-      onCreated();
-      onSelect(result.value.project.projectId);
-    });
-  };
-
-  return (
-    <div className="project-selector">
-      <label className="project-selector__label" htmlFor="project-select">
-        Project
-      </label>
-      <select
-        id="project-select"
-        className="project-selector__select"
-        value={selectedProjectId ?? ''}
-        onChange={(event) => onSelect(event.target.value === '' ? null : event.target.value)}
-      >
-        {/* The empty option is a real state, not a placeholder: it is what "no project is
-            selected" means, and it is the state a signed-in owner with no project is in. */}
-        <option value="">No project selected</option>
-        {projects.map((project) => (
-          <option key={project.projectId} value={project.projectId}>
-            {project.name} ({project.projectId})
-          </option>
-        ))}
-      </select>
-      {creating ? (
-        <form className="project-selector__form" onSubmit={submit} noValidate>
-          <label className="project-selector__label" htmlFor="project-id">
-            Project id
-          </label>
-          <input
-            id="project-id"
-            className="project-selector__input"
-            value={projectId}
-            onChange={(event) => setProjectId(event.target.value)}
-            placeholder="one-word-id, no slashes"
-            disabled={saving}
-          />
-          <label className="project-selector__label" htmlFor="project-name">
-            Project name
-          </label>
-          <input
-            id="project-name"
-            className="project-selector__input"
-            value={name}
-            onChange={(event) => setName(event.target.value)}
-            placeholder="What this project is called"
-            disabled={saving}
-          />
-          {error !== null && (
-            <p className="state-line state-line--error" role="alert" data-state="failed">
-              {error}
-            </p>
-          )}
-          <div className="project-selector__actions">
-            <button className="button" type="submit" disabled={saving}>
-              {saving ? 'Creating…' : 'Create project'}
-            </button>
-            <button
-              className="button button--secondary"
-              type="button"
-              disabled={saving}
-              onClick={() => {
-                setCreating(false);
-                setError(null);
-              }}
-            >
-              Cancel
-            </button>
-          </div>
-        </form>
-      ) : (
-        <button
-          className="button button--secondary"
-          type="button"
-          onClick={() => {
-            setCreating(true);
-            setError(null);
-          }}
-        >
-          New project
-        </button>
-      )}
-    </div>
-  );
+/** Whether a surface is one of the four the MVP path offers. */
+function isPrimary(surface: SurfaceId): boolean {
+  return PRIMARY_IDS.has(surface);
 }
 
 function Shell(): ReactElement {
   const {
     status,
     owner,
+    activeProject,
     selectedProjectId,
+    selectedProjectName,
     selectProject,
     projects,
     reloadProjects,
+    sessionFailure,
     connection,
     connectionEpoch,
+    reloadSession,
     signOut,
     retry,
   } = useSession();
-  const [section, setSection] = useState<Section>('intake');
+  const [surface, setSurface] = useState<SurfaceId>(DEFAULT_SURFACE);
   const [activeProfileId, setActiveProfileId] = useState('');
   const [activeProfileLabel, setActiveProfileLabel] = useState('');
   const [activeIdeaId, setActiveIdeaId] = useState('');
@@ -213,6 +88,17 @@ function Shell(): ReactElement {
     setActiveProfileLabel(label);
   };
 
+  /**
+   * Navigate to a primary surface, from anywhere in the shell.
+   *
+   * A single function so a page's own call to action ("Go to Review") and the navigation row
+   * move the same state, and so the destination is one value rather than a set of booleans a
+   * page has to keep in step with the nav.
+   */
+  const goTo = (destination: PrimarySurfaceId): void => {
+    setSurface(destination);
+  };
+
   if (status === 'checking') {
     return (
       <main className="page page--narrow" id="main">
@@ -227,6 +113,34 @@ function Shell(): ReactElement {
   if (status === 'signed-out' || owner === null) {
     return <SignInPage />;
   }
+
+  // Deliberately not the sign-in screen and not a blank page. A client that cannot read its
+  // session is signed in or signed out so far as every private page is concerned, and it does
+  // not know which; answering with the sign-in form would ask for a password the owner may not
+  // need, and answering with a board would be a claim about a project this client cannot name
+  // (F01-AC2).
+  if (status === 'unreachable') {
+    return (
+      <main className="page page--narrow" id="main">
+        <h1 className="page__title">ShipLoop</h1>
+        <p className="state-line state-line--warn" role="alert" data-state="disconnected">
+          {sessionFailure?.reason ?? 'This browser has not been able to read your session.'} No request has been sent
+          for a project this client cannot name, and nothing you entered has been lost.
+        </p>
+        <div className="form__actions">
+          <button className="button" type="button" onClick={reloadSession}>
+            Try again
+          </button>
+        </div>
+      </main>
+    );
+  }
+
+  // Every primary surface is project-scoped, so "no project" is answered by the onboarding
+  // screen rather than by each surface inventing an answer for itself. The legacy screens are
+  // left alone: they were written to receive a null project and to say they have none, which is
+  // the same statement without a second implementation of it.
+  const blockedByProject = isPrimary(surface) && activeProject === null;
 
   return (
     <>
@@ -246,14 +160,25 @@ function Shell(): ReactElement {
           <p className="app__owner">
             Signed in as {owner.displayName}
             {owner.email === null ? ' (this owner has no sign-in address)' : ` (${owner.email})`}
+            {selectedProjectName === null
+              ? ' (this session has no project selected)'
+              : ` · in project ${selectedProjectName} (${selectedProjectId ?? ''})`}
           </p>
         </div>
-        <ProjectSelector
-          projects={projects}
-          selectedProjectId={selectedProjectId}
-          onSelect={selectProject}
-          onCreated={reloadProjects}
-        />
+        {/*
+          Rendered only when a project is actually selected. With none selected the onboarding
+          screen owns the choice, and two selectors offering the same choice would be one too
+          many controls answering one question.
+        */}
+        {activeProject !== null && activeProject.state === 'Selected' ? (
+          <ProjectSelector
+            projects={projects}
+            activeProject={activeProject}
+            onSelect={selectProject}
+            onCreated={reloadProjects}
+            idPrefix="header"
+          />
+        ) : null}
         <button
           className="button button--secondary"
           type="button"
@@ -269,15 +194,39 @@ function Shell(): ReactElement {
 
       <ConnectionBanner connection={connection} onRetry={retry} />
 
-      <nav className="app__nav" aria-label="Owner sections">
+      <nav className="app__nav" aria-label="Primary">
         <ul className="app__nav-list">
-          {SECTIONS.map((entry) => (
+          {PRIMARY_SURFACES.map((entry) => (
             <li key={entry.id}>
               <button
                 className="button button--tab"
                 type="button"
-                aria-current={section === entry.id ? 'page' : undefined}
-                onClick={() => setSection(entry.id)}
+                aria-current={surface === entry.id ? 'page' : undefined}
+                onClick={() => setSurface(entry.id)}
+              >
+                {entry.label}
+              </button>
+            </li>
+          ))}
+        </ul>
+      </nav>
+
+      {/*
+        The advanced screens, kept reachable and kept out of the primary path. Each label is the
+        one the screen's own heading uses, so a browser test or a runbook that names them still
+        finds them; the row says plainly that it is not part of the MVP so nobody reads it as
+        one of the four.
+      */}
+      <nav className="app__nav app__nav--legacy" aria-label="Advanced, outside the MVP path">
+        <p className="panel__note">Advanced screens, outside the MVP path. They still work and still read the same server routes.</p>
+        <ul className="app__nav-list">
+          {LEGACY_SURFACES.map((entry) => (
+            <li key={entry.id}>
+              <button
+                className="button button--tab button--secondary"
+                type="button"
+                aria-current={surface === entry.id ? 'page' : undefined}
+                onClick={() => setSurface(entry.id)}
               >
                 {entry.label}
               </button>
@@ -296,72 +245,101 @@ function Shell(): ReactElement {
         be a card about nothing (F24-AC2).
       */}
       <main className="app__main" id="main">
-        {section === 'profiles' ? (
-          <ProfilesPage
-            projectId={selectedProjectId}
-            activeProfileId={activeProfileId}
-            onSelectProfile={selectProfile}
-            epoch={connectionEpoch}
+        {blockedByProject ? (
+          <NoProjectState
+            activeProject={activeProject}
+            projects={projects}
+            onSelect={selectProject}
+            onCreated={reloadProjects}
+            onReload={reloadSession}
           />
-        ) : section === 'connectors' ? (
-          <ConnectorsPage
-            projectId={selectedProjectId}
-            profileId={activeProfileId}
-            profileName={activeProfileLabel}
+        ) : surface === 'home' && activeProject?.state === 'Selected' ? (
+          <HomePage
+            projectId={activeProject.activeProjectId}
+            projectName={activeProject.activeProjectName}
             epoch={connectionEpoch}
+            onReload={retry}
+            onNavigate={goTo}
           />
-        ) : section === 'intake' ? (
+        ) : surface === 'new-request' ? (
           <IntakePage
             selectedIdeaId={activeIdeaId}
             selectedProjectId={selectedProjectId}
             onSelectIdea={setActiveIdeaId}
             onOpenBrief={(ideaId) => {
               setActiveIdeaId(ideaId);
-              setSection('brief');
+              setSurface('brief');
             }}
             epoch={connectionEpoch}
           />
-        ) : section === 'runs' ? (
+        ) : surface === 'review' ? (
+          <ReviewCardPage jobId={activeJobId} onBackToRuns={() => setSurface('runs')} epoch={connectionEpoch} />
+        ) : surface === 'settings' && activeProject?.state === 'Selected' ? (
+          <SettingsSurface
+            activeProject={activeProject}
+            projects={projects}
+            onSelect={selectProject}
+            onCreated={reloadProjects}
+          />
+        ) : surface === 'profiles' ? (
+          <ProfilesPage
+            projectId={selectedProjectId}
+            activeProfileId={activeProfileId}
+            onSelectProfile={selectProfile}
+            epoch={connectionEpoch}
+          />
+        ) : surface === 'connectors' ? (
+          <ConnectorsPage
+            projectId={selectedProjectId}
+            profileId={activeProfileId}
+            profileName={activeProfileLabel}
+            epoch={connectionEpoch}
+          />
+        ) : surface === 'brief' ? (
+          <BriefPage
+            ideaId={activeIdeaId}
+            onBackToIntake={() => setSurface('new-request')}
+            epoch={connectionEpoch}
+          />
+        ) : surface === 'runs' ? (
           <RunPage
             selectedJobId={activeJobId}
             onSelectJob={setActiveJobId}
             onOpenReviewCard={(jobId) => {
               setActiveJobId(jobId);
-              setSection('review');
+              setSurface('review');
             }}
             epoch={connectionEpoch}
           />
-        ) : section === 'review' ? (
-          <ReviewCardPage
-            jobId={activeJobId}
-            onBackToRuns={() => setSection('runs')}
-            epoch={connectionEpoch}
-          />
-        ) : section === 'dashboard' ? (
+        ) : surface === 'dashboard' ? (
           <DashboardPage epoch={connectionEpoch} />
-        ) : section === 'brief' ? (
-          <BriefPage
-            ideaId={activeIdeaId}
-            onBackToIntake={() => setSection('intake')}
-            epoch={connectionEpoch}
-          />
-        ) : section === 'plan' ? (
+        ) : surface === 'plan' ? (
           <PlanPage
             ideaId={activeIdeaId}
             onOpenPublication={(planId) => {
               setActivePlanId(planId);
-              setSection('publication');
+              setSurface('publication');
             }}
             epoch={connectionEpoch}
           />
-        ) : (
+        ) : surface === 'publication' ? (
           <PublicationPage
             planId={activePlanId}
             ideaId={activeIdeaId}
             projectId={selectedProjectId}
-            onBackToPlan={() => setSection('plan')}
+            onBackToPlan={() => setSurface('plan')}
             epoch={connectionEpoch}
           />
+        ) : (
+          <section className="page page--narrow" aria-labelledby="no-surface-title">
+            <h2 className="page__title" id="no-surface-title">
+              This screen is not written yet
+            </h2>
+            <p className="state-line state-line--warn" role="status" data-state="unwritten">
+              Nothing is shown for this screen because it has no page in this build. Nothing has been sent to the
+              server and nothing has been recorded.
+            </p>
+          </section>
         )}
       </main>
     </>
@@ -371,11 +349,18 @@ function Shell(): ReactElement {
 /**
  * The owner shell.
  *
- * The signed-out branch returns before any private view is created, and signing out clears
- * the owner, the project context and the CSRF token together, so a client that has lost its
- * session is not left holding the previous owner's cached facts from which it might appear
- * to authorize delivery (F01-AC5). Nothing about the previous session survives in this
- * component's state: the pages that held it are unmounted, not hidden.
+ * The signed-out branch returns before any private view is created, and signing out clears the
+ * owner, the project context and the CSRF token together, so a client that has lost its session
+ * is not left holding the previous owner's cached facts from which it might appear to
+ * authorize delivery (F01-AC5). Nothing about the previous session survives in this component's
+ * state: the pages that held it are unmounted, not hidden.
+ *
+ * The final branch states that a surface has no screen, rather than falling back to another
+ * screen. Every `SurfaceId` is named above, so it is unreachable in practice; it exists because
+ * a surface added to `navigation.ts` without a branch here would otherwise leave the owner
+ * staring at an empty main region, which reads as a page that failed to load rather than as one
+ * that was never written. Answering with the sign-in form would be worse than an empty region:
+ * it would tell a signed-in owner that their session ended.
  */
 export function App(): ReactElement {
   return (

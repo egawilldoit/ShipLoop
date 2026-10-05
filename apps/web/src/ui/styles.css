@@ -195,6 +195,23 @@ li {
   gap: 0.5rem;
 }
 
+/*
+ * The advanced screens, kept reachable below the primary row.
+ *
+ * Set apart by a rule and a muted note rather than by colour alone, and given the same wrapping
+ * behaviour as the primary row so a second row of tabs cannot push the main region past a
+ * 375px viewport (F01-AC3, N03-AC1).
+ */
+.app__nav--legacy {
+  padding-top: 0.5rem;
+  border-top: 1px solid var(--line);
+}
+
+.app__nav--legacy .panel__note {
+  margin: 0 0 0.5rem;
+  font-size: 0.875rem;
+}
+
 .page {
   min-width: 0;
 }
