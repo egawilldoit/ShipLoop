@@ -34,20 +34,23 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 
-import { SESSION_COOKIE_NAME } from '@shiploop/domain';
+import { SESSION_COOKIE_NAME, isBlocking } from '@shiploop/domain';
 import type {
   CandidateId,
   CapabilityDeclaration,
   CapabilityKind,
+  CandidateCheckStatus,
   CheckResult,
   CommitSha,
   DomainError,
+  OwnerId,
   ProjectId,
   Result,
 } from '@shiploop/domain';
 import type { FastifyInstance } from 'fastify';
 import { DeliveryCandidateRepository, SqliteMvpReviewStore } from '@shiploop/storage';
 import type { ConnectorKind } from '@shiploop/storage';
+import type { CandidateView } from '@shiploop/controller';
 import {
   bindControllerSurface,
   createCompositionRoot,
@@ -83,6 +86,15 @@ const NOW = '2026-10-03T09:00:00.000Z';
 const LATER = '2026-10-03T10:00:00.000Z';
 const DISPLAY_NAME = 'Solo Owner';
 const PASSWORD = 'correct horse battery staple';
+/**
+ * A branded owner identity for the candidate-read actor.
+ *
+ * Cast from a fixed literal rather than read from the session, because the candidate read is
+ * driven through the controller here rather than over HTTP and so needs a typed `OwnerId`.
+ * Nothing about the assertion depends on whose it is: the read is asked for by project and
+ * request, and the question is which required-check list it answers with.
+ */
+const READ_OWNER_ID = '11111111-0000-4000-8000-000000000001' as OwnerId;
 const PROJECT_ID = 'checkout';
 const CSRF_SECRET = ['server', 'secret', 'material', '0123456789abcdef'].join('-');
 const FAST_PASSWORD_COST = { N: 1024, r: 8, p: 1, keyLength: 32, saltLength: 16 };
@@ -276,6 +288,16 @@ interface Harness {
   readonly accept: () => Promise<{ readonly status: number; readonly body: string }>;
   /** A second read of the card, so a claim about durable state is not the verify response. */
   readonly review: () => Promise<{ readonly status: number; readonly card: MvpReviewCardView | null; readonly raw: string }>;
+  /**
+   * The candidate surface's own live read, through the same production use case the candidate
+   * route calls.
+   *
+   * Taken from the composition root rather than over HTTP because the candidate port is not on
+   * the shipped `ControllerSurface` in this state — the route answers a stated 503 — so an HTTP
+   * read would prove that refusal rather than the agreement. The use case reached here is the
+   * real one, with the real profile read behind it, which is the half that decides the list.
+   */
+  readonly candidate: () => Promise<CandidateView>;
   /** The evidence rows as the store rebuilds them, with no projection in the way. */
   readonly storedEvidence: () => { readonly count: number; readonly headShas: readonly (string | null)[] };
   readonly close: () => Promise<void>;
@@ -398,6 +420,22 @@ async function harness(
         card: (JSON.parse(response.body) as { review?: MvpReviewCardView }).review ?? null,
         raw: response.body,
       };
+    },
+    candidate: async () => {
+      assert.ok(root.candidateLinkUseCases !== null, 'the scripted provider must compose a candidate port');
+      const read = await root.candidateLinkUseCases.readCandidate({
+        actor: {
+          actorId: READ_OWNER_ID,
+          role: 'Owner',
+          ownerId: READ_OWNER_ID,
+          sessionId: null,
+        },
+        projectId: PROJECT_ID as ProjectId,
+        requestId: seed.requestId,
+        correlationId: 'corr-candidate-read',
+      });
+      assert.ok(read.ok, `the candidate read must succeed: ${read.ok ? '' : read.error.reason}`);
+      return read.value;
     },
     storedEvidence: () => {
       // Read through the store rather than through the card, so "evidence was materialized"
@@ -1225,4 +1263,101 @@ test('F20-AC5, F24-AC3: a red required check blocks acceptance even when every c
   assert.ok(unchanged.card !== null, unchanged.raw);
   assert.equal(unchanged.card.decision.outcome, 'none', 'a refused acceptance records nothing');
   assert.equal(unchanged.card.decision.authorizesCurrentCandidate, false);
+});
+
+/**
+ * The other half of the defect this file was written for, observed from both sides at once.
+ *
+ * F20-AC5, F24-AC3: the candidate surface and the review card must not disagree about what the
+ * project required. They are two routes over one project's saved profile, and the failure this
+ * guards is not that either is wrong — it is that they can each be right about different lists.
+ * The card used to judge itself under a default requiring nothing, so a red required gate blocked
+ * the candidate surface while the acceptance gate the owner submitted against called the work
+ * ready. Either assertion alone would pass against that state: a card that blocked would look
+ * correct here, and a card that stopped blocking would have failed the case above.
+ *
+ * So both are read over HTTP from one session and compared. The comparison is on the property
+ * that matters rather than on either route's wording: the set of required check identities, and
+ * the verdict on the one that is red.
+ */
+test('F20-AC5, F24-AC3: the candidate surface and the review card judge one project by one required-check list', async (t) => {
+  const h = await harness(
+    {
+      checks: [
+        { name: REQUIRED_CHECK, result: 'Passed' },
+        { name: OTHER_CHECK, result: 'Failed' },
+      ],
+      headSha: SHA_A,
+    },
+    { requiredChecks: [REQUIRED_CHECK, OTHER_CHECK] },
+  );
+  t.after(() => h.close());
+
+  const verified = await h.verify();
+  assert.equal(verified.status, 200, verified.body);
+
+  const card = await h.review();
+  assert.ok(card.card !== null, card.raw);
+  const read = await h.candidate();
+
+  // The identity sets are compared as sorted sets because neither surface promises an order,
+  // and an ordering difference is not the disagreement being ruled out. A check that appears on
+  // one side and not the other is, so a missing member fails this rather than being read as
+  // "one of them had nothing to report".
+  const cardRequired = card.card.checks.filter((entry) => entry.required).map((entry) => entry.checkId).sort();
+  const liveRequired = read.checks
+    .filter((entry: CandidateCheckStatus) => entry.required)
+    .map((entry: CandidateCheckStatus) => entry.name)
+    .sort();
+  assert.deepEqual(
+    liveRequired,
+    [OTHER_CHECK, REQUIRED_CHECK].sort(),
+    'the profile saved over HTTP is the list the candidate read judged',
+  );
+  assert.deepEqual(
+    cardRequired,
+    liveRequired,
+    `both surfaces must require the same checks: card ${JSON.stringify(cardRequired)} vs candidate ${JSON.stringify(liveRequired)}`,
+  );
+
+  // And the verdict on the red one, which is where the two could disagree while agreeing on
+  // the list. The card blocks; the candidate surface blocks; neither is ready.
+  const cardLint = card.card.checks.find((entry) => entry.checkId === OTHER_CHECK);
+  const liveLint = read.checks.find((entry: CandidateCheckStatus) => entry.name === OTHER_CHECK);
+  assert.equal(cardLint?.result, 'failed');
+  assert.equal(cardLint?.blocking, true, 'the card blocks on the red required gate');
+  assert.equal(liveLint?.result, 'Failed', 'the candidate surface reports the same red verdict');
+  assert.equal(
+    isBlocking(liveLint?.result ?? 'Passed', liveLint?.notApplicableApprovedByPolicy ?? false),
+    true,
+    'and it is a blocking result for a check this project requires',
+  );
+  assert.equal(read.checksReady, false, 'so its own check verdict is not ready');
+  assert.equal(read.reviewReadiness.ready, false, 'and it withholds the review readiness offer');
+  assert.ok(
+    read.reviewReadiness.reasons.some((reason: string) => reason.includes(OTHER_CHECK)),
+    `naming the same red gate the card names: ${JSON.stringify(read.reviewReadiness.reasons)}`,
+  );
+  assert.equal(card.card.eligibility.readyForOwnerReview, false, 'and so does the review card');
+
+  // The gate the owner submits against agrees with both. The defect this file was written for
+  // was exactly this triple disagreeing: the acceptance gate reporting work ready while two
+  // surfaces said the project's own requirement was unmet.
+  const refused = await h.accept();
+  assert.equal(refused.status, 422, `the acceptance gate must agree that this is not ready: ${refused.body}`);
+  assert.equal(
+    parse<{ error: { code: string } }>(refused.body).error.code,
+    'Blocked',
+    'and it refuses for the same reason the two surfaces named, not for an absence of evidence',
+  );
+
+  // Agreement has to be agreement about *required* checks. Two surfaces that both treated every
+  // observed check as required would pass the comparison above while gating on checks the
+  // project never declared, which is a different defect rather than none.
+  assert.equal(liveLint?.required, true);
+  assert.equal(
+    cardRequired.includes('no-such-check'),
+    false,
+    'and neither invents a required check the profile never declared',
+  );
 });

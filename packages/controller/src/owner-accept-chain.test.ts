@@ -686,6 +686,93 @@ test('the accept gate re-verifies every criterion rather than trusting the owner
   });
 });
 
+test('an owner test the owner fails stays failed, and acceptance stays shut until they say otherwise', async () => {
+  await withChain(async (chain) => {
+    // Everything ShipLoop can verify on its own is satisfied, so the owner test is the only
+    // thing between this candidate and acceptance.
+    await chain.reportChecks([{ name: BOUND_CHECK, result: 'Passed' }], T1);
+    assert.equal(
+      (await chain.cardFor(CANDIDATE_A)).eligibility.readyForAcceptance,
+      false,
+      'the owner test is outstanding, so acceptance is shut (F24-AC3)',
+    );
+
+    // The owner runs it and it does not work. This is the case a "recorded" check would pass
+    // and a "truthful" one must not: a row exists for the criterion, and the answer it carries
+    // is no (F25-AC2, F23-AC1).
+    chain.at(T2);
+    const failed = expectOk(
+      await chain.card.recordOwnerTest({
+        projectId: PROJECT,
+        candidateId: CANDIDATE_A,
+        actor: OWNER,
+        criterionId: OWNER_CRITERION,
+        outcome: 'failed',
+        note: 'Signing in lands on the marketing site.',
+        correlationId: 'corr-fail',
+      }),
+    );
+
+    assert.equal(
+      failed.review.ownerTests[0]?.state,
+      'failed',
+      "the owner's own report stands as given; nothing upgrades a failure to a pass (F25-AC2)",
+    );
+    assert.equal(failed.review.ownerTests[0]?.evidenceId, failed.evidenceId, 'and it names the observation that said so');
+    assert.equal(
+      failed.review.criteria.find((criterion) => criterion.criterionId === OWNER_CRITERION)?.state,
+      'failed',
+      'the criterion reads the same, because the criterion is what the owner judged',
+    );
+    assert.equal(
+      failed.review.eligibility.readyForAcceptance,
+      false,
+      'a recorded owner failure is not an outstanding action, it is a failed requirement (F24-AC3)',
+    );
+    assert.deepEqual(
+      failed.review.eligibility.acceptanceBlockers.map((blocker) => `${blocker.split(':')[0] ?? ''}`),
+      [`Criterion "${OWNER_CRITERION}" is failed`],
+      'and the blocker names the owner test as failed rather than pending (F24-AC3)',
+    );
+
+    // The owner's own gate refuses, naming the same criterion and the same state.
+    const refused = expectErr(await chain.accept(CANDIDATE_A, HEAD_A));
+    assert.deepEqual(
+      blockersOf(refused),
+      { [OWNER_CRITERION]: 'failed' },
+      'and the acceptance gate agrees with the card about what is wrong (F23-AC1)',
+    );
+    assert.equal(chain.decisionRowsFor(CANDIDATE_A).length, 0, 'a refused acceptance records nothing');
+    assert.equal(ownerRows(chain, CANDIDATE_A), 1, 'and the failure itself is kept, because it is the observation the owner made');
+
+    // Re-running it and passing opens the gate. The correction is a second observation rather
+    // than a rewrite of the first, so the owner can see they changed their mind (F25-AC2).
+    chain.at(T3);
+    const corrected = expectOk(
+      await chain.card.recordOwnerTest({
+        projectId: PROJECT,
+        candidateId: CANDIDATE_A,
+        actor: OWNER,
+        criterionId: OWNER_CRITERION,
+        outcome: 'passed',
+        note: 'Fixed the redirect; it lands on the dashboard.',
+        correlationId: 'corr-pass',
+      }),
+    );
+    assert.equal(
+      corrected.review.ownerTests[0]?.state,
+      'passed',
+      'the newest owner observation governs the criterion',
+    );
+    assert.equal(corrected.review.eligibility.readyForAcceptance, true, 'so acceptance opens');
+    assert.equal(ownerRows(chain, CANDIDATE_A), 2, 'and both observations remain on record');
+
+    const accepted = expectOk(await chain.accept(CANDIDATE_A, HEAD_A));
+    assert.equal(accepted.decision.outcome, 'accepted');
+    assert.equal(accepted.decision.decision?.candidateHeadSha, HEAD_A, 'bound to the exact commit it was made against');
+  });
+});
+
 test('a decision is appended, never overwritten, and the newest one governs', async () => {
   await withChain(async (chain) => {
     const accepted = await acceptShaA(chain);
