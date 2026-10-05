@@ -5,6 +5,16 @@
  * This page renders the controller's packet bytes and offers two ways to leave with them. It does not
  * decide anything, and it starts nothing.
  *
+ * ## Which revision is shown, and where that fact comes from
+ *
+ * The packet exists only for an **approved** revision, and the page names the exact one it read:
+ * the revision number, and the contract's `contentFingerprint` alongside the packet's own fingerprint.
+ * Two different digests of two different things, and conflating them would be the kind of small
+ * substitution that makes a handoff unverifiable — the content fingerprint is the identity of the
+ * approved *text*, the packet fingerprint the identity of the rendered *document*. The content
+ * fingerprint is read from `getContract`, and a contract that cannot be read is reported rather than
+ * guessed: the packet still renders, because the packet is the product (mvp-spec 7, N02-AC2).
+ *
  * ## `Open T3` opens a page in another tool. That is the whole of it.
  *
  * T3 is an external tool the owner may or may not use. ShipLoop holds a contract and evidence; it
@@ -38,11 +48,21 @@
  * the property that makes a handoff trustworthy is that a client cannot make two packets differ for a
  * reason nobody chose (N02-AC2). `packet.fingerprint` is shown so the owner can prove the clipboard
  * holds the bytes the server rendered.
+ *
+ * No secret is in that text: the packet is rendered by the controller from the contract content, and
+ * this page adds nothing to it. It also reads no credential to do its job — the T3 state is a
+ * configured-or-not fact, not a key (L02-AC2).
  */
 
 import { useCallback, useEffect, useState, type ReactElement } from 'react';
 import { isHttpUrl } from './external-url.ts';
-import { fetchHandoff, type Handoff, type HandoffExternalTool, type TransportOutcome } from './transport.ts';
+import {
+  fetchHandoff,
+  getContract,
+  type HandoffT3View,
+  type HandoffView,
+  type ProjectScope,
+} from '../mvp-client/index.ts';
 
 export interface HandoffPageProps {
   /** The active project, or null when none is selected (F02-AC1). */
@@ -54,6 +74,14 @@ export interface HandoffPageProps {
   readonly onOpenSettings: () => void;
   /** Bumped by the shell's retry control so this page refetches without prop-drilling. */
   readonly epoch: number;
+  /**
+   * The project scope this page reads through, when the shell has one.
+   *
+   * Optional so the props other surfaces already pass keep working: every call takes a `ProjectScope`
+   * rather than a bare id, and with no scope the client answers `NoProjectSelected` and sends nothing,
+   * which is the behaviour a page with no project must have (F02-AC1, F02-AC2).
+   */
+  readonly scope?: ProjectScope | null;
 }
 
 /**
@@ -67,36 +95,44 @@ export interface HandoffPageProps {
 type ViewState =
   | { readonly kind: 'idle' }
   | { readonly kind: 'loading' }
-  | { readonly kind: 'ready'; readonly handoff: Handoff }
+  | { readonly kind: 'ready'; readonly handoff: HandoffView; readonly contentFingerprint: string | null }
   | { readonly kind: 'refused'; readonly reason: string }
   | { readonly kind: 'unreachable'; readonly reason: string };
 
-export function HandoffPage({
-  projectId,
-  contractId,
-  contractRevision,
-  onOpenSettings,
-  epoch,
-}: HandoffPageProps): ReactElement {
+/**
+ * The scope this page reads through.
+ *
+ * Derived from the scope when the shell supplied one and from `projectId` otherwise, because every
+ * call needs a `ProjectScope` and a bare id is not one. A `projectId` with no name produces a scope
+ * carrying that id and no display name, which is enough to address the project and is not a guess
+ * about anything else (F02-AC1).
+ */
+function scopeOf(props: HandoffPageProps): ProjectScope | null {
+  if (props.scope !== undefined) return props.scope;
+  if (props.projectId === null) return null;
+  return { kind: 'project', projectId: props.projectId, projectName: props.projectId };
+}
+
+export function HandoffPage(props: HandoffPageProps): ReactElement {
+  const { projectId, contractId, contractRevision, onOpenSettings, epoch } = props;
   const [view, setView] = useState<ViewState>({ kind: 'idle' });
   const [copyState, setCopyState] = useState<'idle' | 'copied' | 'refused'>('idle');
   const [copyDetail, setCopyDetail] = useState<string>('');
 
+  const scope = scopeOf(props);
   const addressable =
     projectId !== null && contractId !== null && contractRevision !== null && contractRevision >= 1;
 
   const load = useCallback((): void => {
-    if (!addressable || projectId === null || contractId === null || contractRevision === null) {
+    if (!addressable || scope === null || contractId === null || contractRevision === null) {
       setView({ kind: 'idle' });
       return;
     }
     setView({ kind: 'loading' });
     setCopyState('idle');
     setCopyDetail('');
-    void fetchHandoff(projectId, contractId, contractRevision).then(
-      (outcome: TransportOutcome<Handoff>) => setView(readOutcome(outcome)),
-    );
-  }, [addressable, projectId, contractId, contractRevision]);
+    void readPacket(scope, contractId, contractRevision).then(setView);
+  }, [addressable, scope, contractId, contractRevision]);
 
   useEffect(load, [load, epoch]);
 
@@ -134,6 +170,8 @@ export function HandoffPage({
           <PacketPanel
             markdown={view.handoff.packet.markdown}
             fingerprint={view.handoff.packet.fingerprint}
+            contentFingerprint={view.contentFingerprint}
+            revision={view.handoff.revision}
             copyState={copyState}
             copyDetail={copyDetail}
             onCopy={(text) => {
@@ -160,10 +198,35 @@ export function HandoffPage({
   );
 }
 
-function readOutcome(outcome: TransportOutcome<Handoff>): ViewState {
-  if (outcome.ok) return { kind: 'ready', handoff: outcome.value };
-  if (outcome.unreachable) return { kind: 'unreachable', reason: outcome.failure.reason };
-  return { kind: 'refused', reason: outcome.failure.reason };
+/**
+ * Reads the packet, and the approved text's own fingerprint beside it.
+ *
+ * Two reads because they are two facts about two different things, and the second one is not allowed
+ * to take the packet down with it: the packet is the product, so a contract that will not read is
+ * reported next to a packet that rendered rather than replacing it with an error. The content
+ * fingerprint is what lets the owner see that the sealed text is the text they approved, and that it
+ * is not the same value as the packet's own digest (mvp-spec 7, N02-AC2).
+ */
+async function readPacket(
+  scope: ProjectScope,
+  contractId: string,
+  revision: number,
+): Promise<ViewState> {
+  const [handoff, contract] = await Promise.all([
+    fetchHandoff(scope, contractId, revision),
+    getContract(scope, contractId, revision),
+  ]);
+  const contentFingerprint = contract.ok ? contract.value.contentFingerprint : null;
+  if (handoff.ok) {
+    // The revision the packet names is what this page reports, not the one it asked for: a server
+    // answering a different revision than the one requested would otherwise be rendered under the
+    // number the owner is looking at (mvp-spec 7).
+    return { kind: 'ready', handoff: handoff.value, contentFingerprint };
+  }
+  if (handoff.failure.code === 'Disconnected') {
+    return { kind: 'unreachable', reason: handoff.failure.reason };
+  }
+  return { kind: 'refused', reason: handoff.failure.reason };
 }
 
 function renderView(view: ViewState, reload: () => void): ReactElement {
@@ -222,27 +285,48 @@ function renderView(view: ViewState, reload: () => void): ReactElement {
 interface PacketPanelProps {
   readonly markdown: string;
   readonly fingerprint: string;
+  readonly contentFingerprint: string | null;
+  readonly revision: number;
   readonly copyState: 'idle' | 'copied' | 'refused';
   readonly copyDetail: string;
   readonly onCopy: (text: string) => void;
 }
 
 /**
- * The packet itself: the exact bytes, a copy control, and the fingerprint that proves them.
+ * The packet itself: the exact bytes, a copy control, and the fingerprints that prove them.
  *
  * The text sits in a focusable `<pre>` so the fallback is real — an owner whose browser refuses the
  * clipboard can select the text and copy it by hand, which is why the copy control's refusal names
  * that route rather than only reporting failure (L02-AC3, F24-AC5).
+ *
+ * Two fingerprints are shown and labelled, because they answer two different questions: the content
+ * fingerprint is which text was approved, and the packet fingerprint is which document was rendered
+ * from it. Two reads of the same approved revision produce the same packet, so the packet fingerprint
+ * is what the clipboard can be checked against (N02-AC2).
  */
-function PacketPanel({ markdown, fingerprint, copyState, copyDetail, onCopy }: PacketPanelProps): ReactElement {
+function PacketPanel({
+  markdown,
+  fingerprint,
+  contentFingerprint,
+  revision,
+  copyState,
+  copyDetail,
+  onCopy,
+}: PacketPanelProps): ReactElement {
   return (
     <section className="panel" aria-labelledby="packet-heading">
       <h3 className="panel__title" id="packet-heading">
         The packet
       </h3>
-      <p className="panel__note">
-        {`Fingerprint ${fingerprint}. Two reads of the same approved revision render these same bytes, so this ` +
-          `value is what lets you check the copy rather than trust it (N02-AC2, mvp-spec 7).`}
+      <p className="panel__note" data-testid="packet-revision">
+        {`Revision ${revision}. ` +
+          (contentFingerprint === null
+            ? 'The approved contract text could not be read, so this page shows the packet only and claims nothing about which text it came from.'
+            : `The approved text has content fingerprint ${contentFingerprint}, and this packet has fingerprint ` +
+              `${fingerprint}. They are digests of two different things — the agreed text and the document ` +
+              'rendered from it — so the first is the identity of what you approved and the second is the identity ' +
+              'of what you are about to paste. Two reads of this revision render these same bytes, so either value is ' +
+              'what lets you check the copy rather than trust it (N02-AC2, mvp-spec 7).')}
       </p>
       <div className="form__actions">
         <button className="button" type="button" onClick={() => onCopy(markdown)} data-testid="copy-packet">
@@ -274,7 +358,7 @@ function PacketPanel({ markdown, fingerprint, copyState, copyDetail, onCopy }: P
 }
 
 interface ExternalToolPanelProps {
-  readonly tool: HandoffExternalTool;
+  readonly tool: HandoffT3View;
   readonly onOpenSettings: () => void;
 }
 
