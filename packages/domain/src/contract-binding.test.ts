@@ -94,6 +94,7 @@ function approve(draft: ReturnType<typeof draftOf>) {
     approvedBy: OWNER,
     at: '2026-03-01T11:00:00.000Z',
     expectedContentFingerprint: draft.contentFingerprint,
+    newestRevisionForRequest: draft.revision,
   });
 }
 

@@ -810,6 +810,8 @@ test('a scope snapshot stays append-only (F12-AC1)', async () => {
 
 const REQUEST = 'request-migration-01';
 const CONTRACT = 'contract-migration-01';
+/** A second request, for the cases that need two rows of the same table at once. */
+const OTHER_REQUEST = 'request-migration-02';
 const REQUEST_FINGERPRINT = fingerprint({ request: 'migration' });
 const CRITERIA = canonicalize([
   { id: 'AC1', description: 'The endpoint returns 200.', verificationType: 'automated' },
@@ -1097,10 +1099,11 @@ test('a request may hold many revisions, and each is addressed by its own number
   });
 });
 
-test('a revision is superseded only by a strictly later one, and a superseded one was approved (mvp-spec 3)', async () => {
+test('a revision is superseded only by a strictly later one, approved or not (mvp-spec 3)', async () => {
   await withMigratedDatabase((db) => {
     seedContractParents(db);
     insertRequest(db);
+    insertRequest(db, OTHER_REQUEST);
     insertContract(db);
     // Superseding itself: the reason names revision 1, which is what this row is.
     assert.throws(
@@ -1110,29 +1113,70 @@ test('a revision is superseded only by a strictly later one, and a superseded on
           .run(REQUEST),
       /CHECK constraint failed/,
     );
-    // Superseding by a later revision while the row is a draft: there is no approval to
-    // supersede, so the pairing is refused rather than recorded as one.
+    // A later revision while the row is a draft is recorded, because a draft a newer revision
+    // was written from is history too. It carries no approver, and that is the whole claim.
+    db.prepare("UPDATE delivery_contracts SET status = 'stale', stale_reason = ?, superseded_by_revision = 4 WHERE request_id = ?").run(
+      'Superseded by revision 4.',
+      REQUEST,
+    );
+    const supersededDraft = db.prepare('SELECT status, stale_reason, superseded_by_revision, approved_by_owner_id FROM delivery_contracts WHERE request_id = ?').get(REQUEST);
+    assert.equal(supersededDraft?.['status'], 'stale');
+    assert.equal(supersededDraft?.['stale_reason'], 'Superseded by revision 4.');
+    assert.equal(supersededDraft?.['superseded_by_revision'], 4);
+    assert.equal(supersededDraft?.['approved_by_owner_id'], null, 'it was never agreed, and the row says so');
+
+    // The other shape, unchanged: an approved revision superseded by a later one keeps its
+    // approver, because a superseded revision is history rather than a deletion.
+    insertContract(db, {
+      contractId: 'dc_migration_second',
+      requestId: OTHER_REQUEST,
+      status: 'approved',
+      approvedBy: OWNER,
+      approvedAt: T0,
+    });
+    db.prepare("UPDATE delivery_contracts SET status = 'stale', stale_reason = ?, superseded_by_revision = 2 WHERE request_id = ?").run(
+      'Superseded by revision 2.',
+      OTHER_REQUEST,
+    );
+    const row = db.prepare('SELECT status, stale_reason, superseded_by_revision, approved_by_owner_id FROM delivery_contracts WHERE request_id = ?').get(OTHER_REQUEST);
+    assert.equal(row?.['status'], 'stale');
+    assert.equal(row?.['stale_reason'], 'Superseded by revision 2.');
+    assert.equal(row?.['superseded_by_revision'], 2);
+    assert.equal(row?.['approved_by_owner_id'], OWNER);
+  });
+});
+
+test('a revision keeps the approval it recorded, because a superseded revision is history (mvp-spec 3)', async () => {
+  await withMigratedDatabase((db) => {
+    seedContractParents(db);
+    insertRequest(db);
+    insertContract(db, { status: 'approved', approvedBy: OWNER, approvedAt: T0 });
+    // Half an approval: an instant with no owner is the state the approval rule exists to
+    // prevent. The status CHECK catches it here, and the write guard below catches it after
+    // supersession widened what the CHECK demands of a stale row.
     assert.throws(
-      () =>
-        db
-          .prepare("UPDATE delivery_contracts SET status = 'stale', stale_reason = 'Superseded by revision 4.', superseded_by_revision = 4 WHERE request_id = ?")
-          .run(REQUEST),
-      /CHECK constraint failed/,
+      () => db.prepare('UPDATE delivery_contracts SET approved_by_owner_id = NULL WHERE request_id = ?').run(REQUEST),
+      /keeps the approval it recorded|CHECK constraint failed/,
     );
 
-    // The real shape: an approved revision superseded by a later one.
-    db.prepare('DELETE FROM delivery_contracts WHERE request_id = ?').run(REQUEST);
-    insertContract(db, { status: 'approved', approvedBy: OWNER, approvedAt: T0 });
     db.prepare("UPDATE delivery_contracts SET status = 'stale', stale_reason = ?, superseded_by_revision = 2 WHERE request_id = ?").run(
       'Superseded by revision 2.',
       REQUEST,
     );
-    const row = db.prepare('SELECT status, stale_reason, superseded_by_revision, approved_by_owner_id FROM delivery_contracts WHERE request_id = ?').get(REQUEST);
-    assert.equal(row?.['status'], 'stale');
-    assert.equal(row?.['stale_reason'], 'Superseded by revision 2.');
-    assert.equal(row?.['superseded_by_revision'], 2);
-    // The approval survives, because a superseded revision is history rather than a deletion.
-    assert.equal(row?.['approved_by_owner_id'], OWNER);
+    // The widened status CHECK no longer demands an approver here, so the guard has moved:
+    // dropping the approver a *superseded approval* recorded would rewrite recorded history
+    // into a row that reads as though it was never agreed. The trigger refuses it, and the
+    // supersession itself is still allowed.
+    assert.throws(
+      () => db.prepare('UPDATE delivery_contracts SET approved_by_owner_id = NULL WHERE request_id = ?').run(REQUEST),
+      /keeps the approval it recorded/,
+    );
+    assert.equal(
+      db.prepare('SELECT status, approved_by_owner_id, approved_at FROM delivery_contracts WHERE request_id = ?').get(REQUEST)?.[
+        'approved_by_owner_id'
+      ],
+      OWNER,
+    );
   });
 });
 

@@ -77,6 +77,7 @@ function approved(content = BASE) {
     approvedBy: OWNER,
     at: '2026-03-01T11:00:00.000Z',
     expectedContentFingerprint: draft.contentFingerprint,
+    newestRevisionForRequest: draft.revision,
   });
   assert.ok(approvedValue.ok, approvedValue.ok ? '' : approvedValue.error.reason);
   return approvedValue.value;
@@ -276,6 +277,7 @@ test('approving twice is a conflict naming the state it found', () => {
     approvedBy: OWNER,
     at: '2026-03-02T10:00:00.000Z',
     expectedContentFingerprint: sealed.contentFingerprint,
+    newestRevisionForRequest: sealed.revision,
   });
   assert.ok(!again.ok);
   assert.equal(again.error.code, 'Conflict');
@@ -292,6 +294,7 @@ test('a stale revision cannot be approved', () => {
     approvedBy: OWNER,
     at: '2026-03-02T11:00:00.000Z',
     expectedContentFingerprint: stale.value.contentFingerprint,
+    newestRevisionForRequest: stale.value.revision,
   });
   assert.ok(!late.ok);
   assert.equal(late.error.code, 'Conflict');
@@ -317,6 +320,7 @@ test('an approval naming text the caller did not review is refused, and nothing 
     approvedBy: OWNER,
     at: '2026-03-01T11:00:00.000Z',
     expectedContentFingerprint: reviewed,
+    newestRevisionForRequest: edited.value.revision,
   });
   assert.ok(!refused.ok);
   assert.equal(refused.error.code, 'Conflict');
@@ -339,6 +343,7 @@ test('the fingerprint of some other text is refused as firmly as an old one', ()
     approvedBy: OWNER,
     at: '2026-03-01T11:00:00.000Z',
     expectedContentFingerprint: neverReviewed,
+    newestRevisionForRequest: draft.revision,
   });
   assert.ok(!refused.ok);
   assert.equal(refused.error.code, 'Conflict');
@@ -350,6 +355,7 @@ test('an approval is accepted when the named fingerprint is the text now stored'
     approvedBy: OWNER,
     at: '2026-03-01T11:00:00.000Z',
     expectedContentFingerprint: draft.contentFingerprint,
+    newestRevisionForRequest: draft.revision,
   });
   assert.ok(approvedValue.ok, approvedValue.ok ? '' : approvedValue.error.reason);
   assert.equal(approvedValue.value.status, 'approved');
@@ -365,6 +371,7 @@ test('approval re-derives the fingerprint it seals, so a drifted draft cannot be
     approvedBy: OWNER,
     at: '2026-03-01T11:00:00.000Z',
     expectedContentFingerprint: contractContentFingerprint(BASE),
+    newestRevisionForRequest: drifted.revision,
   });
   assert.ok(refused.ok, 'the caller naming the real text is the one whose read was honest');
   assert.equal(
@@ -389,6 +396,7 @@ test('a no-op edit does not move the lock, so it cannot invalidate a page that r
     approvedBy: OWNER,
     at: '2026-03-01T11:00:00.000Z',
     expectedContentFingerprint: draft.contentFingerprint,
+    newestRevisionForRequest: draft.revision,
   });
   assert.ok(sealed.ok, sealed.ok ? '' : sealed.error.reason);
 });
@@ -456,6 +464,19 @@ test('supersede names the revision that replaced it and refuses an earlier numbe
   assert.equal(backwards.error.code, 'Invalid');
 });
 
+test('an approval that is superseded keeps its approver and its text, because it is history', () => {
+  // Not regressed by a draft being supersedable too: the two cases are the same transition
+  // with different provenance, and the approver is part of what history is.
+  const sealed = approved();
+  const superseded = supersedeContract(sealed, { supersededByRevision: 2, at: '2026-03-02T10:00:00.000Z' });
+  assert.ok(superseded.ok, superseded.ok ? '' : superseded.error.reason);
+  assert.equal(superseded.value.status, 'stale');
+  assert.equal(superseded.value.approvedBy, OWNER);
+  assert.equal(superseded.value.approvedAt, '2026-03-01T11:00:00.000Z');
+  assert.equal(superseded.value.contentFingerprint, sealed.contentFingerprint);
+  assert.deepEqual(superseded.value.acceptanceCriteria, sealed.acceptanceCriteria);
+});
+
 test('revising an approved revision supersedes it in the same step as the new draft', () => {
   const sealed = approved();
   const revised = reviseContract(sealed, {
@@ -476,7 +497,7 @@ test('revising an approved revision supersedes it in the same step as the new dr
   assert.notEqual(revised.value.draft.contentFingerprint, sealed.contentFingerprint);
 });
 
-test('revising a draft supersedes nothing, because there is no approval to invalidate', () => {
+test('revising a draft supersedes that draft, because two approvable drafts are two contract futures', () => {
   const draft = draftAt();
   const revised = reviseContract(draft, {
     contractId: 'dc_2' as ContractId,
@@ -485,9 +506,138 @@ test('revising a draft supersedes nothing, because there is no approval to inval
     revisedBy: OWNER,
     at: '2026-03-02T10:00:00.000Z',
   });
-  assert.ok(revised.ok);
-  assert.equal(revised.value.superseded, null);
+  assert.ok(revised.ok, revised.ok ? '' : revised.error.reason);
   assert.equal(revised.value.draft.revision, 2);
+
+  // The half that used to be missing: revision 1 is superseded, in the same step, by the
+  // revision written from it. `stale` already means "kept, no longer current", so this needed
+  // no new status - only the existing `supersededByRevision` on a row that never held an
+  // approval.
+  const superseded = revised.value.superseded;
+  assert.ok(superseded !== null, 'a revision the new one was written from is not left approvable');
+  assert.equal(superseded.status, 'stale');
+  assert.equal(superseded.supersededByRevision, 2);
+  assert.equal(superseded.staleReason, 'Superseded by revision 2.');
+  assert.equal(superseded.approvedBy, null, 'it was never agreed, and the record says so');
+  assert.equal(superseded.approvedAt, null);
+  assert.equal(superseded.contentFingerprint, draft.contentFingerprint, 'history, not a deletion');
+});
+
+test('revision 1 is refused once revision 2 answers the request, and revision 2 is not (mvp-spec 3)', () => {
+  const draft = draftAt();
+  const revised = reviseContract(draft, {
+    contractId: 'dc_2' as ContractId,
+    content: { ...BASE, outcome: 'The order summary shows the total including tax and shipping.' },
+    requestFingerprint: REQUEST_FINGERPRINT,
+    revisedBy: OWNER,
+    at: '2026-03-02T10:00:00.000Z',
+  });
+  assert.ok(revised.ok, revised.ok ? '' : revised.error.reason);
+  const superseded = revised.value.superseded;
+  assert.ok(superseded !== null);
+
+  // The superseded revision is refused for what it now is.
+  const onSuperseded = approveContract(superseded, {
+    approvedBy: OWNER,
+    at: '2026-03-02T11:00:00.000Z',
+    expectedContentFingerprint: superseded.contentFingerprint,
+    newestRevisionForRequest: 2,
+  });
+  assert.ok(!onSuperseded.ok);
+  assert.equal(onSuperseded.error.code, 'Conflict');
+  assert.equal(onSuperseded.error.actual, 'stale');
+
+  // And the record a stale tab is holding - still a draft, still holding exactly the text its
+  // owner reviewed - is refused too, because revision 2 exists. This is the case no
+  // fingerprint can catch, and the reason the newest revision is part of the approval.
+  const onStaleRead = approveContract(draft, {
+    approvedBy: OWNER,
+    at: '2026-03-02T11:00:00.000Z',
+    expectedContentFingerprint: draft.contentFingerprint,
+    newestRevisionForRequest: 2,
+  });
+  assert.ok(!onStaleRead.ok, 'the agreement revision 2 replaced cannot be sealed after it');
+  assert.equal(onStaleRead.error.code, 'Conflict');
+  if (onStaleRead.error.code !== 'Conflict') return;
+  assert.equal(onStaleRead.error.expected, '1');
+  assert.equal(onStaleRead.error.actual, '2');
+  assert.match(onStaleRead.error.reason, /already answers it/);
+
+  // The revision that does answer the request is approvable, so the refusal above is a fact
+  // about revision 1 rather than a broken gate.
+  const onNewest = approveContract(revised.value.draft, {
+    approvedBy: OWNER,
+    at: '2026-03-02T12:00:00.000Z',
+    expectedContentFingerprint: revised.value.draft.contentFingerprint,
+    newestRevisionForRequest: 2,
+  });
+  assert.ok(onNewest.ok, onNewest.ok ? '' : onNewest.error.reason);
+  assert.equal(onNewest.value.status, 'approved');
+  assert.equal(onNewest.value.revision, 2);
+});
+
+test('an approval that names an older revision than the request holds is refused (mvp-spec 3)', () => {
+  const draft = draftAt();
+  // The caller asserting something impossible rather than something stale: it cannot happen
+  // through the controller, which reads the history, and the domain refuses it anyway because
+  // a guard whose failure mode is "passed the wrong number" is a guard with no answer.
+  const refused = approveContract(draft, {
+    approvedBy: OWNER,
+    at: '2026-03-02T11:00:00.000Z',
+    expectedContentFingerprint: draft.contentFingerprint,
+    newestRevisionForRequest: 0,
+  });
+  assert.ok(!refused.ok);
+  assert.equal(refused.error.code, 'Conflict');
+  assert.match(refused.error.reason, /Reload the request/);
+});
+
+test('revising a revision that is already stale keeps the explanation it was given (mvp-spec 3)', () => {
+  const sealed = approved();
+  const first = supersedeContract(sealed, { supersededByRevision: 2, at: '2026-03-02T10:00:00.000Z' });
+  assert.ok(first.ok);
+
+  const revised = reviseContract(first.value, {
+    contractId: 'dc_3' as ContractId,
+    content: { ...BASE, outcome: 'A third statement of the outcome.' },
+    requestFingerprint: REQUEST_FINGERPRINT,
+    revisedBy: OWNER,
+    at: '2026-03-03T10:00:00.000Z',
+  });
+  assert.ok(revised.ok, revised.ok ? '' : revised.error.reason);
+  // A revision that is already history has nothing to supersede, and saying otherwise would
+  // replace its explanation with a second one.
+  assert.equal(revised.value.superseded, null);
+  assert.equal(revised.value.draft.revision, 2, 'the number comes from the record this call was given');
+  assert.equal(first.value.staleReason, 'Superseded by revision 2.', 'and the first explanation survives');
+
+  const again = supersedeContract(first.value, { supersededByRevision: 3, at: '2026-03-03T11:00:00.000Z' });
+  assert.ok(!again.ok);
+  assert.equal(again.error.code, 'Conflict');
+  assert.equal(again.error.actual, 'stale');
+});
+
+test('a superseded draft is history: its text cannot be edited afterwards', () => {
+  const draft = draftAt();
+  const revised = reviseContract(draft, {
+    contractId: 'dc_2' as ContractId,
+    content: { ...BASE, outcome: 'A different outcome.' },
+    requestFingerprint: REQUEST_FINGERPRINT,
+    revisedBy: OWNER,
+    at: '2026-03-02T10:00:00.000Z',
+  });
+  assert.ok(revised.ok, revised.ok ? '' : revised.error.reason);
+  const superseded = revised.value.superseded;
+  assert.ok(superseded !== null);
+
+  const edited = editContract(superseded, { ...BASE, outcome: 'Rewritten after the fact.' }, {
+    expectedContentFingerprint: superseded.contentFingerprint,
+    at: '2026-03-02T11:00:00.000Z',
+    editedBy: OWNER,
+  });
+  assert.ok(!edited.ok, 'a superseded draft is frozen exactly as a superseded approval is');
+  assert.match(edited.error.code === 'Invalid' ? edited.error.fields.map((f) => f.message).join(' ') : '', /stale/);
+  assert.equal(contractGate(superseded).satisfied, false, 'and it may never be measured against a candidate');
 });
 
 test('revising keeps the brief provenance, so revision 2 does not look unwritten', () => {

@@ -931,6 +931,195 @@ test('superseding by an earlier revision is refused', async () => {
   });
 });
 
+test('retiring a draft supersedes it, so the owner can leave a request with nothing to approve', async () => {
+  await withHarness((harness) => {
+    const stale = expectOk(
+      harness.useCases.supersedeContract(
+        { projectId: PROJECT, contractId: harness.contractId, revision: 1, supersededByRevision: 2 },
+        OWNER,
+      ),
+    );
+    assert.equal(stale.status, 'stale');
+    assert.equal(stale.supersededByRevision, 2);
+    assert.equal(stale.approvedBy, null, 'a draft is retired without inventing an approval');
+    assert.equal(stale.approvedAt, null);
+    assert.match(stale.blockedBecause ?? '', /only an approved revision/);
+
+    // And it really is no longer approvable, through the read a client would make.
+    const detail = expectOk(harness.useCases.getRequest({ projectId: PROJECT, requestId: harness.requestId, expectedUpdatedAt: '' }, OWNER));
+    assert.equal(detail.approvedRevision, null);
+    assert.equal(detail.latestRevision?.status, 'stale');
+    assert.equal(detail.latestRevision?.supersededByRevision, 2);
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* One approvable revision per request (mvp-spec 3)                           */
+/* -------------------------------------------------------------------------- */
+
+/** The revisions of the harness request that could still be approved. */
+function approvableRevisions(harness: Harness): readonly number[] {
+  return expectOk(harness.useCases.listContractRevisions({ projectId: PROJECT, requestId: harness.requestId }, OWNER))
+    .filter((revision) => revision.status === 'draft')
+    .map((revision) => revision.revision);
+}
+
+test('revising a draft supersedes it, so a request never holds two approvable revisions (mvp-spec 3)', async () => {
+  await withHarness((harness) => {
+    const revision2 = expectOk(
+      harness.useCases.reviseContract(
+        { projectId: PROJECT, contractId: harness.contractId, revision: 1, content: CHANGED },
+        OWNER,
+      ),
+    );
+    assert.equal(revision2.revision, 2);
+    assert.equal(revision2.status, 'draft');
+    assert.deepEqual(approvableRevisions(harness), [2], 'the draft it was written from is no longer approvable');
+
+    // The read a client makes reports it as history, with the revision that replaced it, so a
+    // card can tell "there is something newer" from "there is nothing left".
+    const detail = expectOk(harness.useCases.getRequest({ projectId: PROJECT, requestId: harness.requestId, expectedUpdatedAt: '' }, OWNER));
+    assert.deepEqual(
+      detail.revisions.map((revision) => [revision.revision, revision.status]),
+      [
+        [1, 'stale'],
+        [2, 'draft'],
+      ],
+    );
+    assert.equal(detail.revisions[0]?.supersededByRevision, 2);
+    assert.match(detail.revisions[0]?.staleReason ?? '', /revision 2/);
+    assert.equal(detail.revisions[0]?.approvedBy, null, 'revision 1 was never agreed, and the view says so');
+    assert.match(detail.revisions[0]?.blockedBecause ?? '', /only an approved revision/);
+    assert.equal(detail.revisions[0]?.outcome, CONTENT.outcome, 'history keeps the text it carried');
+  });
+});
+
+test('the superseded revision is refused an approval, and the revision that replaced it is not (mvp-spec 3)', async () => {
+  await withHarness((harness) => {
+    // What the tab that missed the revise holds: revision 1's fingerprint, read before the
+    // write. Nothing about the text is wrong - it is exactly what its owner reviewed - which
+    // is why the refusal cannot come from the fingerprint.
+    const reviewedBeforeTheRevise = reviewedDraft(harness);
+    const revision2 = expectOk(
+      harness.useCases.reviseContract(
+        { projectId: PROJECT, contractId: harness.contractId, revision: 1, content: CHANGED },
+        OWNER,
+      ),
+    );
+
+    // The use case re-reads the revision rather than trusting the caller's copy, so it is told
+    // what revision 1 now is. The refusal therefore names the state the row holds; the newest-
+    // revision check underneath it is what closes the window where the re-read is still a draft
+    // but revision 2 has landed, which is proved at the store boundary, where it can be
+    // reached with a stale in-memory record.
+    const refused = expectError(
+      harness.useCases.approveContract(
+        {
+          projectId: PROJECT,
+          contractId: harness.contractId,
+          revision: 1,
+          expectedContentFingerprint: reviewedBeforeTheRevise,
+        },
+        OWNER,
+      ),
+      'Conflict',
+    );
+    assert.match(refused.reason, /Revision 1 is stale and cannot be approved/);
+    assert.deepEqual(approvableRevisions(harness), [2], 'nothing was sealed, so there is still one approvable revision');
+
+    // The revision that does answer the request is approvable, which is what makes the
+    // refusal above a fact about revision 1 rather than a closed door.
+    const approved = expectOk(
+      harness.useCases.approveContract(
+        {
+          projectId: PROJECT,
+          contractId: revision2.contractId as ContractId,
+          revision: revision2.revision,
+          expectedContentFingerprint: revision2.contentFingerprint,
+        },
+        OWNER,
+      ),
+    );
+    assert.equal(approved.status, 'approved');
+    assert.equal(approved.revision, 2);
+    assert.deepEqual(approvableRevisions(harness), []);
+  });
+});
+
+test('two revise attempts from one draft leave exactly one approvable revision (mvp-spec 3)', async () => {
+  await withHarness((harness) => {
+    const reviewedBefore = reviewedDraft(harness);
+
+    const first = harness.useCases.reviseContract(
+      { projectId: PROJECT, contractId: harness.contractId, revision: 1, content: CHANGED },
+      OWNER,
+    );
+    // The second call is built from the same read the first used, which is what a second tab
+    // holds: same contract id, same revision number, a stepped clock so the two attempts are
+    // not the same instant either.
+    const second = harness.useCases.reviseContract(
+      { projectId: PROJECT, contractId: harness.contractId, revision: 1, content: CHANGED },
+      OWNER,
+    );
+
+    expectOk(first);
+    const conflict = expectError(second, 'Conflict');
+    assert.match(conflict.reason, /not the next revision of this request/);
+    assert.deepEqual(approvableRevisions(harness), [2], 'never more than one draft a request can approve');
+
+    const detail = expectOk(harness.useCases.getRequest({ projectId: PROJECT, requestId: harness.requestId, expectedUpdatedAt: '' }, OWNER));
+    assert.deepEqual(
+      detail.revisions.map((revision) => [revision.revision, revision.status]),
+      [
+        [1, 'stale'],
+        [2, 'draft'],
+      ],
+      'and the refused attempt left no revision of its own behind',
+    );
+    assert.ok(
+      detail.revisions.every((revision) => revision.contentFingerprint !== reviewedBefore || revision.revision === 1),
+      'the second attempt wrote nothing, so revision 1 kept the text the first read reviewed',
+    );
+  });
+});
+
+test('an approved revision stays frozen when a newer one is written from it (mvp-spec 3)', async () => {
+  await withHarness((harness) => {
+    const approved = expectOk(approveAsRead(harness));
+    expectOk(
+      harness.useCases.reviseContract(
+        { projectId: PROJECT, contractId: harness.contractId, revision: 1, content: CHANGED },
+        OWNER,
+      ),
+    );
+
+    // History, not a deletion: the agreement it sealed, its approver and its instant survive.
+    const previous = expectOk(harness.useCases.getContract({ projectId: PROJECT, contractId: harness.contractId, revision: 1 }, OWNER));
+    assert.equal(previous.status, 'stale');
+    assert.equal(previous.supersededByRevision, 2);
+    assert.equal(previous.approvedBy, String(OWNER_ID));
+    assert.equal(previous.approvedAt, approved.approvedAt);
+    assert.equal(previous.outcome, CONTENT.outcome);
+    assert.equal(previous.contentFingerprint, approved.contentFingerprint);
+
+    // And the text cannot be edited afterwards, by either path.
+    expectError(
+      harness.useCases.editContract(
+        { projectId: PROJECT, contractId: harness.contractId, revision: 1, content: CHANGED, expectedContentFingerprint: previous.contentFingerprint },
+        OWNER,
+      ),
+      'Invalid',
+    );
+    expectError(
+      harness.useCases.approveContract(
+        { projectId: PROJECT, contractId: harness.contractId, revision: 1, expectedContentFingerprint: previous.contentFingerprint },
+        OWNER,
+      ),
+      'Conflict',
+    );
+  });
+});
+
 /* -------------------------------------------------------------------------- */
 /* Criteria                                                                    */
 /* -------------------------------------------------------------------------- */

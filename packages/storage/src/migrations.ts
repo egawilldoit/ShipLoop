@@ -2726,6 +2726,180 @@ function widenCandidatePullRequestState(db: Database): void {
   db.exec('CREATE INDEX delivery_candidates_by_contract ON delivery_candidates(contract_id, contract_revision)');
 }
 
+/**
+ * The four write guards on `delivery_contracts`, named once so migration 19's rebuild suspends
+ * and restores exactly the set version 13 installed - plus the one version 19 widens.
+ *
+ * Written out rather than shared with {@link MIGRATION_13_REQUESTS_AND_DELIVERY_CONTRACTS}
+ * because that statement is applied history: its checksum is recorded in every database that
+ * has ever run it, so editing it would make those databases fail to reconcile. The two copies
+ * are held together by `contracts.test.ts`, which compares what `sqlite_master` holds after a
+ * fresh migration against this list - a rebuild that dropped one guard, or kept a stale one,
+ * would fail there rather than quietly weakening immutability.
+ *
+ * The fourth is new in version 19 and belongs to it. The status CHECK there stops requiring an
+ * approver on a superseded row, which is what makes a superseded draft storable, and that in
+ * turn means nothing above the CHECK stops a superseded *approval* from losing its approver -
+ * turning recorded history into a row that reads as though it was never agreed. The trigger
+ * closes that, and only that: it fires when a pair that was there is being removed, so
+ * `approve` still writes an approval onto a draft.
+ */
+const DELIVERY_CONTRACT_WRITE_GUARDS: readonly SuspendedTrigger[] = [
+  {
+    name: 'delivery_contracts_frozen_update',
+    create: `CREATE TRIGGER delivery_contracts_frozen_update
+BEFORE UPDATE ON delivery_contracts
+WHEN OLD.status <> 'draft'
+  AND (
+    NEW.outcome IS NOT OLD.outcome
+    OR NEW.scope_json IS NOT OLD.scope_json
+    OR NEW.out_of_scope_json IS NOT OLD.out_of_scope_json
+    OR NEW.acceptance_criteria_json IS NOT OLD.acceptance_criteria_json
+    OR NEW.content_fingerprint IS NOT OLD.content_fingerprint
+    OR NEW.request_id IS NOT OLD.request_id
+    OR NEW.project_id IS NOT OLD.project_id
+    OR NEW.request_fingerprint IS NOT OLD.request_fingerprint
+    OR NEW.revision IS NOT OLD.revision
+    OR NEW.contract_id IS NOT OLD.contract_id
+  )
+BEGIN
+  SELECT RAISE(ABORT, 'an approved or stale delivery contract revision is frozen: record a new revision instead (mvp-spec 3)');
+END`,
+  },
+  {
+    name: 'delivery_contracts_immutable_delete',
+    create: `CREATE TRIGGER delivery_contracts_immutable_delete
+BEFORE DELETE ON delivery_contracts
+WHEN OLD.status <> 'draft'
+BEGIN
+  SELECT RAISE(ABORT, 'an approved or stale delivery contract revision is retained for history (mvp-spec 3)');
+END`,
+  },
+  {
+    name: 'delivery_contracts_draft_identity_fixed',
+    create: `CREATE TRIGGER delivery_contracts_draft_identity_fixed
+BEFORE UPDATE ON delivery_contracts
+WHEN NEW.contract_id IS NOT OLD.contract_id
+   OR NEW.revision IS NOT OLD.revision
+   OR NEW.request_id IS NOT OLD.request_id
+   OR NEW.project_id IS NOT OLD.project_id
+   OR NEW.created_at IS NOT OLD.created_at
+   OR NEW.created_by_owner_id IS NOT OLD.created_by_owner_id
+BEGIN
+  SELECT RAISE(ABORT, 'a delivery contract revision keeps its identity for its whole life (mvp-spec 7)');
+END`,
+  },
+  {
+    name: 'delivery_contracts_approval_immutable',
+    create: `CREATE TRIGGER delivery_contracts_approval_immutable
+BEFORE UPDATE ON delivery_contracts
+WHEN (OLD.approved_by_owner_id IS NOT NULL OR OLD.approved_at IS NOT NULL)
+ AND (NEW.approved_by_owner_id IS NOT OLD.approved_by_owner_id OR NEW.approved_at IS NOT OLD.approved_at)
+BEGIN
+  SELECT RAISE(ABORT, 'a delivery contract revision keeps the approval it recorded, because a superseded revision is history rather than a deletion (mvp-spec 3)');
+END`,
+  },
+];
+
+/**
+ * `delivery_contracts` with a superseded draft representable.
+ *
+ * Column-for-column identical to version 13 except for one clause of the status CHECK, which
+ * is the whole point: version 13 said a `stale` revision that names the revision which
+ * superseded it must also carry an approver and an instant, which made "a draft was replaced
+ * by a newer revision" unstorable. The domain already models that case - `stale` with a null
+ * `approvedAt`/`approvedBy` and a `supersededByRevision` - so the schema was the only thing
+ * standing between the model and the store, and it was the schema alone that forced
+ * `reviseContract` to leave the draft it replaced approvable beside its own successor.
+ *
+ * What is *not* dropped is the rule that carries the meaning: a `superseded_by_revision` that
+ * names anything but a later revision of the same row is still refused, so the stored reason
+ * can never claim a successor that does not exist. And the partial unique index below - at
+ * most one draft per request - stays, which is the invariant this migration exists to let
+ * the repository actually reach.
+ */
+const MIGRATION_19_DELIVERY_CONTRACT_SUPERSEDED_DRAFT = `
+CREATE TABLE delivery_contracts_superseded_draft (
+  contract_id               TEXT NOT NULL,
+  project_id                TEXT NOT NULL REFERENCES projects(project_id) ON DELETE RESTRICT,
+  request_id                TEXT NOT NULL REFERENCES requests(request_id) ON DELETE CASCADE,
+  revision                  INTEGER NOT NULL CHECK (revision > 0),
+  outcome                   TEXT NOT NULL CHECK (length(trim(outcome)) > 0),
+  scope_json                TEXT NOT NULL CHECK (json_valid(scope_json) AND json_type(scope_json) = 'array'),
+  out_of_scope_json         TEXT NOT NULL CHECK (json_valid(out_of_scope_json) AND json_type(out_of_scope_json) = 'array'),
+  acceptance_criteria_json  TEXT NOT NULL CHECK (json_valid(acceptance_criteria_json) AND json_type(acceptance_criteria_json) = 'array'),
+  status                    TEXT NOT NULL DEFAULT 'draft'
+                                CHECK (status IN ('draft', 'approved', 'stale')),
+  content_fingerprint       TEXT NOT NULL ${fingerprintCheck('content_fingerprint')},
+  request_fingerprint       TEXT NOT NULL ${fingerprintCheck('request_fingerprint')},
+  approved_by_owner_id      TEXT REFERENCES owners(owner_id) ON DELETE RESTRICT,
+  approved_at               TEXT,
+  stale_reason              TEXT,
+  superseded_by_revision    INTEGER,
+  source_brief_id           TEXT,
+  source_brief_version      INTEGER,
+  created_by_owner_id       TEXT NOT NULL REFERENCES owners(owner_id) ON DELETE RESTRICT,
+  created_at                TEXT NOT NULL,
+  updated_at                TEXT NOT NULL,
+  PRIMARY KEY (contract_id, revision),
+  UNIQUE (request_id, revision),
+  CHECK (updated_at >= created_at),
+  -- The same three states as version 13, with one clause changed: a stale revision that
+  -- records which revision superseded it no longer has to carry an approver. The approver
+  -- pair is now required only where an approval exists - status 'approved' - and its absence
+  -- on a stale row is exactly the claim "this was superseded before it was ever agreed",
+  -- which the domain's stale variant already expresses.
+  CHECK (
+    (status = 'approved'
+      AND approved_by_owner_id IS NOT NULL
+      AND approved_at IS NOT NULL
+      AND stale_reason IS NULL
+      AND superseded_by_revision IS NULL)
+    OR (status = 'draft'
+      AND approved_by_owner_id IS NULL
+      AND approved_at IS NULL
+      AND stale_reason IS NULL
+      AND superseded_by_revision IS NULL)
+    OR (status = 'stale'
+      AND stale_reason IS NOT NULL
+      AND (superseded_by_revision IS NULL OR superseded_by_revision > revision))
+  ),
+  CHECK (
+    (source_brief_id IS NULL AND source_brief_version IS NULL)
+    OR (source_brief_id IS NOT NULL AND source_brief_version IS NOT NULL AND source_brief_version > 0)
+  )
+);
+`;
+
+/**
+ * Swaps in the rebuilt `delivery_contracts` and restores what SQLite drops with the table.
+ *
+ * Nothing references a `delivery_contracts` row by foreign key - a candidate binds to a
+ * revision by its own `contract_id` and `contract_revision` columns rather than by a
+ * reference - so the rebuild stashes no child rows. The three indexes are recreated from the
+ * statements version 13 created rather than derived from the new definition, because the two
+ * partial unique indexes are the load-bearing part of this table: one draft per request is
+ * the invariant the rebuild above exists to make reachable. The write guards are recreated by
+ * `rebuildTables` itself, from the same list that installed them, because a rebuild drops them
+ * with the table and the point of them is that a second writer, a restored backup or a
+ * hand-run `sqlite3` session cannot make them false.
+ */
+function allowSupersededDeliveryContractDraft(db: Database): void {
+  rebuildTables(db, [
+    {
+      table: 'delivery_contracts',
+      replacement: 'delivery_contracts_superseded_draft',
+      copy: identityCopy(db, 'delivery_contracts'),
+      suspended: DELIVERY_CONTRACT_WRITE_GUARDS,
+    },
+  ]);
+
+  db.exec('CREATE INDEX delivery_contracts_by_request ON delivery_contracts(request_id, revision DESC)');
+  db.exec('CREATE INDEX delivery_contracts_by_project ON delivery_contracts(project_id, request_id, revision DESC)');
+  db.exec('CREATE UNIQUE INDEX delivery_contracts_one_draft_per_request ON delivery_contracts(request_id) WHERE status = \'draft\'');
+  db.exec('CREATE UNIQUE INDEX delivery_contracts_one_approved_per_request ON delivery_contracts(request_id) WHERE status = \'approved\'');
+}
+
 const MIGRATION_12_PROCEDURE_VERSION_IDENTITY = `
 CREATE TABLE procedure_versions_subject_scoped (
   procedure_version_id   TEXT PRIMARY KEY,
@@ -3348,6 +3522,26 @@ const MIGRATIONS: readonly Migration[] = [
     up: (db) => {
       db.exec(MIGRATION_18_CANDIDATE_STATE_UNKNOWN);
       widenCandidatePullRequestState(db);
+    },
+  },
+  {
+    // Widens `delivery_contracts` so a revision superseded before it was ever approved is
+    // storable.
+    //
+    // The defect this closes: `reviseContract` refused to supersede a draft, so revising one
+    // wrote revision N+1 and left revision N as a second live approvable draft - two
+    // competing contract futures for one request. The schema had the last word on that: a
+    // `stale` row naming its successor had to carry an approver, so "superseded while still a
+    // draft" could not be written at all, and the one-draft-per-request index turned the
+    // resulting write into an opaque constraint failure rather than the intended step. SQLite
+    // cannot alter a CHECK, so this re-declares the table and restores the rows column for
+    // column; `rebuildTables` handles what SQLite drops with the table - the indexes and the
+    // three write guards.
+    version: 19,
+    name: 'delivery_contract_superseded_draft',
+    up: (db) => {
+      db.exec(MIGRATION_19_DELIVERY_CONTRACT_SUPERSEDED_DRAFT);
+      allowSupersededDeliveryContractDraft(db);
     },
   },
 ];

@@ -2,8 +2,10 @@
  * Requests and delivery contracts over the migrated SQLite store (mvp-spec 3).
  *
  * One repository for both because the interesting write - "revise" - spans them: a new
- * revision and the supersession of the approval it replaces must land together or not at
- * all. Splitting them would mean two callers each half-remembering to do both.
+ * revision and the supersession of the revision it replaces must land together or not at
+ * all. Splitting them would mean two callers each half-remembering to do both. That is true
+ * of a draft as much as of an approval: a draft left approvable beside its own successor is
+ * two competing contract futures for one request, so the two writes are as inseparable there.
  *
  * Every method takes the project the caller believes it is acting in and checks it
  * against the row, rather than trusting the identifier alone. That is the whole
@@ -321,6 +323,11 @@ function toContract(row: SqlRow): Result<DeliveryContract> {
         reason: `Delivery contract revision ${revision} is stored as stale without saying why.`,
       });
     }
+    // A null approver pair here is not a missing value to fill in: it is the claim that this
+    // revision was superseded or invalidated before it was ever approved, which is what the
+    // domain's `stale` variant already expresses. The schema says the same thing - a stale row
+    // needs a reason and, where it names its successor, a later revision; an approver is
+    // required exactly where a status of `approved` requires one.
     return ok(Object.freeze({ ...base, status: 'stale', approvedAt, approvedBy: approvedBy as OwnerId | null, staleReason, supersededByRevision }));
   }
 
@@ -498,7 +505,7 @@ export interface ApprovalExpectation {
 }
 
 /**
- * The row state one contract write must still find.
+* The row state one contract write must still find.
  *
  * One parameter, named at the call site, so which fields a transition is keyed on is declared
  * where the transition is rather than inferred from what a caller happened to pass.
@@ -508,8 +515,15 @@ export interface ApprovalExpectation {
  * one. A draft edit that fell back to the instant - because it was the field the transport
  * happened to be sending - would let the second of those writes land over the first, which
  * is the whole reason this is one type rather than a positional pair of arguments.
+ *
+ * `status` is carried by every transition because a revision becomes `stale` from either of two
+ * starting states: an approved revision whose approval no longer applies, and a draft that a
+ * newer revision was written from. Naming the status the caller read is what makes the
+ * staleness write a compare-and-set on that fact - the store's statement refuses a row that has
+ * already moved on to `stale`, so the first explanation of why a revision went stale cannot be
+ * overwritten by a second one.
  */
-interface TransitionExpectation {
+export interface TransitionExpectation {
   readonly status: DeliveryContract['status'];
   readonly updatedAt: string | null;
   readonly contentFingerprint: Fingerprint | null;
@@ -522,6 +536,8 @@ export interface ContractStore {
   listForRequest(projectId: ProjectId, requestId: RequestId): Result<readonly DeliveryContract[]>;
   currentApproved(projectId: ProjectId, requestId: RequestId): Result<DeliveryContract | null>;
   latest(projectId: ProjectId, requestId: RequestId): Result<DeliveryContract | null>;
+/** The newest revision number a request holds, or null when it holds none. */
+  newestRevisionNumber(projectId: ProjectId, requestId: RequestId): Result<number | null>;
   /**
    * Writes an edited draft, and only while the row still holds the text the caller acted on.
    *
@@ -533,8 +549,12 @@ export interface ContractStore {
    */
   editDraft(contract: DeliveryContract, expectedContentFingerprint: Fingerprint): Result<DeliveryContract>;
   approve(contract: DeliveryContract, expected: ApprovalExpectation): Result<DeliveryContract>;
-  markStale(contract: DeliveryContract, expectedUpdatedAt: string): Result<DeliveryContract>;
-  /** Writes a new revision and supersedes the approval it replaces, in one transaction. */
+  markStale(contract: DeliveryContract, expected: TransitionExpectation): Result<DeliveryContract>;
+  /**
+   * Writes a new revision and supersedes the revision it replaces, in one transaction.
+   *
+   * `superseded` is null only when the revision being replaced was already stale.
+   */
   revise(input: {
     readonly draft: DeliveryContract;
     readonly superseded: DeliveryContract | null;
@@ -555,12 +575,17 @@ export interface ContractStore {
  *     "did this change?" comparison would be answering about the wrong thing.
  *   - **Approving is a distinct statement from editing, and both name the text.** `approve`
  *     writes the status and the approval together, so there is no intermediate row that
- *     claims an approval it does not have; `editDraft` writes the text and its new fingerprint
+*     claims an approval it does not have; `editDraft` writes the text and its new fingerprint
  *     in the same statement for the same reason. Both statements carry the caller's
  *     `content_fingerprint` in their WHERE clause, which makes the stored fingerprint the one
  *     concurrency token over a draft's text rather than one of two: the condition SQLite
  *     evaluates for an edit and for an approval is "still the text this caller read", so a
  *     tab whose read has been overtaken changes zero rows whichever call it makes (mvp-spec 3).
+ *   - **A request holds at most one approvable revision, and the store says so.** The two
+ *     partial unique indexes make "one draft" and "one approved" true of the schema rather
+ *     than of the code that writes it, and `approve` additionally refuses a draft the request
+ *     has already moved past - which no index can catch, because a revision stops being a draft
+ *     by being superseded rather than by being marked stale.
  */
 export class ContractRepository implements ContractStore {
   private readonly db: Database;
@@ -794,6 +819,28 @@ export class ContractRepository implements ContractStore {
   }
 
   /**
+   * The highest revision number a request holds, whatever its status.
+   *
+   * Separate from `latest` because the two answer different questions for different callers.
+   * `latest` hands back the revision, which a reader of the history needs. This hands back the
+   * number alone, which is what an approval needs in order to know whether the draft it is
+   * about to seal is still the newest one - the check that keeps a request at one approvable
+   * revision, and which cannot be answered from the draft's own row.
+   *
+   * It reads `MAX(revision)` over the same rows rather than a second copy of the ordering, so
+   * it cannot disagree with `latest` about which revision is newest.
+   */
+  newestRevisionNumber(projectId: ProjectId, requestId: RequestId): Result<number | null> {
+    return this.attempt('read the newest delivery contract revision number', () => {
+      const row = this.statement(
+        'SELECT MAX(revision) AS newest FROM delivery_contracts WHERE request_id = ? AND project_id = ?',
+      ).get(requestId, projectId);
+      if (row === undefined) return ok(null);
+      return ok(nullableInteger(row, 'newest'));
+    });
+  }
+
+  /**
    * Moves a draft's text, and only while the row still holds the text the caller acted on.
    *
    * Keyed on `content_fingerprint` alone, and that is the whole fix rather than a detail of
@@ -845,6 +892,15 @@ export class ContractRepository implements ContractStore {
    * mvp-spec 7 "Reject stale requests"). The instant is kept alongside the fingerprint
    * because an approval also writes the record: it must be the same row the caller's read
    * returned, and `editDraft` names the same fingerprint for the same reason.
+   *
+   * The request's newest revision is settled first, in the same transaction, because it is the
+   * one condition no fingerprint can ever cover: a tab that read revision 1 an instant before
+   * another tab wrote revision 2 holds a row that is *still* a draft still holding exactly the
+   * text it reviewed, so every clause below would match and the store would be left holding an
+   * approval beside a newer revision. It is a check followed by a write rather than one
+   * statement, and still one critical section: `withTransaction` opens `BEGIN IMMEDIATE` and
+   * `tx.ts` refuses a second connection holding a write transaction on the same file, so no
+   * other writer can commit between them.
    */
   approve(contract: DeliveryContract, expected: ApprovalExpectation): Result<DeliveryContract> {
     if (contract.status !== 'approved') {
@@ -854,53 +910,73 @@ export class ContractRepository implements ContractStore {
         ]),
       );
     }
-    return this.writeTransition(
-      contract,
-      {
-        status: 'draft',
-        updatedAt: expected.updatedAt,
-        contentFingerprint: expected.contentFingerprint,
-      },
-      `UPDATE delivery_contracts SET status = 'approved', approved_by_owner_id = ?, approved_at = ?,
-         content_fingerprint = ?, updated_at = ?
-       WHERE contract_id = ? AND revision = ? AND project_id = ? AND status = 'draft'
-         AND updated_at = ? AND content_fingerprint = ?`,
-      [
-        contract.approvedBy,
-        contract.approvedAt,
-        contractContentFingerprint(contract),
-        contract.updatedAt,
-        contract.contractId,
-        contract.revision,
-        contract.projectId,
-        expected.updatedAt,
-        expected.contentFingerprint,
-      ],
+    return this.attempt('approve delivery contract revision', () =>
+      // The nesting is deliberate and supported: this call owns the transaction, and
+      // `writeTransition` joins it through a savepoint rather than owning the commit itself.
+      withTransaction(this.db, () => {
+        const newest = this.newestRevisionNumber(contract.projectId, contract.requestId);
+        if (!newest.ok) return err(newest.error);
+        if (newest.value !== contract.revision) {
+          return err({
+            code: 'Conflict',
+            reason: `Revision ${contract.revision} is not the newest revision of this request: revision ${newest.value} already answers it, so approving it would seal an agreement a newer revision replaced.`,
+            expected: String(contract.revision),
+            actual: String(newest.value),
+          });
+        }
+
+        return this.writeTransition(
+          contract,
+          {
+            status: 'draft',
+            updatedAt: expected.updatedAt,
+            contentFingerprint: expected.contentFingerprint,
+          },
+          `UPDATE delivery_contracts SET status = 'approved', approved_by_owner_id = ?, approved_at = ?,
+             content_fingerprint = ?, updated_at = ?
+           WHERE contract_id = ? AND revision = ? AND project_id = ? AND status = 'draft'
+             AND updated_at = ? AND content_fingerprint = ?`,
+          [
+            contract.approvedBy,
+            contract.approvedAt,
+            contractContentFingerprint(contract),
+            contract.updatedAt,
+            contract.contractId,
+            contract.revision,
+            contract.projectId,
+            expected.updatedAt,
+            expected.contentFingerprint,
+          ],
+        );
+      }),
     );
   }
 
   /**
    * Records a revision as stale, superseded or invalidated.
    *
-   * The UPDATE names `status` in its WHERE clause, so a second attempt against the same
-   * starting state changes nothing and the caller's compare-and-set above reports it as
-   * a conflict rather than overwriting the first explanation with a second one. Keyed on the
-   * instant rather than on the text: retiring an approval is not a statement about which text
-   * was agreed, it is a statement that this record is no longer current.
+   * The UPDATE names the status the caller read in its WHERE clause, so a second attempt
+   * against the same starting state changes nothing and the caller's compare-and-set above
+   * reports it as a conflict rather than overwriting the first explanation with a second one.
+   * Two starting states are named because there are two: an approval that no longer applies,
+   * and a draft a newer revision was written from.
+   *
+   * Keyed on the instant rather than on the text: retiring an approval is not a statement about
+   * which text was agreed, it is a statement that this record is no longer current.
    */
-  markStale(contract: DeliveryContract, expectedUpdatedAt: string): Result<DeliveryContract> {
+  markStale(contract: DeliveryContract, expected: TransitionExpectation): Result<DeliveryContract> {
     if (contract.status !== 'stale') {
       return err(
         invalid(`Revision ${contract.revision} is ${contract.status}, so it is not stale.`, [
-          { path: 'status', message: 'Only an approved revision becomes stale.' },
+          { path: 'status', message: 'Only an approved or draft revision becomes stale.' },
         ]),
       );
     }
     return this.writeTransition(
       contract,
-      { status: 'approved', updatedAt: expectedUpdatedAt, contentFingerprint: null },
+      { status: expected.status, updatedAt: expected.updatedAt, contentFingerprint: null },
       `UPDATE delivery_contracts SET status = 'stale', stale_reason = ?, superseded_by_revision = ?, updated_at = ?
-       WHERE contract_id = ? AND revision = ? AND project_id = ? AND status = 'approved' AND updated_at = ?`,
+       WHERE contract_id = ? AND revision = ? AND project_id = ? AND status = ? AND updated_at = ?`,
       [
         contract.staleReason,
         contract.supersededByRevision,
@@ -908,22 +984,34 @@ export class ContractRepository implements ContractStore {
         contract.contractId,
         contract.revision,
         contract.projectId,
-        expectedUpdatedAt,
+        expected.status,
+        expected.updatedAt,
       ],
     );
   }
 
   /**
-   * Writes the next revision and supersedes the approval it replaces.
+   * Writes the next revision and supersedes the revision it replaces.
    *
-   * One transaction because the intermediate states are both wrong: a new revision
-   * existing while the old approval still reads as current, or an approval retired with
-   * no replacement. `superseded === null` is the revise-a-draft case, where there is no
-   * approval to retire.
+   * One transaction because the intermediate states are both wrong: a new revision existing
+   * while the revision it replaces still reads as current, or a revision retired with no
+   * replacement. That is true of a draft as much as of an approval - a draft left approvable
+   * beside its own successor is two competing contract futures for one request - which is why
+   * a superseded draft is written here rather than left approvable beside the replacement.
+   * `superseded === null` is the revise-an-already-stale case, where the revision being
+   * replaced is history and keeps the explanation it was given.
    *
-   * The supersession UPDATE is conditional on `status = 'approved'`, so a concurrent
-   * approval of the revision being replaced is not silently overwritten - the whole
-   * transaction rolls back and the caller retries against what is actually stored.
+   * **The supersession is written first and the insert second**, and that order *is* the
+   * atomicity guarantee rather than a preference. Every condition is settled before either
+   * write, so a refusal leaves nothing behind; and if the insert then fails - a driver fault,
+   * a constraint this build did not anticipate - the throw unwinds the transaction and the
+   * revision that was replaced is *not* left marked superseded. The other order would retire a
+   * revision with no successor, which is the one state an owner cannot act on: the request
+   * would hold no approvable revision and no way to name the one that replaced it.
+   *
+   * The supersession UPDATE is conditional on the status the row held a moment earlier in this
+   * same transaction, so a revision that has already gone stale is not overwritten with a
+   * second, different explanation.
    */
   revise(input: { readonly draft: DeliveryContract; readonly superseded: DeliveryContract | null }): Result<DeliveryContract> {
     return this.attempt('revise delivery contract', () =>
@@ -936,16 +1024,58 @@ export class ContractRepository implements ContractStore {
             ]),
           );
         }
+
+        // The new revision has to be the next number, or it skips or repeats history. Refusing
+        // here rather than letting the primary key say so is what turns "somebody else revised
+        // this request while I was reading it" into a `Conflict` naming the revision that got
+        // there first, instead of an opaque uniqueness failure at the insert - and it is the
+        // check that stops two revise attempts from both writing a live draft.
+        const newest = this.newestRevisionNumber(draft.projectId, draft.requestId);
+        if (!newest.ok) return err(newest.error);
+        const expectedRevision = newest.value === null ? 1 : newest.value + 1;
+        if (draft.revision !== expectedRevision) {
+          return err({
+            code: 'Conflict',
+            reason: `Revision ${draft.revision} is not the next revision of this request: revision ${newest.value ?? 0} already exists, so revision ${expectedRevision} was written instead.`,
+            expected: String(expectedRevision),
+            actual: String(draft.revision),
+          });
+        }
+
         if (superseded !== null) {
           const current = this.rowOf(draft.projectId, superseded.contractId, superseded.revision);
           if (!current.ok) return current;
           const actualStatus = requiredText(current.value, 'status');
-          if (actualStatus !== 'approved') {
+          // Read rather than assumed from the caller's record, so a writer that lost a race is
+          // told what the row says instead of overwriting it. Both `draft` and `approved` are
+          // supersedable; only a revision that has already gone stale is not.
+          if (actualStatus !== 'approved' && actualStatus !== 'draft') {
             return err({
               code: 'Conflict',
-              reason: `Revision ${superseded.revision} is ${actualStatus}, so there is no approval to supersede.`,
-              expected: 'approved',
+              reason: `Revision ${superseded.revision} is ${actualStatus}, so there is nothing to supersede.`,
+              expected: 'approved or draft',
               actual: actualStatus,
+            });
+          }
+
+          const changes = this.statement(
+            `UPDATE delivery_contracts SET status = 'stale', stale_reason = ?, superseded_by_revision = ?, updated_at = ?
+             WHERE contract_id = ? AND revision = ? AND project_id = ? AND status = ?`,
+          ).run(
+            superseded.staleReason,
+            superseded.supersededByRevision,
+            superseded.updatedAt,
+            superseded.contractId,
+            superseded.revision,
+            superseded.projectId,
+            actualStatus,
+          );
+          if (Number(changes.changes) === 0) {
+            return err({
+              code: 'Conflict',
+              reason: `Revision ${superseded.revision} changed while the new revision was being written, so the revision was not recorded.`,
+              expected: actualStatus,
+              actual: 'a different state',
             });
           }
         }
@@ -970,28 +1100,6 @@ export class ContractRepository implements ContractStore {
           draft.createdAt,
           draft.updatedAt,
         );
-
-        if (superseded !== null) {
-          const changes = this.statement(
-            `UPDATE delivery_contracts SET status = 'stale', stale_reason = ?, superseded_by_revision = ?, updated_at = ?
-             WHERE contract_id = ? AND revision = ? AND project_id = ? AND status = 'approved'`,
-          ).run(
-            superseded.staleReason,
-            superseded.supersededByRevision,
-            superseded.updatedAt,
-            superseded.contractId,
-            superseded.revision,
-            superseded.projectId,
-          );
-          if (Number(changes.changes) === 0) {
-            return err({
-              code: 'Conflict',
-              reason: `Revision ${superseded.revision} changed while the new revision was being written, so the revision was not recorded.`,
-              expected: 'approved',
-              actual: 'a different state',
-            });
-          }
-        }
 
         const created = this.rowOf(draft.projectId, draft.contractId, draft.revision);
         if (!created.ok) return created;

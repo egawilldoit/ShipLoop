@@ -127,6 +127,14 @@ Two rules about these records are load-bearing rather than descriptive:
   cannot both reach an approval and an agreement can never be sealed over text its approver did
   not read. Invalidation is an explicit owner action with a named reason, never inferred by a
   candidate, a check or a webhook - demoting an agreement about scope is a decision about scope.
+- **A request has at most one approvable revision.** A draft is normally *replaced* - edited in
+  place, since nothing has been agreed - but when a newer revision is written from it, that
+  draft is superseded by that revision in the same transaction rather than left beside it.
+  Superseded is the same terminal state as invalidated and records which revision replaced it;
+  it does not claim the revision held an approval, because a draft that was never agreed has
+  none. The approval path closes the same door from the other side: it refuses a revision the
+  request has already moved past, which no fingerprint can reveal, because the text is
+  unchanged and only the request's history says a newer revision answers it.
 
 A brief and a contract are different records, not two editable copies of one. A brief is an
 append-only proposal about a problem and is never approved; a contract is the owner-approved

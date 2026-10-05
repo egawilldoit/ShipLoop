@@ -13,10 +13,17 @@ import { err, invalid, ok } from './result.ts';
  *   - **An approved revision is frozen.** `editContract` refuses anything but a draft,
  *     so there is no function that can change approved text. A material change is
  *     answered by `reviseContract`, which writes a *new* revision and marks the
- *     previous approval `stale` in the same step. An approved contract therefore
+ *     revision it replaces `stale` in the same step. An approved contract therefore
  *     cannot silently mutate, and a candidate bound to revision 3 can never be
  *     described by revision 4's text (mvp-spec 3, ARCHITECTURE "Candidate and
  *     decision rules").
+ *   - **At most one revision per request is approvable, and that holds for a draft as
+ *     much as for an approval.** Two drafts would be two competing contract futures for
+ *     one request, and "the contract I am approving" would be answerable two ways - the
+ *     same defect as "the current candidate" being answerable two ways, one level up. So
+ *     a draft is normally *replaced by editing it*, but when a newer revision is written
+ *     from it the draft is superseded by that revision rather than left beside it, and
+ *     `approveContract` refuses a revision a newer one has already answered (mvp-spec 3).
  *   - **Approval is an owner action with a recorded identity, over the exact text the
  *     owner read.** `approveContract` takes an `OwnerId` and writes `approvedBy`, and it
  *     takes the `contentFingerprint` of the draft the caller reviewed and refuses
@@ -33,10 +40,12 @@ import { err, invalid, ok } from './result.ts';
  *     choke point `intake/brief.ts` uses, applied to a stricter rule (MVP, "Never let
  *     agent or model output set approved directly").
  *   - **Staleness has exactly one cause and is never inferred.** A revision becomes
- *     `stale` either because it was superseded by a new revision, or because
- *     `invalidateContract` was called with a named reason. It is never "probably out
- *     of date": a candidate or a check cannot demote an agreement, because demotion
- *     is an owner decision about scope.
+ *     `stale` either because it was superseded by a newer revision, or because
+ *     `invalidateContract` was called with a named reason. It is never "probably out of
+ *     date": a candidate or a check cannot demote an agreement, because demotion is an
+ *     owner decision about scope. A revision superseded before it was ever approved
+ *     reads the same way and is equally history - `stale` means "kept, not current",
+ *     not "used to be agreed".
  *
  * ## Why this is not a second `Brief`
  *
@@ -161,11 +170,15 @@ export type DeliveryContract =
   | (ContractContent &
       ContractRecord & {
         readonly status: 'stale';
-        /** null only when this revision was invalidated before it was ever approved. */
+        /**
+         * Null only when this revision was invalidated or superseded before it was ever
+         * approved.
+         */
         readonly approvedAt: string | null;
-        /** null only when this revision was invalidated before it was ever approved. */
+        /** Null only when this revision was invalidated or superseded before it was ever approved. */
         readonly approvedBy: OwnerId | null;
         readonly staleReason: string;
+        /** The revision that replaced this one, when a newer revision exists. */
         readonly supersededByRevision: number | null;
       });
 
@@ -555,12 +568,22 @@ export function automatedVerificationsOf(content: ContractContent): ReadonlyMap<
  * approved rather than trusting the draft's stored one, so a fingerprint that drifted from
  * its content cannot be sealed into an agreement.
  *
- * It refuses on three counts, and the order is deliberate.
+ * It refuses on four counts, and the order is deliberate.
  *
  * **An already-approved or stale revision is refused for what it is**, before either check
  * below is consulted. "Revision 3 is already approved" is the more useful answer than
  * "your fingerprint is stale", and it is the answer that stays true however the caller
  * reached the call.
+ *
+ * **`newestRevisionForRequest` is a fact about the request rather than about this record**,
+ * and that is why it is required. A caller that read revision 1 an instant before another
+ * tab wrote revision 2 is holding a revision that has already been answered, and every
+ * other check below would pass: the row is still a draft, it still holds the text the
+ * approver read, and nothing about that text is wrong. Only "is this still the newest
+ * revision of this request?" says no. Without it the owner seals an agreement a newer
+ * revision already replaced, and the store is left holding two revisions reading as current
+ * - so the one-approvable-revision property is broken by the very write that claims it, and
+ * it is the approval that has to check it (mvp-spec 3).
  *
  * **An `automated` criterion that names no check is refused** (F23-AC1, F24-AC3). This is
  * the gate that makes the binding load-bearing rather than advisory: without it an approved
@@ -591,6 +614,15 @@ export function approveContract(
     readonly at: string;
     /** The fingerprint of the draft text the approver actually reviewed. */
     readonly expectedContentFingerprint: Fingerprint;
+    /**
+     * The newest revision number this request holds, whether or not it is this one.
+     *
+     * The caller has to have read it, because only the caller can see the request's other
+     * revisions: a revision does not know about its siblings, and a rule about them here
+     * would be a guess. A request holding no other revision is passed as this revision's
+     * own number.
+     */
+    readonly newestRevisionForRequest: number;
   },
 ): Result<DeliveryContract, DomainError> {
   if (contract.status !== 'draft') {
@@ -602,6 +634,22 @@ export function approveContract(
           : `Revision ${contract.revision} is stale and cannot be approved.`,
       expected: 'draft',
       actual: contract.status,
+    });
+  }
+
+  // Before the two text checks, because it is the answer that stays true about the *request*
+  // rather than about this row: no edit to revision 1 and no drift in its fingerprint can
+  // make a revision 2 stop existing.
+  if (input.newestRevisionForRequest !== contract.revision) {
+    const newest = input.newestRevisionForRequest;
+    return err<DomainError>({
+      code: 'Conflict',
+      reason:
+        newest > contract.revision
+          ? `Revision ${contract.revision} is not the newest revision of this request: revision ${newest} already answers it, so approving ${contract.revision} would seal an agreement a newer revision replaced. Read revision ${newest} and approve that.`
+          : `Revision ${contract.revision} is not the newest revision of this request: revision ${newest} was read as the newest. Reload the request before approving anything (mvp-spec 3).`,
+      expected: String(contract.revision),
+      actual: String(newest),
     });
   }
 
@@ -665,9 +713,10 @@ export function approveContract(
  * its text and its approver: it is history, not a deletion, and a candidate measured
  * against it must still be able to say what it was measured against.
  *
- * Only an approved revision can be invalidated this way. A draft has nothing to
- * invalidate, and a revision that is already stale cannot be given a second, different
- * reason - otherwise the first explanation would be silently replaced.
+ * Only an approved revision can be invalidated this way. A draft is not withdrawn by an
+ * owner here: it is *replaced*, either by editing it or by writing the next revision from
+ * it, and that step supersedes it. And a revision that is already stale cannot be given a
+ * second, different reason - otherwise the first explanation would be silently replaced.
  */
 export function invalidateContract(
   contract: DeliveryContract,
@@ -704,26 +753,33 @@ export function invalidateContract(
 }
 
 /**
- * Marks an approved revision superseded, because a newer revision now answers the same
- * request.
+ * Marks a revision superseded, because a newer revision now answers the same request.
  *
  * Kept separate from `invalidateContract` because the two mean different things and a
  * reader must be able to tell them apart: superseded says "there is a newer agreement",
  * invalidated says "this agreement no longer applies, and here is why". Both end in
  * `stale`; only this one records which revision replaced it.
+ *
+ * **A draft may be superseded, and that is the point.** The guard that used to refuse one -
+ * "a draft is replaced by editing it, not by superseding it" - is true of how a draft
+ * normally changes, and it is why `editContract` exists. It stops being true the moment a
+ * newer revision is written *from* the draft: that draft is then a candidate competing
+ * with its own successor for the one approval a request may hold, and it has to be able to
+ * become history without deleting anything. `reviseContract` is the caller that needs this,
+ * and it needs it for exactly that reason.
+ *
+ * Only a revision that is already `stale` is refused, because its stored reason is a fact
+ * about the past and a second, different explanation would replace the first.
  */
 export function supersedeContract(
   contract: DeliveryContract,
   input: { readonly supersededByRevision: number; readonly at: string },
 ): Result<DeliveryContract, DomainError> {
-  if (contract.status !== 'approved') {
+  if (contract.status === 'stale') {
     return err<DomainError>({
       code: 'Conflict',
-      reason:
-        contract.status === 'draft'
-          ? `Revision ${contract.revision} is a draft; a draft is replaced by editing it, not by superseding it.`
-          : `Revision ${contract.revision} is already stale.`,
-      expected: 'approved',
+      reason: `Revision ${contract.revision} is already stale.`,
+      expected: 'approved or draft',
       actual: contract.status,
     });
   }
@@ -738,6 +794,10 @@ export function supersedeContract(
     );
   }
 
+  // The spread carries whichever of `approvedAt`/`approvedBy` the revision held, and a draft
+  // carries neither. That is the whole difference between a superseded approval and a
+  // superseded draft, and it is already what the `stale` variant of the record expresses -
+  // so no status is invented for the second case.
   return ok<DeliveryContract>(
     Object.freeze({
       ...contract,
@@ -750,12 +810,18 @@ export function supersedeContract(
 }
 
 /**
- * Starts the next revision from the current one, superseding the approval it replaces.
+ * Starts the next revision from the current one, superseding the revision it replaces.
  *
- * One step rather than two, because the interesting failure is a new revision that
- * exists while the old approval still reads as current: a candidate measured against
- * revision 3 would then be described by revision 4's text. Both writes belong in one
- * transaction, and this function returns both halves so the caller has no gap to leave.
+ * One step rather than two, because the interesting failure is a new revision that exists
+ * while the revision it replaces still reads as current: a candidate measured against
+ * revision 3 would then be described by revision 4's text, and two drafts would both be
+ * approvable. Both writes belong in one transaction, and this function returns both halves
+ * so the caller has no gap to leave.
+ *
+ * The revision being replaced is superseded whether or not it was ever approved, because
+ * "a newer revision answers this request now" does not depend on whether the older one
+ * held an agreement. `superseded` is null only when the revision being replaced is already
+ * `stale` - it is history already, and it keeps the explanation it was given.
  */
 export function reviseContract(
   current: DeliveryContract,
@@ -785,7 +851,7 @@ export function reviseContract(
   });
   if (!draft.ok) return err(draft.error);
 
-  if (current.status !== 'approved') {
+  if (current.status === 'stale') {
     return ok({ superseded: null, draft: draft.value });
   }
 
