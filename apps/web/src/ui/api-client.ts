@@ -1128,6 +1128,19 @@ export function setCsrfToken(token: string | null): void {
   csrfToken = token;
 }
 
+/**
+ * The token a state-changing call must present, or null when there is none.
+ *
+ * Additive read access to the same module state `setCsrfToken` writes, so a caller that
+ * sends its own header — the owner flow's own client module, which will be replaced by
+ * this one — reads the token this session established rather than keeping a second copy
+ * that could disagree with it. Null means this session has no token, which is a sign-in
+ * problem rather than something to retry (F01-AC4).
+ */
+export function getCsrfToken(): string | null {
+  return csrfToken;
+}
+
 export function subscribeToConnection(listener: (state: ConnectionState) => void): () => void {
   connectionListeners.add(listener);
   return () => {
