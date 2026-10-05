@@ -1044,7 +1044,7 @@ test('if the new revision cannot be written, the one it was written from is not 
     // And it is still a working draft rather than a row nobody can act on.
     const edited = editContract(after[0]!, CHANGED, { expectedContentFingerprint: after[0]!.contentFingerprint, at: T2, editedBy: OWNER });
     assert.ok(edited.ok, edited.ok ? '' : edited.error.reason);
-    expectOk(context.contracts.editDraft(edited.value, edited.value.contentFingerprint));
+    expectOk(context.contracts.editDraft(edited.value, after[0]!.contentFingerprint));
     assert.equal(expectOk(context.contracts.read(PROJECT, CONTRACT, 1)).contentFingerprint, contractContentFingerprint(CHANGED));
   });
 });
