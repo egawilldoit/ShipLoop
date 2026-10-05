@@ -111,14 +111,23 @@ interface Seed {
   readonly requestId: string;
   readonly contractId: string;
   readonly candidateId: string;
+  readonly projectId: ProjectId;
 }
+
+/**
+ * The commit shape the harness works in.
+ *
+ * `HEAD`, `NEXT_HEAD` and `BASE_SHA` are all the same 40 hex characters wide, so a fixture
+ * cannot drift into an abbreviation and start passing for an identity it no longer is.
+ */
+type Sha = typeof HEAD;
 
 interface Harness {
   readonly card: MvpReviewCardUseCases;
   readonly db: Database;
   readonly review: SqliteMvpReviewStore;
   /** Appends the observation a push produces: a new candidate identity at a new commit. */
-  readonly push: (seed: Seed, headSha: typeof HEAD) => CandidateId;
+  readonly push: (seed: Seed, headSha: Sha) => CandidateId;
   readonly at: (instant: string) => void;
 }
 
@@ -137,6 +146,8 @@ function seed(
       readonly id: string;
       readonly description: string;
       readonly verificationType: 'automated' | 'owner_test';
+      // Explicit, because a criterion that names no check is refused at approval and every case
+      // here approves a revision before it can reach the card.
       readonly verificationCheckId: string | null;
     }[];
     /** Leaves revision 1 a draft, so a case can write the row an older build would have. */
@@ -227,7 +238,7 @@ function seed(
     }),
   );
 
-  return { requestId: options.requestId, contractId: options.contractId, candidateId: options.candidateId };
+  return { requestId: options.requestId, contractId: options.contractId, candidateId: options.candidateId, projectId };
 }
 
 /** Drives the use cases against a real migrated database. */
@@ -612,6 +623,73 @@ test('F25-AC3: a push refuses a second acceptance of the same commit and reopens
   });
 });
 
+test('F25-AC4: an owner actor carrying no identity decides nothing, on either method', async () => {
+  await withCard(async (harness) => {
+    const stored = seed(harness.db, OWNER_ONLY_SEED);
+
+    // `role: 'owner'` with an empty identity is the shape a forged body would produce if the
+    // transport ever read the deciding owner from the request instead of the session. The role
+    // claims owner and the identity says nobody, and the identity is what the decision is
+    // attributed to - so it is refused rather than narrowed or defaulted (F01-AC1, F25-AC4).
+    //
+    // A *well-formed* id nobody provisioned is a different case and is not asserted here: it
+    // is unreachable over HTTP, because the only owner id this transport can carry is the one
+    // on a stored session row and that column is a foreign key into `owners`. Asserting it
+    // here would pin a rule the use case does not and should not own.
+    const anonymous: MvpOwnerActor = { role: 'owner', ownerId: '' as OwnerId };
+    const calls: readonly {
+      readonly name: string;
+      readonly call: () => Promise<Result<unknown, DomainError>>;
+    }[] = [
+      {
+        name: 'decide',
+        call: () =>
+          harness.card.decide({
+            projectId: PROJECT,
+            candidateId: stored.candidateId,
+            actor: anonymous,
+            decision: 'changes_requested',
+            expectedHeadSha: HEAD,
+            expectedContractRevision: 1,
+            feedback: 'Decided by nobody.',
+          }),
+      },
+      {
+        name: 'getReview',
+        call: () => harness.card.getReview({ projectId: PROJECT, candidateId: stored.candidateId, actor: anonymous }),
+      },
+    ];
+    for (const entry of calls) {
+      const refused = expectErr(await entry.call());
+      assert.equal(refused.code, 'Forbidden', `${entry.name} must refuse an owner carrying no identity`);
+      assert.ok(
+        !refused.reason.includes(stored.candidateId),
+        `the ${entry.name} refusal must not name the candidate it hid: ${refused.reason}`,
+      );
+    }
+
+    // And the owner that does exist is unaffected: refusing an unattributed actor must not
+    // have narrowed what a real owner may do.
+    const changed = expectOk(
+      await harness.card.decide({
+        projectId: PROJECT,
+        candidateId: stored.candidateId,
+        actor: OWNER,
+        decision: 'changes_requested',
+        expectedHeadSha: HEAD,
+        expectedContractRevision: 1,
+        feedback: 'Decided as the owner the session proved.',
+      }),
+    );
+    assert.equal(changed.decision.outcome, 'changes_requested');
+    assert.equal(
+      changed.decision.decision?.ownerId,
+      OWNER_ID,
+      'and it is attributed to the actor that made it, not to a refused one',
+    );
+  });
+});
+
 test('F25-AC4: an agent may not decide, and the refusal says nothing about the candidate', async () => {
   await withCard(async (harness) => {
     const stored = seed(harness.db, OWNER_ONLY_SEED);
@@ -738,6 +816,47 @@ test('F20-AC3: an observation bound to another commit is reported as history, ne
     );
     assert.equal(projected.staleness.stale, true);
     assert.deepEqual(projected.staleness.staleEvidenceIds, ['evid-stale']);
+  });
+});
+
+test('F02-AC2, F20-AC3: the card is proved to belong to the project that asked for it, at every level', async () => {
+  await withCard(async (harness) => {
+    const stored = seed(harness.db, OWNER_ONLY_SEED);
+    const card = expectOk(
+      await harness.card.getReview({ projectId: PROJECT, candidateId: stored.candidateId, actor: OWNER }),
+    );
+
+    // The candidate is the one thing `readFacts` refuses on project identity, and it is the
+    // only element whose project membership the other facts are derived from. So the other
+    // three are asserted here to pin the shape a client relies on: each names its own
+    // project, so "which project is this card about" has one answer rather than four that
+    // could be read independently (F02-AC2).
+    assert.equal(card.candidate.projectId, PROJECT, 'the candidate names the project it was read under');
+    assert.equal(card.request.projectId, PROJECT, 'and the request it belongs to agrees');
+    assert.equal(card.contract.projectId, PROJECT, 'and so does the contract revision');
+    assert.equal(card.candidate.requestId, stored.requestId, 'the candidate points at the request on the card');
+    assert.equal(card.candidate.contractId, stored.contractId);
+    assert.equal(card.candidate.contractRevision, card.contract.revision, 'the candidate and the card agree on the revision');
+    assert.equal(card.request.requestId, card.contract.requestId, 'the contract belongs to the request on the card');
+  });
+});
+
+test('F20-AC3, F24-AC3: a card carrying evidence from two projects cannot be read through one path', async () => {
+  // The transport re-checks project membership on every element of a card before returning
+  // it, because a projection assembled from several reads could otherwise mix a project in.
+  // The shape that makes that check meaningful is pinned here: every element carries its own
+  // project id rather than sharing one derived from the request (F02-AC2).
+  await withCard(async (harness) => {
+    const stored = seed(harness.db, OWNER_ONLY_SEED);
+    const card = expectOk(
+      await harness.card.getReview({ projectId: PROJECT, candidateId: stored.candidateId, actor: OWNER }),
+    );
+    const projects = new Set([
+      card.request.projectId,
+      card.contract.projectId,
+      card.candidate.projectId,
+    ]);
+    assert.equal(projects.size, 1, `a card must not mix projects; it carries ${[...projects].join(', ')}`);
   });
 });
 
