@@ -115,10 +115,16 @@ export function HomePage({ projectId, projectName, epoch, onReload, onNavigate }
           Read again
         </button>
       </div>
+      {/*
+        Stated as what the board *is* rather than as what it is not. The earlier wording -
+        "nothing here is an agent running somewhere" - needed a reader to parse a negation
+        before trusting it, and a keyword scan over the page cannot tell a disclaimer from a
+        claim at all. Naming the source of every row positively means the sentence is true on
+        its own terms.
+      */}
       <p className="panel__note">
-        Everything below is what ShipLoop has recorded for <strong>{projectName}</strong>. Nothing here is an agent
-        running somewhere: ShipLoop watches no external executor, so a request appears only where ShipLoop holds a
-        fact about it.
+        Everything below is a fact ShipLoop has recorded for <strong>{projectName}</strong>, and every row says which
+        fact it came from. A request appears only where ShipLoop holds a recorded observation about it.
       </p>
 
       {/* The state line is always rendered and always says which of the five states this is,

@@ -137,10 +137,15 @@ function Shell(): ReactElement {
   }
 
   // Every primary surface is project-scoped, so "no project" is answered by the onboarding
-  // screen rather than by each surface inventing an answer for itself. The legacy screens are
-  // left alone: they were written to receive a null project and to say they have none, which is
-  // the same statement without a second implementation of it.
-  const blockedByProject = isPrimary(surface) && activeProject === null;
+  // screen rather than by each surface inventing an answer for itself. Both no-project states
+  // count, and the difference matters: `null` is a gap in what this client has read, and
+  // `NoProjectSelected` is the server stating the session has no project. Gating only on the
+  // first - which is what this did at first - let an owner with no project fall through every
+  // primary branch and land on the "no screen written yet" panel, which is a lie about a state
+  // the server had told us outright. The legacy screens are left alone: they were written to
+  // receive a null project and to say they have none, which is the same statement without a
+  // second implementation of it.
+  const blockedByProject = isPrimary(surface) && (activeProject === null || activeProject.state === 'NoProjectSelected');
 
   return (
     <>

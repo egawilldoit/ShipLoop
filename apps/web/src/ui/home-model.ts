@@ -51,7 +51,7 @@ export const HOME_GROUPS: readonly HomeGroupDescriptor[] = [
     id: 'inProgress',
     title: 'In progress',
     explanation:
-      'Steps ShipLoop has recorded as unfinished. This is not an agent watching an external executor: a request appears here only where ShipLoop holds a recorded fact that a step is outstanding, such as an approved contract with no candidate linked, or a required check with no result recorded against the current commit.',
+      'Steps ShipLoop has recorded as unfinished. A request appears here only where ShipLoop holds a recorded fact that a step is outstanding - an approved contract with no candidate linked, or a required check with no result recorded against the current commit. Membership says a recorded step is incomplete; it is not a reading of any outside system.',
     empty: 'Nothing is recorded as still moving. A request appears here while a step ShipLoop records is unfinished.',
   },
   {
