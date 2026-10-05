@@ -17,15 +17,17 @@
  *     approval to somebody else; the approver is read from the proved session, and the
  *     schema is `strictObject` rather than open, so a body that meant to say who approved is
  *     refused rather than silently dropped (mvp-spec 3).
- *   - **Every write carries what it acted on: an `expectedUpdatedAt`, and for an approval an
- *     `expectedContentFingerprint`.** A stale tab editing a request or a draft revision is
- *     refused with a 409 instead of overwriting text somebody else has since replaced, and
- *     the conflict names both instants (mvp-spec 7, F24-AC4). An approval is the harder
- *     case, because a revision number outlives its text: two tabs on one draft both address
- *     `contracts/:id/1`, so the fingerprint the owner's page was rendered against is the
- *     only thing that separates "I approve what I read" from "I approve what somebody else
- *     wrote". Without it the two-tab defect was real and undetectable afterwards, because a
- *     frozen revision reports itself as approved.
+ *   - **Every write carries what it acted on.** A request edit sends an `expectedUpdatedAt` and
+ *     a contract edit or approval sends an `expectedContentFingerprint` - the fingerprint the
+ *     owner's read returned. A stale tab editing a request or a draft revision is refused with a
+ *     409 instead of overwriting text somebody else has since replaced (mvp-spec 7, F24-AC4).
+ *     A Delivery Contract is keyed on its fingerprint rather than its instant, because a
+ *     revision's number and its `updatedAt` both outlive what it says: two tabs on one draft
+ *     both address `contracts/:id/1`, and two writes can share a millisecond, so only the
+ *     fingerprint separates "I am saving what I read" from "I am overwriting what somebody
+ *     else wrote". Without it the two-tab defect was real and, on an edit, undetectable
+ *     afterwards - a draft simply reports the losing tab's text as its own. An approval is the
+ *     harder case still, because a frozen revision reports itself as approved.
  *   - **Reads of one revision are keyed by `(projectId, contractId, revision)`.** A revision
  *     number is not decoration: a candidate and its evidence bind to it, so addressing a
  *     revision without its number is addressing something unidentifiable (mvp-spec 3).
@@ -163,11 +165,34 @@ const contractContent = z.strictObject({
   acceptanceCriteria: z.array(criterion).min(1, 'A contract needs at least one acceptance criterion.').max(100, 'A contract may hold at most 100 acceptance criteria.'),
 });
 
+/**
+ * An edit names the draft text it replaces, the way an approval names the text it approves.
+ *
+ * `expectedContentFingerprint` is the `contentFingerprint` the revision carried in the read
+ * that rendered the owner's page, sent straight back. It is required rather than optional
+ * because the revision number does not name a state: two tabs on one draft both address
+ * `contracts/:id/1`, so a call that did not say which text it was saving would land over
+ * whatever the other tab had written since the page was rendered, and both tabs would report
+ * success.
+ *
+ * It could not be an `expectedUpdatedAt`, which is what this body carried before. Two writes
+ * can share a millisecond, and then the instant is byte-identical after the first write as it
+ * was before it - so an instant-locked edit would accept the second tab's write over the
+ * first and leave no trace of the loss. The fingerprint moves on every edit that changes
+ * anything (mvp-spec 3, mvp-spec 7).
+ *
+ * As with an approval, it is a reference rather than an instruction: the shape check is the
+ * *server's* fingerprint shape and nothing more, so a client cannot use this value to describe
+ * text of its own choosing. `strictObject` still means a client that sends `expectedUpdatedAt`
+ * instead gets a named field rather than having it dropped.
+ */
 const editContractBody = contractContent.extend({
-  expectedUpdatedAt: z
+  expectedContentFingerprint: z
     .string()
     .trim()
-    .min(1, 'The instant the revision was loaded is required, so a stale editor is refused (mvp-spec 3).'),
+    .min(1, 'The fingerprint of the revision you read is required, so a stale editor is refused (mvp-spec 3).')
+    .max(128)
+    .refine(isFingerprint, 'A content fingerprint looks like "fp_" followed by 32 hex characters.'),
 });
 
 /**
@@ -437,6 +462,14 @@ export function registerContractRoutes(app: FastifyInstance, options: ContractRo
    * `PATCH` on a revision rather than a new revision: nothing is agreed yet, so there is no
    * approval to invalidate and no candidate bound to this text. An approved revision answers
    * 400 here, and `revise` is the way forward (mvp-spec 3).
+   *
+   * The body names the draft text it replaces, and a stale one is a 409 rather than a silent
+   * overwrite: the response names the fingerprint that was asked for and the one now stored, so
+   * a client can reload and re-save without guessing what changed. The 200 body is the whole
+   * revision including the *new* `contentFingerprint`, which is the value the next edit or
+   * approval has to send back - so a client that renders the returned revision can keep
+   * editing without a second round trip and without holding a lock that no longer describes
+   * the text (mvp-spec 7, F24-AC4).
    */
   app.patch('/api/projects/:projectId/contracts/:contractId/:revision', { preHandler: options.guard }, async (request, reply) => {
     const session = request.session;
@@ -451,7 +484,7 @@ export function registerContractRoutes(app: FastifyInstance, options: ContractRo
       contractId: params.value.contractId,
       revision: params.value.revision,
       ...explicitBindings(body.value),
-      expectedUpdatedAt: body.value.expectedUpdatedAt,
+      expectedContentFingerprint: body.value.expectedContentFingerprint,
       actor: session.ownerId,
     });
     if (!edited.ok) return sendProblem(reply, problemFor(edited.error));

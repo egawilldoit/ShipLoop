@@ -22,7 +22,11 @@ import { err, invalid, ok } from './result.ts';
  *     takes the `contentFingerprint` of the draft the caller reviewed and refuses
  *     anything else. Without that second argument an approval names a *revision* but not
  *     a *state*: two tabs on one draft, the first tab approves, and the agreement is
- *     sealed over text its approver never saw. The shape a model may emit
+ *     sealed over text its approver never saw. `editContract` requires the same value of
+ *     the same field, because "is this still the text I read?" is one question about one
+ *     piece of content and the draft's `updatedAt` cannot answer it - two writes in one
+ *     millisecond leave the instant unchanged while the text has certainly moved.
+ *     The shape a model may emit
  *     (`ContractProposal`) has no status, no approval and no timestamp field, and
  *     `applyContractProposal` refuses an unknown key rather than dropping it, so
  *     structured output cannot assert agreement even by naming it. This is the same
@@ -425,14 +429,32 @@ export function createContractDraft(input: CreateContractInput): Result<Delivery
  * approved contract never silently mutates" a property of the API rather than a rule
  * callers are trusted to follow.
  *
- * Every successful edit moves `contentFingerprint`, and a refused no-op does not, which
- * is what makes that field usable as the lock `approveContract` requires: a caller
- * holding an older fingerprint is holding text the store has since replaced.
+ * **`expectedContentFingerprint` is the lock, and it is the same lock `approveContract`
+ * requires.** The field names one question - "is this still the text the caller read?" - and
+ * it answers it by content rather than by clock, because a revision's `updatedAt` is not a
+ * content identity: two tabs can write in the same millisecond, and then the instant is
+ * byte-identical after the first write as it was before it. A timestamp lock would let the
+ * second write land over the first, and nothing afterwards could tell which text survived.
+ * The fingerprint moves on every edit that changes anything, in the same millisecond or
+ * not, so the token a stale tab holds no longer describes what is stored and the edit is a
+ * `Conflict` rather than a silent overwrite (mvp-spec 7, "Reject stale requests").
+ *
+ * Every successful edit moves `contentFingerprint`, and a refused no-op does not, which is
+ * what makes that field usable as a lock at all: a caller holding an older fingerprint is
+ * holding text the store has since replaced. As with an approval, the value compared here is
+ * re-derived from the text rather than read off the record, so the lock cannot be satisfied
+ * by a row whose fingerprint does not describe the text beside it, and both transitions
+ * over a draft's text ask their question in the same terms.
  */
 export function editContract(
   contract: DeliveryContract,
   content: ContractContent,
-  options: { readonly expectedUpdatedAt: string; readonly at: string; readonly editedBy: OwnerId },
+  options: {
+    /** The fingerprint of the draft text the caller read and is replacing. */
+    readonly expectedContentFingerprint: Fingerprint;
+    readonly at: string;
+    readonly editedBy: OwnerId;
+  },
 ): Result<DeliveryContract, DomainError> {
   if (contract.status !== 'draft') {
     return err<DomainError>(
@@ -442,12 +464,13 @@ export function editContract(
       ),
     );
   }
-  if (options.expectedUpdatedAt !== contract.updatedAt) {
+  const currentFingerprint = contractContentFingerprint(normalizeContent(contract));
+  if (options.expectedContentFingerprint !== currentFingerprint) {
     return err<DomainError>({
       code: 'Conflict',
-      reason: 'The contract revision changed after it was loaded. Reload it before saving again.',
-      expected: options.expectedUpdatedAt,
-      actual: contract.updatedAt,
+      reason: `Revision ${contract.revision} changed after it was loaded, so saving now would replace text the store has since replaced. Reload it before saving again.`,
+      expected: options.expectedContentFingerprint,
+      actual: currentFingerprint,
     });
   }
 
@@ -456,7 +479,8 @@ export function editContract(
   if (errors.length > 0) {
     return err<DomainError>(invalid('The contract revision could not be edited.', errors));
   }
-  if (contractContentFingerprint(normalized) === contract.contentFingerprint) {
+  const editedFingerprint = contractContentFingerprint(normalized);
+  if (editedFingerprint === currentFingerprint) {
     return err<DomainError>(
       invalid('The contract revision could not be edited.', [
         { path: 'contract', message: 'Nothing changed; edit the outcome, the scope or a criterion.' },
@@ -478,7 +502,7 @@ export function editContract(
       supersededByRevision: null,
       sourceBriefId: contract.sourceBriefId,
       sourceBriefVersion: contract.sourceBriefVersion,
-      contentFingerprint: contractContentFingerprint(normalized),
+      contentFingerprint: editedFingerprint,
       requestFingerprint: contract.requestFingerprint,
       createdBy: contract.createdBy,
       createdAt: contract.createdAt,

@@ -1746,6 +1746,13 @@ export interface RequestView {
  * `status` says it is no longer current. `answersCurrentRequest` is the layer's *report* that
  * an approved revision no longer matches the request it answers - it does not demote it, since
  * whether a request edit invalidates an agreement is the owner's call about scope.
+ *
+ * `contentFingerprint` is load-bearing rather than descriptive: it is the value a client sends
+ * back as `expectedContentFingerprint` to edit this revision again or to approve it, and it is
+ * the only concurrency token that holds over a draft's text, because a write and the write it
+ * raced can share an `updatedAt`. A response that omitted it, or reported the fingerprint of
+ * the text *before* the change it just made, would leave the next call unable to say what it
+ * is writing over (mvp-spec 3, mvp-spec 7 "Reject stale requests").
  */
 export interface ContractView {
   readonly contractId: string;
@@ -1856,7 +1863,19 @@ export interface ContractUseCases {
     readonly scope: readonly string[];
     readonly outOfScope: readonly string[];
     readonly acceptanceCriteria: readonly ContractCriterionView[];
-    readonly expectedUpdatedAt: string;
+    /**
+     * The `contentFingerprint` the revision carried when it was read, sent back by the
+     * client, and required.
+     *
+     * An edit is a write over text, and the revision number alone does not name which text:
+     * two tabs on one draft both name revision 1. `updatedAt` cannot stand in for it either,
+     * because two writes can share a millisecond and leave the instant unchanged either side
+     * of the first - which would let the second tab's write land over the first while both
+     * reported success. So an edit and an approval carry the same value, and the server
+     * checks it against the fingerprint it derives rather than trusting it (mvp-spec 3,
+     * mvp-spec 7 "Reject stale requests").
+     */
+    readonly expectedContentFingerprint: string;
     readonly actor: OwnerId;
   }): Promise<Result<ContractView, DomainError>>;
   approveRevision(command: {

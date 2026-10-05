@@ -998,7 +998,7 @@ class InMemoryController implements ControllerSurface {
       readonly scope: readonly string[];
       readonly outOfScope: readonly string[];
       readonly acceptanceCriteria: readonly ContractCriterionView[];
-      readonly expectedUpdatedAt: string;
+      readonly expectedContentFingerprint: string;
       readonly actor: OwnerId;
     }): Promise<Result<ContractView, DomainError>> => {
       const stored = this.revisionOf(command.projectId, command.contractId, command.revision);
@@ -1016,10 +1016,17 @@ class InMemoryController implements ControllerSurface {
           ),
         };
       }
-      if (stored.updatedAt !== command.expectedUpdatedAt) {
+      // Keyed on the fingerprint rather than the instant, the way the production store keys
+      // it: two writes can share a millisecond, and then the instant a stale tab holds is
+      // still the stored one (mvp-spec 7, F24-AC4).
+      if (stored.contentFingerprint !== command.expectedContentFingerprint) {
         return {
           ok: false,
-          error: conflict('The contract revision changed after it was loaded.', command.expectedUpdatedAt, stored.updatedAt),
+          error: conflict(
+            'The contract revision is not the text that was loaded.',
+            command.expectedContentFingerprint,
+            stored.contentFingerprint,
+          ),
         };
       }
       const edited: ContractView = {
@@ -2973,7 +2980,7 @@ test('mvp-spec 3: a draft revision is edited in place and keeps its revision num
     method: 'PATCH',
     url: `/api/projects/${PROJECT_ID}/contracts/${contract.contractId}/1`,
     headers: { cookie: session.cookie, [CSRF_HEADER]: session.csrfToken },
-    payload: { ...CHANGED_CONTRACT_CONTENT, expectedUpdatedAt: contract.updatedAt },
+    payload: { ...CHANGED_CONTRACT_CONTENT, expectedContentFingerprint: contract.contentFingerprint },
   });
   assert.equal(edited.statusCode, 200, edited.body);
   const updated = parse<{ contract: ContractView }>(edited).contract;
@@ -2981,6 +2988,119 @@ test('mvp-spec 3: a draft revision is edited in place and keeps its revision num
   assert.equal(updated.outcome, CHANGED_CONTRACT_CONTENT.outcome);
   assert.notEqual(updated.contentFingerprint, contract.contentFingerprint);
   assert.equal(updated.status, 'draft');
+});
+
+test('F24-AC4: the PATCH answer carries the fingerprint the next edit and the approval need', async () => {
+  const h = await harness();
+  const session = await signIn(h.app);
+  const request = await createRequest(h, session);
+  const contract = await draftContract(h, session, request.requestId);
+
+  const edited = await h.app.inject({
+    method: 'PATCH',
+    url: `/api/projects/${PROJECT_ID}/contracts/${contract.contractId}/1`,
+    headers: { cookie: session.cookie, [CSRF_HEADER]: session.csrfToken },
+    payload: { ...CHANGED_CONTRACT_CONTENT, expectedContentFingerprint: contract.contentFingerprint },
+  });
+  assert.equal(edited.statusCode, 200, edited.body);
+  const updated = parse<{ contract: ContractView }>(edited).contract;
+  // The fingerprint in the answer is the one the *new* text has, not the one the request
+  // named and not the one before the change. A page that renders this answer and keeps
+  // editing has a lock that describes what it is showing.
+  assert.match(updated.contentFingerprint, /^fp_[0-9a-f]{32}$/);
+  assert.notEqual(updated.contentFingerprint, contract.contentFingerprint);
+  const reread = parse<{ contract: ContractView }>(
+    await h.app.inject({
+      method: 'GET',
+      url: `/api/projects/${PROJECT_ID}/contracts/${contract.contractId}/1`,
+      headers: { cookie: session.cookie },
+    }),
+  ).contract;
+  assert.equal(updated.contentFingerprint, reread.contentFingerprint, 'the answer names what the store holds');
+
+  // Sending that value straight back saves again, which is the whole contract between this
+  // answer and the next write.
+  const again = await h.app.inject({
+    method: 'PATCH',
+    url: `/api/projects/${PROJECT_ID}/contracts/${contract.contractId}/1`,
+    headers: { cookie: session.cookie, [CSRF_HEADER]: session.csrfToken },
+    payload: {
+      ...CHANGED_CONTRACT_CONTENT,
+      outcome: 'The order summary shows the total including tax and shipping, in the store currency.',
+      expectedContentFingerprint: updated.contentFingerprint,
+    },
+  });
+  assert.equal(again.statusCode, 200, again.body);
+  const twice = parse<{ contract: ContractView }>(again).contract;
+  assert.notEqual(twice.contentFingerprint, updated.contentFingerprint);
+
+  // The fingerprint the first answer carried is now the stale one, and holding it is refused
+  // rather than merged: the response names both, so a client can reload without guessing.
+  const stale = await h.app.inject({
+    method: 'PATCH',
+    url: `/api/projects/${PROJECT_ID}/contracts/${contract.contractId}/1`,
+    headers: { cookie: session.cookie, [CSRF_HEADER]: session.csrfToken },
+    payload: { ...CHANGED_CONTRACT_CONTENT, expectedContentFingerprint: updated.contentFingerprint },
+  });
+  assert.equal(stale.statusCode, 409, stale.body);
+  const refused = parse<ErrorPayload>(stale);
+  assert.equal(refused.error.code, 'Conflict');
+  assert.equal(refused.error.expected, updated.contentFingerprint);
+  assert.equal(refused.error.actual, twice.contentFingerprint);
+  const after = parse<{ contract: ContractView }>(
+    await h.app.inject({
+      method: 'GET',
+      url: `/api/projects/${PROJECT_ID}/contracts/${contract.contractId}/1`,
+      headers: { cookie: session.cookie },
+    }),
+  ).contract;
+  assert.equal(after.outcome, twice.outcome, "and the winning write is what survived");
+});
+
+test('mvp-spec 3: an edit body naming the instant instead of the fingerprint is refused by name', async () => {
+  const h = await harness();
+  const session = await signIn(h.app);
+  const request = await createRequest(h, session);
+  const contract = await draftContract(h, session, request.requestId);
+
+  // `expectedUpdatedAt` was what this route used to lock on, and it cannot: two writes can
+  // share a millisecond. A body still sending it is refused by name rather than having the
+  // field dropped, because a client that believes it named the lock is the defect.
+  const wrongToken = await h.app.inject({
+    method: 'PATCH',
+    url: `/api/projects/${PROJECT_ID}/contracts/${contract.contractId}/1`,
+    headers: { cookie: session.cookie, [CSRF_HEADER]: session.csrfToken },
+    payload: { ...CHANGED_CONTRACT_CONTENT, expectedUpdatedAt: contract.updatedAt },
+  });
+  assert.equal(wrongToken.statusCode, 400, wrongToken.body);
+  const named = parse<ErrorPayload>(wrongToken);
+  assert.ok(
+    named.error.fields?.some((field) => field.path.includes('expectedUpdatedAt')) ?? false,
+    `the refusal names the field: ${wrongToken.body}`,
+  );
+
+  // A value that is not a fingerprint at all describes no draft, so it never reaches the
+  // comparison. The shape checked is the server's, which is what stops a client from using
+  // this field to name text of its own choosing.
+  const notAFingerprint = await h.app.inject({
+    method: 'PATCH',
+    url: `/api/projects/${PROJECT_ID}/contracts/${contract.contractId}/1`,
+    headers: { cookie: session.cookie, [CSRF_HEADER]: session.csrfToken },
+    payload: { ...CHANGED_CONTRACT_CONTENT, expectedContentFingerprint: 'the outcome I want' },
+  });
+  assert.equal(notAFingerprint.statusCode, 400, notAFingerprint.body);
+  assert.ok(
+    parse<ErrorPayload>(notAFingerprint).error.fields?.some((field) => field.path === 'expectedContentFingerprint') ?? false,
+    `the refusal names the field: ${notAFingerprint.body}`,
+  );
+  const unchanged = parse<{ contract: ContractView }>(
+    await h.app.inject({
+      method: 'GET',
+      url: `/api/projects/${PROJECT_ID}/contracts/${contract.contractId}/1`,
+      headers: { cookie: session.cookie },
+    }),
+  ).contract;
+  assert.equal(unchanged.outcome, CONTRACT_CONTENT.outcome, 'and nothing was written');
 });
 
 test('mvp-spec 3: approval attributes itself to the session and carries no approver in the body', async () => {
@@ -3041,7 +3161,7 @@ test('mvp-spec 3: an approved revision cannot be edited, and approving twice is 
     method: 'PATCH',
     url: `/api/projects/${PROJECT_ID}/contracts/${contract.contractId}/1`,
     headers: { cookie: session.cookie, [CSRF_HEADER]: session.csrfToken },
-    payload: { ...CHANGED_CONTRACT_CONTENT, expectedUpdatedAt: approved.updatedAt },
+    payload: { ...CHANGED_CONTRACT_CONTENT, expectedContentFingerprint: approved.contentFingerprint },
   });
   assert.equal(edit.statusCode, 400, edit.body);
   assert.match(edit.body, /frozen|Draft a new revision/);
@@ -3083,7 +3203,7 @@ test('mvp-spec 3, mvp-spec 7: the first of two tabs to approve loses, and the se
     method: 'PATCH',
     url: `/api/projects/${PROJECT_ID}/contracts/${contract.contractId}/1`,
     headers: { cookie: session.cookie, [CSRF_HEADER]: session.csrfToken },
-    payload: { ...CHANGED_CONTRACT_CONTENT, expectedUpdatedAt: contract.updatedAt },
+    payload: { ...CHANGED_CONTRACT_CONTENT, expectedContentFingerprint: contract.contentFingerprint },
   });
   assert.equal(edited.statusCode, 200, edited.body);
   const revised = parse<{ contract: ContractView }>(edited).contract;
@@ -3386,7 +3506,7 @@ test('mvp-spec 3, F02-AC2: nothing here crosses a project boundary', async () =>
         method: 'PATCH',
         url: `/api/projects/${elsewhere}/contracts/${contract.contractId}/1`,
         headers: { cookie: session.cookie, [CSRF_HEADER]: session.csrfToken },
-        payload: { ...CHANGED_CONTRACT_CONTENT, expectedUpdatedAt: contract.updatedAt },
+        payload: { ...CHANGED_CONTRACT_CONTENT, expectedContentFingerprint: contract.contentFingerprint },
       }),
     },
     {
@@ -3478,7 +3598,7 @@ test('mvp-spec 3, F02-AC2: an id that addresses nothing is a 404 on every route,
       label: 'edit an unknown contract',
       method: 'PATCH',
       url: `/api/projects/${PROJECT_ID}/contracts/dc_nope/1`,
-      payload: { ...CONTRACT_CONTENT, expectedUpdatedAt: contract.updatedAt },
+      payload: { ...CONTRACT_CONTENT, expectedContentFingerprint: contract.contentFingerprint },
     },
     {
       label: 'approve an unknown contract',
@@ -3510,7 +3630,7 @@ test('mvp-spec 3, F02-AC2: an id that addresses nothing is a 404 on every route,
       label: 'edit a revision number that does not exist',
       method: 'PATCH',
       url: `/api/projects/${PROJECT_ID}/contracts/${contract.contractId}/7`,
-      payload: { ...CHANGED_CONTRACT_CONTENT, expectedUpdatedAt: contract.updatedAt },
+      payload: { ...CHANGED_CONTRACT_CONTENT, expectedContentFingerprint: contract.contentFingerprint },
     },
     {
       label: 'approve a revision number that does not exist',
@@ -3739,7 +3859,7 @@ test('mvp-spec 3: a retired revision is history, so it is not editable either', 
     method: 'PATCH',
     url: `/api/projects/${PROJECT_ID}/contracts/${contract.contractId}/1`,
     headers: { cookie: session.cookie, [CSRF_HEADER]: session.csrfToken },
-    payload: { ...CHANGED_CONTRACT_CONTENT, expectedUpdatedAt: approved.updatedAt },
+    payload: { ...CHANGED_CONTRACT_CONTENT, expectedContentFingerprint: approved.contentFingerprint },
   });
   assert.equal(edit.statusCode, 400, edit.body);
   assert.match(edit.body, /stale/i);
@@ -3822,7 +3942,7 @@ test('F01-AC1: every request and contract route refuses an anonymous caller', as
     { method: 'GET', url: `/api/projects/${PROJECT_ID}/requests/req_1/contracts`, payload: null },
     { method: 'GET', url: `/api/projects/${PROJECT_ID}/contracts/dc_1/1`, payload: null },
     { method: 'GET', url: `/api/projects/${PROJECT_ID}/contracts/dc_1/1/criteria`, payload: null },
-    { method: 'PATCH', url: `/api/projects/${PROJECT_ID}/contracts/dc_1/1`, payload: { ...CONTRACT_CONTENT, expectedUpdatedAt: 'y' } },
+    { method: 'PATCH', url: `/api/projects/${PROJECT_ID}/contracts/dc_1/1`, payload: { ...CONTRACT_CONTENT, expectedContentFingerprint: 'y' } },
     { method: 'POST', url: `/api/projects/${PROJECT_ID}/contracts/dc_1/1/approve`, payload: { expectedContentFingerprint: contractContentFingerprint(CONTRACT_CONTENT) } },
     { method: 'POST', url: `/api/projects/${PROJECT_ID}/contracts/dc_1/1/revise`, payload: CONTRACT_CONTENT },
     { method: 'POST', url: `/api/projects/${PROJECT_ID}/contracts/dc_1/1/invalidate`, payload: { reason: 'RequestChanged' } },

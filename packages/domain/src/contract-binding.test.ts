@@ -200,7 +200,7 @@ test('repointing a criterion at a different check is a material change to the ag
 
   const draft = draftOf(BASE);
   const edited = editContract(draft, repointed, {
-    expectedUpdatedAt: draft.updatedAt,
+    expectedContentFingerprint: draft.contentFingerprint,
     at: '2026-03-01T10:30:00.000Z',
     editedBy: OWNER,
   });

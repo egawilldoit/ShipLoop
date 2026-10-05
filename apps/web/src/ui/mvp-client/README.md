@@ -93,10 +93,17 @@ rendered; a stale editor is a `Conflict`, not an overwrite.
 | `draftContract(scope, requestId, content)` | `POST …/requests/:requestId/contracts` |
 | `getContract(scope, contractId, revision)` | `GET …/contracts/:contractId/:revision` |
 | `listContractCriteria(scope, contractId, revision)` | `GET …/contracts/:contractId/:revision/criteria` |
-| `editContract(scope, contractId, revision, content & { expectedUpdatedAt })` | `PATCH …/contracts/:contractId/:revision` |
+| `editContract(scope, contractId, revision, content & { expectedContentFingerprint })` | `PATCH …/contracts/:contractId/:revision` |
 | `approveContract(scope, contractId, revision, expectedContentFingerprint)` | `POST …/contracts/:contractId/:revision/approve` |
 | `reviseContract(scope, contractId, revision, content)` | `POST …/contracts/:contractId/:revision/revise` |
 | `invalidateContract(scope, contractId, revision, reason)` | `POST …/contracts/:contractId/:revision/invalidate` |
+
+**Editing a draft is the same compare-and-set.** `editContract` also takes
+`expectedContentFingerprint`, the `contentFingerprint` of the read that was rendered, and the 200
+body's `contract.contentFingerprint` is the value the *next* edit or approval must send back. A
+stale one is a `Conflict`: offer a reload and re-save rather than reporting success. The instant
+cannot stand in for it — two writes can share a millisecond — so a page must never substitute
+`contract.updatedAt` here.
 
 **Approval is a compare-and-set.** `expectedContentFingerprint` is `contract.contentFingerprint`
 from the read that was rendered, and it is required. `approveContract` returns a union:

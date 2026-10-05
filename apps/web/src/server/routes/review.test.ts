@@ -726,7 +726,7 @@ test('F23-AC1, F24-AC3: an automated criterion that names no check is refused at
     method: 'PATCH',
     url: `/api/projects/${PROJECT_ID}/contracts/${contract.contractId}/${contract.revision}`,
     headers: { cookie: session.cookie, [CSRF_HEADER]: session.csrfToken },
-    payload: { ...CONTRACT_CONTENT, expectedUpdatedAt: contract.updatedAt },
+    payload: { ...CONTRACT_CONTENT, expectedContentFingerprint: contract.contentFingerprint },
   });
   assert.equal(bound.statusCode, 200, bound.body);
   // The binding edit changed the text, so the approval names the fingerprint of the *bound* draft.
