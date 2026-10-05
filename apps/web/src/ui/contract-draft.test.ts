@@ -136,6 +136,22 @@ describe('approval rules, matching the server', () => {
     assert.equal(problems.approvable, false);
     assert.match(problems.criteria['criterion-1']?.[0]?.message ?? '', /needs a description/);
   });
+
+  it('predicts the route\'s own bounds, so a limit is met before a save rather than after one', () => {
+    // The bounds live in the route's schema. Repeating them here is only safe if the two
+    // agree, so this asserts the agreement rather than trusting the comment.
+    const tooManyCriteria = Array.from({ length: 101 }, (_, index) =>
+      criterion({ key: `criterion-${index}`, id: `AC${index + 1}` }),
+    );
+    const criteria = draftProblems(draftWith(tooManyCriteria));
+    assert.equal(criteria.approvable, false);
+    assert.match(criteria.criteria['criteria-region']?.[0]?.message ?? '', /at most 100 acceptance criteria/);
+
+    const tooManyEntries = Array.from({ length: 201 }, (_, index) => `entry ${index}`);
+    const scope = draftProblems({ outcome: 'A thing.', scope: tooManyEntries, outOfScope: [], acceptanceCriteria: [criterion()] });
+    assert.equal(scope.approvable, false);
+    assert.match(scope.scope.at(-1)?.message ?? '', /at most 200 entries/);
+  });
 });
 
 describe('the body a save sends', () => {

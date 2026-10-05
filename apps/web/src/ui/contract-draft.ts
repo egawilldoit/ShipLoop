@@ -16,16 +16,18 @@
 
 import type {
   ContractContentInput,
-  ContractCriterionView,
   ContractView,
   VerificationCheckChoices,
 } from './contract-client.ts';
 
-/** Who settles a criterion. A closed vocabulary: a text field here is how "verified" comes to mean "someone read it". */
+/**
+ * Who settles a criterion.
+ *
+ * A closed vocabulary rather than free text, because a text field here is how "verified"
+ * comes to mean "someone read it". The same pair the route accepts and the review card
+ * reports, spelled the same way, so no translation layer can drift from the server's.
+ */
 export type VerificationType = 'automated' | 'owner_test';
-
-/** The kinds of verification the UI can report on. */
-export const VERIFICATION_TYPES: readonly VerificationType[] = ['automated', 'owner_test'];
 
 /**
  * One criterion as the owner is editing it.
@@ -62,9 +64,16 @@ const MAXIMUM_CRITERION_ID_LENGTH = 128;
 /** Longest check name the route accepts. */
 const MAXIMUM_CHECK_NAME_LENGTH = 200;
 
-/** At most this many list entries, and this many criteria — the route's own bounds. */
-export const MAXIMUM_LIST_ENTRIES = 200;
-export const MAXIMUM_CRITERIA = 100;
+/**
+ * The route's own bounds, repeated here so the client can predict them.
+ *
+ * Kept in step with `routes/contracts.ts` rather than trusted from it at runtime: a bound
+ * enforced only by the server is a bound the owner discovers by being refused, and the
+ * whole point of this module is to reach the same conclusion first. `contract-draft.test.ts`
+ * asserts these agree with the route's schema.
+ */
+const MAXIMUM_LIST_ENTRIES = 200;
+const MAXIMUM_CRITERIA = 100;
 
 /**
  * A criterion id derived from the row's position and the ids already in use.
@@ -193,10 +202,14 @@ export function draftProblems(draft: ContractDraft): DraftProblems {
 
   const criteria: Record<string, readonly DraftProblem[]> = {};
   const bindings: Record<string, readonly DraftProblem[]> = {};
+  // Both bounds attach to the criteria region rather than a row: the offending entry is the
+  // one past the bound, and there is no row for it.
   if (draft.acceptanceCriteria.length === 0) {
-    // Attached to the criteria region rather than a row, because there is no row to
-    // attach it to.
     criteria['criteria-region'] = [{ key: 'criteria-region', message: 'A contract needs at least one acceptance criterion.' }];
+  } else if (draft.acceptanceCriteria.length > MAXIMUM_CRITERIA) {
+    criteria['criteria-region'] = [
+      { key: 'criteria-region', message: `A contract may hold at most ${MAXIMUM_CRITERIA} acceptance criteria.` },
+    ];
   }
 
   for (const criterion of draft.acceptanceCriteria) {
@@ -228,7 +241,7 @@ export function draftProblems(draft: ContractDraft): DraftProblems {
   return { outcome, scope, outOfScope, criteria, bindings, approvable };
 }
 
-/** Blank entries in a statement list, which the route refuses. */
+/** Blank entries in a statement list, which the route refuses, plus the route's entry bound. */
 function listProblems(entries: readonly string[], listKey: string): readonly DraftProblem[] {
   const problems: DraftProblem[] = [];
   entries.forEach((entry, index) => {
@@ -236,6 +249,14 @@ function listProblems(entries: readonly string[], listKey: string): readonly Dra
       problems.push({ key: `${listKey}-${index}`, message: 'An empty entry says nothing; remove it instead.' });
     }
   });
+  // Reported against the list rather than a row, because the entry that would be refused is
+  // the one past the bound and there is no row for it to attach to.
+  if (entries.length > MAXIMUM_LIST_ENTRIES) {
+    problems.push({
+      key: listKey,
+      message: `A list may hold at most ${MAXIMUM_LIST_ENTRIES} entries.`,
+    });
+  }
   return problems;
 }
 
@@ -380,18 +401,6 @@ export function verificationChoices(
   return { kind: 'available', choices };
 }
 
-/**
- * Whether a check name is one this project's configuration still names.
- *
- * Used to label a retained binding as out of date rather than to refuse it: the criterion
- * is already bound to it, and refusing to show it would make the owner re-choose something
- * they already chose in order to save.
- */
-export function isConfiguredCheck(configured: VerificationCheckChoices, name: string): boolean {
-  if (configured.kind !== 'configured') return false;
-  return configured.checks.includes(name);
-}
-
 /* -------------------------------------------------------------------------- */
 /* Reading what the server refused                                             */
 /* -------------------------------------------------------------------------- */
@@ -442,9 +451,12 @@ export function rowForRefusedCriterion(
 /**
  * How a revision reads to the owner, in words that do not overclaim.
  *
- * `blockedBecause` is carried by the server and named here rather than recomputed, because
- * it is the layer's report of why a revision may not be measured against a candidate — a
- * second opinion computed here would be a third answer to the same question.
+ * `approvedAt` is nullable on the wire because a revision's history is what a reader needs:
+ * an invalidated approval keeps its approver while `status` says it is no longer current.
+ * `answersCurrentRequest` is the layer's *report* that an approved revision no longer
+ * matches the request it answers — it does not demote it, since whether a request edit
+ * invalidates an agreement is the owner's call about scope. It is carried here so the UI can
+ * say so rather than rendering an out-of-date agreement as a current one.
  */
 export type ContractState =
   | { readonly kind: 'draft' }
@@ -470,14 +482,4 @@ export function contractState(contract: ContractView): ContractState {
     return { kind: 'superseded', byRevision: contract.supersededByRevision };
   }
   return { kind: 'draft' };
-}
-
-/** The wire criterion shape, for a read that is not being edited. */
-export function toCriterionView(criterion: DraftCriterion): ContractCriterionView {
-  return {
-    id: criterion.id,
-    description: criterion.description,
-    verificationType: criterion.verificationType,
-    verificationCheckId: criterion.verificationCheckId,
-  };
 }
