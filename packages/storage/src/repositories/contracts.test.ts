@@ -26,6 +26,7 @@ import {
   fingerprint,
   invalidateContract,
   reviseContract,
+  supersedeContract,
   updateRequest,
   type ContractContent,
   type ContractId,
@@ -38,7 +39,8 @@ import {
   type Result,
 } from '@shiploop/domain';
 import { openDatabase, type Database } from '../db.ts';
-import { migrate } from '../migrations.ts';
+import { migrate, migrationDefinitions, LATEST_SCHEMA_VERSION } from '../migrations.ts';
+import { withTransaction } from '../tx.ts';
 import { ActiveProjectRepository } from './core.ts';
 import {
   ContractRepository,
@@ -147,6 +149,67 @@ async function withDatabase(run: (context: Harness) => Promise<void> | void): Pr
   }
 }
 
+/**
+ * A database left at the version before the delivery-contract rebuild, with real rows in it.
+ *
+ * `migrate` is not run on this connection: the definitions are applied one at a time up to
+ * `upToVersion`, which is exactly the state an existing deployment is in. A fresh database
+ * proves the *result* of version 19; only this proves the *upgrade*, where the table is
+ * dropped and re-declared underneath rows that already exist.
+ *
+ * The ledger rows are copied from a fully migrated reference database rather than written here,
+ * because `migrate` reconciles a version's recorded name and checksum against this build's and
+ * refuses a mismatch - which is the check that makes a rewritten migration fail loudly. A
+ * fixture that invented its own checksums would be refused for a reason that has nothing to do
+ * with the migration under test, and a fixture that copied this build's own checksum would
+ * happily accept a rewritten migration. The reference database's ledger is the honest source.
+ */
+async function withDatabaseAtVersion(
+  upToVersion: number,
+  run: (context: { readonly database: Database; readonly contracts: ContractRepository }) => Promise<void> | void,
+): Promise<void> {
+  const directory = await mkdtemp(join(tmpdir(), 'shiploop-contracts-upgrade-'));
+  const reference = openDatabase(join(directory, 'reference.sqlite'));
+  assert.ok(reference.ok, 'the reference database opened');
+  try {
+    expectOk(migrate(reference.value));
+    const ledgerDdl = String(
+      reference.value.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'").get()?.['sql'],
+    );
+    const history = reference.value
+      .prepare('SELECT version, name, applied_at, checksum FROM schema_migrations WHERE version <= ? ORDER BY version')
+      .all(upToVersion);
+
+    const opened = openDatabase(join(directory, 'contracts.sqlite'));
+    assert.ok(opened.ok, 'the older database opened');
+    const connection: Database = opened.value;
+    try {
+      connection.exec(ledgerDdl);
+      for (const definition of migrationDefinitions) {
+        if (definition.version > upToVersion) break;
+        withTransaction(connection, () => definition.up(connection));
+      }
+      const record = connection.prepare('INSERT INTO schema_migrations (version, name, applied_at, checksum) VALUES (?, ?, ?, ?)');
+      for (const row of history) {
+        record.run(row['version'] as number, row['name'] as string, row['applied_at'] as string, row['checksum'] as string);
+      }
+
+      connection.prepare('INSERT INTO owners (owner_id, display_name) VALUES (?, ?)').run(OWNER, 'Solo owner');
+      connection.prepare('INSERT INTO projects (project_id, name) VALUES (?, ?)').run(PROJECT, 'Checkout');
+      connection
+        .prepare('INSERT INTO requests (request_id, project_id, title, description, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)')
+        .run(REQUEST, PROJECT, 'Checkout totals', 'The order summary shows the pre-tax total.', T0, T0);
+
+      await run({ database: connection, contracts: new ContractRepository(connection) });
+    } finally {
+      connection.close();
+    }
+  } finally {
+    reference.value.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+}
+
 function draft(
   overrides: Partial<Parameters<typeof createContractDraft>[0]> = {},
 ): DeliveryContract {
@@ -177,6 +240,10 @@ function approve(contract: DeliveryContract, at = T1): DeliveryContract {
       approvedBy: OWNER,
       at,
       expectedContentFingerprint: contract.contentFingerprint,
+      // Every fixture here approves a revision while it is still the request's newest one;
+      // the cases that are about a newer revision arriving pass the higher number
+      // themselves, because that is the whole fact under test.
+      newestRevisionForRequest: contract.revision,
     }),
   );
   return approvedValue;
@@ -185,6 +252,43 @@ function approve(contract: DeliveryContract, at = T1): DeliveryContract {
 /** The guard a store call carries: the instant and the text the owner reviewed. */
 function guard(contract: DeliveryContract): ApprovalExpectation {
   return { updatedAt: contract.updatedAt, contentFingerprint: contract.contentFingerprint };
+}
+
+/**
+ * One revise step, written out because several cases below need the same two calls and the
+ * ordering inside them is the point.
+ *
+ * Returns what the store handed back next to what the domain asked for, so a case can assert
+ * on the refusal as well as on the rows.
+ */
+function reviseOnce(
+  context: Harness,
+  current: DeliveryContract,
+  overrides: { readonly contractId?: ContractId; readonly content?: ContractContent; readonly at?: string } = {},
+) {
+  const revised = expectOk(
+    reviseContract(current, {
+      contractId: overrides.contractId ?? NEXT_CONTRACT,
+      content: overrides.content ?? CHANGED,
+      requestFingerprint: REQUEST_FINGERPRINT,
+      revisedBy: OWNER,
+      at: overrides.at ?? T2,
+    }),
+  );
+  return { domain: revised, written: context.contracts.revise(revised) };
+}
+
+/**
+ * The revisions of one request that could still be approved.
+ *
+ * The invariant every revise case below asserts, read back through the repository rather than
+ * through the objects the calls returned: a request holds at most one approvable revision, and
+ * that is a property of what is stored, not of what a caller was handed.
+ */
+function approvableRevisions(contracts: ContractRepository): readonly number[] {
+  return expectOk(contracts.listForRequest(PROJECT, REQUEST))
+    .filter((contract) => contract.status === 'draft')
+    .map((contract) => contract.revision);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -604,7 +708,7 @@ test('an invalidated approval records why, and a second explanation cannot repla
     const approved = expectOk(context.contracts.approve(approve(stored), guard(stored)));
 
     const stale = expectOk(invalidateContract(approved, { reason: 'The owner changed the scope.', at: T2 }));
-    expectOk(context.contracts.markStale(stale, T1));
+    expectOk(context.contracts.markStale(stale, { updatedAt: T1, status: 'approved' }));
 
     const stored1 = expectOk(context.contracts.read(PROJECT, CONTRACT, 1));
     assert.equal(stored1.status, 'stale');
@@ -612,7 +716,7 @@ test('an invalidated approval records why, and a second explanation cannot repla
     assert.equal(stored1.supersededByRevision, null);
     assert.equal(stored1.approvedBy, OWNER);
 
-    const again = expectError(context.contracts.markStale(stored1, T1), 'Conflict');
+    const again = expectError(context.contracts.markStale(stored1, { updatedAt: T1, status: 'approved' }), 'Conflict');
     // The refusal names the state the writer expected and the one it found, so a client
     // can tell "someone else got there first" from "you sent nonsense".
     assert.equal(again.code === 'Conflict' ? again.expected : null, 'approved@2026-03-01T10:00:00.000Z');
@@ -714,5 +818,313 @@ test('a criterion whose stored binding is not text is reported rather than read 
     const read = context.contracts.read(PROJECT, CONTRACT, 1);
     const error = expectError(read, 'Unavailable');
     assert.match(error.reason, /verificationCheckId/);
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* One approvable revision per request (mvp-spec 3)                           */
+/* -------------------------------------------------------------------------- */
+
+test('revising a draft supersedes that draft, so a request holds one approvable revision (mvp-spec 3)', async () => {
+  await withDatabase((context) => {
+    const stored = storedDraft(context);
+    const { domain, written } = reviseOnce(context, stored);
+    assert.ok(domain.superseded !== null, 'the revision the new one was written from is not left alone');
+
+    expectOk(written);
+    const history = expectOk(context.contracts.listForRequest(PROJECT, REQUEST));
+    assert.deepEqual(
+      history.map((contract) => [contract.revision, contract.status]),
+      [
+        [1, 'stale'],
+        [2, 'draft'],
+      ],
+      'exactly what the approved case produces, because the invariant is the same',
+    );
+    assert.deepEqual(approvableRevisions(context.contracts), [2]);
+
+    // The read path reports it as history: superseded, with no approver, and keeping its text.
+    const previous = history[0];
+    assert.equal(previous?.supersededByRevision, 2);
+    assert.equal(previous?.staleReason, 'Superseded by revision 2.');
+    assert.equal(previous?.approvedBy, null);
+    assert.equal(previous?.approvedAt, null);
+    assert.equal(previous?.outcome, CONTENT.outcome);
+    assert.equal(expectOk(context.contracts.latest(PROJECT, REQUEST))?.revision, 2);
+    assert.equal(expectOk(context.contracts.currentApproved(PROJECT, REQUEST)), null);
+  });
+});
+
+test('a superseded draft cannot be edited, because history is frozen (mvp-spec 3)', async () => {
+  await withDatabase((context) => {
+    const stored = storedDraft(context);
+    expectOk(reviseOnce(context, stored).written);
+
+    const edited = editContract(expectOk(context.contracts.read(PROJECT, CONTRACT, 1)), CHANGED, {
+      expectedUpdatedAt: T2,
+      at: T2,
+      editedBy: OWNER,
+    });
+    assert.ok(!edited.ok, 'the domain refuses, so the row cannot even be named as editable');
+    const write = context.contracts.editDraft(
+      expectOk(
+        supersedeContract(stored, { supersededByRevision: 2, at: T2 }),
+      ),
+      T0,
+    );
+    assert.ok(!write.ok, 'and the store refuses a stale revision even when handed one');
+  });
+});
+
+test('two revise attempts from one draft leave exactly one approvable revision (mvp-spec 3)', async () => {
+  await withDatabase((context) => {
+    const stored = storedDraft(context);
+
+    // Interleaved rather than sequential: the second attempt is built from the record the
+    // *first* read produced, which is what a second tab holds. If the store let both through,
+    // revision 2 would be written twice or a second live draft would appear beside it.
+    const first = reviseOnce(context, stored);
+    const second = reviseOnce(context, stored, {
+      contractId: 'dc-contracts-03' as ContractId,
+      content: { ...CHANGED, outcome: 'A different third wording.' },
+      at: '2026-03-01T12:00:00.000Z',
+    });
+
+    expectOk(first.written);
+    const conflict = expectError(second.written, 'Conflict');
+    assert.match(conflict.reason, /not the next revision of this request/);
+    assert.equal(conflict.code === 'Conflict' ? conflict.expected : null, '3');
+    assert.equal(conflict.code === 'Conflict' ? conflict.actual : null, '2');
+
+    assert.deepEqual(approvableRevisions(context.contracts), [2], 'never more than one draft a request can approve');
+    const history = expectOk(context.contracts.listForRequest(PROJECT, REQUEST));
+    assert.deepEqual(
+      history.map((contract) => [contract.revision, contract.status]),
+      [
+        [1, 'stale'],
+        [2, 'draft'],
+      ],
+      'and the refused attempt left no row of its own behind',
+    );
+  });
+});
+
+test('a third revise, from the revision the store says is newest, is refused against a stale read (mvp-spec 3)', async () => {
+  await withDatabase((context) => {
+    const stored = storedDraft(context);
+    const first = reviseOnce(context, stored);
+    expectOk(first.written);
+
+    // The successor of revision 2 exists, so a revise built from revision 2 must be revision 3.
+    // Asking for revision 3 is fine and lands; asking again from the same read is not.
+    const second = reviseOnce(context, first.domain.draft, {
+      contractId: 'dc-contracts-03' as ContractId,
+      content: { ...CHANGED, outcome: 'The third statement of the outcome.' },
+      at: '2026-03-01T12:00:00.000Z',
+    });
+    expectOk(second.written);
+    assert.deepEqual(approvableRevisions(context.contracts), [3]);
+    assert.deepEqual(
+      expectOk(context.contracts.listForRequest(PROJECT, REQUEST)).map((contract) => [
+        contract.revision,
+        contract.status,
+      ]),
+      [
+        [1, 'stale'],
+        [2, 'stale'],
+        [3, 'draft'],
+      ],
+    );
+
+    const third = reviseOnce(context, first.domain.draft, {
+      contractId: 'dc-contracts-04' as ContractId,
+      content: { ...CHANGED, outcome: 'A fourth statement of the outcome.' },
+      at: '2026-03-01T13:00:00.000Z',
+    });
+    expectError(third.written, 'Conflict');
+    assert.deepEqual(approvableRevisions(context.contracts), [3]);
+  });
+});
+
+test('if the new revision cannot be written, the one it was written from is not left superseded (mvp-spec 3)', async () => {
+  await withDatabase((context) => {
+    const stored = storedDraft(context);
+
+    // Fault injection at the only place it can happen: the second write of the transaction.
+    // Without it the step would have to be faked by racing a second connection, which
+    // `tx.ts` refuses on purpose.
+    context.database.exec(
+      `CREATE TRIGGER probe_refuse_new_revision BEFORE INSERT ON delivery_contracts
+       BEGIN SELECT RAISE(ABORT, 'probe: this revision cannot be written'); END`,
+    );
+    const written = reviseOnce(context, stored).written;
+    context.database.exec('DROP TRIGGER probe_refuse_new_revision');
+
+    // The failure is reported as a store fault rather than a rule, which is honest: nothing
+    // about the request was wrong.
+    const refused = expectError(written, 'Unavailable');
+    assert.match(refused.reason, /cannot be written/);
+
+    // The property under test. A retired draft with no successor is the one state an owner
+    // cannot act on: nothing to approve, and nothing naming what replaced it.
+    const after = expectOk(context.contracts.listForRequest(PROJECT, REQUEST));
+    assert.deepEqual(
+      after.map((contract) => [contract.revision, contract.status, contract.supersededByRevision]),
+      [[1, 'draft', null]],
+      'the whole step rolled back: no new revision, and no orphaned stale draft',
+    );
+    assert.deepEqual(approvableRevisions(context.contracts), [1], 'the request still has the draft it had');
+
+    // And it is still a working draft rather than a row nobody can act on.
+    const edited = editContract(after[0]!, CHANGED, { expectedUpdatedAt: T0, at: T2, editedBy: OWNER });
+    assert.ok(edited.ok, edited.ok ? '' : edited.error.reason);
+    expectOk(context.contracts.editDraft(edited.value, T0));
+    assert.equal(expectOk(context.contracts.read(PROJECT, CONTRACT, 1)).contentFingerprint, contractContentFingerprint(CHANGED));
+  });
+});
+
+test('a revision the request has already moved past cannot be approved (mvp-spec 3)', async () => {
+  await withDatabase((context) => {
+    const stored = storedDraft(context);
+    expectOk(reviseOnce(context, stored).written);
+
+    // What a tab that missed the revise holds: a draft, at the instant it read, holding exactly
+    // the text its owner reviewed. Every fingerprint and instant guard would pass.
+    const refused = context.contracts.approve(approve(stored), guard(stored));
+    const conflict = expectError(refused, 'Conflict');
+    assert.match(conflict.reason, /not the newest revision of this request/);
+    assert.equal(conflict.code === 'Conflict' ? conflict.expected : null, '1');
+    assert.equal(conflict.code === 'Conflict' ? conflict.actual : null, '2');
+
+    const history = expectOk(context.contracts.listForRequest(PROJECT, REQUEST));
+    assert.deepEqual(
+      history.map((contract) => [contract.revision, contract.status]),
+      [
+        [1, 'stale'],
+        [2, 'draft'],
+      ],
+      'nothing was sealed, so the request still has exactly one approvable revision',
+    );
+  });
+});
+
+test('the newest revision of a request is reported, so an approval can ask the question (mvp-spec 3)', async () => {
+  await withDatabase((context) => {
+    assert.equal(expectOk(context.contracts.newestRevisionNumber(PROJECT, REQUEST)), null, 'no revision, no number');
+    const stored = storedDraft(context);
+    assert.equal(expectOk(context.contracts.newestRevisionNumber(PROJECT, REQUEST)), 1);
+    expectOk(reviseOnce(context, stored).written);
+    assert.equal(expectOk(context.contracts.newestRevisionNumber(PROJECT, REQUEST)), 2);
+    assert.equal(
+      expectOk(context.contracts.newestRevisionNumber(PROJECT, OTHER_REQUEST)),
+      null,
+      "another request's history is not this one's answer",
+    );
+  });
+});
+
+test('an approval of the newest revision still lands, so the guard is not a closed door (mvp-spec 3)', async () => {
+  await withDatabase((context) => {
+    const stored = storedDraft(context);
+    const second = expectOk(reviseOnce(context, stored).written);
+    // Approved at the instant it was written, which is the earliest a row may be stamped:
+    // `updated_at >= created_at` is a fact about the store's own clock, not about the guard.
+    const approved = expectOk(context.contracts.approve(approve(second, T2), guard(second)));
+    assert.equal(approved.status, 'approved');
+    assert.equal(approved.revision, 2);
+    assert.equal(expectOk(context.contracts.newestRevisionNumber(PROJECT, REQUEST)), 2);
+  });
+});
+
+test('a stale revision keeps its first explanation whichever status the caller read it as (mvp-spec 3)', async () => {
+  await withDatabase((context) => {
+    const stored = storedDraft(context);
+    expectOk(reviseOnce(context, stored).written);
+
+    // A second retirement attempt, built from the record that was stored, is refused as a
+    // conflict rather than overwriting the reason - for a draft source as much as an approved
+    // one, which is the case this guard had never covered.
+    const again = context.contracts.markStale(expectOk(context.contracts.read(PROJECT, CONTRACT, 1)), {
+      updatedAt: T0,
+      status: 'draft',
+    });
+    const conflict = expectError(again, 'Conflict');
+    assert.equal(conflict.code === 'Conflict' ? conflict.expected : null, `draft@${T0}`);
+    assert.equal(conflict.code === 'Conflict' ? conflict.actual : null, `stale@${T2}`);
+    assert.equal(
+      expectOk(context.contracts.read(PROJECT, CONTRACT, 1)).staleReason,
+      'Superseded by revision 2.',
+      'the first explanation is the one that was stored',
+    );
+  });
+});
+
+test('the write guards on a delivery contract survive the schema rebuild (mvp-spec 3)', async () => {
+  await withDatabase((context) => {
+    // Version 19 re-declares this table, and a rebuild drops the indexes and triggers with it.
+    // What it must not drop is the immutability of an agreed revision, so the guards are
+    // compared here against the definitions the migration restores.
+    const guards = context.database
+      .prepare("SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'delivery_contracts' ORDER BY name")
+      .all()
+      .map((row) => row['name']);
+    assert.deepEqual(guards, [
+      'delivery_contracts_approval_immutable',
+      'delivery_contracts_draft_identity_fixed',
+      'delivery_contracts_frozen_update',
+      'delivery_contracts_immutable_delete',
+    ]);
+
+    const approved = expectOk(context.contracts.approve(approve(storedDraft(context)), { updatedAt: T0, contentFingerprint: expectOk(context.contracts.read(PROJECT, CONTRACT, 1)).contentFingerprint }));
+    assert.throws(
+      () => context.database.prepare("UPDATE delivery_contracts SET outcome = 'Rewritten.' WHERE request_id = ?").run(REQUEST),
+      /frozen/,
+      'an agreed revision is still frozen by the schema itself',
+    );
+    assert.throws(
+      () => context.database.prepare('DELETE FROM delivery_contracts WHERE request_id = ?').run(REQUEST),
+      /retained for history/,
+    );
+    assert.equal(expectOk(context.contracts.read(PROJECT, CONTRACT, 1)).outcome, CONTENT.outcome);
+    assert.equal(approved.status, 'approved');
+  });
+});
+
+test('an existing delivery contract survives the upgrade that makes a superseded draft writable (mvp-spec 3)', async () => {
+  // The rebuild drops and re-declares a table real deployments already hold rows in, so the
+  // upgrade path is a separate proof from a fresh migration: every column has to come back.
+  await withDatabaseAtVersion(LATEST_SCHEMA_VERSION - 1, (context) => {
+    const contracts = new ContractRepository(context.database);
+    const stored = expectOk(contracts.createDraft(draft()));
+    const approved = expectOk(contracts.approve(approve(stored), guard(stored)));
+    assert.equal(approved.status, 'approved');
+    const before = expectOk(contracts.read(PROJECT, CONTRACT, 1));
+
+    const upgraded = migrate(context.database);
+    assert.ok(upgraded.ok, `the upgrade failed: ${upgraded.ok ? '' : upgraded.error.reason}`);
+
+    const after = expectOk(contracts.read(PROJECT, CONTRACT, 1));
+    assert.deepEqual(after, before, 'a rebuild that translated a row would change what it means');
+    assert.equal(
+      expectOk(contracts.newestRevisionNumber(PROJECT, REQUEST)),
+      1,
+      'and the request history is still readable through the repository',
+    );
+
+    // The rebuilt table really is the new one: a revision superseded while it was a draft is
+    // writable, which the previous CHECK refused outright.
+    const revised = expectOk(
+      reviseContract(approved, {
+        contractId: NEXT_CONTRACT,
+        content: CHANGED,
+        requestFingerprint: REQUEST_FINGERPRINT,
+        revisedBy: OWNER,
+        at: T2,
+      }),
+    );
+    expectOk(contracts.revise(revised));
+    assert.equal(expectOk(contracts.read(PROJECT, CONTRACT, 1)).status, 'stale');
+    assert.equal(expectOk(contracts.read(PROJECT, CONTRACT, 1)).supersededByRevision, 2);
+    assert.deepEqual(approvableRevisions(contracts), [2], 'and the one-draft index came back with the table');
   });
 });

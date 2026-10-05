@@ -24,6 +24,10 @@
  *     approver comes from the actor; the reviewed text comes from the read. Neither is
  *     taken from the command's other members, which is what makes "an owner approved this
  *     scope" a fact rather than a claim.
+ *   - **Saying whether the draft being approved is still the newest revision.** Read from the
+ *     stored history rather than taken from the command, because a request that has moved
+ *     past a revision is the one thing no fingerprint can reveal: the text is unchanged and
+ *     a newer revision already answers the request (mvp-spec 3).
  *
  * What this module deliberately has no path for: creating a ticket, starting a run, or
  * setting a status from anything but an explicit owner action. Nothing here imports an
@@ -640,13 +644,18 @@ export function createContractUseCases(deps: ContractUseCaseDeps) {
    * - and no model behind a caller - can record an approval attributed to somebody else
    * (mvp-spec 3, MVP: "Never let agent or model output set approved directly").
    *
-   * The command also has to say which text the owner reviewed, and that is checked twice
-   * on purpose. The domain refuses a fingerprint that does not describe the draft it holds,
-   * and the store's WHERE clause refuses to write when the row has moved since - so the
-   * two-tab case is refused whether the other tab's edit landed before this call was made
-   * or between the read and the write. Neither check reads text from the command: the
-   * command carries one value the server derived, and the server decides whether it still
-   * describes what is stored (mvp-spec 7, "Reject stale requests").
+   * The command also has to say which text the owner reviewed, and that is checked three
+   * times on purpose. The domain refuses a fingerprint that does not describe the draft it
+   * holds, the domain refuses a draft the request has already moved past - and that refusal
+   * is the one no fingerprint can cover, since a tab that read revision 1 an instant before
+   * another tab wrote revision 2 holds a row still describing exactly the text it reviewed -
+   * and the store re-checks both inside its own transaction. Neither check reads text from
+   * the command: the command carries one value the server derived, and the server decides
+   * whether it still describes what is stored (mvp-spec 7, "Reject stale requests").
+   *
+   * The newest revision is read here rather than supplied by the caller, for the same reason
+   * the fingerprint is: a client that named it could name anything, and the whole point of
+   * the check is that nobody gets to answer it.
    */
   const approveContractUseCase = (
     command: ApproveContractCommand,
@@ -673,10 +682,18 @@ export function createContractUseCases(deps: ContractUseCaseDeps) {
     const contract = requireContract(command.projectId, command.contractId, command.revision);
     if (!contract.ok) return err(contract.error);
 
+    const newest = deps.contracts.newestRevisionNumber(command.projectId, contract.value.requestId);
+    if (!newest.ok) return err(newest.error);
+
     const approvedValue = approveContract(contract.value, {
       approvedBy: owner.value,
       at: deps.clock.now(),
       expectedContentFingerprint: reviewed,
+      // A revision cannot answer "what is the newest revision of this request?" about itself,
+      // so the answer comes from the stored history. A request with no revision cannot be
+      // holding the contract that was just read, so the fallback is the revision itself and
+      // the domain decides whether that is plausible.
+      newestRevisionForRequest: newest.value ?? contract.value.revision,
     });
     if (!approvedValue.ok) return err(approvedValue.error);
 
@@ -692,12 +709,14 @@ export function createContractUseCases(deps: ContractUseCaseDeps) {
   };
 
   /**
-   * Starts the next revision from the current one, retiring the approval it replaces.
+   * Starts the next revision from the current one, retiring the revision it replaces.
    *
    * The two writes are the domain's single step and the repository's single transaction,
-   * because the state worth preventing is a new revision existing while the previous
-   * approval still reads as current: a candidate measured against revision 1 would then
-   * be described by revision 2's text (mvp-spec 3).
+   * because the state worth preventing is a new revision existing while the revision it
+   * replaces still reads as current: a candidate measured against revision 1 would then be
+   * described by revision 2's text (mvp-spec 3). That holds for a draft exactly as it does
+   * for an approval - two approvable drafts for one request is the same ambiguity - so
+   * revising a draft supersedes that draft rather than leaving it beside its successor.
    */
   const reviseContractUseCase = (
     command: ReviseContractCommand,
@@ -767,7 +786,14 @@ export function createContractUseCases(deps: ContractUseCaseDeps) {
     const stale = invalidateContract(contract.value, { reason: STALE_REASON_TEXT[reason], at });
     if (!stale.ok) return err(stale.error);
 
-    const written = deps.contracts.markStale(stale.value, contract.value.updatedAt);
+    const written = deps.contracts.markStale(stale.value, {
+      updatedAt: contract.value.updatedAt,
+      // The status the caller read, which is what makes the store's write a compare-and-set
+      // on the state it decided against. The domain has already refused a draft here, so it
+      // is always 'approved' - named rather than assumed so the two stay in step if that
+      // domain rule ever changes.
+      status: contract.value.status === 'draft' ? 'draft' : 'approved',
+    });
     if (!written.ok) return err(written.error);
 
     const request = requireRequest(command.projectId, written.value.requestId);
@@ -776,12 +802,18 @@ export function createContractUseCases(deps: ContractUseCaseDeps) {
   };
 
   /**
-   * Supersedes an approved revision without drafting its replacement.
+   * Supersedes a revision without drafting its replacement.
    *
    * Separate from `invalidateContractUseCase` because the two facts are different:
    * superseded says "there is a newer agreement", withdrawn says "there is none". A
-   * caller that only wants to retire an approval without yet writing the next revision
+   * caller that only wants to retire a revision without yet writing the next one
    * uses this, and the stored reason says which of the two happened.
+   *
+   * A draft may be superseded here as well as an approval, because a draft is normally
+   * *replaced* - by editing it, or by writing the next revision from it - and this is what a
+   * draft is replaced by when the owner says so without drafting the text now. A request left
+   * with no approvable revision is a legitimate thing for an owner to ask for: it says the
+   * request has no agreed scope yet, and `reviseContract` or `draftContract` is the way back.
    */
   const supersedeContractUseCase = (
     command: { readonly projectId: ProjectId; readonly contractId: ContractId; readonly revision: number; readonly supersededByRevision: number },
@@ -799,7 +831,10 @@ export function createContractUseCases(deps: ContractUseCaseDeps) {
     });
     if (!superseded.ok) return err(superseded.error);
 
-    const written = deps.contracts.markStale(superseded.value, contract.value.updatedAt);
+    const written = deps.contracts.markStale(superseded.value, {
+      updatedAt: contract.value.updatedAt,
+      status: contract.value.status === 'draft' ? 'draft' : 'approved',
+    });
     if (!written.ok) return err(written.error);
 
     const request = requireRequest(command.projectId, written.value.requestId);

@@ -28,6 +28,7 @@ import test from 'node:test';
 
 import {
   approveContract,
+  supersedeContract,
   asCommitSha,
   createContractDraft,
   createRequest,
@@ -152,6 +153,8 @@ function seed(
     }[];
     /** Leaves revision 1 a draft, so a case can write the row an older build would have. */
     readonly approve?: boolean;
+    /** Supersedes revision 1 by a later revision once the approval has landed. */
+    readonly supersededByRevision?: number;
     readonly headSha?: typeof HEAD;
   },
 ): Seed {
@@ -207,11 +210,26 @@ function seed(
   if (options.approve !== false) {
     const reviewed = draft.contentFingerprint;
     const approved = expectOk(
-      approveContract(draft, { approvedBy: OWNER_ID, at: T0, expectedContentFingerprint: reviewed }),
+      approveContract(draft, {
+        approvedBy: OWNER_ID,
+        at: T0,
+        expectedContentFingerprint: reviewed,
+        newestRevisionForRequest: draft.revision,
+      }),
     );
     expectOk(
       contracts.approve(approved, { updatedAt: draft.updatedAt, contentFingerprint: reviewed }),
     );
+
+    // A newer revision answers the request from here on. Written after the approval because
+    // the schema freezes an approved revision's material content, and through the repository
+    // because this is the step that retires an agreement - the card has to report the result.
+    if (options.supersededByRevision !== undefined) {
+      const superseding = expectOk(
+        supersedeContract(approved, { supersededByRevision: options.supersededByRevision, at: T1 }),
+      );
+      expectOk(contracts.markStale(superseding, { updatedAt: T0, status: 'approved' }));
+    }
   }
 
   const head = options.headSha ?? HEAD;
@@ -384,6 +402,36 @@ test('F24-AC2: the card carries the request, the contract revision, the candidat
     assert.equal(card.contract.approval.approvedAt, T0);
     assert.equal(card.decision.outcome, 'none');
     assert.ok(card.collectedAt.length > 0, 'the card says when it was collected');
+  });
+});
+
+test('a card for a superseded revision is refused, so no card reads as current against history (mvp-spec 3)', async () => {
+  await withCard(async (harness) => {
+    // The card reads the revision a candidate was bound to, which is the one revision that
+    // cannot be answered by "whatever is newest now". That makes it the surface where a
+    // superseded revision must read as historical - and it does so by refusing, which is
+    // stronger than reporting: `buildMvpReviewReadModel` refuses any revision that is not
+    // approved, so a superseded draft and a superseded approval are both unreachable here rather
+    // than rendering a card whose criteria an owner might read as the current agreement.
+    const stored = seed(harness.db, {
+      requestId: 'req-superseded' as RequestId,
+      contractId: 'contract-superseded' as ContractId,
+      candidateId: 'cand-superseded' as CandidateId,
+      supersededByRevision: 2,
+    });
+
+    // The row really was superseded, so the refusal below is about supersession and not about
+    // a fixture that failed to reach the interesting state.
+    const storedContract = expectOk(
+      new ContractRepository(harness.db).read(PROJECT, stored.contractId as ContractId, 1),
+    );
+    assert.equal(storedContract.status, 'stale');
+    assert.equal(storedContract.supersededByRevision, 2);
+
+    const refused = expectErr(
+      await harness.card.getReview({ projectId: PROJECT, candidateId: stored.candidateId, actor: OWNER }),
+    );
+    assert.match(refused.reason, /is stale, so there is nothing to review against/);
   });
 });
 

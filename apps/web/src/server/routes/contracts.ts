@@ -491,12 +491,13 @@ export function registerContractRoutes(app: FastifyInstance, options: ContractRo
   });
 
   /**
-   * Starts the next revision and retires the approval it replaces.
+   * Starts the next revision and retires the revision it replaces.
    *
    * `POST` to a `/revise` sub-resource rather than a `PUT` of the revision, because a revision
    * is immutable and this creates a *new* one. The two writes are the controller's single
-   * step, so no caller can separate them and leave a new revision beside a still-current
-   * approval (mvp-spec 3).
+   * step, so no caller can separate them and leave a new revision beside a still-current one -
+   * which is true of a draft as much as of an approval, since two approvable drafts are two
+   * competing contract futures for one request (mvp-spec 3).
    */
   app.post('/api/projects/:projectId/contracts/:contractId/:revision/revise', { preHandler: options.guard }, async (request, reply) => {
     const session = request.session;

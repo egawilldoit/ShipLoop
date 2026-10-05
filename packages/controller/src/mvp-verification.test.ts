@@ -355,7 +355,12 @@ function seed(db: Database): Seed {
   // fixture cannot quietly stop exercising the guard.
   const reviewed = contractContentFingerprint(draft);
   const approved = expectOk(
-    approveContract(draft, { approvedBy: OWNER_ID, at: T0, expectedContentFingerprint: reviewed }),
+    approveContract(draft, {
+      approvedBy: OWNER_ID,
+      at: T0,
+      expectedContentFingerprint: reviewed,
+      newestRevisionForRequest: draft.revision,
+    }),
   );
   expectOk(contracts.approve(approved, { updatedAt: draft.updatedAt, contentFingerprint: reviewed }));
 

@@ -1075,6 +1075,7 @@ class InMemoryController implements ControllerSurface {
         approvedBy: command.actor,
         at: this.contractInstant(),
         expectedContentFingerprint: asFingerprint(command.expectedContentFingerprint),
+        newestRevisionForRequest: stored.revision,
       });
       if (!sealed.ok) {
         return { ok: false, error: sealed.error };
