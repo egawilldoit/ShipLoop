@@ -1725,6 +1725,68 @@ test('F24-AC4, F25-AC3: a change request against a stale commit or revision is r
   assert.equal(card.decision.authorizesCurrentCandidate, false, 'a change request authorises nothing (F27-AC3)');
 });
 
+test('F24-AC4, F25-AC3: a decision against a superseded candidate is a conflict, not a readiness answer', async (t) => {
+  const h = await harness({ content: OWNER_ONLY_CONTENT });
+  t.after(() => h.close());
+
+  // The owner tests and accepts SHA A. Every criterion on SHA A is satisfied, so this card is
+  // eligible and the submission below is well-formed in every respect except currency.
+  h.recordOwnerTest({ evidenceId: 'evid-owner-pass', headSha: HEAD });
+  const accepted = await h.decide(decisionBody({ decision: 'accepted', expectedHeadSha: HEAD, feedback: null }));
+  assert.equal(accepted.status, 200, accepted.body);
+  h.advance(60);
+
+  // A push lands: the same pull request, a new candidate identity at a new commit. This is the
+  // state the owner's open tab is now sitting in - it still shows SHA A, and SHA A is still
+  // internally consistent, so nothing on that page looks wrong.
+  h.push({ candidateId: 'cand-checkout-pushed', headSha: PUSHED_HEAD });
+
+  // The owner clicks Accept again on that tab. It must be refused as a conflict naming the
+  // commit that moved, and refused *before* any readiness report: a 422 here would tell them to
+  // go and discharge requirements on a build that is not going to ship, and would never mention
+  // the push (F24-AC4, F25-AC3).
+  const stale = await h.decideOn(
+    'cand-checkout',
+    decisionBody({ decision: 'accepted', expectedHeadSha: HEAD, feedback: null }),
+  );
+  assert.equal(stale.status, 409, `an acceptance of a superseded candidate must conflict: ${stale.body}`);
+  const problem = problemOf(stale.body);
+  assert.equal(problem.error.code, 'Conflict');
+  assert.equal(problem.error.expected, HEAD, 'the refusal names the commit the submission was prepared against');
+  assert.equal(problem.error.actual, PUSHED_HEAD, 'and the commit the request now holds');
+  assert.deepEqual(
+    problem.error.prerequisites ?? [],
+    [],
+    'a conflict carries no eligibility report, so it cannot be mistaken for a readiness answer',
+  );
+
+  // The same holds for a change request: feedback filed against a build the request has moved
+  // past is feedback a fix pass on the new build will never read (F25-AC2).
+  const staleFeedback = await h.decideOn(
+    'cand-checkout',
+    decisionBody({ expectedHeadSha: HEAD, feedback: 'The redirect is wrong.' }),
+  );
+  assert.equal(staleFeedback.status, 409, `a change request for a superseded candidate must conflict: ${staleFeedback.body}`);
+  assert.equal(problemOf(staleFeedback.body).error.code, 'Conflict');
+
+  // Nothing was written by either refusal, so SHA A still carries exactly the one acceptance the
+  // owner made before the push, and the push did not retract it (F25-AC3).
+  const original = await h.review();
+  assert.equal(original.card?.candidate.headSha, HEAD);
+  assert.equal(original.card?.decision.outcome, 'accepted', 'the acceptance made before the push is history, not retracted');
+  assert.deepEqual(
+    original.card?.decision.staleDecisions,
+    [],
+    'and it still describes SHA A, which is what that card is about',
+  );
+
+  // The new build is authorised by nothing and needs its own owner test (F27-AC3).
+  const pushed = await h.reviewFor('cand-checkout-pushed');
+  assert.equal(pushed.card?.decision.outcome, 'none');
+  assert.equal(pushed.card?.decision.authorizesCurrentCandidate, false);
+  assert.equal(pushed.card?.ownerTests[0]?.state, 'pending');
+});
+
 test('F02-AC2: a candidate is addressed by its own project, never by id alone', async (t) => {
   const h = await harness();
   t.after(() => h.close());
