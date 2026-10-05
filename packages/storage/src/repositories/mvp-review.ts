@@ -236,6 +236,31 @@ export class SqliteMvpReviewStore implements MvpReviewStore {
         });
       }
 
+      // `Untested` is the *absence* of a method, and this table has no column for an absence:
+      // `method_kind` is constrained to the four named methods and `method_detail` carries the
+      // one string each of them names. Relabelling it as `AutomatedCheck` on the way in would
+      // store a row claiming a check identity of the empty string — a verdict no projection can
+      // ever match, written as though it were the observation that was made. So it is refused
+      // here, where the caller can be told, instead of being quietly rewritten on the way to disk.
+      //
+      // No shipped path records one, and it is refused anyway because this module's stated
+      // contract is that it serialises what the domain produced rather than editing it: a silent
+      // edit is the one thing a persistence layer must not do to a value it does not own (F23-AC1).
+      if (evidence.method.kind === 'Untested') {
+        return err({
+          code: 'Invalid',
+          reason:
+            'An observation with no assigned verification method is not evidence of anything and cannot be stored: a stored row must name the method that observed it (F23-AC1).',
+          fields: [
+            {
+              path: 'method',
+              message:
+                'Name the verification method that made this observation. A criterion with none is reported Untested by the projection; it is not stored as an observation.',
+            },
+          ],
+        });
+      }
+
       const recorded = this.insertEvidence(input);
       if (!recorded.ok) return err(recorded.error);
       return ok({ evidenceId: recorded.value.evidenceId });
@@ -260,7 +285,7 @@ export class SqliteMvpReviewStore implements MvpReviewStore {
         input.candidateHeadSha,
         evidence.subject.kind,
         evidence.subject.kind === 'criterion' ? evidence.subject.criterionId : evidence.subject.checkId,
-        evidence.method.kind === 'Untested' ? 'AutomatedCheck' : evidence.method.kind,
+        evidence.method.kind,
         methodDetailOf(evidence.method),
         evidence.source,
         evidence.outcome,

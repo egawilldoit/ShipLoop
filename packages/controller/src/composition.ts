@@ -1443,6 +1443,17 @@ export function createCompositionRoot(config: CompositionRootConfig): Result<Com
     candidates: new DeliveryCandidateRepository(database),
     review: new SqliteMvpReviewStore(database),
     newDecisionId: () => randomUUID(),
+    // The project's own saved profile, read for the same reason and through the same reader the
+    // candidate module uses: one project's required-check list cannot be two lists, and a card
+    // judged under a default that requires nothing would report a red required gate as ready
+    // (F24-AC3, F20-AC5). A project with no saved profile has declared no required gate, so it
+    // reads as an empty list rather than as a refusal - the MVP journey must work with none.
+    requiredCheckIds: (projectId) => {
+      const current = profiles.currentVersion(projectId);
+      return current.ok
+        ? ok(current.value?.content.policy.requiredChecks ?? [])
+        : err(current.error);
+    },
     readLiveCandidate:
       candidateLinkUseCases === null
         ? null
