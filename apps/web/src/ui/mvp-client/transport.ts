@@ -408,7 +408,24 @@ export interface MvpRequest {
    * would be sending a body where the server expects none (F20-AC2).
    */
   readonly body?: unknown;
+  /**
+   * The one call that is made before a session exists.
+   *
+   * Not a general opt-out and not settable by a caller freely: `send` grants the exemption **only**
+   * when this is `true` *and* the method is POST *and* the path is the sign-in route, and it refuses
+   * every other combination. The reason the exemption exists at all is that the forgery token is
+   * derived from a session, so a browser with no session has no token to send — and the route that
+   * issues sessions is registered without the session guard precisely because it is the way in.
+   *
+   * Without this, `POST /api/owner/sign-in` is refused by the client before it is sent, and the
+   * refusal names a missing token rather than the server being unreachable — which is both untrue
+   * and useless to an owner who is trying to sign in for the first time (F01-AC4).
+   */
+  readonly establishesSession?: boolean;
 }
+
+/** The one path permitted to be called with no forgery token: the one that issues one. */
+const SESSION_ESTABLISHING_PATH = '/api/owner/sign-in';
 
 /**
  * Performs one request and reads the answer as a value.
@@ -425,7 +442,14 @@ export async function send<T>(request: MvpRequest): Promise<MvpResult<T>> {
   const headers: Record<string, string> = { accept: 'application/json' };
   const init: RequestInit = { method: request.method, headers, credentials: 'same-origin' };
 
-  if (request.method !== 'GET') {
+  // Read once, and only ever true for the sign-in route: a caller that sets it on anything else
+  // still gets the guard below, because the exemption is checked against the path as well.
+  const establishesSession =
+    request.establishesSession === true &&
+    request.method === 'POST' &&
+    request.path === SESSION_ESTABLISHING_PATH;
+
+  if (request.method !== 'GET' && !establishesSession) {
     const token = csrfToken;
     if (token === null) {
       // Reported rather than attempted: the guard would refuse it as `Forbidden` with a message

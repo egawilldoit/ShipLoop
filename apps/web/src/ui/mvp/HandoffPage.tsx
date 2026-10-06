@@ -72,8 +72,14 @@ export interface HandoffPageProps {
   readonly contractRevision: number | null;
   /** Sends the owner to Settings, where the external tool's address is configured (L02-AC3). */
   readonly onOpenSettings: () => void;
-  /** Bumped by the shell's retry control so this page refetches without prop-drilling. */
-  readonly epoch: number;
+  /**
+   * Bumped by the shell's retry control so this page refetches without prop-drilling.
+   *
+   * Optional because the page reads its packet on mount regardless, and because it is rendered
+   * inside the contract screen as well as from a shell — where the shell's connection epoch is not
+   * in scope and where a made-up number would be a fabricated fact about a connection (N03-AC3).
+   */
+  readonly epoch?: number;
   /**
    * The project scope this page reads through, when the shell has one.
    *

@@ -135,6 +135,9 @@ export function signIn(credentials: {
     method: 'POST',
     path: '/api/owner/sign-in',
     body: { identifier: credentials.identifier, password: credentials.password },
+    // The forgery token is derived from the session this call is trying to create, so there is
+    // none to send. `send` grants the exemption only for this path (F01-AC4).
+    establishesSession: true,
   });
 }
 

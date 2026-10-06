@@ -28,6 +28,12 @@ function describeFailure(failure: MvpFailure): string {
     case 'RateLimited':
       return 'Too many sign-in attempts. Wait a moment before trying again.';
     case 'Unavailable':
+    // A dropped connection is grouped with an unreachable server rather than falling through to the
+    // transport's own reason. That reason is written for a generic write ("nothing was changed"),
+    // and it leaves an owner who was trying to sign in without being told the thing they were
+    // trying to do did not happen — which is the whole reason this screen distinguishes a
+    // transport failure from rejected credentials (F01-AC1, N03-AC3).
+    case 'Disconnected':
       return 'The server could not be reached, so sign-in could not be completed.';
     case 'Forbidden':
     case 'Unauthorized':

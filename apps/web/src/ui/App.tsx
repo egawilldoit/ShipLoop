@@ -30,7 +30,8 @@ import { DEFAULT_SECTION, PRIMARY_SECTIONS, type PrimarySection } from './naviga
 import { HomeScreen } from './mvp/HomeScreen.tsx';
 import type { HomeTarget } from './mvp/home-model.ts';
 import { SettingsScreen } from './mvp/SettingsScreen.tsx';
-import { NewRequestSlot, ReviewSlot } from './mvp/slots.tsx';
+import { RequestJourney } from './mvp/RequestJourney.tsx';
+import { ReviewJourney } from './mvp/ReviewJourney.tsx';
 import { SignInPage } from './pages/SignInPage.tsx';
 import { SessionProvider, useSession } from './session.tsx';
 
@@ -81,7 +82,7 @@ function ProjectSelector({ onNewProject }: { readonly onNewProject: () => void }
 }
 
 function Shell(): ReactElement {
-  const { status, owner, scope, epoch, connection, signOut, retry, failure } = useSession();
+  const { status, owner, scope, epoch, connection, signOut, retry } = useSession();
   const [section, setSection] = useState<PrimarySection>(DEFAULT_SECTION);
   const [signingOut, setSigningOut] = useState(false);
 
@@ -96,23 +97,10 @@ function Shell(): ReactElement {
     );
   }
 
-  // "The server could not be reached" is not "you are signed out". Rendering the sign-in form for
-  // an unreachable server tells an owner with a live session to sign in again, which is a false
-  // statement about their own state and an action that cannot succeed (N03-AC3).
-  if (status === 'unreachable') {
-    return (
-      <main className="page page--narrow" id="main">
-        <h1 className="page__title">ShipLoop</h1>
-        <p className="state-line state-line--error" role="alert" data-state="failed">
-          {failure?.reason ?? 'The server could not be reached, so ShipLoop cannot tell whether you are signed in.'}
-        </p>
-        <button className="button" type="button" onClick={retry}>
-          Try again
-        </button>
-      </main>
-    );
-  }
-
+  // A session read that failed cannot say whether this browser holds a session, so the shell does
+  // not claim to: it shows the sign-in form, and the sign-in attempt is what establishes the answer.
+  // The connection banner carries the disconnect meanwhile, and the form reports a failed attempt
+  // as the server being unreachable rather than the credentials being wrong (N03-AC3).
   if (status === 'signed-out' || owner === null) {
     return <SignInPage />;
   }
@@ -173,9 +161,9 @@ function Shell(): ReactElement {
         {section === 'home' ? (
           <HomeScreen scope={scope} epoch={epoch} onOpen={open} />
         ) : section === 'request' ? (
-          <NewRequestSlot scope={scope} epoch={epoch} />
+          <RequestJourney scope={scope} epoch={epoch} />
         ) : section === 'review' ? (
-          <ReviewSlot scope={scope} epoch={epoch} />
+          <ReviewJourney scope={scope} epoch={epoch} />
         ) : (
           <SettingsScreen scope={scope} epoch={epoch} />
         )}

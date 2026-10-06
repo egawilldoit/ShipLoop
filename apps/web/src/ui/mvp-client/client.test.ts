@@ -56,12 +56,13 @@ import {
   readCandidate,
   readVerificationCheckNames,
   recordOwnerTest,
+  signIn,
   refreshCandidate,
   selectActiveProject,
   updateRequest,
   verifyCandidate,
 } from './client.ts';
-import { setMvpCsrfToken } from './transport.ts';
+import { send, setMvpCsrfToken } from './transport.ts';
 import type { ProjectScope } from './types.ts';
 
 const SCOPE: ProjectScope = { kind: 'project', projectId: 'demo', projectName: 'Demo' };
@@ -812,3 +813,98 @@ function matchesRoute(template: string, path: string): boolean {
     return segment === pathSegments[index];
   });
 }
+/**
+ * The sign-in exemption is the one place this transport lets a state-changing call go out with no
+ * forgery token, so it is pinned from both sides: sign-in is sent, and nothing else is.
+ *
+ * Without the first case the shell cannot sign in at all — the guard refused the request before it
+ * was sent and named a missing token rather than the server being unreachable, which is both untrue
+ * and useless to someone signing in for the first time (F01-AC4). Without the second, "allow a
+ * tokenless POST" would have become a property any caller could reach, and the guard that protects
+ * every other write in the product would be one flag away from being off.
+ */
+test('the session-establishing call is sent with no forgery token', async () => {
+  recordFetch();
+  setMvpCsrfToken(null);
+  try {
+    answer(200, { owner: {}, session: {}, csrfToken: 'tok' });
+
+    const result = await signIn({ identifier: 'owner@example.invalid', password: 'hunter2-hunter2' });
+
+    assert.equal(result.ok, true, `sign-in must be sent, not refused locally: ${JSON.stringify(result)}`);
+    assert.deepEqual(
+      calls.map((call) => call.path),
+      ['/api/owner/sign-in'],
+      'and it must be the sign-in route that was called',
+    );
+  } finally {
+    restoreFetch();
+  }
+});
+
+test('no other state-changing call is sent without a forgery token', async () => {
+  // Every other write in the product depends on this refusal. The two calls below are chosen because
+  // they are the ones that change a delivery decision, so the exemption leaking to either would be
+  // the owner being able to decide something the server should have refused.
+  recordFetch();
+  try {
+    for (const entry of [
+      { name: 'recordOwnerTest', run: () => recordOwnerTest(SCOPE, 'cand-1', 'AC2', { result: 'passed' }) },
+      {
+        name: 'decideCandidate',
+        run: () =>
+          decideCandidate(SCOPE, 'cand-1', {
+            decision: 'accepted' as const,
+            expectedHeadSha: 'a'.repeat(40),
+            expectedContractRevision: 1,
+            feedback: null,
+          }),
+      },
+    ]) {
+      setMvpCsrfToken(null);
+      calls = [];
+      answer(200, {});
+
+      const result = await entry.run();
+
+      // The two calls report failure differently on purpose: the decision call answers with its own
+      // outcome vocabulary because the transport answers a decision refusal with the outstanding
+      // requirements the owner still has to discharge. Both must carry the same transport refusal,
+      // and both must be refused before a request is made — which is what is asserted here, rather
+      // than which shape each one happens to use (F24-AC3).
+      const failure =
+        'ok' in result && result.ok === false
+          ? result.failure
+          : 'failure' in result
+            ? result.failure
+            : null;
+      assert.ok(failure !== null, `${entry.name} must report a refusal, got ${JSON.stringify(result)}`);
+      assert.equal(failure.code, 'Forbidden', `${entry.name} must refuse for the missing forgery token`);
+      assert.deepEqual(calls, [], `${entry.name} must be refused *before* any request was made`);
+    }
+  } finally {
+    restoreFetch();
+  }
+});
+
+test('the exemption is not reachable by asking for it on another route', async () => {
+  // `establishesSession` is a member a caller can set, so the guard has to check it against the
+  // path as well as the flag. A caller that sets it on a decision write must still be refused.
+  recordFetch();
+  try {
+    setMvpCsrfToken(null);
+    answer(200, {});
+
+    const result = await send({
+      method: 'POST',
+      path: '/api/projects/demo/candidates/cand-1/decision',
+      body: { decision: 'accepted' },
+      establishesSession: true,
+    });
+
+    assert.equal(result.ok, false, 'asking for the exemption on another route must not work');
+    assert.deepEqual(calls, [], 'and must be refused before any request');
+  } finally {
+    restoreFetch();
+  }
+});

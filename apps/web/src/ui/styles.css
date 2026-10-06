@@ -794,3 +794,26 @@ li {
   margin-block: 0.5rem 0;
   padding-inline-start: 1.25rem;
 }
+
+/* --------------------------------------------------------------------------
+   The two journeys
+   --------------------------------------------------------------------------
+   New Request and Review each hold three and two steps respectively rather than
+   becoming five or six primary areas. The step list is a `nav` inside the area so
+   the primary navigation stays the four the product promised, and `aria-current`
+   marks the step rather than a colour alone (mvp-spec 3).
+   -------------------------------------------------------------------------- */
+
+.journey__steps {
+  border-bottom: 1px solid var(--line);
+  margin-block-end: 1rem;
+}
+
+.journey__step-list {
+  list-style: none;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin: 0 0 0.75rem;
+  padding: 0;
+}

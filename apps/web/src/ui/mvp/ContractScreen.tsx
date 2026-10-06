@@ -61,6 +61,7 @@ import {
   type ContractSaveOutcome,
 } from './contract-agreement.ts';
 import { NoProjectSelected, ScreenEmpty, ScreenFailure, ScreenLoading } from './screen.tsx';
+import { HandoffPage } from './HandoffPage.tsx';
 import type { ScreenProps } from './screen.tsx';
 import { readProjectRequests } from './request-intake.ts';
 import type {
@@ -375,7 +376,7 @@ function ContractEditor({
               'approval of this revision must send back, and it changed because the text did.'}
           </p>
           {write.contract.status === 'approved' ? (
-            <ApprovedReport contract={write.contract} />
+            <ApprovedReport contract={write.contract} scope={scope} />
           ) : (
             <p className="panel__note">
               Nothing is agreed until you approve it. The text above is now what the server holds.
@@ -554,8 +555,35 @@ function RevisionStatus({ read }: { readonly read: ContractRead }): ReactElement
   );
 }
 
-/** The approved revision, named as the owner sealed it (N02-AC2). */
-function ApprovedReport({ contract }: { readonly contract: ContractView }): ReactElement {
+/**
+ * The approved revision, named as the owner sealed it, and the packet for exactly that revision.
+ *
+ * ## Why the handoff lives here and not on a separate screen
+ *
+ * `HandoffPage` is addressed by a contract and a revision, and the only revision this screen can
+ * name truthfully is the one the server just sealed. A separate handoff step would have to be
+ * *told* which revision to show, and a shell that went looking for "the approved contract" could
+ * land the owner on a packet for an approval they did not just make — so the packet is rendered by
+ * the screen that performed the approval, for the identity the approval returned (F24-AC4).
+ *
+ * This also keeps `ScreenProps` the one screen seam: no second exported props shape, because the
+ * screen needs nothing its `ScreenProps` does not already carry.
+ *
+ * Nothing here starts or sends anything. Approving sealed text; the packet below is what the owner
+ * may copy and hand to whatever executes the work, and this product does not observe that tool
+ * (mvp-spec 3).
+ */
+function ApprovedReport({
+  contract,
+  scope,
+}: {
+  readonly contract: ContractView;
+  readonly scope: ProjectScope;
+}): ReactElement {
+  // Owned here rather than lifted: a screen cannot switch the shell's primary area without a second
+  // seam, so the honest thing the "configure the address" control can do is name where the setting
+  // lives (L02-AC3).
+  const [settingsNotice, setSettingsNotice] = useState(false);
   return (
     <>
       <p data-testid="contract-approved-revision">
@@ -563,9 +591,31 @@ function ApprovedReport({ contract }: { readonly contract: ContractView }): Reac
       </p>
       <p data-testid="contract-approved-fingerprint">{`Content fingerprint ${contract.contentFingerprint}.`}</p>
       <p className="panel__note">
-        The implementation packet for this revision is on the handoff screen. Nothing was started or sent
-        anywhere by approving it here.
+        Approving sealed this text. Nothing was started or sent anywhere by doing so.
       </p>
+      <section className="panel" aria-labelledby="contract-handoff-heading">
+        <h3 className="panel__title" id="contract-handoff-heading">
+          Implementation handoff
+        </h3>
+        <HandoffPage
+          projectId={scope.kind === 'project' ? scope.projectId : null}
+          contractId={contract.contractId}
+          contractRevision={contract.revision}
+          scope={scope}
+          onOpenSettings={() => {
+            // The handoff's own "configure the address" control, rendered inside a screen that has
+            // no way to switch the shell's primary area, therefore says where the setting lives
+            // rather than pretending to take the owner there (L02-AC3).
+            setSettingsNotice(true);
+          }}
+        />
+        {settingsNotice && (
+          <p className="state-line" data-testid="handoff-settings-pointer">
+            The external tool's address is a project setting. Open Settings in the navigation beside
+            this area to set it; Copy works without one.
+          </p>
+        )}
+      </section>
     </>
   );
 }

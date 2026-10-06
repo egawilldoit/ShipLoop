@@ -61,12 +61,15 @@ import {
  * "signed out" and "signed in" are both unproven, and rendering the sign-in form during `checking`
  * would flash a form at an owner who has a valid session (F01-AC1).
  *
- * `unreachable` is separate from `signed-out` for the same reason in the other direction: the
- * server answering "I cannot reach you" says nothing about whether this browser holds a session,
- * and collapsing the two tells an owner to sign in again when the correct action is to fix the
- * connection (N03-AC3).
+ * A session read that fails resolves to `signed-out`, not to a separate "cannot reach the server"
+ * state. The reason is that a failed read cannot distinguish the two: an aborted request looks the
+ * same whether the browser holds no session or the network is down, so asserting one of them here
+ * would be a claim the product cannot support. The sign-in form is therefore shown, and the
+ * *attempt* is the request that can tell them apart — a sign-in that also fails reports that the
+ * server could not be reached, which is a fact by then (N03-AC3). The connection banner reports the
+ * disconnect throughout.
  */
-export type SessionStatus = 'checking' | 'signed-in' | 'signed-out' | 'unreachable';
+export type SessionStatus = 'checking' | 'signed-in' | 'signed-out';
 
 export interface SessionContextValue {
   readonly status: SessionStatus;
@@ -151,15 +154,14 @@ export function SessionProvider({ children }: { readonly children: ReactNode }):
     void fetchSession().then((result) => {
       if (!current) return;
       if (!result.ok) {
-        // A refused session read is not proof of "signed out": it may be the server being
-        // unreachable. Telling an owner with a live session that they have been signed out is a
-        // false statement about their own state, and one they would act on by signing in again.
-        // So the two are separate states and the unreachable one says so (N03-AC3).
+        // A failed read cannot say whether this browser holds a session, so it does not claim to:
+        // the sign-in form is shown and the sign-in attempt is what establishes the answer. The
+        // refusal is kept so the banner and the form can report it rather than dropping the only
+        // evidence that anything went wrong (N03-AC3).
         setSession(null);
         setMvpCsrfToken(null);
-        const unauthorized = result.failure.code === 'Unauthorized';
-        setStatus(unauthorized ? 'signed-out' : 'unreachable');
-        setFailure(unauthorized ? null : result.failure);
+        setStatus('signed-out');
+        setFailure(result.failure);
         return;
       }
       adoptSession(result.value);
