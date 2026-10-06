@@ -45,6 +45,32 @@ Actual ARM64 VM proof is required before claiming ARM64 support.
 
 ## Runner contract
 
+### An outer timeout may not be tighter than the bounds it wraps
+
+`app-tests` runs `scripts/run-tests.mjs`, which discovers suites dynamically and
+enforces a 900-second deadline **per suite**. That deadline is a backstop against one
+hanging suite, not a budget for the whole run: the runner's permitted worst case is
+900s multiplied by the number of suites it discovers.
+
+`verify.mjs` bounds each command independently, so its outer bound must not be tighter
+than the inner one it wraps — otherwise it kills a run its own runner considers legal.
+`app-tests` was 900000, the same 900 seconds as a *single* suite, while the suites needed
+1761 seconds in aggregate. That made `verify.mjs application` un-passable on this
+two-core VM with no product defect present, and is consistent with the last fully green
+`verify:app` in this repository's own record predating the suite's growth.
+
+It is now 3600000 — one hour, which is the maximum `scripts/lib/command.mjs` accepts.
+That is not the runner's theoretical worst case (900s × suites), so a run under
+sufficient contention could still be killed at the hour; that ceiling is the schema's
+and is stated rather than worked around.
+
+The distinction that matters: raising an outer bound that was *contradictory* is a
+correction, whereas raising one to fit a slow suite is a waiver. No individual suite's
+deadline was touched, so a hanging suite is still killed at 900s inside the runner, and a
+failing suite still fails.
+
+### Everything else
+
 verification.json owns profiles and commands. Commands are argument arrays executed
 without a shell. Every command has a timeout and bounded captured output. The runner
 cleans only its spawned POSIX process group. Programs that escape the process group

@@ -137,7 +137,7 @@
             "node",
             "scripts/run-tests.mjs"
           ],
-          "timeoutMs": 900000,
+          "timeoutMs": 3600000,
           "maxOutputBytes": 262144
         },
         {
