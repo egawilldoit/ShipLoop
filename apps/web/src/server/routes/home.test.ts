@@ -510,6 +510,14 @@ async function harness(options: { readonly sources?: HomeEvidenceSources | null 
   const contracts = new SeededContracts();
   const record = storedSession(now);
   const controller: ControllerSurface = {
+    // Carried so the double satisfies the surface. This file drives the route through an
+    // explicitly injected `sources`; the production wiring is proved in `home.surface.test.ts`,
+    // which is the only place that can catch Home arriving with no sources at all (F11-AC1).
+    home: {
+      recordedCandidate: async () => ok(null),
+      reviewReadModel: async () =>
+        notImplemented('home.reviewReadModel') as unknown as never,
+    },
     owners: {
       provision: () => notImplemented('owners.provision'),
       signIn: () => notImplemented('owners.signIn'),
@@ -991,6 +999,7 @@ test('N02-AC1: a refusal from the candidate read is not hidden behind a shorter 
   const now = (): Date => new Date(START);
   const record = storedSession(now);
   const controller: ControllerSurface = {
+    home: { recordedCandidate: async () => ok(null), reviewReadModel: async () => notImplemented('home.reviewReadModel') as unknown as never },
     owners: { provision: () => notImplemented('owners.provision'), signIn: () => notImplemented('owners.signIn'), describe: () => notImplemented('owners.describe'), selectActiveProject: () => notImplemented('owners.selectActiveProject') },
     projects: PROJECTS,
     contracts: contractUseCases(contracts),

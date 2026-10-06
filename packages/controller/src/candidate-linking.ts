@@ -799,7 +799,21 @@ function factsFrom(
 }
 
 /** Projects a stored row into the domain candidate, keeping both SHAs at full length. */
-function toDeliveryCandidate(record: DeliveryCandidateRecord): DeliveryCandidate {
+/**
+ * The stored row as the domain's candidate.
+ *
+ * Exported so a reader that has the row but not this module's use cases — Home's board, which
+ * must compose on a deployment that configured no git provider — narrows `provider` and drops the
+ * storage-only columns through the *same* projection every other reader uses. A second narrowing
+ * would be a second spelling of what a candidate is, which is how a durable fact and a projected
+ * one come to disagree (F24-AC2).
+ *
+ * `provider` is the one value that genuinely narrows: the column is a `TEXT` and the domain's is
+ * the provider literal, so a row carrying anything else would be a fact this product does not have
+ * a word for. It is written as the constant rather than cast, because the composition only ever
+ * records candidates through a provider the domain recognises.
+ */
+export function toDeliveryCandidate(record: DeliveryCandidateRecord): DeliveryCandidate {
   return {
     candidateId: record.candidateId,
     projectId: record.projectId,

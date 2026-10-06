@@ -113,9 +113,14 @@ import type {
 } from '@shiploop/storage';
 import type { GitRepositoryRef, TicketState } from '@shiploop/adapters';
 import { createGitTransport } from '@shiploop/adapters';
-import { DeliveryCandidateRepository } from '@shiploop/storage';
+import { DeliveryCandidateRepository, SqliteMvpReviewStore } from '@shiploop/storage';
 import type { CandidateLinkStore } from '@shiploop/storage';
-import type { CandidateBinding, CandidateCheckStatus, DeliveryCandidate } from '@shiploop/domain';
+import type {
+  CandidateBinding,
+  CandidateCheckStatus,
+  DeliveryCandidate,
+  MvpReviewReadModel,
+} from '@shiploop/domain';
 import type {
   CandidateLinkUseCases,
   CandidateView,
@@ -147,6 +152,9 @@ import type {
   MvpReviewCard,
   MvpVerificationReport,
 } from './mvp-review-card.ts';
+import { readFacts } from './mvp-review-card.ts';
+import { toDeliveryCandidate } from './candidate-linking.ts';
+import type { MvpReviewCardDeps } from './mvp-review-card.ts';
 import type { OwnerObservationRecord, OwnerObservationTarget, OwnerObservationUseCases } from './owner-tests.ts';
 import { SqliteOwnerObservationJournal, createOwnerObservationUseCases } from './owner-tests.ts';
 import { SqliteObservationJournal } from './verification.ts';
@@ -2027,6 +2035,40 @@ export interface SurfaceCandidateUseCases {
   readCandidate(command: SurfaceReadCandidateCommand): Promise<Result<SurfaceCandidateReport, DomainError>>;
 }
 
+/**
+ * The two durable reads the Home board composes from.
+ *
+ * Both answer from rows ShipLoop already holds. Neither contacts a provider: there is no pull
+ * request refresh, no check re-read and no execution of any kind behind them, so opening Home
+ * cannot turn a page view into network I/O or into work the owner did not ask for (mvp-spec 3,
+ * F20-AC3).
+ *
+ * The shape matches `HomeEvidenceSources` in `apps/web/src/server/routes/home.ts` structurally.
+ * It is declared here rather than imported because the controller cannot depend on the transport;
+ * the two agreeing is checked by the transport's own type, which is what makes the wiring a
+ * compile-time fact instead of a runtime discovery.
+ */
+export interface SurfaceHomeReads {
+  /** The candidate this request currently holds, or null when none is linked. */
+  recordedCandidate(input: {
+    readonly projectId: string;
+    readonly requestId: string;
+  }): Promise<Result<DeliveryCandidate | null, DomainError>>;
+  /**
+   * The review projection for one candidate, from stored evidence and stored decisions under the
+   * project's saved required-check policy.
+   *
+   * This is the M0-certified read model, reached through the same `readFacts` the review card uses.
+   * Home therefore cannot hold a different opinion about evidence freshness, required checks,
+   * staleness or eligibility than the card the owner is about to act on (F23-AC1, F24-AC3).
+   */
+  reviewReadModel(input: {
+    readonly projectId: string;
+    readonly requestId: string;
+    readonly candidateId: string;
+  }): Promise<Result<MvpReviewReadModel, DomainError>>;
+}
+
 /** The whole injected surface. One argument, so a missing use case is a type error. */
 export interface ControllerSurface {
   readonly owners: SurfaceOwnerUseCases;
@@ -2046,6 +2088,15 @@ export interface ControllerSurface {
    * at the operation, with the missing wiring named — rather than a port that is quietly absent.
    */
   readonly candidates: SurfaceCandidateUseCases;
+  /**
+   * Home's durable reads, always present.
+   *
+   * Declared rather than discovered, and that is the whole point: Home was registered, its use
+   * cases existed on the root, and nothing connected them, so `GET .../home` answered `503` on
+   * every deployment — the same invisibility the candidate port had (F11-AC1, F02-AC4). A
+   * transport that has to look for a group at runtime is a transport that can be missing one.
+   */
+  readonly home: SurfaceHomeReads;
   readonly mvpReview: SurfaceMvpReviewUseCases;
   readonly sessions: SurfaceSessionUseCases;
   readonly profiles: SurfaceProfileUseCases;
@@ -3293,6 +3344,15 @@ export function createControllerSurface(resolve: SurfaceRootResolver): Controlle
   };
 
   return {
+    /**
+     * Home's reads resolve the root per call, like every other group here. A captured root would
+     * pin this surface to whichever deployment it was built from, which is the opposite of what a
+     * lazily-resolved surface is for (F02-AC4).
+     */
+    home: {
+      recordedCandidate: (input) => use((root) => homeReadsFor(root).recordedCandidate(input)),
+      reviewReadModel: (input) => use((root) => homeReadsFor(root).reviewReadModel(input)),
+    },
     owners: {
       /**
        * Provisions the owner, naming it the way the transport names it (F01-AC1).
@@ -5257,6 +5317,72 @@ const SYSTEM_CLOCK: ControllerClock = { now: () => new Date().toISOString() };
 /** The same clock the root records writes with, so one process has one time source. */
 function controllerClock(): ControllerClock {
   return SYSTEM_CLOCK;
+}
+
+/**
+ * Home's two durable reads, over the same stores the review card reads.
+ *
+ * Both methods are reads of rows that already exist, and neither can reach a provider: the
+ * candidate repository and the review store are SQLite handles, and the projection is the
+ * M0-certified `buildMvpReviewReadModel` reached through `readFacts` — the same assembly the card
+ * performs, so the board and the card cannot disagree about a candidate (F23-AC1, F24-AC3).
+ *
+ * `readFacts` is reached with only the durable members of `MvpReviewCardDeps`, which is the
+ * mechanical reason a provider call is impossible here rather than merely absent: there is no
+ * live-candidate reader in the object it is given.
+ */
+function homeReadsFor(root: CompositionRoot): SurfaceHomeReads {
+  const candidateStore = new DeliveryCandidateRepository(root.database);
+  const deps: MvpReviewCardDeps = {
+    // The card's clock is the controller clock; the root does not carry its own. Home reads no
+    // instant of its own, so this is only here because the deps shape requires it.
+    clock: controllerClock(),
+    requests: root.requests,
+    contracts: root.contracts,
+    candidates: candidateStore,
+    review: new SqliteMvpReviewStore(root.database),
+    // Read from the project's own saved profile, which is where the certified policy comes from.
+    // Absent rather than defaulted: a project with no profile has declared no required gate, and
+    // the read then answers the shipped default rather than inventing a list (F20-AC5).
+    requiredCheckIds: (projectId) => {
+      const current = root.profiles.currentVersion(projectId);
+      return current.ok
+        ? ok(current.value?.content.policy.requiredChecks ?? [])
+        : err(current.error);
+    },
+  };
+
+  return {
+    recordedCandidate: async ({ projectId, requestId }) => {
+      const current = candidateStore.currentForRequest(requestId);
+      if (!current.ok) return current;
+      // Scoped like every other read: a candidate belonging to another project is invisible
+      // through this project's session rather than merely absent (F02-AC2).
+      const found = current.value;
+      if (found !== null && String(found.projectId) !== projectId) return ok(null);
+      // Narrowed through the candidate module's own projection rather than returned as the stored
+      // row, so Home's `provider` is the domain literal and not the column's text (F24-AC2).
+      return ok(found === null ? null : toDeliveryCandidate(found));
+    },
+
+    reviewReadModel: async ({ projectId, candidateId }) => {
+      const facts = readFacts(deps, { projectId, candidateId });
+      if (!facts.ok) return facts;
+      const candidate = facts.value.candidate;
+      // The card's own read is addressed by candidate; this one is addressed the same way, and
+      // passes the recorded commit because that is the commit the stored evidence was bound to.
+      // Nothing here re-judges currency - `buildMvpReviewReadModel` does (F24-AC4).
+      const model = await root.mvpReviewUseCases.review({
+        projectId,
+        requestId: candidate.requestId,
+        candidateId,
+        expectedHeadSha: candidate.headSha,
+        expectedContractRevision: candidate.contractRevision,
+        facts: facts.value.facts,
+      });
+      return model;
+    },
+  };
 }
 
 /**

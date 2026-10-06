@@ -558,10 +558,24 @@ interface ReviewFacts {
  * Every read is keyed by the project as well as the identity, and a candidate recorded against
  * another project is refused rather than projected: a cross-project lookup by id alone would let
  * one project's owner read another's review card (F02-AC2).
+ *
+ * **Exported, and only for that.** The Home board needs the same facts for the same candidate and
+ * must reach the same verdict about them, so it reads them through this function rather than
+ * assembling its own. Two implementations of "the facts about a candidate" is precisely the
+ * arrangement that let the candidate surface and the review card disagree about what a project
+ * required, which F20-AC5 exists to prevent; this is the second place that could have happened and
+ * is now the same place as the first. It takes no `MvpReviewCardDeps` member that is not a durable
+ * store, so composing it cannot introduce a provider call (F23-AC1).
+ *
+ * Its command is narrowed to the project and candidate because those are the only two it reads.
+ * Authorization is not dropped by doing that — every caller that reaches this function is already
+ * behind a proved owner session, and the project scope check below is what stops one project
+ * reading another's candidate. A fact reader that demanded an identity it would not use would push
+ * a second, meaningless owner identity into a shared helper (F01-AC1, F02-AC2).
  */
-function readFacts(
+export function readFacts(
   deps: MvpReviewCardDeps,
-  command: ReadMvpReviewCommand,
+  command: Pick<ReadMvpReviewCommand, 'projectId' | 'candidateId'>,
 ): Result<ReviewFacts, DomainError> {
   const candidate = deps.candidates.get(command.candidateId as CandidateId);
   if (!candidate.ok) return candidate;

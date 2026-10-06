@@ -85,11 +85,18 @@ export interface AppDependencies {
   /**
    * The stored candidate and review projections the home route composes.
    *
-   * Optional, and null by default, because the composition root does not expose
-   * `createCandidateLinkUseCases` or `createMvpReviewUseCases` yet. Until it does, the home
-   * route refuses with a 503 naming the missing dependency rather than answering with three
-   * empty groups — an empty board is a claim about the project, and a server that cannot read
-   * a candidate has no basis for one. Owned by the composition root, not by this route.
+   * Overridable only so a test can substitute its own facts.
+   *
+   * **Defaults to the controller's own `home` group**, which is the durable candidate and review
+   * reads built by the composition root. It used to default to `null`, on the stated assumption
+   * that the composition root did not expose those reads yet — and because nothing anywhere passed
+   * a value, Home answered `503 This deployment exposes no stored candidate or review projection`
+   * on every deployment, including ones with a fully populated database. The route's refusal was
+   * correct; the composition was not (F11-AC1, F02-AC4).
+   *
+   * Defaulting to the surface means a deployment cannot end up without these reads by omission:
+   * the group is declared on `ControllerSurface`, so a surface lacking it is a type error rather
+   * than a runtime 503 (F03-AC2).
    */
   readonly homeSources?: HomeEvidenceSources | null;
 }
@@ -141,7 +148,15 @@ export async function buildApp(deps: AppDependencies): Promise<FastifyInstance> 
   // Last of the project-scoped group, and for the same reason as the rest: the project
   // identity is part of the path, so settings cannot be addressed without one (mvp-spec 3).
   registerSettingsRoutes(app, { controller, guard, now });
-  registerHomeRoutes(app, { controller, guard, now, sources: deps.homeSources ?? null });
+  // The `??` below distinguishes an omitted value from an explicit `null`: `undefined` means
+  // "use what the surface carries", while `null` is a caller deliberately supplying no
+  // sources so the route's refusal can be exercised (N03-AC3).
+  registerHomeRoutes(app, {
+    controller,
+    guard,
+    now,
+    sources: deps.homeSources === undefined ? controller.home : deps.homeSources,
+  });
   // The last project-scoped pair, and for the same reason as the rest: the review card and
   // the owner decision are addressed as `/projects/:projectId/candidates/:candidateId/...`,
   // so a request cannot name a candidate without naming the project that holds it. The MVP

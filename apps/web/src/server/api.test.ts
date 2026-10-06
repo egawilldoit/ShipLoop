@@ -351,6 +351,22 @@ function notImplemented<T>(useCase: string): Promise<Result<T, DomainError>> {
 }
 
 class InMemoryController implements ControllerSurface {
+  /**
+   * Home's durable reads, as this double answers them.
+   *
+   * Present because the group is on the interface, not because this double exercises Home: the
+   * board is composed in `routes/home.test.ts`, and what matters here is that a surface carrying
+   * no candidate at all is still a *typed* surface. Answering "no candidate" rather than throwing is
+   * what makes the absence honest for a double that holds no delivery-candidate rows (F02-AC1).
+   */
+  readonly home = {
+    recordedCandidate: async () => ok(null),
+    reviewReadModel: async () => ({
+      ok: false as const,
+      error: { code: 'NotFound' as const, reason: 'This double holds no candidate to review.' },
+    }),
+  };
+
   private readonly sessionsById = new Map<string, StoredSessionRecord>();
   private readonly sessionIdByDigest = new Map<string, string>();
   private readonly profileVersions = new Map<string, ProfileVersionView[]>();
@@ -4675,6 +4691,12 @@ test('the loaded controller module is validated before it can serve a request', 
     // Its absence is exactly the state this product was in: generation implemented and
     // unreachable from any shipped path (F07-AC1, F08-AC1).
     generation: new InMemoryController(() => new Date("2026-10-02T10:00:00.000Z"), ADAPTER_CAPABILITIES, true).generation,
+    // Home's group must be declared on the surface too. Its absence is the second instance of
+    // the same state this guard exists for: the route was registered, `buildApp` had a place to
+    // receive the reads, and nothing supplied them, so `GET .../home` answered 503 on every
+    // deployment - including this one, which is built from a real controller over a real store
+    // (F11-AC1, F02-AC4).
+    home: { recordedCandidate() {}, reviewReadModel() {} },
   };
   assert.equal(isControllerSurface(complete), true);
   const missingOwnerTestMethod = {

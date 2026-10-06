@@ -34,6 +34,7 @@ import type {
   ProjectId,
   Result,
 } from '@shiploop/domain';
+import type { HomeEvidenceSources } from './routes/home.ts';
 
 /**
  * Narrows an identifier that arrived as validated HTTP text.
@@ -2367,6 +2368,16 @@ export interface ControllerSurface {
   readonly contracts: ContractUseCases;
   readonly handoff: HandoffUseCases;
   /**
+   * The two durable reads the Home board composes from.
+   *
+   * Typed here as the Home route's own `HomeEvidenceSources` rather than a second declaration, so
+   * the transport and the controller must agree on the shape or this file will not compile. The
+   * member is declared rather than discovered for the reason the candidate port now is: a group a
+   * transport looks for at runtime is a group that can be missing, and this one was — Home
+   * answered 503 on every deployment until it was carried (F11-AC1, F02-AC4).
+   */
+  readonly home: HomeEvidenceSources;
+  /**
    * The review card and the owner's decision (F24, F25).
    *
    * Declared on the surface rather than resolved optionally: a review card and a decision
@@ -2465,6 +2476,7 @@ const REQUIRED_METHODS = {
     'requestAdoptedEvaluation',
   ],
   generation: ['startBriefGeneration', 'startPlanGeneration', 'getGeneration', 'listGenerations'],
+  home: ['recordedCandidate', 'reviewReadModel'],
 } as const satisfies Record<keyof ControllerSurface, readonly string[]>;
 
 export type ControllerGroup = keyof typeof REQUIRED_METHODS;
